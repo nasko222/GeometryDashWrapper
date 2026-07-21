@@ -68,6 +68,10 @@ static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
 
+extern int shim_bionic_setjmp(uint32_t *environment);
+extern int shim_bionic_sigsetjmp(uint32_t *environment, int save_mask);
+extern void shim_bionic_longjmp(uint32_t *environment, int value);
+
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info) {
     uintptr_t address = (uintptr_t)info->ExceptionRecord->ExceptionAddress;
     runtime_log("FATAL: Windows exception 0x%08lx at %p",
@@ -153,7 +157,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.1");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha1");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -1645,6 +1649,12 @@ static void *custom_function(const char *name) {
     CUSTOM("unlink", shim_unlink);
     CUSTOM("srand48", shim_srand48);
     CUSTOM("lrand48", shim_lrand48);
+    CUSTOM("setjmp", shim_bionic_setjmp);
+    CUSTOM("_setjmp", shim_bionic_setjmp);
+    CUSTOM("sigsetjmp", shim_bionic_sigsetjmp);
+    CUSTOM("longjmp", shim_bionic_longjmp);
+    CUSTOM("_longjmp", shim_bionic_longjmp);
+    CUSTOM("siglongjmp", shim_bionic_longjmp);
     CUSTOM("wctype", shim_wctype);
     CUSTOM("iswctype", shim_iswctype);
     CUSTOM("towlower", shim_towlower);

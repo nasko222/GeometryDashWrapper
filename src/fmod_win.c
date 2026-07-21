@@ -13,6 +13,8 @@
 #define FMOD_ERR_INVALID_PARAM 31
 #define FMOD_VERSION_1_05_04 0x00010504u
 #define FMOD_LOOP_NORMAL 0x00000002u
+#define FMOD_TIMEUNIT_RAWBYTES 0x00000008u
+#define FMOD_SPEAKERMODE_STEREO 3
 
 #define SYSTEM_MAGIC 0x53595346u
 #define SOUND_MAGIC 0x444e5346u
@@ -33,6 +35,12 @@ typedef struct {
     uint32_t magic;
     int initialized;
     int suspended;
+    unsigned stream_buffer_size;
+    unsigned stream_buffer_time_unit;
+    int output_type;
+    int software_rate;
+    int software_speaker_mode;
+    int software_raw_speakers;
 } FakeFmodSystem;
 
 typedef struct {
@@ -230,6 +238,10 @@ static int fake_system_create(void **output) {
     g_next_effect_sound = 0;
     g_next_effect_channel = 0;
     g_system.magic = SYSTEM_MAGIC;
+    g_system.stream_buffer_size = 16384u;
+    g_system.stream_buffer_time_unit = FMOD_TIMEUNIT_RAWBYTES;
+    g_system.software_rate = 44100;
+    g_system.software_speaker_mode = FMOD_SPEAKERMODE_STEREO;
     g_dsp.magic = DSP_MAGIC;
     *output = &g_system;
     runtime_log("FMOD 1.05.04 compatibility bridge initialized");
@@ -242,6 +254,74 @@ static int fake_system_get_version(void *opaque, unsigned *version) {
         return FMOD_ERR_INVALID_PARAM;
     }
     *version = FMOD_VERSION_1_05_04;
+    return FMOD_OK;
+}
+
+static int fake_system_get_stream_buffer_size(void *opaque, unsigned *size,
+                                               unsigned *time_unit) {
+    FakeFmodSystem *system = (FakeFmodSystem *)opaque;
+    if (!system || system->magic != SYSTEM_MAGIC || !size || !time_unit) {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+    *size = system->stream_buffer_size;
+    *time_unit = system->stream_buffer_time_unit;
+    runtime_log("FMOD bridge: stream buffer queried (%u, unit=0x%08x)",
+                *size, *time_unit);
+    return FMOD_OK;
+}
+
+static int fake_system_set_stream_buffer_size(void *opaque, unsigned size,
+                                               unsigned time_unit) {
+    FakeFmodSystem *system = (FakeFmodSystem *)opaque;
+    if (!system || system->magic != SYSTEM_MAGIC || !size) {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+    system->stream_buffer_size = size;
+    system->stream_buffer_time_unit = time_unit;
+    runtime_log("FMOD bridge: stream buffer configured (%u, unit=0x%08x)",
+                size, time_unit);
+    return FMOD_OK;
+}
+
+static int fake_system_set_output(void *opaque, int output_type) {
+    FakeFmodSystem *system = (FakeFmodSystem *)opaque;
+    if (!system || system->magic != SYSTEM_MAGIC) {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+    system->output_type = output_type;
+    runtime_log("FMOD bridge: accepted output type %d for Windows backend",
+                output_type);
+    return FMOD_OK;
+}
+
+static int fake_system_get_software_format(void *opaque, int *sample_rate,
+                                           int *speaker_mode,
+                                           int *raw_speakers) {
+    FakeFmodSystem *system = (FakeFmodSystem *)opaque;
+    if (!system || system->magic != SYSTEM_MAGIC || !sample_rate ||
+        !speaker_mode || !raw_speakers) {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+    *sample_rate = system->software_rate;
+    *speaker_mode = system->software_speaker_mode;
+    *raw_speakers = system->software_raw_speakers;
+    runtime_log("FMOD bridge: software format queried (%d Hz, mode=%d, raw=%d)",
+                *sample_rate, *speaker_mode, *raw_speakers);
+    return FMOD_OK;
+}
+
+static int fake_system_set_software_format(void *opaque, int sample_rate,
+                                           int speaker_mode,
+                                           int raw_speakers) {
+    FakeFmodSystem *system = (FakeFmodSystem *)opaque;
+    if (!system || system->magic != SYSTEM_MAGIC || sample_rate <= 0) {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+    system->software_rate = sample_rate;
+    system->software_speaker_mode = speaker_mode;
+    system->software_raw_speakers = raw_speakers;
+    runtime_log("FMOD bridge: software format configured (%d Hz, mode=%d, raw=%d)",
+                sample_rate, speaker_mode, raw_speakers);
     return FMOD_OK;
 }
 
@@ -587,6 +667,10 @@ static const FmodFunction functions[] = {
     {"_ZN4FMOD3DSP18setMeteringEnabledEbb", (void *)fake_dsp_set_metering_enabled},
     {"_ZN4FMOD5Sound7releaseEv", (void *)fake_sound_release},
     {"_ZN4FMOD6System10getVersionEPj", (void *)fake_system_get_version},
+    {"_ZN4FMOD6System17getSoftwareFormatEPiP16FMOD_SPEAKERMODES1_", (void *)fake_system_get_software_format},
+    {"_ZN4FMOD6System17setSoftwareFormatEi16FMOD_SPEAKERMODEi", (void *)fake_system_set_software_format},
+    {"_ZN4FMOD6System19getStreamBufferSizeEPjS1_", (void *)fake_system_get_stream_buffer_size},
+    {"_ZN4FMOD6System19setStreamBufferSizeEjj", (void *)fake_system_set_stream_buffer_size},
     {"_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (void *)fake_system_create_sound},
     {"_ZN4FMOD6System11mixerResumeEv", (void *)fake_system_mixer_resume},
     {"_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE", (void *)fake_system_create_stream},
@@ -595,6 +679,7 @@ static const FmodFunction functions[] = {
     {"_ZN4FMOD6System5closeEv", (void *)fake_system_close},
     {"_ZN4FMOD6System6updateEv", (void *)fake_system_update},
     {"_ZN4FMOD6System7releaseEv", (void *)fake_system_release},
+    {"_ZN4FMOD6System9setOutputE15FMOD_OUTPUTTYPE", (void *)fake_system_set_output},
     {"_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE", (void *)fake_system_play_sound},
     {"_ZN4FMOD7Channel11getPositionEPjj", (void *)fake_channel_get_position},
     {"_ZN4FMOD7Channel11setPositionEjj", (void *)fake_channel_set_position},

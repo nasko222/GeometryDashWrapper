@@ -162,6 +162,7 @@ def main() -> int:
         root / "src/main.c",
         root / "src/loader.c",
         root / "src/runtime.c",
+        root / "src/bionic_x86.S",
         root / "src/jni_shim.c",
         root / "src/audio_win.c",
         root / "src/fmod_win.c",
