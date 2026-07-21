@@ -152,7 +152,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.8.1");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.8.2");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -449,38 +449,65 @@ static const char *translate_game_path(const char *path, char *translated,
     return path;
 }
 
-static FILE *shim_fopen(const char *path, const char *mode) {
+static void *shim_fopen(const char *path, const char *mode) {
+    typedef void *(__cdecl *CrtFopenFunction)(const char *, const char *);
+    static CrtFopenFunction function;
     char translated[MAX_PATH * 2];
     const char *resolved = translate_game_path(path, translated,
                                                sizeof(translated));
+    if (!function && g_msvcrt) {
+        function = (CrtFopenFunction)GetProcAddress(g_msvcrt, "fopen");
+    }
     if (resolved == translated) {
         runtime_log("Game data: fopen %s (%s)", resolved,
                     mode ? mode : "<null mode>");
     }
-    return fopen(resolved, mode);
+    return function ? function(resolved, mode) : NULL;
 }
 
 static int shim_rename(const char *old_path, const char *new_path) {
+    typedef int (__cdecl *CrtRenameFunction)(const char *, const char *);
+    static CrtRenameFunction function;
     char old_translated[MAX_PATH * 2];
     char new_translated[MAX_PATH * 2];
     const char *old_resolved = translate_game_path(old_path, old_translated,
                                                    sizeof(old_translated));
     const char *new_resolved = translate_game_path(new_path, new_translated,
                                                    sizeof(new_translated));
+    if (!function && g_msvcrt) {
+        function = (CrtRenameFunction)GetProcAddress(g_msvcrt, "rename");
+    }
     if (old_resolved == old_translated || new_resolved == new_translated) {
         runtime_log("Game data: rename %s -> %s", old_resolved, new_resolved);
     }
-    return rename(old_resolved, new_resolved);
+    return function ? function(old_resolved, new_resolved) : -1;
 }
 
 static int shim_remove(const char *path) {
+    typedef int (__cdecl *CrtPathFunction)(const char *);
+    static CrtPathFunction function;
     char translated[MAX_PATH * 2];
-    return remove(translate_game_path(path, translated, sizeof(translated)));
+    if (!function && g_msvcrt) {
+        function = (CrtPathFunction)GetProcAddress(g_msvcrt, "remove");
+    }
+    return function ? function(translate_game_path(path, translated,
+                                                   sizeof(translated)))
+                    : -1;
 }
 
 static int shim_unlink(const char *path) {
+    typedef int (__cdecl *CrtPathFunction)(const char *);
+    static CrtPathFunction function;
     char translated[MAX_PATH * 2];
-    return _unlink(translate_game_path(path, translated, sizeof(translated)));
+    if (!function && g_msvcrt) {
+        function = (CrtPathFunction)GetProcAddress(g_msvcrt, "_unlink");
+        if (!function) {
+            function = (CrtPathFunction)GetProcAddress(g_msvcrt, "unlink");
+        }
+    }
+    return function ? function(translate_game_path(path, translated,
+                                                   sizeof(translated)))
+                    : -1;
 }
 
 static void shim_srand48(long seed) {
