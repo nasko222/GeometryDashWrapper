@@ -53,10 +53,10 @@ static float g_effects_volume = 1.0f;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
-static OutputMeter *g_output_meter;
-static int g_com_release_required;
-static int g_output_meter_attempted;
-static int g_output_peak_logged;
+static HANDLE g_output_meter_thread;
+static HANDLE g_output_meter_stop;
+static volatile LONG g_output_peak_bits;
+static volatile LONG g_output_peak_logged;
 
 /* Keep the Core Audio GUIDs local so the wrapper does not need uuid.lib. */
 static const GUID g_clsid_mmdevice_enumerator = {
@@ -78,19 +78,20 @@ static float clamp_volume(float value) {
     return value;
 }
 
-static void initialize_output_meter(void) {
+static DWORD WINAPI output_meter_thread(void *unused) {
     IMMDeviceEnumerator *enumerator = NULL;
     IMMDevice *device = NULL;
+    OutputMeter *meter = NULL;
     HRESULT result;
-    if (g_output_meter || g_output_meter_attempted) return;
-    g_output_meter_attempted = 1;
+    int release_com = 0;
+    (void)unused;
     result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (SUCCEEDED(result)) {
-        g_com_release_required = 1;
-    } else if (result != RPC_E_CHANGED_MODE) {
+        release_com = 1;
+    } else {
         runtime_log("WASAPI metering: COM initialization failed (0x%08lx)",
                     (unsigned long)result);
-        return;
+        return 1;
     }
     result = CoCreateInstance(
         &g_clsid_mmdevice_enumerator, NULL, CLSCTX_INPROC_SERVER,
@@ -102,15 +103,55 @@ static void initialize_output_meter(void) {
     if (SUCCEEDED(result)) {
         result = IMMDevice_Activate(
             device, &g_iid_audio_meter_information, CLSCTX_INPROC_SERVER,
-            NULL, (void **)&g_output_meter);
+            NULL, (void **)&meter);
     }
     if (device) IMMDevice_Release(device);
     if (enumerator) IMMDeviceEnumerator_Release(enumerator);
-    if (SUCCEEDED(result) && g_output_meter) {
+    if (SUCCEEDED(result) && meter) {
         runtime_log("WASAPI output metering initialized for FMOD DSP peaks");
     } else {
         runtime_log("WASAPI output metering unavailable (0x%08lx)",
                     (unsigned long)result);
+        if (release_com) CoUninitialize();
+        return 2;
+    }
+    while (WaitForSingleObject(g_output_meter_stop, 10) == WAIT_TIMEOUT) {
+        union {
+            float floating;
+            LONG integer;
+        } peak_bits;
+        peak_bits.floating = 0.0f;
+        if (FAILED(meter->lpVtbl->GetPeakValue(meter,
+                                               &peak_bits.floating))) {
+            peak_bits.floating = 0.0f;
+        }
+        peak_bits.floating = clamp_volume(peak_bits.floating);
+        InterlockedExchange(&g_output_peak_bits, peak_bits.integer);
+        if (peak_bits.floating > 0.001f &&
+            InterlockedCompareExchange(&g_output_peak_logged, 1, 0) == 0) {
+            runtime_log("WASAPI FMOD metering: first nonzero peak %.3f",
+                        peak_bits.floating);
+        }
+    }
+    InterlockedExchange(&g_output_peak_bits, 0);
+    meter->lpVtbl->Release(meter);
+    if (release_com) CoUninitialize();
+    return 0;
+}
+
+static void initialize_output_meter(void) {
+    if (g_output_meter_thread) return;
+    g_output_meter_stop = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_output_meter_stop) {
+        runtime_log("WASAPI metering: failed to create stop event");
+        return;
+    }
+    g_output_meter_thread = CreateThread(
+        NULL, 0, output_meter_thread, NULL, 0, NULL);
+    if (!g_output_meter_thread) {
+        runtime_log("WASAPI metering: failed to create worker thread");
+        CloseHandle(g_output_meter_stop);
+        g_output_meter_stop = NULL;
     }
 }
 
@@ -325,18 +366,20 @@ void audio_set_apk_path(const char *apk_path) {
 }
 
 void audio_shutdown(void) {
+    if (g_output_meter_stop) SetEvent(g_output_meter_stop);
+    if (g_output_meter_thread) {
+        WaitForSingleObject(g_output_meter_thread, INFINITE);
+        CloseHandle(g_output_meter_thread);
+        g_output_meter_thread = NULL;
+    }
+    if (g_output_meter_stop) {
+        CloseHandle(g_output_meter_stop);
+        g_output_meter_stop = NULL;
+    }
+    InterlockedExchange(&g_output_peak_bits, 0);
+    InterlockedExchange(&g_output_peak_logged, 0);
     audio_stop_all_effects();
     close_music();
-    if (g_output_meter) {
-        g_output_meter->lpVtbl->Release(g_output_meter);
-        g_output_meter = NULL;
-    }
-    if (g_com_release_required) {
-        CoUninitialize();
-        g_com_release_required = 0;
-    }
-    g_output_meter_attempted = 0;
-    g_output_peak_logged = 0;
 }
 
 void audio_preload_background(const char *path) {
@@ -460,18 +503,12 @@ void audio_set_background_volume(float volume) {
 }
 
 float audio_get_output_peak(void) {
-    float peak = 0.0f;
-    HRESULT result;
-    if (!g_output_meter) initialize_output_meter();
-    if (!g_output_meter) return 0.0f;
-    result = g_output_meter->lpVtbl->GetPeakValue(g_output_meter, &peak);
-    if (FAILED(result)) return 0.0f;
-    peak = clamp_volume(peak);
-    if (peak > 0.001f && !g_output_peak_logged) {
-        g_output_peak_logged = 1;
-        runtime_log("WASAPI FMOD metering: first nonzero peak %.3f", peak);
-    }
-    return peak;
+    union {
+        float floating;
+        LONG integer;
+    } peak_bits;
+    peak_bits.integer = InterlockedCompareExchange(&g_output_peak_bits, 0, 0);
+    return clamp_volume(peak_bits.floating);
 }
 
 void audio_preload_effect(const char *path) {
