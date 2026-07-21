@@ -382,6 +382,120 @@ static long shim_lrand48(void) {
     return (long)((g_lcg_state >> 1) & 0x7fffffffu);
 }
 
+enum {
+    WCTYPE_ALNUM = 1,
+    WCTYPE_ALPHA,
+    WCTYPE_BLANK,
+    WCTYPE_CNTRL,
+    WCTYPE_DIGIT,
+    WCTYPE_GRAPH,
+    WCTYPE_LOWER,
+    WCTYPE_PRINT,
+    WCTYPE_PUNCT,
+    WCTYPE_SPACE,
+    WCTYPE_UPPER,
+    WCTYPE_XDIGIT
+};
+
+static uint32_t shim_wctype(const char *name) {
+    static const char *const names[] = {
+        "", "alnum", "alpha", "blank", "cntrl", "digit", "graph",
+        "lower", "print", "punct", "space", "upper", "xdigit"
+    };
+    uint32_t index;
+    for (index = 1; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (name && strcmp(name, names[index]) == 0) {
+            return index;
+        }
+    }
+    return 0;
+}
+
+static int shim_iswctype(uint32_t character, uint32_t type) {
+    unsigned char value;
+    if (character > 0x7f) {
+        return 0;
+    }
+    value = (unsigned char)character;
+    switch (type) {
+    case WCTYPE_ALNUM: return isalnum(value) != 0;
+    case WCTYPE_ALPHA: return isalpha(value) != 0;
+    case WCTYPE_BLANK: return value == ' ' || value == '\t';
+    case WCTYPE_CNTRL: return iscntrl(value) != 0;
+    case WCTYPE_DIGIT: return isdigit(value) != 0;
+    case WCTYPE_GRAPH: return isgraph(value) != 0;
+    case WCTYPE_LOWER: return islower(value) != 0;
+    case WCTYPE_PRINT: return isprint(value) != 0;
+    case WCTYPE_PUNCT: return ispunct(value) != 0;
+    case WCTYPE_SPACE: return isspace(value) != 0;
+    case WCTYPE_UPPER: return isupper(value) != 0;
+    case WCTYPE_XDIGIT: return isxdigit(value) != 0;
+    default: return 0;
+    }
+}
+
+static uint32_t shim_towlower(uint32_t character) {
+    return character <= 0x7f ? (uint32_t)tolower((unsigned char)character) : character;
+}
+
+static uint32_t shim_towupper(uint32_t character) {
+    return character <= 0x7f ? (uint32_t)toupper((unsigned char)character) : character;
+}
+
+static int shim_wctob(uint32_t character) {
+    return character <= 0xff ? (int)character : -1;
+}
+
+static uint32_t shim_btowc(int character) {
+    return character == -1 ? UINT32_MAX : (uint32_t)(unsigned char)character;
+}
+
+static size_t shim_wcslen(const uint32_t *string) {
+    const uint32_t *cursor = string;
+    while (*cursor) {
+        ++cursor;
+    }
+    return (size_t)(cursor - string);
+}
+
+static uint32_t *shim_wmemchr(const uint32_t *memory, uint32_t value, size_t count) {
+    size_t index;
+    for (index = 0; index < count; ++index) {
+        if (memory[index] == value) {
+            return (uint32_t *)(memory + index);
+        }
+    }
+    return NULL;
+}
+
+static int shim_wmemcmp(const uint32_t *first, const uint32_t *second, size_t count) {
+    size_t index;
+    for (index = 0; index < count; ++index) {
+        if (first[index] != second[index]) {
+            return first[index] < second[index] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t *shim_wmemcpy(uint32_t *destination, const uint32_t *source,
+                              size_t count) {
+    return (uint32_t *)memcpy(destination, source, count * sizeof(uint32_t));
+}
+
+static uint32_t *shim_wmemmove(uint32_t *destination, const uint32_t *source,
+                               size_t count) {
+    return (uint32_t *)memmove(destination, source, count * sizeof(uint32_t));
+}
+
+static uint32_t *shim_wmemset(uint32_t *destination, uint32_t value, size_t count) {
+    size_t index;
+    for (index = 0; index < count; ++index) {
+        destination[index] = value;
+    }
+    return destination;
+}
+
 static int shim_getdtablesize(void) {
     return 2048;
 }
@@ -591,6 +705,98 @@ static void shim_glClearDepthf(float depth) {
     }
 }
 
+static int token_boundary(char value) {
+    return !(value == '_' || (value >= '0' && value <= '9') ||
+             (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z'));
+}
+
+static void erase_shader_token(char *text, size_t length, const char *token) {
+    size_t token_length = strlen(token);
+    size_t index;
+    if (length < token_length) {
+        return;
+    }
+    for (index = 0; index + token_length <= length; ++index) {
+        if ((index == 0 || token_boundary(text[index - 1])) &&
+            (index + token_length == length || token_boundary(text[index + token_length])) &&
+            memcmp(text + index, token, token_length) == 0) {
+            memset(text + index, ' ', token_length);
+        }
+    }
+}
+
+static void erase_precision_statements(char *text, size_t length) {
+    const char token[] = "precision";
+    size_t index;
+    for (index = 0; index + sizeof(token) - 1 <= length; ++index) {
+        size_t end;
+        if ((index != 0 && !token_boundary(text[index - 1])) ||
+            memcmp(text + index, token, sizeof(token) - 1) != 0) {
+            continue;
+        }
+        end = index;
+        while (end < length && text[end] != ';' && text[end] != '\n') {
+            ++end;
+        }
+        if (end < length && text[end] == ';') {
+            ++end;
+        }
+        while (index < end) {
+            if (text[index] != '\r' && text[index] != '\n') {
+                text[index] = ' ';
+            }
+            ++index;
+        }
+    }
+}
+
+static void shim_glShaderSource(unsigned int shader, int count,
+                                const char *const *strings, const int *lengths) {
+    typedef void (APIENTRY *Function)(unsigned int, int, const char *const *,
+                                      const int *);
+    static Function function;
+    char **copies;
+    int *copy_lengths;
+    int index;
+    if (!function) {
+        function = (Function)wglGetProcAddress("glShaderSource");
+    }
+    if (!function || count <= 0) {
+        runtime_log("ERROR: desktop glShaderSource is unavailable");
+        return;
+    }
+    copies = (char **)calloc((size_t)count, sizeof(*copies));
+    copy_lengths = (int *)calloc((size_t)count, sizeof(*copy_lengths));
+    if (!copies || !copy_lengths) {
+        free(copies);
+        free(copy_lengths);
+        function(shader, count, strings, lengths);
+        return;
+    }
+    for (index = 0; index < count; ++index) {
+        size_t length = lengths && lengths[index] >= 0
+                            ? (size_t)lengths[index]
+                            : strlen(strings[index]);
+        copies[index] = (char *)malloc(length + 1);
+        if (!copies[index]) {
+            continue;
+        }
+        memcpy(copies[index], strings[index], length);
+        copies[index][length] = 0;
+        copy_lengths[index] = (int)length;
+        erase_precision_statements(copies[index], length);
+        erase_shader_token(copies[index], length, "lowp");
+        erase_shader_token(copies[index], length, "mediump");
+        erase_shader_token(copies[index], length, "highp");
+    }
+    function(shader, count, (const char *const *)copies, copy_lengths);
+    for (index = 0; index < count; ++index) {
+        free(copies[index]);
+    }
+    free(copy_lengths);
+    free(copies);
+}
+
 static uintptr_t shim_stub_zero(void) {
     return 0;
 }
@@ -650,6 +856,18 @@ static void *custom_function(const char *name) {
     CUSTOM("basename", shim_basename);
     CUSTOM("srand48", shim_srand48);
     CUSTOM("lrand48", shim_lrand48);
+    CUSTOM("wctype", shim_wctype);
+    CUSTOM("iswctype", shim_iswctype);
+    CUSTOM("towlower", shim_towlower);
+    CUSTOM("towupper", shim_towupper);
+    CUSTOM("wctob", shim_wctob);
+    CUSTOM("btowc", shim_btowc);
+    CUSTOM("wcslen", shim_wcslen);
+    CUSTOM("wmemchr", shim_wmemchr);
+    CUSTOM("wmemcmp", shim_wmemcmp);
+    CUSTOM("wmemcpy", shim_wmemcpy);
+    CUSTOM("wmemmove", shim_wmemmove);
+    CUSTOM("wmemset", shim_wmemset);
     CUSTOM("getdtablesize", shim_getdtablesize);
     CUSTOM("alarm", shim_alarm);
     CUSTOM("fork", shim_process_unsupported);
@@ -658,6 +876,7 @@ static void *custom_function(const char *name) {
     CUSTOM("waitpid", shim_process_unsupported);
     CUSTOM("syscall", shim_syscall);
     CUSTOM("glClearDepthf", shim_glClearDepthf);
+    CUSTOM("glShaderSource", shim_glShaderSource);
     CUSTOM("pthread_attr_init", shim_pthread_attr_init);
     CUSTOM("pthread_cond_destroy", shim_pthread_cond_destroy);
     CUSTOM("pthread_cond_init", shim_pthread_cond_init);

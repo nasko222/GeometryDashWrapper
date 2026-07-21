@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the 32-bit Windows Geometry Dash 1.8 native-wrapper probe."""
+"""Build the 32-bit Windows Geometry Dash 1.8 native wrapper."""
 
 from __future__ import annotations
 
@@ -72,6 +72,7 @@ def main() -> int:
         root / "src/main.c",
         root / "src/loader.c",
         root / "src/runtime.c",
+        root / "src/jni_shim.c",
         *sorted((root / "third_party/zlib").glob("*.c")),
     ]
     command = [
@@ -91,6 +92,9 @@ def main() -> int:
         str(output / "GeometryDash18Wrapper.exe"),
         *(str(path) for path in sources),
         "-lws2_32",
+        "-lopengl32",
+        "-lgdi32",
+        "-luser32",
     ]
     environment = os.environ.copy()
     environment["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")
@@ -98,7 +102,9 @@ def main() -> int:
     subprocess.run(command, check=True, env=environment)
 
     if args.apk:
-        extract_library(args.apk.resolve(), output / "libcocos2dcpp.so")
+        apk = args.apk.resolve()
+        extract_library(apk, output / "libcocos2dcpp.so")
+        shutil.copy2(apk, output / "game.apk")
 
     print(output / "GeometryDash18Wrapper.exe")
     return 0
