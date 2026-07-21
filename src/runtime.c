@@ -15,6 +15,7 @@
 
 #define MAX_IMPORTS 1024
 #define THUNK_SIZE 16
+#define CALLCONV_THUNK_SIZE 80
 #define MAX_ATEXIT 1024
 
 typedef struct {
@@ -35,6 +36,7 @@ static FILE *g_log;
 static char *g_import_names[MAX_IMPORTS];
 static void *g_import_targets[MAX_IMPORTS];
 static unsigned char *g_thunks;
+static unsigned char *g_callconv_thunks;
 static HMODULE g_msvcrt;
 static HMODULE g_ws2;
 static HMODULE g_opengl;
@@ -113,6 +115,9 @@ void runtime_initialize(const char *log_path) {
     g_thunks = (unsigned char *)VirtualAlloc(
         NULL, MAX_IMPORTS * THUNK_SIZE, MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE);
+    g_callconv_thunks = (unsigned char *)VirtualAlloc(
+        NULL, MAX_IMPORTS * CALLCONV_THUNK_SIZE, MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE);
     for (i = 0; i < 384; ++i) {
         int value = (int)i - 128;
         unsigned char c = (unsigned char)value;
@@ -122,7 +127,7 @@ void runtime_initialize(const char *log_path) {
         g_tolower[i] = (int16_t)tolower(c);
         g_toupper[i] = (int16_t)toupper(c);
     }
-    runtime_log("Geometry Dash 1.8 native wrapper probe");
+    runtime_log("Geometry Dash 1.8 native compatibility wrapper 0.3");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -133,6 +138,10 @@ void runtime_shutdown(void) {
     if (g_thunks) {
         VirtualFree(g_thunks, 0, MEM_RELEASE);
         g_thunks = NULL;
+    }
+    if (g_callconv_thunks) {
+        VirtualFree(g_callconv_thunks, 0, MEM_RELEASE);
+        g_callconv_thunks = NULL;
     }
     WSACleanup();
     if (g_log) {
@@ -919,6 +928,126 @@ static void *custom_function(const char *name) {
     return NULL;
 }
 
+typedef struct {
+    const char *name;
+    unsigned char argument_dwords;
+} CallConventionEntry;
+
+/*
+ * Android/i386 GLES entry points use cdecl.  The 32-bit Windows OpenGL ABI
+ * uses stdcall, including functions returned by wglGetProcAddress.  Jumping
+ * from an ELF import thunk straight to a Windows GL function therefore makes
+ * the callee pop the Android caller's argument area and corrupts its stack.
+ * These counts let us build a tiny cdecl wrapper around each stdcall target.
+ */
+static const CallConventionEntry gl_call_conventions[] = {
+    {"glActiveTexture", 1}, {"glAttachShader", 2},
+    {"glBindAttribLocation", 3}, {"glBindBuffer", 2},
+    {"glBindFramebuffer", 2}, {"glBindRenderbuffer", 2},
+    {"glBindTexture", 2}, {"glBlendEquation", 1},
+    {"glBlendFunc", 2}, {"glBufferData", 4},
+    {"glBufferSubData", 4}, {"glCheckFramebufferStatus", 1},
+    {"glClear", 1}, {"glClearColor", 4}, {"glClearStencil", 1},
+    {"glCompileShader", 1}, {"glCompressedTexImage2D", 8},
+    {"glCreateProgram", 0}, {"glCreateShader", 1},
+    {"glDeleteBuffers", 2}, {"glDeleteFramebuffers", 2},
+    {"glDeleteProgram", 1}, {"glDeleteRenderbuffers", 2},
+    {"glDeleteShader", 1}, {"glDeleteTextures", 2},
+    {"glDepthFunc", 1}, {"glDepthMask", 1}, {"glDisable", 1},
+    {"glDisableVertexAttribArray", 1}, {"glDrawArrays", 3},
+    {"glDrawElements", 4}, {"glEnable", 1},
+    {"glEnableVertexAttribArray", 1},
+    {"glFramebufferRenderbuffer", 4}, {"glFramebufferTexture2D", 5},
+    {"glGenBuffers", 2}, {"glGenFramebuffers", 2},
+    {"glGenRenderbuffers", 2}, {"glGenTextures", 2},
+    {"glGenerateMipmap", 1}, {"glGetBooleanv", 2},
+    {"glGetError", 0}, {"glGetFloatv", 2}, {"glGetIntegerv", 2},
+    {"glGetProgramInfoLog", 4}, {"glGetProgramiv", 3},
+    {"glGetShaderInfoLog", 4}, {"glGetShaderSource", 4},
+    {"glGetShaderiv", 3}, {"glGetString", 1},
+    {"glGetUniformLocation", 2}, {"glIsEnabled", 1},
+    {"glLineWidth", 1}, {"glLinkProgram", 1},
+    {"glPixelStorei", 2}, {"glReadPixels", 7},
+    {"glRenderbufferStorage", 4}, {"glScissor", 4},
+    {"glStencilFunc", 3}, {"glStencilMask", 1}, {"glStencilOp", 3},
+    {"glTexImage2D", 9}, {"glTexParameteri", 3},
+    {"glUniform1f", 2}, {"glUniform1i", 2},
+    {"glUniform2f", 3}, {"glUniform2fv", 3},
+    {"glUniform2i", 3}, {"glUniform2iv", 3},
+    {"glUniform3f", 4}, {"glUniform3fv", 3},
+    {"glUniform3i", 4}, {"glUniform3iv", 3},
+    {"glUniform4f", 5}, {"glUniform4fv", 3},
+    {"glUniform4i", 5}, {"glUniform4iv", 3},
+    {"glUniformMatrix4fv", 4}, {"glUseProgram", 1},
+    {"glVertexAttribPointer", 6}, {"glViewport", 4},
+};
+
+static int gl_argument_dwords(const char *name) {
+    size_t index;
+    for (index = 0;
+         index < sizeof(gl_call_conventions) / sizeof(gl_call_conventions[0]);
+         ++index) {
+        if (strcmp(name, gl_call_conventions[index].name) == 0) {
+            return gl_call_conventions[index].argument_dwords;
+        }
+    }
+    return -1;
+}
+
+static void *lookup_opengl_function(const char *name) {
+    void *address = module_symbol(MOD_GL, name);
+    if (!address && g_opengl) {
+        typedef PROC (WINAPI *WglGetProcAddressFunction)(LPCSTR);
+        WglGetProcAddressFunction get_proc =
+            (WglGetProcAddressFunction)GetProcAddress(g_opengl,
+                                                       "wglGetProcAddress");
+        if (get_proc) {
+            PROC proc = get_proc(name);
+            if (proc && proc != (PROC)1 && proc != (PROC)2 &&
+                proc != (PROC)3 && proc != (PROC)-1) {
+                address = (void *)proc;
+            }
+        }
+    }
+    return address;
+}
+
+static void *make_cdecl_to_stdcall_thunk(uint32_t id, void *target,
+                                         unsigned argument_dwords,
+                                         const char *name) {
+    unsigned char *code;
+    size_t position = 0;
+    int argument;
+    if (!g_callconv_thunks || id >= MAX_IMPORTS || argument_dwords > 9) {
+        return NULL;
+    }
+    code = g_callconv_thunks + id * CALLCONV_THUNK_SIZE;
+    code[position++] = 0x55;             /* push ebp */
+    code[position++] = 0x89;             /* mov ebp, esp */
+    code[position++] = 0xe5;
+    for (argument = (int)argument_dwords; argument >= 1; --argument) {
+        code[position++] = 0xff;         /* push dword ptr [ebp+disp32] */
+        code[position++] = 0xb5;
+        *(uint32_t *)(code + position) = 4u + (uint32_t)argument * 4u;
+        position += 4;
+    }
+    code[position++] = 0xb8;             /* mov eax, target */
+    *(uint32_t *)(code + position) = (uint32_t)(uintptr_t)target;
+    position += 4;
+    code[position++] = 0xff;             /* call eax */
+    code[position++] = 0xd0;
+    code[position++] = 0xc9;             /* leave */
+    code[position++] = 0xc3;             /* ret (cdecl: caller owns args) */
+    if (position > CALLCONV_THUNK_SIZE) {
+        runtime_log("FATAL: call-convention thunk overflow for %s", name);
+        return NULL;
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, position);
+    runtime_log("OpenGL ABI bridge: %s (%u argument dwords)", name,
+                argument_dwords);
+    return code;
+}
+
 static void *lookup_function(const char *name) {
     void *address;
     size_t i;
@@ -942,31 +1071,32 @@ static void *lookup_function(const char *name) {
     if (address) {
         return address;
     }
-    address = module_symbol(MOD_GL, name);
-    if (address) {
-        return address;
-    }
-    if (g_opengl) {
-        typedef PROC (WINAPI *WglGetProcAddressFunction)(LPCSTR);
-        WglGetProcAddressFunction get_proc =
-            (WglGetProcAddressFunction)GetProcAddress(g_opengl, "wglGetProcAddress");
-        if (get_proc) {
-            PROC proc = get_proc(name);
-            if (proc && proc != (PROC)1 && proc != (PROC)2 &&
-                proc != (PROC)3 && proc != (PROC)-1) {
-                return (void *)proc;
-            }
-        }
-    }
     return NULL;
 }
 
 void *runtime_resolve_function(const char *name, uint32_t id) {
     void *target;
+    int gl_arguments;
     if (id < MAX_IMPORTS && g_import_targets[id]) {
         return g_import_targets[id];
     }
-    target = lookup_function(name);
+    target = custom_function(name);
+    gl_arguments = name && name[0] == 'g' && name[1] == 'l'
+                       ? gl_argument_dwords(name)
+                       : -1;
+    if (!target && gl_arguments >= 0) {
+        void *raw_target = lookup_opengl_function(name);
+        if (raw_target) {
+            target = make_cdecl_to_stdcall_thunk(
+                id, raw_target, (unsigned)gl_arguments, name);
+        }
+    } else if (!target && name && name[0] == 'g' && name[1] == 'l') {
+        runtime_log("UNSUPPORTED OPENGL IMPORT: %s", name);
+    }
+    if (!target && gl_arguments < 0 &&
+        !(name && name[0] == 'g' && name[1] == 'l')) {
+        target = lookup_function(name);
+    }
     if (!target) {
         runtime_log("UNIMPLEMENTED IMPORT CALLED: %s", name ? name : "<invalid>");
         target = (void *)shim_stub_zero;
