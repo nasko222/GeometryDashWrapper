@@ -62,10 +62,67 @@ static const char *path_file_name(const char *path) {
 static void resolve_storage_path(const char *path, char *destination,
                                  size_t capacity) {
     if (!path) path = "";
-    if ((path[0] && path[1] == ':') || path[0] == '/' || path[0] == '\\') {
+    if (strcmp(path, "/save") == 0 || strcmp(path, "/save/") == 0) {
+        snprintf(destination, capacity, "%s", g_writable_directory);
+    } else if (strncmp(path, "/save/", 6) == 0) {
+        snprintf(destination, capacity, "%s%s", g_writable_directory, path + 6);
+    } else if ((path[0] && path[1] == ':') || path[0] == '/' ||
+               path[0] == '\\') {
         snprintf(destination, capacity, "%s", path);
     } else {
         snprintf(destination, capacity, "%s%s", g_writable_directory, path);
+    }
+}
+
+static void migrate_legacy_root_file(const char *root, const char *name) {
+    char source[MAX_PATH * 2];
+    char destination[MAX_PATH * 2];
+    DWORD source_attributes;
+    DWORD destination_attributes;
+    snprintf(source, sizeof(source), "%s/%s", root, name);
+    snprintf(destination, sizeof(destination), "%s%s", g_writable_directory,
+             name);
+    source_attributes = GetFileAttributesA(source);
+    if (source_attributes == INVALID_FILE_ATTRIBUTES ||
+        (source_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return;
+    }
+    destination_attributes = GetFileAttributesA(destination);
+    if (destination_attributes != INVALID_FILE_ATTRIBUTES) {
+        runtime_log("Save migration: kept existing save/%s; legacy root file remains",
+                    name);
+        return;
+    }
+    if (MoveFileExA(source, destination, MOVEFILE_WRITE_THROUGH)) {
+        runtime_log("Save migration: moved legacy root %s into save/", name);
+    } else {
+        runtime_log("Save migration: could not move legacy root %s (%lu)", name,
+                    (unsigned long)GetLastError());
+    }
+}
+
+static void migrate_legacy_root_saves(void) {
+    static const char *const names[] = {
+        "CCGameManager.dat", "CCGameManager.dat.bak",
+        "CCLocalLevels.dat", "CCLocalLevels.dat.bak",
+        "CCGameStore.dat", "CCGameStore.dat.bak",
+        "CCData.dat", "CCData.dat.bak"
+    };
+    char root[MAX_PATH * 2];
+    char *separator;
+    size_t length;
+    size_t index;
+    snprintf(root, sizeof(root), "%s", g_writable_directory);
+    length = strlen(root);
+    while (length && (root[length - 1] == '/' || root[length - 1] == '\\')) {
+        root[--length] = 0;
+    }
+    separator = strrchr(root, '/');
+    if (!separator) separator = strrchr(root, '\\');
+    if (!separator || strcmp(separator + 1, "save") != 0) return;
+    *separator = 0;
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
+        migrate_legacy_root_file(root, names[index]);
     }
 }
 
@@ -284,6 +341,7 @@ void storage_initialize(const char *writable_directory) {
     snprintf(g_writable_directory, sizeof(g_writable_directory), "%s",
              writable_directory ? writable_directory : "./save/");
     CreateDirectoryA(g_writable_directory, NULL);
+    migrate_legacy_root_saves();
     snprintf(g_preferences_path, sizeof(g_preferences_path), "%spreferences.bin",
              g_writable_directory);
     InitializeCriticalSection(&g_preferences_lock);

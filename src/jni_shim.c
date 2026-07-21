@@ -751,16 +751,19 @@ static int vm_get_env(void *java_vm, void **environment, int version) {
 }
 
 void jni_shim_initialize(const char *executable_directory) {
+    char storage_path[MAX_PATH * 2];
     size_t i;
-    snprintf(g_writable_path, sizeof(g_writable_path), "%s/save/",
+    snprintf(storage_path, sizeof(storage_path), "%s/save/",
              executable_directory ? executable_directory : ".");
-    for (i = 0; g_writable_path[i]; ++i) {
-        if (g_writable_path[i] == '\\') {
-            g_writable_path[i] = '/';
+    for (i = 0; storage_path[i]; ++i) {
+        if (storage_path[i] == '\\') {
+            storage_path[i] = '/';
         }
     }
-    CreateDirectoryA(g_writable_path, NULL);
-    storage_initialize(g_writable_path);
+    CreateDirectoryA(storage_path, NULL);
+    storage_initialize(storage_path);
+    /* CCFileUtilsAndroid only recognizes a leading slash as a disk path. */
+    snprintf(g_writable_path, sizeof(g_writable_path), "/save");
     audio_initialize(executable_directory);
 
     for (i = 0; i < JNI_TABLE_SIZE; ++i) {
@@ -833,7 +836,8 @@ void jni_shim_initialize(const char *executable_directory) {
     g_vm_table[5] = (void *)vm_detach_current_thread;
     g_vm_table[6] = (void *)vm_get_env;
     g_vm_table[7] = (void *)vm_attach_current_thread;
-    runtime_log("JNI shim initialized; writable path: %s", g_writable_path);
+    runtime_log("JNI shim initialized; Cocos writable path: %s/", g_writable_path);
+    runtime_log("JNI shim initialized; Windows storage path: %s", storage_path);
 }
 
 void jni_shim_shutdown(void) {

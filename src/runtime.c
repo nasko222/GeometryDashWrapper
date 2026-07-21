@@ -152,7 +152,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.8");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.8.1");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -405,6 +405,82 @@ static char *shim_basename(char *path) {
         slash = backslash;
     }
     return slash ? slash + 1 : path;
+}
+
+static int is_game_data_name(const char *name) {
+    static const char *const prefixes[] = {
+        "CCGameManager.dat", "CCLocalLevels.dat",
+        "CCGameStore.dat", "CCData.dat"
+    };
+    size_t index;
+    if (!name) return 0;
+    for (index = 0; index < sizeof(prefixes) / sizeof(prefixes[0]); ++index) {
+        size_t length = strlen(prefixes[index]);
+        if (strcmp(name, prefixes[index]) == 0 ||
+            (strncmp(name, prefixes[index], length) == 0 &&
+             strcmp(name + length, ".bak") == 0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *translate_game_path(const char *path, char *translated,
+                                       size_t capacity) {
+    const char *slash;
+    const char *backslash;
+    const char *name;
+    if (!path) return path;
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    name = slash && (!backslash || slash > backslash) ? slash + 1
+                                                       : backslash ? backslash + 1
+                                                                   : path;
+    if (is_game_data_name(name)) {
+        snprintf(translated, capacity, "save/%s", name);
+        return translated;
+    }
+    if (strncmp(path, "/save/", 6) == 0 || strcmp(path, "/save") == 0) {
+        return path + 1;
+    }
+    if (path[0] == '/' && isalpha((unsigned char)path[1]) && path[2] == ':') {
+        return path + 1;
+    }
+    return path;
+}
+
+static FILE *shim_fopen(const char *path, const char *mode) {
+    char translated[MAX_PATH * 2];
+    const char *resolved = translate_game_path(path, translated,
+                                               sizeof(translated));
+    if (resolved == translated) {
+        runtime_log("Game data: fopen %s (%s)", resolved,
+                    mode ? mode : "<null mode>");
+    }
+    return fopen(resolved, mode);
+}
+
+static int shim_rename(const char *old_path, const char *new_path) {
+    char old_translated[MAX_PATH * 2];
+    char new_translated[MAX_PATH * 2];
+    const char *old_resolved = translate_game_path(old_path, old_translated,
+                                                   sizeof(old_translated));
+    const char *new_resolved = translate_game_path(new_path, new_translated,
+                                                   sizeof(new_translated));
+    if (old_resolved == old_translated || new_resolved == new_translated) {
+        runtime_log("Game data: rename %s -> %s", old_resolved, new_resolved);
+    }
+    return rename(old_resolved, new_resolved);
+}
+
+static int shim_remove(const char *path) {
+    char translated[MAX_PATH * 2];
+    return remove(translate_game_path(path, translated, sizeof(translated)));
+}
+
+static int shim_unlink(const char *path) {
+    char translated[MAX_PATH * 2];
+    return _unlink(translate_game_path(path, translated, sizeof(translated)));
 }
 
 static void shim_srand48(long seed) {
@@ -1533,6 +1609,10 @@ static void *custom_function(const char *name) {
     CUSTOM("strlcat", shim_strlcat);
     CUSTOM("memrchr", shim_memrchr);
     CUSTOM("basename", shim_basename);
+    CUSTOM("fopen", shim_fopen);
+    CUSTOM("rename", shim_rename);
+    CUSTOM("remove", shim_remove);
+    CUSTOM("unlink", shim_unlink);
     CUSTOM("srand48", shim_srand48);
     CUSTOM("lrand48", shim_lrand48);
     CUSTOM("wctype", shim_wctype);
