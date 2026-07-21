@@ -19,6 +19,7 @@ void audio_set_background_volume(float volume);
 
 void audio_preload_effect(const char *path);
 unsigned audio_play_effect(const char *path, int loop);
+int audio_is_effect_playing(unsigned identifier);
 void audio_pause_effect(unsigned identifier);
 void audio_resume_effect(unsigned identifier);
 void audio_stop_effect(unsigned identifier);

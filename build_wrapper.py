@@ -164,6 +164,7 @@ def main() -> int:
         root / "src/runtime.c",
         root / "src/jni_shim.c",
         root / "src/audio_win.c",
+        root / "src/fmod_win.c",
         root / "src/storage_win.c",
         embedded_effects,
         *sorted((root / "third_party/zlib").glob("*.c")),

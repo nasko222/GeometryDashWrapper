@@ -18,6 +18,7 @@
 #include <time.h>
 
 #include "runtime.h"
+#include "fmod_win.h"
 #include "../third_party/zlib/zlib.h"
 
 #define MAX_IMPORTS 1024
@@ -152,11 +153,11 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.8.2");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.0");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
-    runtime_log("Compatibility services: zlib, pthread, Winsock/POSIX, audio, and JNI bridges");
+    runtime_log("Compatibility services: zlib, pthread, Winsock/POSIX, Cocos/FMOD audio, and JNI bridges");
 }
 
 void runtime_shutdown(void) {
@@ -1616,6 +1617,8 @@ static void *module_symbol(int module, const char *name) {
 }
 
 static void *custom_function(const char *name) {
+    void *fmod_function = fmod_win_resolve(name);
+    if (fmod_function) return fmod_function;
 #define CUSTOM(symbol, function) if (strcmp(name, symbol) == 0) return (void *)(function)
     CUSTOM("__android_log_print", shim_android_log_print);
     CUSTOM("__assert2", shim_assert2);

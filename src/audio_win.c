@@ -388,6 +388,17 @@ unsigned audio_play_effect(const char *path, int loop) {
     return identifier;
 }
 
+int audio_is_effect_playing(unsigned identifier) {
+    EffectSlot *slot = find_effect(identifier);
+    char command[80];
+    char mode[32] = {0};
+    if (!slot) return 0;
+    snprintf(command, sizeof(command), "status %s mode", slot->alias);
+    if (!mci_command(command, mode, sizeof(mode), 0)) return 0;
+    return _stricmp(mode, "playing") == 0 ||
+           _stricmp(mode, "paused") == 0;
+}
+
 void audio_pause_effect(unsigned identifier) {
     EffectSlot *slot = find_effect(identifier);
     char command[80];
