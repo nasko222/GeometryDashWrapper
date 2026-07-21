@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "jni_shim.h"
@@ -62,6 +63,64 @@ typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
     unsigned long *size, int asynchronous);
 
 static AndroidFileDataFunction g_original_android_file_data;
+typedef void *(__cdecl *ElfNewArrayFunction)(unsigned int size);
+typedef void (__cdecl *ElfDeleteArrayFunction)(void *pointer);
+static ElfNewArrayFunction g_elf_new_array;
+static ElfDeleteArrayFunction g_elf_delete_array;
+static char g_apk_path[MAX_PATH * 2];
+
+static uint32_t fnv1a32(const unsigned char *data, size_t size) {
+    uint32_t hash = 2166136261u;
+    size_t index;
+    for (index = 0; index < size; ++index) {
+        hash ^= data[index];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static unsigned char *verified_object_definitions(
+    unsigned char *cocos_data, unsigned long *cocos_size) {
+    static const char member[] = "assets/objectDefinitions.plist";
+    unsigned char *verified = NULL;
+    unsigned char *replacement = NULL;
+    size_t verified_size = 0;
+    unsigned long current_size = cocos_size ? *cocos_size : 0;
+    uint32_t verified_hash;
+    uint32_t current_hash = cocos_data
+                                ? fnv1a32(cocos_data, (size_t)current_size)
+                                : 0;
+    if (!g_apk_path[0] ||
+        !apk_extract_member(g_apk_path, member, &verified, &verified_size)) {
+        runtime_log("Meltdown plist verification: independent APK read failed");
+        return cocos_data;
+    }
+    verified_hash = fnv1a32(verified, verified_size);
+    runtime_log("Meltdown plist verification: Cocos=%lu/%08lx APK=%lu/%08lx",
+                current_size, (unsigned long)current_hash,
+                (unsigned long)verified_size,
+                (unsigned long)verified_hash);
+    if (verified_size != 5554u || verified_hash != 0xf492ba19u) {
+        free(verified);
+        return cocos_data;
+    }
+    if (g_elf_new_array && verified_size < UINT32_MAX) {
+        replacement = (unsigned char *)g_elf_new_array(
+            (unsigned int)verified_size + 1u);
+    }
+    if (!replacement) {
+        runtime_log("Meltdown plist verification: compatible allocation failed");
+        free(verified);
+        return cocos_data;
+    }
+    memcpy(replacement, verified, verified_size);
+    replacement[verified_size] = 0;
+    free(verified);
+    if (cocos_data && g_elf_delete_array) g_elf_delete_array(cocos_data);
+    if (cocos_size) *cocos_size = (unsigned long)verified_size;
+    runtime_log("Meltdown plist fix: using CRC-verified, NUL-terminated APK bytes");
+    return replacement;
+}
 
 static unsigned char *trace_android_file_data(
     void *self, const char *filename, const char *mode,
@@ -72,6 +131,9 @@ static unsigned char *trace_android_file_data(
                 asynchronous != 0);
     result = g_original_android_file_data(
         self, filename, mode, size, asynchronous);
+    if (filename && strcmp(filename, "assets/objectDefinitions.plist") == 0) {
+        result = verified_object_definitions(result, size);
+    }
     runtime_log("APK asset result: %s -> %s (%lu bytes)",
                 filename ? filename : "<null>", result ? "ok" : "MISSING",
                 size ? *size : 0ul);
@@ -134,6 +196,10 @@ static void install_android_asset_trace(const ElfImage *image) {
     void *target = elf_image_find_export(
         image,
         "_ZN7cocos2d18CCFileUtilsAndroid13doGetFileDataEPKcS2_Pmb");
+    g_elf_new_array = (ElfNewArrayFunction)elf_image_find_export(image,
+                                                                  "_Znaj");
+    g_elf_delete_array = (ElfDeleteArrayFunction)elf_image_find_export(
+        image, "_ZdaPv");
     if (!target) {
         runtime_log("APK asset trace: Cocos Android reader export unavailable");
         return;
@@ -544,6 +610,8 @@ int main(int argc, char **argv) {
         runtime_shutdown();
         return 6;
     }
+    strncpy(g_apk_path, absolute_apk, sizeof(g_apk_path) - 1);
+    g_apk_path[sizeof(g_apk_path) - 1] = 0;
     set_apk_path = (NativeSetApkPathFunction)elf_image_find_export(
         &image, "Java_org_cocos2dx_lib_Cocos2dxHelper_nativeSetApkPath");
     if (set_apk_path) {
