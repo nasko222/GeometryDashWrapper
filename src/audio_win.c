@@ -44,6 +44,7 @@ struct OutputMeter {
 
 static char g_audio_directory[MAX_PATH * 2];
 static char g_audio_cache_directory[MAX_PATH * 2];
+static char g_save_directory[MAX_PATH * 2];
 static char g_apk_path[MAX_PATH * 2];
 static char g_music_path[MAX_PATH * 2];
 static EffectSlot g_effects[MAX_EFFECT_SLOTS];
@@ -272,6 +273,16 @@ static int audio_asset_path(const char *requested, int effect,
             return 1;
         }
     }
+    if (!effect) {
+        /* Downloaded custom songs live directly in Cocos's writable folder.
+           The game refers to them through an Android path such as
+           /save/590577.mp3, which is not a valid absolute path on Windows. */
+        snprintf(destination, capacity, "%s\\%s", g_save_directory, name);
+        if (file_is_regular(destination)) {
+            runtime_log("Audio custom song: using writable save file %s", name);
+            return 1;
+        }
+    }
     snprintf(destination, capacity, "%s\\%s", g_audio_cache_directory,
              converted);
     if (file_is_regular(destination)) return 1;
@@ -349,6 +360,8 @@ void audio_initialize(const char *executable_directory) {
              executable_directory ? executable_directory : ".");
     snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
              "%s\\save\\audio-cache",
+             executable_directory ? executable_directory : ".");
+    snprintf(g_save_directory, sizeof(g_save_directory), "%s\\save",
              executable_directory ? executable_directory : ".");
     snprintf(g_apk_path, sizeof(g_apk_path), "%s\\game.apk",
              executable_directory ? executable_directory : ".");
