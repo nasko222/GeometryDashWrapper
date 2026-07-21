@@ -69,6 +69,22 @@ static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
 
+/*
+ * The Android/i386 signal ABI used by these APKs is a compact 16-byte
+ * sigaction. Windows sockets never raise SIGPIPE, but libcurl/OpenSSL still
+ * save, replace, and restore these records. Keeping an in-process copy gives
+ * those libraries the state semantics they expect without installing Unix
+ * handlers into the Windows process.
+ */
+typedef struct {
+    uint32_t words[4];
+} AndroidSigaction;
+
+#define ANDROID_SIGNAL_COUNT 65
+static SRWLOCK g_signal_lock = SRWLOCK_INIT;
+static AndroidSigaction g_signal_actions[ANDROID_SIGNAL_COUNT];
+static uint32_t g_signal_mask;
+
 extern int shim_bionic_setjmp(uint32_t *environment);
 extern int shim_bionic_sigsetjmp(uint32_t *environment, int save_mask);
 extern void shim_bionic_longjmp(uint32_t *environment, int value);
@@ -204,7 +220,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha11");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.3-alpha1");
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
@@ -504,6 +520,163 @@ static unsigned long long shim_strtoull(const char *text, char **end,
     conversion_error = errno;
     if (conversion_error) g_errno_value = conversion_error;
     return result;
+}
+
+static const char *android_error_string(int error) {
+    switch (error) {
+    case 0: return "Success";
+    case 1: return "Operation not permitted";
+    case 2: return "No such file or directory";
+    case 4: return "Interrupted system call";
+    case 5: return "Input/output error";
+    case 9: return "Bad file descriptor";
+    case 11: return "Resource temporarily unavailable";
+    case 12: return "Out of memory";
+    case 13: return "Permission denied";
+    case 14: return "Bad address";
+    case 22: return "Invalid argument";
+    case 24: return "Too many open files";
+    case 32: return "Broken pipe";
+    case 34: return "Result too large";
+    case 88: return "Socket operation on non-socket";
+    case 89: return "Destination address required";
+    case 90: return "Message too long";
+    case 91: return "Protocol wrong type for socket";
+    case 92: return "Protocol option not available";
+    case 93: return "Protocol not supported";
+    case 94: return "Socket type not supported";
+    case 95: return "Operation not supported";
+    case 96: return "Protocol family not supported";
+    case 97: return "Address family not supported";
+    case 98: return "Address already in use";
+    case 99: return "Cannot assign requested address";
+    case 100: return "Network is down";
+    case 101: return "Network is unreachable";
+    case 102: return "Network dropped connection on reset";
+    case 103: return "Software caused connection abort";
+    case 104: return "Connection reset by peer";
+    case 105: return "No buffer space available";
+    case 106: return "Socket is already connected";
+    case 107: return "Socket is not connected";
+    case 108: return "Cannot send after socket shutdown";
+    case 109: return "Too many references";
+    case 110: return "Connection timed out";
+    case 111: return "Connection refused";
+    case 112: return "Host is down";
+    case 113: return "No route to host";
+    case 114: return "Operation already in progress";
+    case 115: return "Operation now in progress";
+    default: return "Unknown error";
+    }
+}
+
+static char *shim_strerror(int error) {
+    return (char *)android_error_string(error);
+}
+
+/*
+ * The bundled fmt code was compiled for GNU strerror_r (char * return), while
+ * the bundled curl code only needs a populated buffer and tolerates a nonzero
+ * return. Returning the supplied buffer therefore satisfies both call sites;
+ * returning POSIX's integer zero would make fmt store a null string pointer and
+ * is the cause of the observed song-download exception after a failed connect.
+ */
+static char *shim_strerror_r(int error, char *buffer, size_t size) {
+    static LONG logged;
+    const char *message = android_error_string(error);
+    size_t length = strlen(message);
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        runtime_log("Network error text: GNU/POSIX-compatible strerror_r buffer bridge active");
+    }
+    if (!buffer || !size) {
+        return (char *)message;
+    }
+    if (length >= size) {
+        length = size - 1;
+        g_errno_value = 34;
+    }
+    memcpy(buffer, message, length);
+    buffer[length] = 0;
+    return buffer;
+}
+
+static const char *shim_gai_strerror(int error) {
+    if (error < 0 && error >= -14) error = -error;
+    switch (error) {
+    case WSAHOST_NOT_FOUND: return "Name or service not known";
+    case WSATRY_AGAIN: return "Temporary failure in name resolution";
+    case WSANO_RECOVERY: return "Non-recoverable name resolution failure";
+    case WSANO_DATA: return "No address associated with host";
+    case WSAEAFNOSUPPORT: return "Address family not supported";
+    case WSAESOCKTNOSUPPORT: return "Socket type not supported";
+    case 1: return "Address family for hostname not supported";
+    case 2: return "Temporary failure in name resolution";
+    case 3: return "Invalid value for ai_flags";
+    case 4: return "Non-recoverable name resolution failure";
+    case 5: return "Address family not supported";
+    case 6: return "Out of memory";
+    case 7: return "No address associated with hostname";
+    case 8: return "Name or service not known";
+    case 9: return "Service not supported for socket type";
+    case 10: return "Socket type not supported";
+    default: return "Unknown address resolution error";
+    }
+}
+
+static int shim_sigaction(int signal_number, const void *action,
+                          void *old_action) {
+    static LONG logged;
+    if (signal_number <= 0 || signal_number >= ANDROID_SIGNAL_COUNT) {
+        g_errno_value = 22;
+        return -1;
+    }
+    AcquireSRWLockExclusive(&g_signal_lock);
+    if (old_action) {
+        memcpy(old_action, &g_signal_actions[signal_number],
+               sizeof(AndroidSigaction));
+    }
+    if (action) {
+        memcpy(&g_signal_actions[signal_number], action,
+               sizeof(AndroidSigaction));
+    }
+    ReleaseSRWLockExclusive(&g_signal_lock);
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        runtime_log("POSIX signals: preserving Android 16-byte sigaction state (SIGPIPE is virtual)");
+    }
+    return 0;
+}
+
+static void *shim_bsd_signal(int signal_number, void *handler) {
+    AndroidSigaction action;
+    AndroidSigaction old_action;
+    memset(&action, 0, sizeof(action));
+    action.words[0] = (uint32_t)(uintptr_t)handler;
+    if (shim_sigaction(signal_number, &action, &old_action) != 0) {
+        return (void *)(intptr_t)-1;
+    }
+    return (void *)(uintptr_t)old_action.words[0];
+}
+
+static int shim_sigprocmask(int how, const uint32_t *set, uint32_t *old_set) {
+    uint32_t previous;
+    AcquireSRWLockExclusive(&g_signal_lock);
+    previous = g_signal_mask;
+    if (old_set) *old_set = previous;
+    if (set) {
+        if (how == 0) {
+            g_signal_mask |= *set;
+        } else if (how == 1) {
+            g_signal_mask &= ~*set;
+        } else if (how == 2) {
+            g_signal_mask = *set;
+        } else {
+            ReleaseSRWLockExclusive(&g_signal_lock);
+            g_errno_value = 22;
+            return -1;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_signal_lock);
+    return 0;
 }
 
 static int is_game_data_name(const char *name) {
@@ -1113,11 +1286,15 @@ static void free_android_addrinfo(AndroidAddrInfo *entry) {
 static int shim_getaddrinfo(const char *node, const char *service,
                             const AndroidAddrInfo *hints,
                             AndroidAddrInfo **result) {
+    static LONG trace_count;
     ADDRINFOA windows_hints;
     ADDRINFOA *windows_result = NULL;
     ADDRINFOA *cursor;
     AndroidAddrInfo *head = NULL;
     AndroidAddrInfo **tail = &head;
+    unsigned ipv4_count = 0;
+    unsigned ipv6_count = 0;
+    int first_family = 0;
     int status;
     if (!result) {
         return EAI_FAIL;
@@ -1146,6 +1323,9 @@ static int shim_getaddrinfo(const char *node, const char *service,
         }
         entry->ai_flags = cursor->ai_flags;
         entry->ai_family = windows_family_to_android(cursor->ai_family);
+        if (!first_family) first_family = entry->ai_family;
+        if (entry->ai_family == AF_INET) ++ipv4_count;
+        if (entry->ai_family == ANDROID_AF_INET6) ++ipv6_count;
         entry->ai_socktype = cursor->ai_socktype;
         entry->ai_protocol = cursor->ai_protocol;
         entry->ai_addrlen = (uint32_t)cursor->ai_addrlen;
@@ -1178,6 +1358,16 @@ static int shim_getaddrinfo(const char *node, const char *service,
     }
     freeaddrinfo(windows_result);
     *result = head;
+    {
+        LONG trace = InterlockedIncrement(&trace_count);
+        if (trace <= 64) {
+            runtime_log("Network DNS result #%ld: first=%s IPv4=%u IPv6=%u",
+                        (long)trace,
+                        first_family == ANDROID_AF_INET6 ? "IPv6" :
+                        first_family == AF_INET ? "IPv4" : "other",
+                        ipv4_count, ipv6_count);
+        }
+    }
     return 0;
 }
 
@@ -1220,31 +1410,40 @@ static int shim_bind(int descriptor, const struct sockaddr *address, int length)
 }
 
 static int shim_connect(int descriptor, const struct sockaddr *address, int length) {
-    static LONG logged_connected;
-    static LONG logged_pending;
-    static LONG logged_failure;
+    static LONG trace_count;
     struct sockaddr_storage storage;
     int windows_length = length;
+    LONG trace = InterlockedIncrement(&trace_count);
+    const char *family = address && address->sa_family == ANDROID_AF_INET6
+                             ? "IPv6"
+                             : address && address->sa_family == AF_INET
+                                   ? "IPv4"
+                                   : "other";
     const struct sockaddr *windows_address =
         address_to_windows(address, length, &storage, &windows_length);
     if (connect((SOCKET)(uintptr_t)(uint32_t)descriptor, windows_address,
                 windows_length) == SOCKET_ERROR) {
         int windows_error = WSAGetLastError();
-        if ((windows_error == WSAEWOULDBLOCK ||
-             windows_error == WSAEINPROGRESS) &&
-            InterlockedCompareExchange(&logged_pending, 1, 0) == 0) {
-            runtime_log("Network connect: nonblocking connection pending");
-        } else if (windows_error != WSAEWOULDBLOCK &&
-                   windows_error != WSAEINPROGRESS &&
-                   InterlockedCompareExchange(&logged_failure, 1, 0) == 0) {
-            runtime_log("Network connect: first failure, Winsock error %d",
-                        windows_error);
+        int android_error = windows_error_to_android(windows_error);
+        if (trace <= 64) {
+            if (windows_error == WSAEWOULDBLOCK ||
+                windows_error == WSAEINPROGRESS) {
+                runtime_log("Network connect #%ld: fd=%d %s pending",
+                            (long)trace, descriptor, family);
+            } else {
+                runtime_log("Network connect #%ld: fd=%d %s failed "
+                            "(Winsock=%d Android errno=%d)",
+                            (long)trace, descriptor, family, windows_error,
+                            android_error);
+            }
         }
+        g_errno_value = android_error;
         WSASetLastError(windows_error);
-        return set_socket_error();
+        return -1;
     }
-    if (InterlockedCompareExchange(&logged_connected, 1, 0) == 0) {
-        runtime_log("Network connect: first connection established immediately");
+    if (trace <= 64) {
+        runtime_log("Network connect #%ld: fd=%d %s connected immediately",
+                    (long)trace, descriptor, family);
     }
     return 0;
 }
@@ -1408,31 +1607,121 @@ static int shim_shutdown(int descriptor, int how) {
     return 0;
 }
 
+static void trace_http_request(int descriptor, const void *buffer, int length) {
+    static LONG request_count;
+    static const char *const methods[] = {
+        "GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH"
+    };
+    const char *bytes = (const char *)buffer;
+    const char *method = NULL;
+    size_t method_length = 0;
+    size_t method_index;
+    char path[192];
+    size_t path_length = 0;
+    size_t offset;
+    LONG trace;
+    if (!bytes || length <= 0) return;
+    for (method_index = 0;
+         method_index < sizeof(methods) / sizeof(methods[0]); ++method_index) {
+        size_t candidate_length = strlen(methods[method_index]);
+        if (length > (int)candidate_length &&
+            memcmp(bytes, methods[method_index], candidate_length) == 0 &&
+            bytes[candidate_length] == ' ') {
+            method = methods[method_index];
+            method_length = candidate_length;
+            break;
+        }
+    }
+    if (!method) return;
+    offset = method_length + 1;
+    while (offset < (size_t)length && path_length + 1 < sizeof(path)) {
+        unsigned char character = (unsigned char)bytes[offset++];
+        if (character == ' ' || character == '?' || character == '\r' ||
+            character == '\n' || character < 0x20 || character > 0x7e) {
+            break;
+        }
+        path[path_length++] = (char)character;
+    }
+    path[path_length] = 0;
+    trace = InterlockedIncrement(&request_count);
+    if (trace <= 64) {
+        runtime_log("Network HTTP request #%ld: fd=%d %s %s (%d bytes)",
+                    (long)trace, descriptor, method,
+                    path_length ? path : "<path unavailable>", length);
+    }
+}
+
+static void trace_http_response(int descriptor, const void *buffer, int length) {
+    static LONG response_count;
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    char status[128];
+    size_t status_length = 0;
+    LONG trace;
+    if (!bytes || length < 5 || memcmp(bytes, "HTTP/", 5) != 0) return;
+    while (status_length < (size_t)length &&
+           status_length + 1 < sizeof(status)) {
+        unsigned char character = bytes[status_length];
+        if (character == '\r' || character == '\n') break;
+        status[status_length++] =
+            character >= 0x20 && character <= 0x7e ? (char)character : '?';
+    }
+    status[status_length] = 0;
+    trace = InterlockedIncrement(&response_count);
+    if (trace <= 64) {
+        runtime_log("Network HTTP response #%ld: fd=%d %s",
+                    (long)trace, descriptor,
+                    status_length ? status : "<status unavailable>");
+    }
+}
+
 static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
-    static LONG logged_response;
+    static LONG error_count;
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
-    if (result > 0 &&
-        InterlockedCompareExchange(&logged_response, 1, 0) == 0) {
-        runtime_log("Network recv: first response delivered (%d bytes)", result);
+    if (result > 0) {
+        trace_http_response(descriptor, buffer, result);
+        return result;
     }
-    return result == SOCKET_ERROR ? set_socket_error() : result;
+    if (result == SOCKET_ERROR) {
+        int windows_error = WSAGetLastError();
+        int android_error = windows_error_to_android(windows_error);
+        LONG trace = InterlockedIncrement(&error_count);
+        if (trace <= 32 && windows_error != WSAEWOULDBLOCK) {
+            runtime_log("Network recv error #%ld: fd=%d Winsock=%d Android errno=%d",
+                        (long)trace, descriptor, windows_error, android_error);
+        }
+        g_errno_value = android_error;
+        WSASetLastError(windows_error);
+        return -1;
+    }
+    return result;
 }
 
 static int shim_send(int descriptor, const void *buffer, size_t length, int flags) {
-    static LONG logged_request;
+    static LONG error_count;
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = send((SOCKET)(uintptr_t)(uint32_t)descriptor, (const char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
-    if (result > 0 &&
-        InterlockedCompareExchange(&logged_request, 1, 0) == 0) {
-        runtime_log("Network send: first request payload accepted (%d bytes)",
-                    result);
+    if (result > 0) {
+        trace_http_request(descriptor, buffer, result);
+        return result;
     }
-    return result == SOCKET_ERROR ? set_socket_error() : result;
+    if (result == SOCKET_ERROR) {
+        int windows_error = WSAGetLastError();
+        int android_error = windows_error_to_android(windows_error);
+        LONG trace = InterlockedIncrement(&error_count);
+        if (trace <= 32 && windows_error != WSAEWOULDBLOCK) {
+            runtime_log("Network send error #%ld: fd=%d Winsock=%d Android errno=%d",
+                        (long)trace, descriptor, windows_error, android_error);
+        }
+        g_errno_value = android_error;
+        WSASetLastError(windows_error);
+        return -1;
+    }
+    return result;
 }
 
 static int shim_recvfrom(int descriptor, void *buffer, size_t length, int flags,
@@ -2109,6 +2398,9 @@ static void *custom_function(const char *name) {
     CUSTOM("strlcat", shim_strlcat);
     CUSTOM("memrchr", shim_memrchr);
     CUSTOM("basename", shim_basename);
+    CUSTOM("strerror", shim_strerror);
+    CUSTOM("strerror_r", shim_strerror_r);
+    CUSTOM("gai_strerror", shim_gai_strerror);
     CUSTOM("strtoll", shim_strtoll);
     CUSTOM("strtoull", shim_strtoull);
     CUSTOM("fopen", shim_fopen);
@@ -2137,6 +2429,9 @@ static void *custom_function(const char *name) {
     CUSTOM("longjmp", shim_bionic_longjmp);
     CUSTOM("_longjmp", shim_bionic_longjmp);
     CUSTOM("siglongjmp", shim_bionic_longjmp);
+    CUSTOM("sigaction", shim_sigaction);
+    CUSTOM("bsd_signal", shim_bsd_signal);
+    CUSTOM("sigprocmask", shim_sigprocmask);
     CUSTOM("wctype", shim_wctype);
     CUSTOM("iswctype", shim_iswctype);
     CUSTOM("towlower", shim_towlower);

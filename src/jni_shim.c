@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #include <shellapi.h>
 
 #include <stdarg.h>
@@ -52,6 +53,7 @@ static void *g_vm_table[8];
 static FakeJNIEnv g_environment = {g_jni_table};
 static FakeJavaVM g_java_vm = {g_vm_table};
 static char g_writable_path[MAX_PATH * 2];
+static char g_android_user_id[17] = "0";
 static double g_frame_interval = 1.0 / 60.0;
 static int g_text_input_active;
 
@@ -234,6 +236,60 @@ static const char *reference_string(FakeRef *reference) {
                : "";
 }
 
+static int valid_android_user_id(const char *value) {
+    size_t index;
+    if (!value || strlen(value) != 16) return 0;
+    for (index = 0; index < 16; ++index) {
+        char character = value[index];
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f') ||
+              (character >= 'A' && character <= 'F'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void initialize_android_user_id(void) {
+    static const char key[] = "__gd_wrapper_android_id_v1";
+    char *stored = storage_get_string_copy(key, "");
+    if (valid_android_user_id(stored)) {
+        size_t index;
+        memcpy(g_android_user_id, stored, 17);
+        for (index = 0; index < 16; ++index) {
+            if (g_android_user_id[index] >= 'A' &&
+                g_android_user_id[index] <= 'F') {
+                g_android_user_id[index] =
+                    (char)(g_android_user_id[index] - 'A' + 'a');
+            }
+        }
+    } else {
+        GUID guid;
+        if (SUCCEEDED(CoCreateGuid(&guid))) {
+            snprintf(g_android_user_id, sizeof(g_android_user_id),
+                     "%08lx%04x%04x", (unsigned long)guid.Data1,
+                     (unsigned)guid.Data2, (unsigned)guid.Data3);
+        } else {
+            FILETIME now;
+            LARGE_INTEGER counter;
+            uint32_t first;
+            uint32_t second;
+            GetSystemTimeAsFileTime(&now);
+            QueryPerformanceCounter(&counter);
+            first = now.dwLowDateTime ^ (uint32_t)counter.LowPart ^
+                    (uint32_t)GetCurrentProcessId();
+            second = now.dwHighDateTime ^ (uint32_t)counter.HighPart ^
+                     (uint32_t)GetCurrentThreadId();
+            snprintf(g_android_user_id, sizeof(g_android_user_id),
+                     "%08lx%08lx", (unsigned long)first,
+                     (unsigned long)second);
+        }
+        storage_set_string(key, g_android_user_id);
+    }
+    free(stored);
+    runtime_log("JNI identity bridge: stable Android-style user ID ready");
+}
+
 static int has_prefix(const char *value, const char *prefix) {
     return value && prefix && strncmp(value, prefix, strlen(prefix)) == 0;
 }
@@ -283,7 +339,7 @@ static void *dispatch_object(FakeRef *method, va_list arguments) {
         return jni_shim_new_string("Windows Native Wrapper");
     }
     if (strcmp(name, "getUserID") == 0) {
-        return jni_shim_new_string("0");
+        return jni_shim_new_string(g_android_user_id);
     }
     if (strcmp(name, "getStringForKey") == 0) {
         FakeRef *key = checked_reference(va_arg(arguments, void *));
@@ -762,6 +818,7 @@ void jni_shim_initialize(const char *executable_directory) {
     }
     CreateDirectoryA(storage_path, NULL);
     storage_initialize(storage_path);
+    initialize_android_user_id();
     /* CCFileUtilsAndroid only recognizes a leading slash as a disk path. */
     snprintf(g_writable_path, sizeof(g_writable_path), "/save");
     audio_initialize(executable_directory);
