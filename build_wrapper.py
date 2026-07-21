@@ -60,10 +60,10 @@ def locate_ffmpeg(value: str | None) -> Path:
 
 
 def generate_embedded_effects(
-    apk: Path | None, destination: Path, ffmpeg: Path | None
+    apks: list[Path], destination: Path, ffmpeg: Path | None
 ) -> None:
     effects: list[tuple[str, bytes, int]] = []
-    if apk is None:
+    if not apks:
         destination.write_text(
             '#include "embedded_effects.h"\n'
             'const EmbeddedEffect *embedded_effect_find(const char *name) '
@@ -72,15 +72,27 @@ def generate_embedded_effects(
         )
         return
     assert ffmpeg is not None
-    with zipfile.ZipFile(apk) as archive, tempfile.TemporaryDirectory() as temporary:
+    payloads: dict[str, bytes] = {}
+    for apk in apks:
+        with zipfile.ZipFile(apk) as archive:
+            members = sorted(
+                name for name in archive.namelist()
+                if name.startswith("assets/") and name.lower().endswith(".ogg")
+            )
+            for member in members:
+                name = Path(member).name
+                payload = archive.read(member)
+                previous = payloads.get(name)
+                if previous is not None and previous != payload:
+                    raise RuntimeError(
+                        f"Conflicting Ogg effect {name!r} in {apk}; a universal "
+                        "build needs version-aware effect selection"
+                    )
+                payloads[name] = payload
+
+    with tempfile.TemporaryDirectory() as temporary:
         temporary_path = Path(temporary)
-        members = sorted(
-            name for name in archive.namelist()
-            if name.startswith("assets/") and name.lower().endswith(".ogg")
-        )
-        for index, member in enumerate(members):
-            name = Path(member).name
-            payload = archive.read(member)
+        for index, (name, payload) in enumerate(sorted(payloads.items())):
             source = temporary_path / f"source-{index}.ogg"
             target = temporary_path / f"effect-{index}.wav"
             source.write_bytes(payload)
@@ -142,6 +154,10 @@ def main() -> int:
     parser.add_argument("--zig", help="Path to Zig")
     parser.add_argument("--ffmpeg", help="Path to FFmpeg for Ogg effect conversion")
     parser.add_argument("--apk", type=Path, help="Optional Geometry Dash APK with x86 code")
+    parser.add_argument(
+        "--effects-apk", type=Path, action="append", default=[],
+        help="Additional APK whose Ogg effects should be embedded in the same EXE; repeatable",
+    )
     parser.add_argument("--out", type=Path, default=Path("dist"))
     args = parser.parse_args()
 
@@ -150,16 +166,22 @@ def main() -> int:
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=True)
     apk = args.apk.resolve() if args.apk else None
+    effect_apks = [path.resolve() for path in args.effects_apk]
     ffmpeg = None
     if apk:
         validate_apk(apk)
+        effect_apks.insert(0, apk)
+    for effect_apk in effect_apks:
+        if not effect_apk.is_file():
+            raise RuntimeError(f"Effects APK was not found: {effect_apk}")
+    if effect_apks:
         ffmpeg = locate_ffmpeg(args.ffmpeg)
     cache = root / "build-cache"
     cache.mkdir(exist_ok=True)
     generated = cache / "generated"
     generated.mkdir(exist_ok=True)
     embedded_effects = generated / "embedded_effects.c"
-    generate_embedded_effects(apk, embedded_effects, ffmpeg)
+    generate_embedded_effects(effect_apks, embedded_effects, ffmpeg)
 
     sources = [
         root / "src/main.c",
@@ -196,6 +218,7 @@ def main() -> int:
         "-luser32",
         "-lshell32",
         "-lwinmm",
+        "-lole32",
     ]
     environment = os.environ.copy()
     environment["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")

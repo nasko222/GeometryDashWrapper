@@ -17,6 +17,7 @@ float audio_get_background_time(void);
 int audio_is_background_playing(void);
 float audio_get_background_volume(void);
 void audio_set_background_volume(float volume);
+float audio_get_output_peak(void);
 
 void audio_preload_effect(const char *path);
 unsigned audio_play_effect(const char *path, int loop);

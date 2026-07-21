@@ -203,7 +203,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha7");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha8");
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",

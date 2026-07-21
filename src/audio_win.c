@@ -1,6 +1,9 @@
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <windows.h>
 #include <mmsystem.h>
+#include <mmdeviceapi.h>
+#include <objbase.h>
 
 #include <io.h>
 #include <stdio.h>
@@ -22,6 +25,22 @@ typedef struct {
     char alias[32];
 } EffectSlot;
 
+/* MinGW's endpointvolume.h only forward-declares this interface in C. */
+typedef struct OutputMeter OutputMeter;
+typedef struct {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(OutputMeter *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(OutputMeter *);
+    ULONG (STDMETHODCALLTYPE *Release)(OutputMeter *);
+    HRESULT (STDMETHODCALLTYPE *GetPeakValue)(OutputMeter *, float *);
+    HRESULT (STDMETHODCALLTYPE *GetMeteringChannelCount)(OutputMeter *, UINT *);
+    HRESULT (STDMETHODCALLTYPE *GetChannelsPeakValues)(OutputMeter *, UINT,
+                                                        float *);
+    HRESULT (STDMETHODCALLTYPE *QueryHardwareSupport)(OutputMeter *, DWORD *);
+} OutputMeterVtbl;
+struct OutputMeter {
+    const OutputMeterVtbl *lpVtbl;
+};
+
 static char g_audio_directory[MAX_PATH * 2];
 static char g_audio_cache_directory[MAX_PATH * 2];
 static char g_apk_path[MAX_PATH * 2];
@@ -34,11 +53,65 @@ static float g_effects_volume = 1.0f;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
+static OutputMeter *g_output_meter;
+static int g_com_release_required;
+static int g_output_meter_attempted;
+static int g_output_peak_logged;
+
+/* Keep the Core Audio GUIDs local so the wrapper does not need uuid.lib. */
+static const GUID g_clsid_mmdevice_enumerator = {
+    0xbcde0395, 0xe52f, 0x467c,
+    {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}
+};
+static const GUID g_iid_mmdevice_enumerator = {
+    0xa95664d2, 0x9614, 0x4f35,
+    {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}
+};
+static const GUID g_iid_audio_meter_information = {
+    0xc02216f6, 0x8c67, 0x4b5b,
+    {0x9d, 0x00, 0xd0, 0x08, 0xe7, 0x3e, 0x00, 0x64}
+};
 
 static float clamp_volume(float value) {
     if (value < 0.0f) return 0.0f;
     if (value > 1.0f) return 1.0f;
     return value;
+}
+
+static void initialize_output_meter(void) {
+    IMMDeviceEnumerator *enumerator = NULL;
+    IMMDevice *device = NULL;
+    HRESULT result;
+    if (g_output_meter || g_output_meter_attempted) return;
+    g_output_meter_attempted = 1;
+    result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(result)) {
+        g_com_release_required = 1;
+    } else if (result != RPC_E_CHANGED_MODE) {
+        runtime_log("WASAPI metering: COM initialization failed (0x%08lx)",
+                    (unsigned long)result);
+        return;
+    }
+    result = CoCreateInstance(
+        &g_clsid_mmdevice_enumerator, NULL, CLSCTX_INPROC_SERVER,
+        &g_iid_mmdevice_enumerator, (void **)&enumerator);
+    if (SUCCEEDED(result)) {
+        result = IMMDeviceEnumerator_GetDefaultAudioEndpoint(
+            enumerator, eRender, eMultimedia, &device);
+    }
+    if (SUCCEEDED(result)) {
+        result = IMMDevice_Activate(
+            device, &g_iid_audio_meter_information, CLSCTX_INPROC_SERVER,
+            NULL, (void **)&g_output_meter);
+    }
+    if (device) IMMDevice_Release(device);
+    if (enumerator) IMMDeviceEnumerator_Release(enumerator);
+    if (SUCCEEDED(result) && g_output_meter) {
+        runtime_log("WASAPI output metering initialized for FMOD DSP peaks");
+    } else {
+        runtime_log("WASAPI output metering unavailable (0x%08lx)",
+                    (unsigned long)result);
+    }
 }
 
 static int mci_command(const char *command, char *result, unsigned capacity,
@@ -240,6 +313,7 @@ void audio_initialize(const char *executable_directory) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
     }
+    initialize_output_meter();
     runtime_log("Windows MCI audio bridge initialized; APK cache: %s",
                 g_audio_cache_directory);
 }
@@ -253,6 +327,16 @@ void audio_set_apk_path(const char *apk_path) {
 void audio_shutdown(void) {
     audio_stop_all_effects();
     close_music();
+    if (g_output_meter) {
+        g_output_meter->lpVtbl->Release(g_output_meter);
+        g_output_meter = NULL;
+    }
+    if (g_com_release_required) {
+        CoUninitialize();
+        g_com_release_required = 0;
+    }
+    g_output_meter_attempted = 0;
+    g_output_peak_logged = 0;
 }
 
 void audio_preload_background(const char *path) {
@@ -373,6 +457,21 @@ float audio_get_background_volume(void) { return g_music_volume; }
 void audio_set_background_volume(float volume) {
     g_music_volume = clamp_volume(volume);
     if (g_music_open) set_alias_volume("gd18_music", g_music_volume);
+}
+
+float audio_get_output_peak(void) {
+    float peak = 0.0f;
+    HRESULT result;
+    if (!g_output_meter) initialize_output_meter();
+    if (!g_output_meter) return 0.0f;
+    result = g_output_meter->lpVtbl->GetPeakValue(g_output_meter, &peak);
+    if (FAILED(result)) return 0.0f;
+    peak = clamp_volume(peak);
+    if (peak > 0.001f && !g_output_peak_logged) {
+        g_output_peak_logged = 1;
+        runtime_log("WASAPI FMOD metering: first nonzero peak %.3f", peak);
+    }
+    return peak;
 }
 
 void audio_preload_effect(const char *path) {

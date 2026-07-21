@@ -71,7 +71,8 @@ typedef struct {
 
 typedef struct {
     uint32_t magic;
-    int metering_enabled;
+    int input_metering_enabled;
+    int output_metering_enabled;
 } FakeFmodDsp;
 
 typedef struct {
@@ -627,23 +628,46 @@ static int fake_channel_set_position(void *opaque, unsigned position,
 static int fake_dsp_set_metering_enabled(void *opaque, int input_enabled,
                                          int output_enabled) {
     FakeFmodDsp *dsp = (FakeFmodDsp *)opaque;
-    (void)input_enabled;
     if (!dsp || dsp->magic != DSP_MAGIC) return FMOD_ERR_INVALID_PARAM;
-    dsp->metering_enabled = output_enabled != 0;
+    dsp->input_metering_enabled = input_enabled != 0;
+    dsp->output_metering_enabled = output_enabled != 0;
     return FMOD_OK;
+}
+
+static void fill_metering_info(FakeFmodMeteringInfo *metering, float peak) {
+    if (!metering) return;
+    memset(metering, 0, sizeof(*metering));
+    metering->numsamples = peak > 0.0f ? 1 : 0;
+    metering->peaklevel[0] = peak;
+    metering->peaklevel[1] = peak;
+    metering->rmslevel[0] = peak * 0.70710678f;
+    metering->rmslevel[1] = peak * 0.70710678f;
+    metering->numchannels = 2;
 }
 
 static int fake_dsp_get_metering_info(void *opaque, void *input_info,
                                       void *output_info) {
     FakeFmodDsp *dsp = (FakeFmodDsp *)opaque;
-    FakeFmodMeteringInfo *metering =
+    FakeFmodMeteringInfo *input_metering =
+        (FakeFmodMeteringInfo *)input_info;
+    FakeFmodMeteringInfo *output_metering =
         (FakeFmodMeteringInfo *)output_info;
-    (void)input_info;
-    if (!dsp || dsp->magic != DSP_MAGIC || !metering) {
+    float peak = 0.0f;
+    if (!dsp || dsp->magic != DSP_MAGIC ||
+        (!input_metering && !output_metering)) {
         return FMOD_ERR_INVALID_PARAM;
     }
-    memset(metering, 0, sizeof(*metering));
-    metering->numchannels = 2;
+    if (((input_metering && dsp->input_metering_enabled) ||
+         (output_metering && dsp->output_metering_enabled)) &&
+        g_background_channel.magic == CHANNEL_MAGIC &&
+        g_background_channel.started && !g_background_channel.paused &&
+        !g_background_channel.stopped) {
+        peak = audio_get_output_peak();
+    }
+    fill_metering_info(input_metering,
+                       dsp->input_metering_enabled ? peak : 0.0f);
+    fill_metering_info(output_metering,
+                       dsp->output_metering_enabled ? peak : 0.0f);
     return FMOD_OK;
 }
 
