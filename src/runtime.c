@@ -203,7 +203,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha8.1");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha9");
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
@@ -943,7 +943,19 @@ enum {
     ANDROID_O_NONBLOCK = 0x800,
     ANDROID_FIONREAD = 0x541b,
     ANDROID_FIONBIO = 0x5421,
-    ANDROID_MSG_NOSIGNAL = 0x4000
+    ANDROID_MSG_NOSIGNAL = 0x4000,
+    ANDROID_SOCK_NONBLOCK = 0x800,
+    ANDROID_SOCK_CLOEXEC = 0x80000,
+    ANDROID_POLLIN = 0x0001,
+    ANDROID_POLLPRI = 0x0002,
+    ANDROID_POLLOUT = 0x0004,
+    ANDROID_POLLERR = 0x0008,
+    ANDROID_POLLHUP = 0x0010,
+    ANDROID_POLLNVAL = 0x0020,
+    ANDROID_POLLRDNORM = 0x0040,
+    ANDROID_POLLRDBAND = 0x0080,
+    ANDROID_POLLWRNORM = 0x0100,
+    ANDROID_POLLWRBAND = 0x0200
 };
 
 static int android_family_to_windows(int family) {
@@ -1148,10 +1160,24 @@ static void shim_freeaddrinfo(AndroidAddrInfo *result) {
 }
 
 static int shim_socket(int family, int type, int protocol) {
-    SOCKET descriptor = socket(android_family_to_windows(family), type, protocol);
+    int windows_type = type & 0x0f;
+    SOCKET descriptor = socket(android_family_to_windows(family), windows_type,
+                               protocol);
     if (descriptor == INVALID_SOCKET) {
         return set_socket_error();
     }
+    if (type & ANDROID_SOCK_NONBLOCK) {
+        u_long enabled = 1;
+        if (ioctlsocket(descriptor, FIONBIO, &enabled) == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            closesocket(descriptor);
+            WSASetLastError(error);
+            return set_socket_error();
+        }
+    }
+    /* Windows handles are non-inheritable by default; SOCK_CLOEXEC needs no
+       additional operation. */
+    (void)ANDROID_SOCK_CLOEXEC;
     return (int)(uintptr_t)descriptor;
 }
 
@@ -1168,13 +1194,31 @@ static int shim_bind(int descriptor, const struct sockaddr *address, int length)
 }
 
 static int shim_connect(int descriptor, const struct sockaddr *address, int length) {
+    static LONG logged_connected;
+    static LONG logged_pending;
+    static LONG logged_failure;
     struct sockaddr_storage storage;
     int windows_length = length;
     const struct sockaddr *windows_address =
         address_to_windows(address, length, &storage, &windows_length);
     if (connect((SOCKET)(uintptr_t)(uint32_t)descriptor, windows_address,
                 windows_length) == SOCKET_ERROR) {
+        int windows_error = WSAGetLastError();
+        if ((windows_error == WSAEWOULDBLOCK ||
+             windows_error == WSAEINPROGRESS) &&
+            InterlockedCompareExchange(&logged_pending, 1, 0) == 0) {
+            runtime_log("Network connect: nonblocking connection pending");
+        } else if (windows_error != WSAEWOULDBLOCK &&
+                   windows_error != WSAEINPROGRESS &&
+                   InterlockedCompareExchange(&logged_failure, 1, 0) == 0) {
+            runtime_log("Network connect: first failure, Winsock error %d",
+                        windows_error);
+        }
+        WSASetLastError(windows_error);
         return set_socket_error();
+    }
+    if (InterlockedCompareExchange(&logged_connected, 1, 0) == 0) {
+        runtime_log("Network connect: first connection established immediately");
     }
     return 0;
 }
@@ -1339,18 +1383,29 @@ static int shim_shutdown(int descriptor, int how) {
 }
 
 static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
+    static LONG logged_response;
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
+    if (result > 0 &&
+        InterlockedCompareExchange(&logged_response, 1, 0) == 0) {
+        runtime_log("Network recv: first response delivered (%d bytes)", result);
+    }
     return result == SOCKET_ERROR ? set_socket_error() : result;
 }
 
 static int shim_send(int descriptor, const void *buffer, size_t length, int flags) {
+    static LONG logged_request;
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = send((SOCKET)(uintptr_t)(uint32_t)descriptor, (const char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
+    if (result > 0 &&
+        InterlockedCompareExchange(&logged_request, 1, 0) == 0) {
+        runtime_log("Network send: first request payload accepted (%d bytes)",
+                    result);
+    }
     return result == SOCKET_ERROR ? set_socket_error() : result;
 }
 
@@ -1387,8 +1442,73 @@ static int shim_sendto(int descriptor, const void *buffer, size_t length, int fl
     return result == SOCKET_ERROR ? set_socket_error() : result;
 }
 
+static short android_poll_to_windows(short events) {
+    short result = 0;
+    if (events & ANDROID_POLLIN) result |= POLLRDNORM | POLLRDBAND;
+    if (events & ANDROID_POLLPRI) result |= POLLPRI;
+    if (events & ANDROID_POLLOUT) result |= POLLWRNORM;
+    if (events & ANDROID_POLLRDNORM) result |= POLLRDNORM;
+    if (events & ANDROID_POLLRDBAND) result |= POLLRDBAND;
+    if (events & ANDROID_POLLWRNORM) result |= POLLWRNORM;
+    if (events & ANDROID_POLLWRBAND) result |= POLLWRBAND;
+    return result;
+}
+
+static short windows_poll_to_android(short events) {
+    short result = 0;
+    if (events & POLLRDNORM) result |= ANDROID_POLLIN | ANDROID_POLLRDNORM;
+    if (events & POLLRDBAND) result |= ANDROID_POLLIN | ANDROID_POLLRDBAND;
+    if (events & POLLPRI) result |= ANDROID_POLLPRI;
+    if (events & POLLWRNORM) result |= ANDROID_POLLOUT | ANDROID_POLLWRNORM;
+    if (events & POLLWRBAND) result |= ANDROID_POLLOUT | ANDROID_POLLWRBAND;
+    if (events & POLLERR) result |= ANDROID_POLLERR;
+    if (events & POLLHUP) result |= ANDROID_POLLHUP;
+    if (events & POLLNVAL) result |= ANDROID_POLLNVAL;
+    return result;
+}
+
 static int shim_poll(AndroidPollFd *descriptors, uint32_t count, int timeout) {
-    int result = WSAPoll((WSAPOLLFD *)descriptors, count, timeout);
+    static LONG logged_translation;
+    static LONG logged_ready;
+    WSAPOLLFD *windows_descriptors;
+    uint32_t index;
+    int result;
+    if (!count) {
+        Sleep(timeout < 0 ? INFINITE : (DWORD)timeout);
+        return 0;
+    }
+    if (!descriptors || count > 4096u) {
+        g_errno_value = 22;
+        return -1;
+    }
+    windows_descriptors = (WSAPOLLFD *)calloc(
+        count, sizeof(*windows_descriptors));
+    if (!windows_descriptors) {
+        g_errno_value = 12;
+        return -1;
+    }
+    for (index = 0; index < count; ++index) {
+        windows_descriptors[index].fd =
+            (SOCKET)(uintptr_t)(uint32_t)descriptors[index].descriptor;
+        windows_descriptors[index].events =
+            android_poll_to_windows(descriptors[index].events);
+        descriptors[index].returned_events = 0;
+    }
+    if (InterlockedCompareExchange(&logged_translation, 1, 0) == 0) {
+        runtime_log("Network poll ABI: translating Android readiness masks to Winsock");
+    }
+    result = WSAPoll(windows_descriptors, count, timeout);
+    if (result != SOCKET_ERROR) {
+        for (index = 0; index < count; ++index) {
+            descriptors[index].returned_events = windows_poll_to_android(
+                windows_descriptors[index].revents);
+        }
+        if (result > 0 &&
+            InterlockedCompareExchange(&logged_ready, 1, 0) == 0) {
+            runtime_log("Network poll: first translated readiness event delivered");
+        }
+    }
+    free(windows_descriptors);
     return result == SOCKET_ERROR ? set_socket_error() : result;
 }
 
