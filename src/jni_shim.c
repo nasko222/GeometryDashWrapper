@@ -121,6 +121,32 @@ void *jni_shim_new_float_array(const float *values, size_t count) {
     return new_array(FAKE_FLOAT_ARRAY, values, count, sizeof(float));
 }
 
+int jni_shim_update_int_array(void *array_object, const int32_t *values,
+                              size_t count) {
+    FakeRef *array = checked_reference(array_object);
+    if (!array || array->kind != FAKE_INT_ARRAY || count > array->length ||
+        (count && !values)) {
+        return 0;
+    }
+    if (count) {
+        memcpy(array->data, values, count * sizeof(*values));
+    }
+    return 1;
+}
+
+int jni_shim_update_float_array(void *array_object, const float *values,
+                                size_t count) {
+    FakeRef *array = checked_reference(array_object);
+    if (!array || array->kind != FAKE_FLOAT_ARRAY || count > array->length ||
+        (count && !values)) {
+        return 0;
+    }
+    if (count) {
+        memcpy(array->data, values, count * sizeof(*values));
+    }
+    return 1;
+}
+
 static uintptr_t jni_stub_zero(void) {
     return 0;
 }
@@ -526,6 +552,41 @@ static void jni_release_array_elements(void *environment, void *array_object,
     (void)mode;
 }
 
+static void jni_get_byte_array_region(void *environment, void *array_object,
+                                      int start, int length, int8_t *values) {
+    FakeRef *array = checked_reference(array_object);
+    (void)environment;
+    if (array && array->kind == FAKE_BYTE_ARRAY && values && start >= 0 &&
+        length >= 0 && (size_t)start <= array->length &&
+        (size_t)length <= array->length - (size_t)start) {
+        memcpy(values, (const int8_t *)array->data + start, (size_t)length);
+    }
+}
+
+static void jni_get_int_array_region(void *environment, void *array_object,
+                                     int start, int length, int32_t *values) {
+    FakeRef *array = checked_reference(array_object);
+    (void)environment;
+    if (array && array->kind == FAKE_INT_ARRAY && values && start >= 0 &&
+        length >= 0 && (size_t)start <= array->length &&
+        (size_t)length <= array->length - (size_t)start) {
+        memcpy(values, (const int32_t *)array->data + start,
+               (size_t)length * sizeof(*values));
+    }
+}
+
+static void jni_get_float_array_region(void *environment, void *array_object,
+                                       int start, int length, float *values) {
+    FakeRef *array = checked_reference(array_object);
+    (void)environment;
+    if (array && array->kind == FAKE_FLOAT_ARRAY && values && start >= 0 &&
+        length >= 0 && (size_t)start <= array->length &&
+        (size_t)length <= array->length - (size_t)start) {
+        memcpy(values, (const float *)array->data + start,
+               (size_t)length * sizeof(*values));
+    }
+}
+
 static void jni_set_byte_array_region(void *environment, void *array_object,
                                       int start, int length, const int8_t *values) {
     FakeRef *array = checked_reference(array_object);
@@ -672,6 +733,9 @@ void jni_shim_initialize(const char *executable_directory) {
     g_jni_table[192] = (void *)jni_release_array_elements;
     g_jni_table[195] = (void *)jni_release_array_elements;
     g_jni_table[197] = (void *)jni_release_array_elements;
+    g_jni_table[200] = (void *)jni_get_byte_array_region;
+    g_jni_table[203] = (void *)jni_get_int_array_region;
+    g_jni_table[205] = (void *)jni_get_float_array_region;
     g_jni_table[208] = (void *)jni_set_byte_array_region;
     g_jni_table[211] = (void *)jni_set_int_array_region;
     g_jni_table[213] = (void *)jni_set_float_array_region;

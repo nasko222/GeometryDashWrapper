@@ -20,6 +20,8 @@ typedef struct {
 } ElfImage;
 
 int elf_image_load(ElfImage *image, const char *path);
+int elf_image_load_from_apk(ElfImage *image, const char *apk_path,
+                            const char *member_name);
 void elf_image_unload(ElfImage *image);
 void *elf_image_find_export(const ElfImage *image, const char *name);
 int elf_image_run_constructors(const ElfImage *image);

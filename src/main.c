@@ -37,12 +37,30 @@ typedef struct {
     NativeKeyFunction key_down;
     NativeInsertTextFunction insert_text;
     NativeDeleteBackwardFunction delete_backward;
+    void *touch_ids;
+    void *touch_xs;
+    void *touch_ys;
+    int native_width;
+    int native_height;
+    float last_touch_x;
+    float last_touch_y;
     int native_ready;
     int mouse_down;
     int keyboard_down;
 } GameHost;
 
 static GameHost g_host;
+
+static void client_to_native(HWND window, float *x, float *y) {
+    RECT area;
+    if (!x || !y || !GetClientRect(window, &area) || area.right <= area.left ||
+        area.bottom <= area.top || g_host.native_width <= 0 ||
+        g_host.native_height <= 0) {
+        return;
+    }
+    *x = *x * (float)g_host.native_width / (float)(area.right - area.left);
+    *y = *y * (float)g_host.native_height / (float)(area.bottom - area.top);
+}
 
 static void send_touch_begin(float x, float y) {
     if (g_host.native_ready && g_host.touch_begin) {
@@ -58,16 +76,21 @@ static void send_touch_end(float x, float y) {
 
 static void send_touch_move(float x, float y) {
     int32_t id = 0;
-    void *ids;
-    void *xs;
-    void *ys;
     if (!g_host.native_ready || !g_host.touch_move) {
         return;
     }
-    ids = jni_shim_new_int_array(&id, 1);
-    xs = jni_shim_new_float_array(&x, 1);
-    ys = jni_shim_new_float_array(&y, 1);
-    g_host.touch_move(jni_shim_env(), NULL, ids, xs, ys);
+    if (!g_host.touch_ids) {
+        g_host.touch_ids = jni_shim_new_int_array(&id, 1);
+        g_host.touch_xs = jni_shim_new_float_array(&x, 1);
+        g_host.touch_ys = jni_shim_new_float_array(&y, 1);
+    }
+    if (!jni_shim_update_int_array(g_host.touch_ids, &id, 1) ||
+        !jni_shim_update_float_array(g_host.touch_xs, &x, 1) ||
+        !jni_shim_update_float_array(g_host.touch_ys, &y, 1)) {
+        return;
+    }
+    g_host.touch_move(jni_shim_env(), NULL, g_host.touch_ids,
+                      g_host.touch_xs, g_host.touch_ys);
 }
 
 static void send_text_character(WPARAM character) {
@@ -101,6 +124,12 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
                                          WPARAM wparam, LPARAM lparam) {
     float x = (float)GET_X_LPARAM(lparam);
     float y = (float)GET_Y_LPARAM(lparam);
+    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+        message == WM_MOUSEMOVE) {
+        client_to_native(window, &x, &y);
+        g_host.last_touch_x = x;
+        g_host.last_touch_y = y;
+    }
     switch (message) {
     case WM_CLOSE:
         DestroyWindow(window);
@@ -125,6 +154,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_LBUTTONDOWN:
         g_host.mouse_down = 1;
+        SetFocus(window);
         SetCapture(window);
         send_touch_begin(x, y);
         return 0;
@@ -140,6 +170,12 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             send_touch_end(x, y);
         }
         return 0;
+    case WM_CAPTURECHANGED:
+        if (g_host.mouse_down) {
+            g_host.mouse_down = 0;
+            send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+        }
+        return 0;
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
@@ -147,19 +183,17 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
             !jni_shim_text_input_active()) {
-            RECT area;
-            GetClientRect(window, &area);
             g_host.keyboard_down = 1;
-            send_touch_begin((float)(area.right / 2), (float)(area.bottom / 2));
+            send_touch_begin((float)g_host.native_width * 0.5f,
+                             (float)g_host.native_height * 0.5f);
             return 0;
         }
         break;
     case WM_KEYUP:
         if ((wparam == VK_SPACE || wparam == VK_UP) && g_host.keyboard_down) {
-            RECT area;
-            GetClientRect(window, &area);
             g_host.keyboard_down = 0;
-            send_touch_end((float)(area.right / 2), (float)(area.bottom / 2));
+            send_touch_end((float)g_host.native_width * 0.5f,
+                           (float)g_host.native_height * 0.5f);
             return 0;
         }
         break;
@@ -182,7 +216,7 @@ static int create_opengl_window(int client_width, int client_height) {
     window_class.lpfnWndProc = window_procedure;
     window_class.hInstance = GetModuleHandleA(NULL);
     window_class.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    window_class.lpszClassName = "GD18NativeWrapperWindow";
+    window_class.lpszClassName = "GDAndroidNativeWrapperWindow";
     if (!RegisterClassA(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         runtime_log("ERROR: RegisterClass failed: %lu", (unsigned long)GetLastError());
         return 0;
@@ -190,7 +224,7 @@ static int create_opengl_window(int client_width, int client_height) {
 
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     g_host.window = CreateWindowExA(
-        0, window_class.lpszClassName, "Geometry Dash 1.8 - native wrapper",
+        0, window_class.lpszClassName, "Geometry Dash - Android native wrapper",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -291,7 +325,7 @@ static int run_message_loop(void) {
 }
 
 int main(int argc, char **argv) {
-    const char *library_path = "libcocos2dcpp.so";
+    const char *library_path = NULL;
     const char *apk_path = "game.apk";
     int mode = 2; /* 0 = relocate, 1 = probe, 2 = graphical boot */
     ElfImage image;
@@ -305,10 +339,12 @@ int main(int argc, char **argv) {
     int i;
 
     memset(&g_host, 0, sizeof(g_host));
+    g_host.native_width = 1280;
+    g_host.native_height = 720;
     if (!executable_directory(directory, sizeof(directory))) {
         strcpy(directory, ".");
     }
-    runtime_initialize("gd18-wrapper.log");
+    runtime_initialize("gd-wrapper.log");
     jni_shim_initialize(directory);
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--relocate-only") == 0) {
@@ -317,13 +353,17 @@ int main(int argc, char **argv) {
             mode = 1;
         } else if (strncmp(argv[i], "--apk=", 6) == 0) {
             apk_path = argv[i] + 6;
+        } else if (strncmp(argv[i], "--library=", 10) == 0) {
+            library_path = argv[i] + 10;
         } else {
             library_path = argv[i];
         }
     }
     runtime_log("Mode: %s", mode == 0 ? "relocation only" :
                 mode == 1 ? "constructors + JNI_OnLoad" : "graphical native boot");
-    if (!elf_image_load(&image, library_path)) {
+    if (!(library_path ? elf_image_load(&image, library_path)
+                       : elf_image_load_from_apk(
+                             &image, apk_path, "lib/x86/libcocos2dcpp.so"))) {
         runtime_log("RESULT: ELF_LOAD_FAILED");
         runtime_shutdown();
         return 2;
@@ -352,7 +392,7 @@ int main(int argc, char **argv) {
         runtime_shutdown();
         return 5;
     }
-    runtime_log("RESULT: NATIVE_1_8_PROBE_OK");
+    runtime_log("RESULT: NATIVE_PROBE_OK");
     if (mode == 1) {
         elf_image_unload(&image);
         runtime_shutdown();
@@ -395,14 +435,15 @@ int main(int argc, char **argv) {
     set_apk_path(jni_shim_env(), NULL, apk_string);
     runtime_log("RESULT: APK_PATH_SET");
 
-    if (!create_opengl_window(1280, 720)) {
+    if (!create_opengl_window(g_host.native_width, g_host.native_height)) {
         runtime_log("RESULT: OPENGL_HOST_FAILED");
         runtime_shutdown();
         return 8;
     }
     runtime_log("RESULT: OPENGL_HOST_OK");
-    runtime_log("Calling authentic Android 1.8 nativeInit(1280, 720)");
-    native_init(jni_shim_env(), NULL, 1280, 720);
+    runtime_log("Calling authentic Android nativeInit(%d, %d)",
+                g_host.native_width, g_host.native_height);
+    native_init(jni_shim_env(), NULL, g_host.native_width, g_host.native_height);
     g_host.native_ready = 1;
     runtime_log("RESULT: NATIVE_INIT_RETURNED");
     run_message_loop();

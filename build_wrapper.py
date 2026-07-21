@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
-"""Build the 32-bit Windows Geometry Dash 1.8 native wrapper."""
+"""Build the 32-bit Windows wrapper for x86 Android Geometry Dash APKs."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-
-
-EXPECTED_SO_SHA256 = "829bea8061e4136c584633a301c438ac2608641108a5a10fcf31672075dfbb4d"
-
-
-def file_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def locate_zig(value: str | None) -> Path:
@@ -39,20 +27,21 @@ def locate_zig(value: str | None) -> Path:
     return candidate.resolve()
 
 
-def extract_library(apk: Path, destination: Path) -> None:
+def validate_apk(apk: Path) -> None:
     with zipfile.ZipFile(apk) as archive:
         member = "lib/x86/libcocos2dcpp.so"
         try:
-            payload = archive.read(member)
+            with archive.open(member) as stream:
+                header = stream.read(20)
         except KeyError as error:
-            raise RuntimeError(f"APK does not contain {member}") from error
-    destination.write_bytes(payload)
-    actual = file_hash(destination)
-    if actual != EXPECTED_SO_SHA256:
-        destination.unlink(missing_ok=True)
-        raise RuntimeError(
-            "This is not the expected intact Geometry Dash 1.8 x86 library: " + actual
-        )
+            raise RuntimeError(f"APK does not contain the required {member}") from error
+    if (
+        len(header) < 20
+        or header[:6] != b"\x7fELF\x01\x01"
+        or int.from_bytes(header[16:18], "little") != 3
+        or int.from_bytes(header[18:20], "little") != 3
+    ):
+        raise RuntimeError(f"{member} is not a little-endian ELF32/i386 shared object")
 
 
 def locate_ffmpeg(value: str | None) -> Path:
@@ -95,7 +84,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--zig", help="Path to Zig")
     parser.add_argument("--ffmpeg", help="Path to FFmpeg for Ogg effect conversion")
-    parser.add_argument("--apk", type=Path, help="Optional original 1.8 APK")
+    parser.add_argument("--apk", type=Path, help="Optional Geometry Dash APK with x86 code")
     parser.add_argument("--out", type=Path, default=Path("dist"))
     args = parser.parse_args()
 
@@ -103,6 +92,8 @@ def main() -> int:
     zig = locate_zig(args.zig)
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if args.apk:
+        validate_apk(args.apk.resolve())
     cache = root / "build-cache"
     cache.mkdir(exist_ok=True)
 
@@ -128,7 +119,7 @@ def main() -> int:
         "-mstackrealign",
         f"-I{root / 'third_party/zlib'}",
         "-o",
-        str(output / "GeometryDash18Wrapper.exe"),
+        str(output / "GeometryDashWrapper.exe"),
         *(str(path) for path in sources),
         "-lws2_32",
         "-lopengl32",
@@ -141,13 +132,16 @@ def main() -> int:
     environment["ZIG_LOCAL_CACHE_DIR"] = str(cache / "local")
     subprocess.run(command, check=True, env=environment)
 
+    (output / "GeometryDash18Wrapper.exe").unlink(missing_ok=True)
+    (output / "GeometryDash18Wrapper.pdb").unlink(missing_ok=True)
+    (output / "libcocos2dcpp.so").unlink(missing_ok=True)
+
     if args.apk:
         apk = args.apk.resolve()
-        extract_library(apk, output / "libcocos2dcpp.so")
         shutil.copy2(apk, output / "game.apk")
         extract_audio(apk, output / "audio", locate_ffmpeg(args.ffmpeg))
 
-    print(output / "GeometryDash18Wrapper.exe")
+    print(output / "GeometryDashWrapper.exe")
     return 0
 
 
