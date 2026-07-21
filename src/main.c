@@ -62,6 +62,10 @@ typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
     unsigned long *size, int asynchronous);
 
 static AndroidFileDataFunction g_original_android_file_data;
+typedef int (__cdecl *TinyXmlParseFunction)(void *document,
+                                             const char *xml,
+                                             unsigned int size);
+static TinyXmlParseFunction g_original_tinyxml_parse;
 
 static unsigned char *trace_android_file_data(
     void *self, const char *filename, const char *mode,
@@ -75,6 +79,20 @@ static unsigned char *trace_android_file_data(
     runtime_log("APK asset result: %s -> %s (%lu bytes)",
                 filename ? filename : "<null>", result ? "ok" : "MISSING",
                 size ? *size : 0ul);
+    return result;
+}
+
+static int trace_tinyxml_parse(void *document, const char *xml,
+                               unsigned int size) {
+    int result = g_original_tinyxml_parse(document, xml, size);
+    if (size == 5554u || size == 17466u) {
+        int document_error = document
+                                 ? *(const int *)((const unsigned char *)document +
+                                                  0x30)
+                                 : -1;
+        runtime_log("TinyXML objectDefinitions: size=%u result=%d documentError=%d",
+                    size, result, document_error);
+    }
     return result;
 }
 
@@ -144,6 +162,25 @@ static void install_android_asset_trace(const ElfImage *image) {
         runtime_log("APK asset trace: installed");
     } else {
         runtime_log("APK asset trace: skipped (unknown Cocos prologue)");
+    }
+}
+
+static void install_tinyxml_trace(const ElfImage *image) {
+    static const unsigned char expected[] = {
+        0x8d, 0x64, 0x24, 0xd4, 0x89, 0x5c, 0x24, 0x1c
+    };
+    void *target = elf_image_find_export(
+        image, "_ZN8tinyxml211XMLDocument5ParseEPKcj");
+    if (!target) {
+        runtime_log("TinyXML trace: parser export unavailable");
+        return;
+    }
+    if (install_x86_detour(target, expected, sizeof(expected),
+                           trace_tinyxml_parse,
+                           (void **)&g_original_tinyxml_parse)) {
+        runtime_log("TinyXML trace: installed");
+    } else {
+        runtime_log("TinyXML trace: skipped (unknown parser prologue)");
     }
 }
 
@@ -587,6 +624,7 @@ int main(int argc, char **argv) {
     }
 
     install_android_asset_trace(&image);
+    install_tinyxml_trace(&image);
 
     apk_string = jni_shim_new_string(absolute_apk);
     jni_shim_set_apk_path(absolute_apk);

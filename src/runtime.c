@@ -203,8 +203,9 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha6");
-    runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing; __sF stdio bridge ready");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha7");
+    runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
+    runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -549,67 +550,147 @@ static int is_bionic_standard_stream(const void *stream) {
     return value == g_sF || value == g_sF + 84 || value == g_sF + 168;
 }
 
-static FILE *windows_stream(void *stream) {
+static FILE *wrapper_standard_stream(void *stream) {
     unsigned char *value = (unsigned char *)stream;
     if (!stream) return NULL;
     if (value == g_sF) return stdin;
     if (value == g_sF + 84) return stdout;
     if (value == g_sF + 168) return stderr;
-    return (FILE *)stream;
+    return NULL;
 }
 
 static int shim_fclose(void *stream) {
-    FILE *resolved = windows_stream(stream);
+    typedef int (__cdecl *Function)(void *);
+    static Function function;
     if (is_bionic_standard_stream(stream)) {
+        FILE *resolved = wrapper_standard_stream(stream);
         return resolved ? fflush(resolved) : EOF;
     }
-    return resolved ? fclose(resolved) : EOF;
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fclose");
+    }
+    return function && stream ? function(stream) : EOF;
 }
 
 static int shim_fflush(void *stream) {
-    return fflush(windows_stream(stream));
+    typedef int (__cdecl *Function)(void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fflush(wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fflush");
+    }
+    return function ? function(stream) : EOF;
 }
 
 static char *shim_fgets(char *buffer, int count, void *stream) {
-    return fgets(buffer, count, windows_stream(stream));
+    typedef char *(__cdecl *Function)(char *, int, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fgets(buffer, count, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fgets");
+    }
+    return function ? function(buffer, count, stream) : NULL;
 }
 
 static int shim_fprintf(void *stream, const char *format, ...) {
+    typedef int (__cdecl *Function)(void *, const char *, va_list);
+    static Function function;
     int result;
     va_list arguments;
     va_start(arguments, format);
-    result = vfprintf(windows_stream(stream), format, arguments);
+    if (is_bionic_standard_stream(stream)) {
+        result = vfprintf(wrapper_standard_stream(stream), format, arguments);
+    } else {
+        if (!function && g_msvcrt) {
+            function = (Function)GetProcAddress(g_msvcrt, "vfprintf");
+        }
+        result = function ? function(stream, format, arguments) : -1;
+    }
     va_end(arguments);
     return result;
 }
 
 static int shim_fputc(int character, void *stream) {
-    return fputc(character, windows_stream(stream));
+    typedef int (__cdecl *Function)(int, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fputc(character, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fputc");
+    }
+    return function ? function(character, stream) : EOF;
 }
 
 static int shim_fputs(const char *text, void *stream) {
-    return fputs(text, windows_stream(stream));
+    typedef int (__cdecl *Function)(const char *, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fputs(text, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fputs");
+    }
+    return function ? function(text, stream) : EOF;
 }
 
 static size_t shim_fread(void *buffer, size_t size, size_t count,
                          void *stream) {
-    return fread(buffer, size, count, windows_stream(stream));
+    typedef size_t (__cdecl *Function)(void *, size_t, size_t, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fread(buffer, size, count, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fread");
+    }
+    return function ? function(buffer, size, count, stream) : 0;
 }
 
 static int shim_fseek(void *stream, long offset, int origin) {
-    return fseek(windows_stream(stream), offset, origin);
+    typedef int (__cdecl *Function)(void *, long, int);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fseek(wrapper_standard_stream(stream), offset, origin);
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fseek");
+    }
+    return function ? function(stream, offset, origin) : -1;
 }
 
 static long shim_ftell(void *stream) {
-    return ftell(windows_stream(stream));
+    typedef long (__cdecl *Function)(void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return ftell(wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "ftell");
+    }
+    return function ? function(stream) : -1;
 }
 
 static size_t shim_fwrite(const void *buffer, size_t size, size_t count,
                           void *stream) {
-    return fwrite(buffer, size, count, windows_stream(stream));
+    typedef size_t (__cdecl *Function)(const void *, size_t, size_t, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return fwrite(buffer, size, count, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "fwrite");
+    }
+    return function ? function(buffer, size, count, stream) : 0;
 }
 
 static int shim_setvbuf(void *stream, char *buffer, int mode, size_t size) {
+    typedef int (__cdecl *Function)(void *, char *, int, size_t);
+    static Function function;
     int windows_mode;
     switch (mode) {
     case 0: windows_mode = _IOFBF; break;
@@ -617,15 +698,38 @@ static int shim_setvbuf(void *stream, char *buffer, int mode, size_t size) {
     case 2: windows_mode = _IONBF; break;
     default: return -1;
     }
-    return setvbuf(windows_stream(stream), buffer, windows_mode, size);
+    if (is_bionic_standard_stream(stream)) {
+        return setvbuf(wrapper_standard_stream(stream), buffer, windows_mode,
+                       size);
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "setvbuf");
+    }
+    return function ? function(stream, buffer, windows_mode, size) : -1;
 }
 
 static int shim_ungetc(int character, void *stream) {
-    return ungetc(character, windows_stream(stream));
+    typedef int (__cdecl *Function)(int, void *);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return ungetc(character, wrapper_standard_stream(stream));
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "ungetc");
+    }
+    return function ? function(character, stream) : EOF;
 }
 
 static int shim_vfprintf(void *stream, const char *format, va_list arguments) {
-    return vfprintf(windows_stream(stream), format, arguments);
+    typedef int (__cdecl *Function)(void *, const char *, va_list);
+    static Function function;
+    if (is_bionic_standard_stream(stream)) {
+        return vfprintf(wrapper_standard_stream(stream), format, arguments);
+    }
+    if (!function && g_msvcrt) {
+        function = (Function)GetProcAddress(g_msvcrt, "vfprintf");
+    }
+    return function ? function(stream, format, arguments) : -1;
 }
 
 static int shim_rename(const char *old_path, const char *new_path) {
