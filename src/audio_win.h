@@ -10,6 +10,7 @@ void audio_play_background(const char *path, int loop);
 void audio_stop_background(void);
 void audio_pause_background(void);
 void audio_resume_background(void);
+void audio_resume_background_from(float seconds);
 void audio_rewind_background(void);
 void audio_set_background_time(float seconds);
 float audio_get_background_time(void);

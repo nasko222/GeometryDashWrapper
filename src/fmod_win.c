@@ -46,10 +46,12 @@ typedef struct {
     uint32_t magic;
     unsigned mode;
     unsigned effect_identifier;
+    unsigned position_ms;
     int background;
     int loop;
     int paused;
     int stopped;
+    int started;
     int mixer_paused;
     int observed_playing;
     int callback_sent;
@@ -170,17 +172,46 @@ static FakeFmodChannel *checked_channel(void *opaque) {
 
 static int channel_backend_playing(FakeFmodChannel *channel) {
     if (!channel || channel->stopped) return 0;
+    if (!channel->started) return channel->paused != 0;
     if (channel->paused) return 1;
     if (channel->background) return audio_is_background_playing();
     return channel->effect_identifier &&
            audio_is_effect_playing(channel->effect_identifier);
 }
 
+static void start_background_channel(FakeFmodChannel *channel) {
+    if (!channel || channel->stopped || channel->started) return;
+    audio_play_background(channel->path, channel->loop);
+    channel->started = 1;
+    if (channel->position_ms) {
+        audio_set_background_time((float)channel->position_ms / 1000.0f);
+    }
+    runtime_log("FMOD bridge: released deferred music channel at %u ms",
+                channel->position_ms);
+}
+
 static void set_channel_paused(FakeFmodChannel *channel, int paused) {
-    if (!channel || channel->stopped || channel->paused == paused) return;
+    if (!channel || channel->stopped) return;
+    if (channel->background && !channel->started) {
+        channel->paused = paused;
+        if (!paused) start_background_channel(channel);
+        return;
+    }
+    if (channel->paused == paused) return;
     if (channel->background) {
-        if (paused) audio_pause_background();
-        else audio_resume_background();
+        if (paused) {
+            float seconds = audio_get_background_time();
+            if (seconds >= 0.0f) {
+                channel->position_ms =
+                    (unsigned)(seconds * 1000.0f + 0.5f);
+            }
+            audio_pause_background();
+        } else {
+            /* MCI's resume command is unreliable after an FMOD-style pause or
+               seek. Re-seek and issue a fresh play from the exact pause point. */
+            audio_resume_background_from(
+                (float)channel->position_ms / 1000.0f);
+        }
     } else if (channel->effect_identifier) {
         if (paused) audio_pause_effect(channel->effect_identifier);
         else audio_resume_effect(channel->effect_identifier);
@@ -236,6 +267,7 @@ static int fake_system_update(void *opaque) {
         return FMOD_ERR_INVALID_PARAM;
     }
     if (channel->magic != CHANNEL_MAGIC || channel->stopped ||
+        !channel->started ||
         channel->paused || channel->loop) {
         return FMOD_OK;
     }
@@ -371,13 +403,19 @@ static int fake_system_play_sound(void *opaque, void *opaque_sound,
     copy_path(channel->path, sizeof(channel->path), sound->path);
     if (channel->background) {
         channel->volume = audio_get_background_volume();
-        audio_play_background(channel->path, channel->loop);
+        if (paused) {
+            channel->paused = 1;
+            runtime_log("FMOD bridge: level music armed in paused state");
+        } else {
+            start_background_channel(channel);
+        }
     } else {
         channel->volume = audio_get_effects_volume();
         channel->effect_identifier =
             audio_play_effect(channel->path, channel->loop);
+        channel->started = channel->effect_identifier != 0;
+        if (paused) set_channel_paused(channel, 1);
     }
-    if (paused) set_channel_paused(channel, 1);
     *output = channel;
     return FMOD_OK;
 }
@@ -392,7 +430,7 @@ static int fake_sound_release(void *opaque) {
 static int fake_channel_stop(void *opaque) {
     FakeFmodChannel *channel = checked_channel(opaque);
     if (!channel) return FMOD_OK;
-    if (channel->background) audio_stop_background();
+    if (channel->background && channel->started) audio_stop_background();
     else if (channel->effect_identifier) {
         audio_stop_effect(channel->effect_identifier);
     }
@@ -447,7 +485,7 @@ static int fake_channel_set_mode(void *opaque, unsigned mode) {
     old_loop = channel->loop;
     channel->mode = mode;
     channel->loop = (mode & FMOD_LOOP_NORMAL) != 0;
-    if (channel->background && !channel->stopped &&
+    if (channel->background && channel->started && !channel->stopped &&
         old_loop != channel->loop) {
         float position = audio_get_background_time();
         audio_play_background(channel->path, channel->loop);
@@ -481,8 +519,15 @@ static int fake_channel_get_position(void *opaque, unsigned *position,
     if (!position) return FMOD_ERR_INVALID_PARAM;
     *position = 0;
     if (!channel || !channel->background) return FMOD_OK;
+    if (!channel->started) {
+        *position = channel->position_ms;
+        return FMOD_OK;
+    }
     seconds = audio_get_background_time();
-    if (seconds > 0.0f) *position = (unsigned)(seconds * 1000.0f + 0.5f);
+    if (seconds > 0.0f) {
+        channel->position_ms = (unsigned)(seconds * 1000.0f + 0.5f);
+    }
+    *position = channel->position_ms;
     return FMOD_OK;
 }
 
@@ -491,7 +536,10 @@ static int fake_channel_set_position(void *opaque, unsigned position,
     FakeFmodChannel *channel = checked_channel(opaque);
     (void)time_unit;
     if (channel && channel->background) {
-        audio_set_background_time((float)position / 1000.0f);
+        channel->position_ms = position;
+        if (channel->started) {
+            audio_set_background_time((float)position / 1000.0f);
+        }
     }
     return FMOD_OK;
 }

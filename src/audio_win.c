@@ -300,6 +300,23 @@ void audio_resume_background(void) {
     g_music_paused = 0;
 }
 
+void audio_resume_background_from(float seconds) {
+    char command[128];
+    unsigned long milliseconds;
+    if (!g_music_open) return;
+    if (seconds < 0.0f) seconds = 0.0f;
+    milliseconds = (unsigned long)(seconds * 1000.0f + 0.5f);
+    mci_command("set gd18_music time format milliseconds", NULL, 0, 0);
+    snprintf(command, sizeof(command), "seek gd18_music to %lu", milliseconds);
+    if (!mci_command(command, NULL, 0, 1)) return;
+    snprintf(command, sizeof(command), "play gd18_music from %lu%s",
+             milliseconds, g_music_loop ? " repeat" : "");
+    if (mci_command(command, NULL, 0, 1)) {
+        g_music_paused = 0;
+        runtime_log("Audio music resumed from %lu ms", milliseconds);
+    }
+}
+
 void audio_rewind_background(void) {
     int playing = audio_is_background_playing();
     if (!g_music_open) return;
