@@ -57,6 +57,96 @@ typedef struct {
 
 static GameHost g_host;
 
+typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
+    void *self, const char *filename, const char *mode,
+    unsigned long *size, int asynchronous);
+
+static AndroidFileDataFunction g_original_android_file_data;
+
+static unsigned char *trace_android_file_data(
+    void *self, const char *filename, const char *mode,
+    unsigned long *size, int asynchronous) {
+    unsigned char *result;
+    runtime_log("APK asset read: %s (mode=%s async=%d)",
+                filename ? filename : "<null>", mode ? mode : "<null>",
+                asynchronous != 0);
+    result = g_original_android_file_data(
+        self, filename, mode, size, asynchronous);
+    runtime_log("APK asset result: %s -> %s (%lu bytes)",
+                filename ? filename : "<null>", result ? "ok" : "MISSING",
+                size ? *size : 0ul);
+    return result;
+}
+
+static int install_x86_detour(void *target, const unsigned char *expected,
+                              size_t overwrite_size, void *replacement,
+                              void **original) {
+#if defined(__i386__)
+    unsigned char *entry = (unsigned char *)target;
+    unsigned char *trampoline;
+    int32_t displacement;
+    DWORD old_protection;
+    DWORD ignored_protection;
+    size_t index;
+    if (!entry || !replacement || !original || overwrite_size < 5 ||
+        memcmp(entry, expected, overwrite_size) != 0) {
+        return 0;
+    }
+    trampoline = (unsigned char *)VirtualAlloc(
+        NULL, overwrite_size + 5, MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE);
+    if (!trampoline) return 0;
+    memcpy(trampoline, entry, overwrite_size);
+    trampoline[overwrite_size] = 0xe9;
+    displacement = (int32_t)((uintptr_t)entry + overwrite_size -
+                             ((uintptr_t)trampoline + overwrite_size + 5));
+    memcpy(trampoline + overwrite_size + 1, &displacement,
+           sizeof(displacement));
+    if (!VirtualProtect(entry, overwrite_size, PAGE_EXECUTE_READWRITE,
+                        &old_protection)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return 0;
+    }
+    entry[0] = 0xe9;
+    displacement = (int32_t)((uintptr_t)replacement -
+                             ((uintptr_t)entry + 5));
+    memcpy(entry + 1, &displacement, sizeof(displacement));
+    for (index = 5; index < overwrite_size; ++index) entry[index] = 0x90;
+    FlushInstructionCache(GetCurrentProcess(), entry, overwrite_size);
+    VirtualProtect(entry, overwrite_size, old_protection,
+                   &ignored_protection);
+    *original = trampoline;
+    return 1;
+#else
+    (void)target;
+    (void)expected;
+    (void)overwrite_size;
+    (void)replacement;
+    (void)original;
+    return 0;
+#endif
+}
+
+static void install_android_asset_trace(const ElfImage *image) {
+    static const unsigned char expected[] = {
+        0x8d, 0x64, 0x24, 0xa4, 0x8b, 0x4c, 0x24, 0x68
+    };
+    void *target = elf_image_find_export(
+        image,
+        "_ZN7cocos2d18CCFileUtilsAndroid13doGetFileDataEPKcS2_Pmb");
+    if (!target) {
+        runtime_log("APK asset trace: Cocos Android reader export unavailable");
+        return;
+    }
+    if (install_x86_detour(target, expected, sizeof(expected),
+                           trace_android_file_data,
+                           (void **)&g_original_android_file_data)) {
+        runtime_log("APK asset trace: installed");
+    } else {
+        runtime_log("APK asset trace: skipped (unknown Cocos prologue)");
+    }
+}
+
 static void pause_native_game(const char *reason) {
     if (!g_host.native_ready || g_host.native_paused || !g_host.pause) return;
     runtime_log("Android lifecycle: nativeOnPause (%s)",
@@ -495,6 +585,8 @@ int main(int argc, char **argv) {
         runtime_shutdown();
         return 7;
     }
+
+    install_android_asset_trace(&image);
 
     apk_string = jni_shim_new_string(absolute_apk);
     jni_shim_set_apk_path(absolute_apk);

@@ -95,7 +95,7 @@ static void log_crash_stack(uintptr_t stack_pointer) {
     }
     available = (size_t)(region_end - stack_pointer);
     count = available / sizeof(uint32_t);
-    if (count > 32) count = 32;
+    if (count > 96) count = 96;
     stack = (const uint32_t *)stack_pointer;
     runtime_log("Stack: first %lu DWORDs from ESP (ELF values are candidate return addresses)",
                 (unsigned long)count);
@@ -202,7 +202,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha3");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha4");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
