@@ -22,6 +22,7 @@ typedef struct {
     unsigned identifier;
     int open;
     int paused;
+    float volume;
     char alias[32];
 } EffectSlot;
 
@@ -50,6 +51,7 @@ static unsigned g_next_effect_identifier = 1;
 static unsigned g_next_effect_slot;
 static float g_music_volume = 1.0f;
 static float g_effects_volume = 1.0f;
+static volatile LONG g_effect_log_count;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
@@ -327,6 +329,7 @@ static void close_effect_slot(EffectSlot *slot) {
     slot->open = 0;
     slot->paused = 0;
     slot->identifier = 0;
+    slot->volume = 1.0f;
 }
 
 static EffectSlot *find_effect(unsigned identifier) {
@@ -350,6 +353,7 @@ void audio_initialize(const char *executable_directory) {
     snprintf(g_apk_path, sizeof(g_apk_path), "%s\\game.apk",
              executable_directory ? executable_directory : ".");
     CreateDirectoryA(g_audio_cache_directory, NULL);
+    InterlockedExchange(&g_effect_log_count, 0);
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
@@ -531,12 +535,17 @@ unsigned audio_play_effect(const char *path, int loop) {
     if (!mci_command(command, NULL, 0, 1)) return 0;
     slot->open = 1;
     slot->identifier = identifier;
-    set_alias_volume(slot->alias, g_effects_volume);
+    slot->volume = 1.0f;
+    set_alias_volume(slot->alias, g_effects_volume * slot->volume);
     snprintf(command, sizeof(command), "play %s from 0%s", slot->alias,
              loop ? " repeat" : "");
     if (!mci_command(command, NULL, 0, 1)) {
         close_effect_slot(slot);
         return 0;
+    }
+    if (InterlockedIncrement(&g_effect_log_count) <= 64) {
+        runtime_log("Audio effect playing: %s (id=%u, loop=%s)",
+                    file_name_part(path), identifier, loop ? "yes" : "no");
     }
     return identifier;
 }
@@ -550,6 +559,13 @@ int audio_is_effect_playing(unsigned identifier) {
     if (!mci_command(command, mode, sizeof(mode), 0)) return 0;
     return _stricmp(mode, "playing") == 0 ||
            _stricmp(mode, "paused") == 0;
+}
+
+void audio_set_effect_volume(unsigned identifier, float volume) {
+    EffectSlot *slot = find_effect(identifier);
+    if (!slot) return;
+    slot->volume = clamp_volume(volume);
+    set_alias_volume(slot->alias, g_effects_volume * slot->volume);
 }
 
 void audio_pause_effect(unsigned identifier) {
@@ -605,7 +621,8 @@ void audio_set_effects_volume(float volume) {
     g_effects_volume = clamp_volume(volume);
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open) {
-            set_alias_volume(g_effects[index].alias, g_effects_volume);
+            set_alias_volume(g_effects[index].alias,
+                             g_effects_volume * g_effects[index].volume);
         }
     }
 }

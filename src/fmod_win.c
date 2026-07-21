@@ -540,7 +540,9 @@ static int fake_channel_set_volume(void *opaque, float volume) {
     if (!channel) return FMOD_OK;
     channel->volume = volume;
     if (channel->background) audio_set_background_volume(volume);
-    else audio_set_effects_volume(volume);
+    else if (channel->effect_identifier) {
+        audio_set_effect_volume(channel->effect_identifier, volume);
+    }
     return FMOD_OK;
 }
 

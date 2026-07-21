@@ -22,6 +22,7 @@ float audio_get_output_peak(void);
 void audio_preload_effect(const char *path);
 unsigned audio_play_effect(const char *path, int loop);
 int audio_is_effect_playing(unsigned identifier);
+void audio_set_effect_volume(unsigned identifier, float volume);
 void audio_pause_effect(unsigned identifier);
 void audio_resume_effect(unsigned identifier);
 void audio_stop_effect(unsigned identifier);

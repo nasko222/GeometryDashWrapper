@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <ctype.h>
+#include <errno.h>
 #include <io.h>
 #include <limits.h>
 #include <math.h>
@@ -203,7 +204,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha9");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha10");
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
@@ -478,6 +479,31 @@ static char *shim_basename(char *path) {
         slash = backslash;
     }
     return slash ? slash + 1 : path;
+}
+
+static long long shim_strtoll(const char *text, char **end, int base) {
+    static LONG logged;
+    long long result;
+    int conversion_error;
+    errno = 0;
+    result = strtoll(text, end, base);
+    conversion_error = errno;
+    if (conversion_error) g_errno_value = conversion_error;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        runtime_log("Network HTTP parser: 64-bit signed conversion bridge active");
+    }
+    return result;
+}
+
+static unsigned long long shim_strtoull(const char *text, char **end,
+                                        int base) {
+    unsigned long long result;
+    int conversion_error;
+    errno = 0;
+    result = strtoull(text, end, base);
+    conversion_error = errno;
+    if (conversion_error) g_errno_value = conversion_error;
+    return result;
 }
 
 static int is_game_data_name(const char *name) {
@@ -2083,6 +2109,8 @@ static void *custom_function(const char *name) {
     CUSTOM("strlcat", shim_strlcat);
     CUSTOM("memrchr", shim_memrchr);
     CUSTOM("basename", shim_basename);
+    CUSTOM("strtoll", shim_strtoll);
+    CUSTOM("strtoull", shim_strtoull);
     CUSTOM("fopen", shim_fopen);
     CUSTOM("fclose", shim_fclose);
     CUSTOM("fflush", shim_fflush);
