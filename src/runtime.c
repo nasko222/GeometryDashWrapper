@@ -178,31 +178,33 @@ void runtime_initialize(const char *log_path) {
     g_callconv_thunks = (unsigned char *)VirtualAlloc(
         NULL, MAX_IMPORTS * CALLCONV_THUNK_SIZE, MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE);
-    for (i = 0; i < 384; ++i) {
-        int value = (int)i - 128;
+    memset(g_ctype, 0, sizeof(g_ctype));
+    memset(g_tolower, 0, sizeof(g_tolower));
+    memset(g_toupper, 0, sizeof(g_toupper));
+    g_tolower[0] = -1;
+    g_toupper[0] = -1;
+    for (i = 0; i <= 255; ++i) {
+        int value = (int)i;
         unsigned char flags = 0;
-        if (value >= 0 && value <= 255) {
-            unsigned char c = (unsigned char)value;
-            if (isupper(c)) flags |= 0x01;
-            if (islower(c)) flags |= 0x02;
-            if (isdigit(c)) flags |= 0x04;
-            if (isspace(c)) flags |= 0x08;
-            if (ispunct(c)) flags |= 0x10;
-            if (iscntrl(c)) flags |= 0x20;
-            if (isxdigit(c)) flags |= 0x40;
-            if (c == ' ' || c == '\t') flags |= 0x80;
-            g_tolower[i] = (int16_t)tolower(c);
-            g_toupper[i] = (int16_t)toupper(c);
-        } else {
-            g_tolower[i] = (int16_t)value;
-            g_toupper[i] = (int16_t)value;
-        }
-        g_ctype[i] = flags;
+        unsigned char c = (unsigned char)value;
+        if (isupper(c)) flags |= 0x01;
+        if (islower(c)) flags |= 0x02;
+        if (isdigit(c)) flags |= 0x04;
+        if (isspace(c)) flags |= 0x08;
+        if (ispunct(c)) flags |= 0x10;
+        if (iscntrl(c)) flags |= 0x20;
+        if (isxdigit(c)) flags |= 0x40;
+        if (c == ' ') flags |= 0x80;
+        /* Bionic indexes all three exported tables as (table + 1)[c]. */
+        g_ctype[i + 1] = flags;
+        g_tolower[i + 1] = (int16_t)tolower(c);
+        g_toupper[i + 1] = (int16_t)toupper(c);
     }
-    g_ctype_pointer = g_ctype + 128;
-    g_tolower_pointer = g_tolower + 128;
-    g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha5");
+    g_ctype_pointer = g_ctype;
+    g_tolower_pointer = g_tolower;
+    g_toupper_pointer = g_toupper;
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha6");
+    runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing; __sF stdio bridge ready");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -533,6 +535,97 @@ static void *shim_fopen(const char *path, const char *mode) {
                     mode ? mode : "<null mode>");
     }
     return function ? function(resolved, mode) : NULL;
+}
+
+/*
+ * Older Bionic exposes stdin/stdout/stderr as three 84-byte __sFILE objects
+ * in __sF. Android code performs the pointer arithmetic itself, so the ELF
+ * cannot be pointed at the smaller MSVCRT FILE array. Map those three sentinel
+ * addresses at every imported stdio boundary while passing ordinary streams
+ * returned by shim_fopen through unchanged.
+ */
+static int is_bionic_standard_stream(const void *stream) {
+    const unsigned char *value = (const unsigned char *)stream;
+    return value == g_sF || value == g_sF + 84 || value == g_sF + 168;
+}
+
+static FILE *windows_stream(void *stream) {
+    unsigned char *value = (unsigned char *)stream;
+    if (!stream) return NULL;
+    if (value == g_sF) return stdin;
+    if (value == g_sF + 84) return stdout;
+    if (value == g_sF + 168) return stderr;
+    return (FILE *)stream;
+}
+
+static int shim_fclose(void *stream) {
+    FILE *resolved = windows_stream(stream);
+    if (is_bionic_standard_stream(stream)) {
+        return resolved ? fflush(resolved) : EOF;
+    }
+    return resolved ? fclose(resolved) : EOF;
+}
+
+static int shim_fflush(void *stream) {
+    return fflush(windows_stream(stream));
+}
+
+static char *shim_fgets(char *buffer, int count, void *stream) {
+    return fgets(buffer, count, windows_stream(stream));
+}
+
+static int shim_fprintf(void *stream, const char *format, ...) {
+    int result;
+    va_list arguments;
+    va_start(arguments, format);
+    result = vfprintf(windows_stream(stream), format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int shim_fputc(int character, void *stream) {
+    return fputc(character, windows_stream(stream));
+}
+
+static int shim_fputs(const char *text, void *stream) {
+    return fputs(text, windows_stream(stream));
+}
+
+static size_t shim_fread(void *buffer, size_t size, size_t count,
+                         void *stream) {
+    return fread(buffer, size, count, windows_stream(stream));
+}
+
+static int shim_fseek(void *stream, long offset, int origin) {
+    return fseek(windows_stream(stream), offset, origin);
+}
+
+static long shim_ftell(void *stream) {
+    return ftell(windows_stream(stream));
+}
+
+static size_t shim_fwrite(const void *buffer, size_t size, size_t count,
+                          void *stream) {
+    return fwrite(buffer, size, count, windows_stream(stream));
+}
+
+static int shim_setvbuf(void *stream, char *buffer, int mode, size_t size) {
+    int windows_mode;
+    switch (mode) {
+    case 0: windows_mode = _IOFBF; break;
+    case 1: windows_mode = _IOLBF; break;
+    case 2: windows_mode = _IONBF; break;
+    default: return -1;
+    }
+    return setvbuf(windows_stream(stream), buffer, windows_mode, size);
+}
+
+static int shim_ungetc(int character, void *stream) {
+    return ungetc(character, windows_stream(stream));
+}
+
+static int shim_vfprintf(void *stream, const char *format, va_list arguments) {
+    return vfprintf(windows_stream(stream), format, arguments);
 }
 
 static int shim_rename(const char *old_path, const char *new_path) {
@@ -1767,6 +1860,19 @@ static void *custom_function(const char *name) {
     CUSTOM("memrchr", shim_memrchr);
     CUSTOM("basename", shim_basename);
     CUSTOM("fopen", shim_fopen);
+    CUSTOM("fclose", shim_fclose);
+    CUSTOM("fflush", shim_fflush);
+    CUSTOM("fgets", shim_fgets);
+    CUSTOM("fprintf", shim_fprintf);
+    CUSTOM("fputc", shim_fputc);
+    CUSTOM("fputs", shim_fputs);
+    CUSTOM("fread", shim_fread);
+    CUSTOM("fseek", shim_fseek);
+    CUSTOM("ftell", shim_ftell);
+    CUSTOM("fwrite", shim_fwrite);
+    CUSTOM("setvbuf", shim_setvbuf);
+    CUSTOM("ungetc", shim_ungetc);
+    CUSTOM("vfprintf", shim_vfprintf);
     CUSTOM("rename", shim_rename);
     CUSTOM("remove", shim_remove);
     CUSTOM("unlink", shim_unlink);
