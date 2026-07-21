@@ -51,6 +51,7 @@ typedef struct {
     int mouse_down;
     int keyboard_down;
     int native_paused;
+    int window_active;
     int closing;
 } GameHost;
 
@@ -174,6 +175,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         PostQuitMessage(0);
         return 0;
     case WM_ACTIVATEAPP:
+        g_host.window_active = wparam != 0;
         if (wparam) {
             resume_native_game("window activated");
         } else {
@@ -358,11 +360,15 @@ static int run_message_loop(void) {
             TranslateMessage(&message);
             DispatchMessageA(&message);
         }
-        if (g_host.render) {
+        if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
+            Sleep(1);
+        } else {
+            /* Do not alternate stale front/back buffers while the app is
+               inactive. This also avoids advancing the game behind a pause. */
+            Sleep(16);
         }
-        Sleep(1);
     }
     return 0;
 }
@@ -384,6 +390,7 @@ int main(int argc, char **argv) {
     memset(&g_host, 0, sizeof(g_host));
     g_host.native_width = 1280;
     g_host.native_height = 720;
+    g_host.window_active = 1;
     if (!executable_directory(directory, sizeof(directory))) {
         strcpy(directory, ".");
     }

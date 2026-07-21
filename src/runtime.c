@@ -72,6 +72,50 @@ extern int shim_bionic_setjmp(uint32_t *environment);
 extern int shim_bionic_sigsetjmp(uint32_t *environment, int save_mask);
 extern void shim_bionic_longjmp(uint32_t *environment, int value);
 
+#if defined(__i386__)
+static void log_crash_stack(uintptr_t stack_pointer) {
+    MEMORY_BASIC_INFORMATION memory;
+    uintptr_t region_end;
+    size_t available;
+    size_t count;
+    size_t index;
+    const uint32_t *stack;
+
+    if (!stack_pointer ||
+        !VirtualQuery((const void *)stack_pointer, &memory, sizeof(memory)) ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        runtime_log("Stack: unavailable at %p", (void *)stack_pointer);
+        return;
+    }
+    region_end = (uintptr_t)memory.BaseAddress + memory.RegionSize;
+    if (region_end <= stack_pointer) {
+        runtime_log("Stack: invalid memory region at %p", (void *)stack_pointer);
+        return;
+    }
+    available = (size_t)(region_end - stack_pointer);
+    count = available / sizeof(uint32_t);
+    if (count > 32) count = 32;
+    stack = (const uint32_t *)stack_pointer;
+    runtime_log("Stack: first %lu DWORDs from ESP (ELF values are candidate return addresses)",
+                (unsigned long)count);
+    for (index = 0; index < count; ++index) {
+        uintptr_t value = stack[index];
+        if (g_elf_base && value >= (uintptr_t)g_elf_base &&
+            value < (uintptr_t)g_elf_base + g_elf_size) {
+            runtime_log("  ESP+0x%02lx = %08lx  ELF+0x%08lx",
+                        (unsigned long)(index * sizeof(uint32_t)),
+                        (unsigned long)value,
+                        (unsigned long)(value - (uintptr_t)g_elf_base));
+        } else {
+            runtime_log("  ESP+0x%02lx = %08lx",
+                        (unsigned long)(index * sizeof(uint32_t)),
+                        (unsigned long)value);
+        }
+    }
+}
+#endif
+
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info) {
     uintptr_t address = (uintptr_t)info->ExceptionRecord->ExceptionAddress;
     runtime_log("FATAL: Windows exception 0x%08lx at %p",
@@ -94,6 +138,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info) {
                     (unsigned long)info->ContextRecord->Edi,
                     (unsigned long)info->ContextRecord->Ebp,
                     (unsigned long)info->ContextRecord->Esp);
+        log_crash_stack((uintptr_t)info->ContextRecord->Esp);
     }
 #endif
     runtime_log("The wrapper stopped. Send gd-wrapper.log with this address.");
@@ -157,7 +202,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha2");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha3");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
