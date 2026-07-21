@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <ctype.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,6 +54,9 @@ static unsigned char g_sF[512];
 static unsigned char g_ctype[384];
 static int16_t g_tolower[384];
 static int16_t g_toupper[384];
+static const unsigned char *g_ctype_pointer;
+static const int16_t *g_tolower_pointer;
+static const int16_t *g_toupper_pointer;
 static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
@@ -120,14 +124,29 @@ void runtime_initialize(const char *log_path) {
         PAGE_EXECUTE_READWRITE);
     for (i = 0; i < 384; ++i) {
         int value = (int)i - 128;
-        unsigned char c = (unsigned char)value;
-        g_ctype[i] = (unsigned char)((isalpha(c) ? 1 : 0) |
-                                     (isdigit(c) ? 4 : 0) |
-                                     (isspace(c) ? 8 : 0));
-        g_tolower[i] = (int16_t)tolower(c);
-        g_toupper[i] = (int16_t)toupper(c);
+        unsigned char flags = 0;
+        if (value >= 0 && value <= 255) {
+            unsigned char c = (unsigned char)value;
+            if (isupper(c)) flags |= 0x01;
+            if (islower(c)) flags |= 0x02;
+            if (isdigit(c)) flags |= 0x04;
+            if (isspace(c)) flags |= 0x08;
+            if (ispunct(c)) flags |= 0x10;
+            if (iscntrl(c)) flags |= 0x20;
+            if (isxdigit(c)) flags |= 0x40;
+            if (c == ' ' || c == '\t') flags |= 0x80;
+            g_tolower[i] = (int16_t)tolower(c);
+            g_toupper[i] = (int16_t)toupper(c);
+        } else {
+            g_tolower[i] = (int16_t)value;
+            g_toupper[i] = (int16_t)value;
+        }
+        g_ctype[i] = flags;
     }
-    runtime_log("Geometry Dash 1.8 native compatibility wrapper 0.3");
+    g_ctype_pointer = g_ctype + 128;
+    g_tolower_pointer = g_tolower + 128;
+    g_toupper_pointer = g_toupper + 128;
+    runtime_log("Geometry Dash 1.8 native compatibility wrapper 0.4");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -706,6 +725,33 @@ static long shim_syscall(long number, ...) {
     return -1;
 }
 
+/* Older msvcrt.dll builds do not export the C99 float entry points that the
+ * Android library imports.  Keep the Android cdecl/float ABI and delegate to
+ * the universally available double-precision functions. */
+static float shim_acosf(float value) { return (float)acos((double)value); }
+static float shim_asinf(float value) { return (float)asin((double)value); }
+static float shim_atan2f(float y, float x) {
+    return (float)atan2((double)y, (double)x);
+}
+static float shim_ceilf(float value) { return (float)ceil((double)value); }
+static float shim_cosf(float value) { return (float)cos((double)value); }
+static float shim_expf(float value) { return (float)exp((double)value); }
+static float shim_floorf(float value) { return (float)floor((double)value); }
+static float shim_fmodf(float x, float y) {
+    return (float)fmod((double)x, (double)y);
+}
+static float shim_logf(float value) { return (float)log((double)value); }
+static float shim_powf(float x, float y) {
+    return (float)pow((double)x, (double)y);
+}
+static float shim_roundf(float value) {
+    return value < 0.0f ? (float)ceil((double)value - 0.5)
+                        : (float)floor((double)value + 0.5);
+}
+static float shim_sinf(float value) { return (float)sin((double)value); }
+static float shim_sqrtf(float value) { return (float)sqrt((double)value); }
+static float shim_tanf(float value) { return (float)tan((double)value); }
+
 static void shim_glClearDepthf(float depth) {
     typedef void (APIENTRY *Function)(double);
     Function function = (Function)GetProcAddress(g_opengl, "glClearDepth");
@@ -884,6 +930,20 @@ static void *custom_function(const char *name) {
     CUSTOM("setsid", shim_process_unsupported);
     CUSTOM("waitpid", shim_process_unsupported);
     CUSTOM("syscall", shim_syscall);
+    CUSTOM("acosf", shim_acosf);
+    CUSTOM("asinf", shim_asinf);
+    CUSTOM("atan2f", shim_atan2f);
+    CUSTOM("ceilf", shim_ceilf);
+    CUSTOM("cosf", shim_cosf);
+    CUSTOM("expf", shim_expf);
+    CUSTOM("floorf", shim_floorf);
+    CUSTOM("fmodf", shim_fmodf);
+    CUSTOM("logf", shim_logf);
+    CUSTOM("powf", shim_powf);
+    CUSTOM("roundf", shim_roundf);
+    CUSTOM("sinf", shim_sinf);
+    CUSTOM("sqrtf", shim_sqrtf);
+    CUSTOM("tanf", shim_tanf);
     CUSTOM("glClearDepthf", shim_glClearDepthf);
     CUSTOM("glShaderSource", shim_glShaderSource);
     CUSTOM("pthread_attr_init", shim_pthread_attr_init);
@@ -1110,9 +1170,10 @@ void *runtime_resolve_function(const char *name, uint32_t id) {
 void *runtime_resolve_object(const char *name) {
     if (strcmp(name, "__stack_chk_guard") == 0) return &g_stack_guard;
     if (strcmp(name, "__sF") == 0) return g_sF;
-    if (strcmp(name, "_ctype_") == 0) return g_ctype + 128;
-    if (strcmp(name, "_tolower_tab_") == 0) return g_tolower + 128;
-    if (strcmp(name, "_toupper_tab_") == 0) return g_toupper + 128;
+    /* Bionic exports these as pointer objects, not as the tables themselves. */
+    if (strcmp(name, "_ctype_") == 0) return &g_ctype_pointer;
+    if (strcmp(name, "_tolower_tab_") == 0) return &g_tolower_pointer;
+    if (strcmp(name, "_toupper_tab_") == 0) return &g_toupper_pointer;
     if (strcmp(name, "optarg") == 0) return &g_optarg;
     if (strcmp(name, "optind") == 0) return &g_optind;
     return NULL;
