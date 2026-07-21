@@ -10,6 +10,7 @@
 #include "audio_win.h"
 #include "jni_shim.h"
 #include "runtime.h"
+#include "storage_win.h"
 
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004
@@ -226,6 +227,12 @@ static void log_first_call(FakeRef *method) {
     }
 }
 
+static const char *reference_string(FakeRef *reference) {
+    return reference && reference->kind == FAKE_STRING && reference->data
+               ? (const char *)reference->data
+               : "";
+}
+
 static void *dispatch_object(FakeRef *method, va_list arguments) {
     const char *name = method && method->name ? method->name : "";
     log_first_call(method);
@@ -245,14 +252,25 @@ static void *dispatch_object(FakeRef *method, va_list arguments) {
         return jni_shim_new_string("0");
     }
     if (strcmp(name, "getStringForKey") == 0) {
-        (void)va_arg(arguments, void *);
-        return va_arg(arguments, void *);
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        FakeRef *default_value = checked_reference(va_arg(arguments, void *));
+        char *value = storage_get_string_copy(reference_string(key),
+                                              reference_string(default_value));
+        void *result = jni_shim_new_string(value ? value : "");
+        free(value);
+        return result;
     }
     if (strcmp(name, "getStringWithEllipsis") == 0) {
         return va_arg(arguments, void *);
     }
-    if (strcmp(name, "loadAndDecryptFileToString") == 0 ||
-        strcmp(name, "getItem") == 0) {
+    if (strcmp(name, "loadAndDecryptFileToString") == 0) {
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        char *value = storage_read_game_file(reference_string(path), NULL);
+        void *result = jni_shim_new_string(value ? value : "");
+        free(value);
+        return result;
+    }
+    if (strcmp(name, "getItem") == 0) {
         return jni_shim_new_string("");
     }
     return new_reference(FAKE_OBJECT);
@@ -262,10 +280,14 @@ static int dispatch_boolean(FakeRef *method, va_list arguments) {
     const char *name = method && method->name ? method->name : "";
     log_first_call(method);
     if (strcmp(name, "getBoolForKey") == 0) {
-        (void)va_arg(arguments, void *);
-        return va_arg(arguments, int) ? 1 : 0;
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        int default_value = va_arg(arguments, int);
+        return storage_get_bool(reference_string(key), default_value);
     }
     if (strcmp(name, "shouldResumeSound") == 0) {
+        return 1;
+    }
+    if (strcmp(name, "isNetworkAvailable") == 0) {
         return 1;
     }
     if (strcmp(name, "isBackgroundMusicPlaying") == 0) {
@@ -273,8 +295,7 @@ static int dispatch_boolean(FakeRef *method, va_list arguments) {
     }
     if (strcmp(name, "doesFileExist") == 0) {
         FakeRef *path = checked_reference(va_arg(arguments, void *));
-        return path && path->data &&
-               GetFileAttributesA((const char *)path->data) != INVALID_FILE_ATTRIBUTES;
+        return storage_file_exists(reference_string(path));
     }
     return 0;
 }
@@ -286,8 +307,9 @@ static int dispatch_int(FakeRef *method, va_list arguments) {
         return 96;
     }
     if (strcmp(name, "getIntegerForKey") == 0) {
-        (void)va_arg(arguments, void *);
-        return va_arg(arguments, int);
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        int default_value = va_arg(arguments, int);
+        return (int)storage_get_integer(reference_string(key), default_value);
     }
     if (strcmp(name, "getFontSizeAccordingHeight") == 0) {
         return va_arg(arguments, int);
@@ -305,8 +327,9 @@ static float dispatch_float(FakeRef *method, va_list arguments) {
     const char *name = method && method->name ? method->name : "";
     log_first_call(method);
     if (strcmp(name, "getFloatForKey") == 0) {
-        (void)va_arg(arguments, void *);
-        return (float)va_arg(arguments, double);
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        float default_value = (float)va_arg(arguments, double);
+        return storage_get_float(reference_string(key), default_value);
     }
     if (strcmp(name, "getBackgroundMusicVolume") == 0)
         return audio_get_background_volume();
@@ -321,8 +344,9 @@ static double dispatch_double(FakeRef *method, va_list arguments) {
     const char *name = method && method->name ? method->name : "";
     log_first_call(method);
     if (strcmp(name, "getDoubleForKey") == 0) {
-        (void)va_arg(arguments, void *);
-        return va_arg(arguments, double);
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        double default_value = va_arg(arguments, double);
+        return storage_get_double(reference_string(key), default_value);
     }
     return 0.0;
 }
@@ -336,6 +360,28 @@ static void dispatch_void(FakeRef *method, va_list arguments) {
             g_frame_interval = interval;
             runtime_log("JNI animation interval: %.6f", interval);
         }
+    } else if (strcmp(name, "setStringForKey") == 0) {
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        FakeRef *value = checked_reference(va_arg(arguments, void *));
+        storage_set_string(reference_string(key), reference_string(value));
+    } else if (strcmp(name, "setBoolForKey") == 0) {
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        storage_set_bool(reference_string(key), va_arg(arguments, int));
+    } else if (strcmp(name, "setIntegerForKey") == 0) {
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        storage_set_integer(reference_string(key), va_arg(arguments, int));
+    } else if (strcmp(name, "setFloatForKey") == 0) {
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        storage_set_float(reference_string(key),
+                          (float)va_arg(arguments, double));
+    } else if (strcmp(name, "setDoubleForKey") == 0) {
+        FakeRef *key = checked_reference(va_arg(arguments, void *));
+        storage_set_double(reference_string(key), va_arg(arguments, double));
+    } else if (strcmp(name, "saveAndEncryptStringToFile") == 0) {
+        FakeRef *value = checked_reference(va_arg(arguments, void *));
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        storage_write_game_file(reference_string(path), reference_string(value),
+                                value ? value->length : 0);
     } else if (strcmp(name, "terminateProcess") == 0) {
         PostQuitMessage(0);
     } else if (strcmp(name, "showDialog") == 0) {
@@ -674,6 +720,7 @@ void jni_shim_initialize(const char *executable_directory) {
         }
     }
     CreateDirectoryA(g_writable_path, NULL);
+    storage_initialize(g_writable_path);
     audio_initialize(executable_directory);
 
     for (i = 0; i < JNI_TABLE_SIZE; ++i) {
@@ -751,6 +798,11 @@ void jni_shim_initialize(const char *executable_directory) {
 
 void jni_shim_shutdown(void) {
     audio_shutdown();
+    storage_shutdown();
+}
+
+void jni_shim_set_apk_path(const char *apk_path) {
+    audio_set_apk_path(apk_path);
 }
 
 void *jni_shim_env(void) {

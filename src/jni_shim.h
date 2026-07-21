@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 void jni_shim_initialize(const char *executable_directory);
+void jni_shim_set_apk_path(const char *apk_path);
 void jni_shim_shutdown(void);
 void *jni_shim_env(void);
 void *jni_shim_vm(void);

@@ -431,6 +431,7 @@ int main(int argc, char **argv) {
     }
 
     apk_string = jni_shim_new_string(absolute_apk);
+    jni_shim_set_apk_path(absolute_apk);
     runtime_log("Setting APK path: %s", absolute_apk);
     set_apk_path(jni_shim_env(), NULL, apk_string);
     runtime_log("RESULT: APK_PATH_SET");

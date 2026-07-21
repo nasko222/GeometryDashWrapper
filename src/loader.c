@@ -56,8 +56,8 @@ static uint32_t read_u32(const unsigned char *value) {
            ((uint32_t)value[2] << 16) | ((uint32_t)value[3] << 24);
 }
 
-static int extract_apk_member(const char *apk_path, const char *member_name,
-                              unsigned char **output, size_t *output_size) {
+int apk_extract_member(const char *apk_path, const char *member_name,
+                       unsigned char **output, size_t *output_size) {
     unsigned char *apk = NULL;
     size_t apk_size = 0;
     size_t eocd_position;
@@ -430,7 +430,7 @@ int elf_image_load_from_apk(ElfImage *image, const char *apk_path,
                             const char *member_name) {
     memset(image, 0, sizeof(*image));
     runtime_log("Opening Android game APK: %s", apk_path);
-    if (!extract_apk_member(apk_path, member_name, &image->file_data,
+    if (!apk_extract_member(apk_path, member_name, &image->file_data,
                             &image->file_size) ||
         !validate_headers(image) || !map_segments(image)) {
         elf_image_unload(image);

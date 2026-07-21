@@ -2,12 +2,16 @@
 #include <windows.h>
 #include <mmsystem.h>
 
+#include <io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "audio_win.h"
+#include "embedded_effects.h"
+#include "loader.h"
 #include "runtime.h"
+#include "../third_party/zlib/zlib.h"
 
 #define MAX_EFFECT_SLOTS 24
 
@@ -19,6 +23,8 @@ typedef struct {
 } EffectSlot;
 
 static char g_audio_directory[MAX_PATH * 2];
+static char g_audio_cache_directory[MAX_PATH * 2];
+static char g_apk_path[MAX_PATH * 2];
 static char g_music_path[MAX_PATH * 2];
 static EffectSlot g_effects[MAX_EFFECT_SLOTS];
 static unsigned g_next_effect_identifier = 1;
@@ -58,6 +64,72 @@ static const char *file_name_part(const char *path) {
     return path;
 }
 
+static int file_is_regular(const char *path) {
+    DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int write_cached_audio(const char *destination, const void *data,
+                              size_t size) {
+    char temporary[MAX_PATH * 2 + 32];
+    FILE *stream;
+    int ok;
+    snprintf(temporary, sizeof(temporary), "%s.wrapper.tmp", destination);
+    stream = fopen(temporary, "wb");
+    if (!stream) return 0;
+    ok = (!size || fwrite(data, 1, size, stream) == size) &&
+         fflush(stream) == 0 && _commit(_fileno(stream)) == 0;
+    if (fclose(stream) != 0) ok = 0;
+    if (ok && MoveFileExA(temporary, destination,
+                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return 1;
+    }
+    DeleteFileA(temporary);
+    return 0;
+}
+
+static int materialize_embedded_effect(const char *name,
+                                       const char *destination) {
+    const EmbeddedEffect *effect = embedded_effect_find(name);
+    unsigned char *decoded;
+    uLongf decoded_size;
+    int result;
+    if (!effect || !effect->compressed_data || !effect->uncompressed_size) {
+        return 0;
+    }
+    decoded = (unsigned char *)malloc(effect->uncompressed_size);
+    if (!decoded) return 0;
+    decoded_size = (uLongf)effect->uncompressed_size;
+    result = uncompress(decoded, &decoded_size, effect->compressed_data,
+                        (uLong)effect->compressed_size) == Z_OK &&
+             decoded_size == effect->uncompressed_size &&
+             write_cached_audio(destination, decoded, decoded_size);
+    free(decoded);
+    if (result) {
+        runtime_log("Audio cache: materialized %s from embedded APK conversion",
+                    name);
+    }
+    return result;
+}
+
+static int materialize_apk_audio(const char *name, const char *destination) {
+    char member[MAX_PATH * 2];
+    unsigned char *payload = NULL;
+    size_t payload_size = 0;
+    int result;
+    snprintf(member, sizeof(member), "assets/%s", name);
+    if (!apk_extract_member(g_apk_path, member, &payload, &payload_size)) {
+        return 0;
+    }
+    result = write_cached_audio(destination, payload, payload_size);
+    free(payload);
+    if (result) {
+        runtime_log("Audio cache: extracted %s from game.apk", name);
+    }
+    return result;
+}
+
 static int audio_asset_path(const char *requested, int effect,
                             char *destination, size_t capacity) {
     const char *name = file_name_part(requested);
@@ -83,6 +155,13 @@ static int audio_asset_path(const char *requested, int effect,
             snprintf(destination, capacity, "%s", requested);
             return 1;
         }
+    }
+    snprintf(destination, capacity, "%s\\%s", g_audio_cache_directory,
+             converted);
+    if (file_is_regular(destination)) return 1;
+    if ((effect && materialize_embedded_effect(converted, destination)) ||
+        (!effect && materialize_apk_audio(name, destination))) {
+        return 1;
     }
     runtime_log("Audio asset is missing: %s", destination);
     return 0;
@@ -151,11 +230,24 @@ void audio_initialize(const char *executable_directory) {
     unsigned index;
     snprintf(g_audio_directory, sizeof(g_audio_directory), "%s\\audio",
              executable_directory ? executable_directory : ".");
+    snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
+             "%s\\save\\audio-cache",
+             executable_directory ? executable_directory : ".");
+    snprintf(g_apk_path, sizeof(g_apk_path), "%s\\game.apk",
+             executable_directory ? executable_directory : ".");
+    CreateDirectoryA(g_audio_cache_directory, NULL);
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
     }
-    runtime_log("Windows MCI audio bridge initialized: %s", g_audio_directory);
+    runtime_log("Windows MCI audio bridge initialized; APK cache: %s",
+                g_audio_cache_directory);
+}
+
+void audio_set_apk_path(const char *apk_path) {
+    if (apk_path && apk_path[0]) {
+        snprintf(g_apk_path, sizeof(g_apk_path), "%s", apk_path);
+    }
 }
 
 void audio_shutdown(void) {

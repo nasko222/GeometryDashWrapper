@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 
@@ -54,30 +56,82 @@ def locate_ffmpeg(value: str | None) -> Path:
     return Path(candidate).resolve()
 
 
-def extract_audio(apk: Path, destination: Path, ffmpeg: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
+def generate_embedded_effects(
+    apk: Path | None, destination: Path, ffmpeg: Path | None
+) -> None:
+    effects: list[tuple[str, bytes, int]] = []
+    if apk is None:
+        destination.write_text(
+            '#include "embedded_effects.h"\n'
+            'const EmbeddedEffect *embedded_effect_find(const char *name) '
+            '{ (void)name; return 0; }\n',
+            encoding="utf-8",
+        )
+        return
+    assert ffmpeg is not None
     with zipfile.ZipFile(apk) as archive, tempfile.TemporaryDirectory() as temporary:
         temporary_path = Path(temporary)
         members = sorted(
             name for name in archive.namelist()
-            if name.startswith("assets/") and name.lower().endswith((".mp3", ".ogg"))
+            if name.startswith("assets/") and name.lower().endswith(".ogg")
         )
-        for member in members:
+        for index, member in enumerate(members):
             name = Path(member).name
             payload = archive.read(member)
-            if name.lower().endswith(".mp3"):
-                (destination / name).write_bytes(payload)
-                continue
-            source = temporary_path / name
-            target = destination / (Path(name).stem + ".wav")
+            source = temporary_path / f"source-{index}.ogg"
+            target = temporary_path / f"effect-{index}.wav"
             source.write_bytes(payload)
             subprocess.run(
                 [
                     str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", str(source), "-vn", "-c:a", "pcm_s16le", str(target),
+                    "-i", str(source), "-vn", "-ar", "44100", "-ac", "1",
+                    "-c:a", "pcm_s16le", str(target),
                 ],
                 check=True,
             )
+            wav = target.read_bytes()
+            effects.append(
+                (Path(name).with_suffix(".wav").name, zlib.compress(wav, 9), len(wav))
+            )
+
+    if not effects:
+        destination.write_text(
+            '#include "embedded_effects.h"\n'
+            'const EmbeddedEffect *embedded_effect_find(const char *name) '
+            '{ (void)name; return 0; }\n',
+            encoding="utf-8",
+        )
+        return
+
+    lines = ['#include <string.h>', '#include "embedded_effects.h"', '']
+    for index, (_, compressed, _) in enumerate(effects):
+        lines.append(f"static const unsigned char effect_{index}[] = {{")
+        for offset in range(0, len(compressed), 16):
+            chunk = compressed[offset : offset + 16]
+            lines.append("    " + ", ".join(f"0x{byte:02x}" for byte in chunk) + ",")
+        lines.append("};")
+    lines.extend(["", "static const EmbeddedEffect effects[] = {"])
+    for index, (name, compressed, uncompressed_size) in enumerate(effects):
+        lines.append(
+            f"    {{{json.dumps(name)}, effect_{index}, {len(compressed)}u, "
+            f"{uncompressed_size}u}},"
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "const EmbeddedEffect *embedded_effect_find(const char *name) {",
+            "    size_t index;",
+            "    if (!name) return 0;",
+            "    for (index = 0; index < sizeof(effects) / sizeof(effects[0]); ++index) {",
+            "        if (strcmp(name, effects[index].name) == 0) return &effects[index];",
+            "    }",
+            "    return 0;",
+            "}",
+            "",
+        ]
+    )
+    destination.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> int:
@@ -92,10 +146,17 @@ def main() -> int:
     zig = locate_zig(args.zig)
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    if args.apk:
-        validate_apk(args.apk.resolve())
+    apk = args.apk.resolve() if args.apk else None
+    ffmpeg = None
+    if apk:
+        validate_apk(apk)
+        ffmpeg = locate_ffmpeg(args.ffmpeg)
     cache = root / "build-cache"
     cache.mkdir(exist_ok=True)
+    generated = cache / "generated"
+    generated.mkdir(exist_ok=True)
+    embedded_effects = generated / "embedded_effects.c"
+    generate_embedded_effects(apk, embedded_effects, ffmpeg)
 
     sources = [
         root / "src/main.c",
@@ -103,6 +164,8 @@ def main() -> int:
         root / "src/runtime.c",
         root / "src/jni_shim.c",
         root / "src/audio_win.c",
+        root / "src/storage_win.c",
+        embedded_effects,
         *sorted((root / "third_party/zlib").glob("*.c")),
     ]
     command = [
@@ -118,6 +181,7 @@ def main() -> int:
         "-Wno-deprecated-non-prototype",
         "-mstackrealign",
         f"-I{root / 'third_party/zlib'}",
+        f"-I{root / 'src'}",
         "-o",
         str(output / "GeometryDashWrapper.exe"),
         *(str(path) for path in sources),
@@ -135,11 +199,10 @@ def main() -> int:
     (output / "GeometryDash18Wrapper.exe").unlink(missing_ok=True)
     (output / "GeometryDash18Wrapper.pdb").unlink(missing_ok=True)
     (output / "libcocos2dcpp.so").unlink(missing_ok=True)
+    shutil.rmtree(output / "audio", ignore_errors=True)
 
-    if args.apk:
-        apk = args.apk.resolve()
+    if apk:
         shutil.copy2(apk, output / "game.apk")
-        extract_audio(apk, output / "audio", locate_ffmpeg(args.ffmpeg))
 
     print(output / "GeometryDashWrapper.exe")
     return 0
