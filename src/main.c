@@ -66,6 +66,10 @@ typedef int (__cdecl *TinyXmlParseFunction)(void *document,
                                              const char *xml,
                                              unsigned int size);
 static TinyXmlParseFunction g_original_tinyxml_parse;
+typedef void (__cdecl *MusicDownloadCompletedFunction)(void *self,
+                                                        void *client,
+                                                        void *response);
+static MusicDownloadCompletedFunction g_original_music_download_completed;
 
 static unsigned char *trace_android_file_data(
     void *self, const char *filename, const char *mode,
@@ -94,6 +98,57 @@ static int trace_tinyxml_parse(void *document, const char *xml,
                     size, result, document_error);
     }
     return result;
+}
+
+static void copy_readable_text(const char *source, char *destination,
+                               size_t capacity) {
+    MEMORY_BASIC_INFORMATION memory;
+    const char *region_end;
+    size_t index = 0;
+    if (!destination || !capacity) return;
+    destination[0] = 0;
+    if (!source ||
+        !VirtualQuery(source, &memory, sizeof(memory)) ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        snprintf(destination, capacity, "<unavailable>");
+        return;
+    }
+    region_end = (const char *)memory.BaseAddress + memory.RegionSize;
+    while (index + 1 < capacity && source + index < region_end &&
+           source[index]) {
+        unsigned char character = (unsigned char)source[index];
+        destination[index] = character >= 0x20 && character < 0x7f
+                                 ? (char)character
+                                 : ' ';
+        ++index;
+    }
+    destination[index] = 0;
+    if (!index) snprintf(destination, capacity, "<empty>");
+}
+
+static void trace_music_download_completed(void *self, void *client,
+                                           void *response) {
+    int success = 0;
+    int response_code = 0;
+    size_t response_size = 0;
+    char error[192] = "<unavailable>";
+    if (response) {
+        const unsigned char *object = (const unsigned char *)response;
+        const unsigned char *begin = *(const unsigned char *const *)(object + 0x28);
+        const unsigned char *end = *(const unsigned char *const *)(object + 0x2c);
+        const char *error_source = *(const char *const *)(object + 0x44);
+        success = object[0x24] != 0;
+        response_code = *(const int *)(object + 0x40);
+        if (begin && (uintptr_t)end >= (uintptr_t)begin) {
+            response_size = (size_t)((uintptr_t)end - (uintptr_t)begin);
+        }
+        copy_readable_text(error_source, error, sizeof(error));
+    }
+    runtime_log("Song HTTP completion: success=%s status=%d bytes=%lu error=%s",
+                success ? "yes" : "no", response_code,
+                (unsigned long)response_size, error);
+    g_original_music_download_completed(self, client, response);
 }
 
 static int install_x86_detour(void *target, const unsigned char *expected,
@@ -181,6 +236,26 @@ static void install_tinyxml_trace(const ElfImage *image) {
         runtime_log("TinyXML trace: installed");
     } else {
         runtime_log("TinyXML trace: skipped (unknown parser prologue)");
+    }
+}
+
+static void install_music_download_trace(const ElfImage *image) {
+    static const unsigned char expected[] = {
+        0x8d, 0x64, 0x24, 0xb4, 0x89, 0x5c, 0x24, 0x3c
+    };
+    void *target = elf_image_find_export(
+        image,
+        "_ZN20MusicDownloadManager23onDownloadSongCompletedEPN7cocos2d9extension12CCHttpClientEPNS1_14CCHttpResponseE");
+    if (!target) {
+        runtime_log("Song HTTP trace: callback export unavailable");
+        return;
+    }
+    if (install_x86_detour(target, expected, sizeof(expected),
+                           trace_music_download_completed,
+                           (void **)&g_original_music_download_completed)) {
+        runtime_log("Song HTTP trace: installed");
+    } else {
+        runtime_log("Song HTTP trace: skipped (unknown callback prologue)");
     }
 }
 
@@ -396,7 +471,7 @@ static int create_opengl_window(int client_width, int client_height) {
 
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     g_host.window = CreateWindowExA(
-        0, window_class.lpszClassName, "Geometry Dash - Android native wrapper",
+        0, window_class.lpszClassName, "Android x86 native compatibility wrapper",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -625,6 +700,7 @@ int main(int argc, char **argv) {
 
     install_android_asset_trace(&image);
     install_tinyxml_trace(&image);
+    install_music_download_trace(&image);
 
     apk_string = jni_shim_new_string(absolute_apk);
     jni_shim_set_apk_path(absolute_apk);

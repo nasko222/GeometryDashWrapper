@@ -16,6 +16,9 @@
 #include "runtime.h"
 #include "../third_party/zlib/zlib.h"
 
+#define STB_VORBIS_HEADER_ONLY
+#include "../third_party/stb/stb_vorbis.c"
+
 #define MAX_EFFECT_SLOTS 24
 
 typedef struct {
@@ -60,6 +63,8 @@ static HANDLE g_output_meter_thread;
 static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
 static volatile LONG g_output_peak_logged;
+static volatile LONG g_short_path_logged;
+static SRWLOCK g_mci_lock = SRWLOCK_INIT;
 
 /* Keep the Core Audio GUIDs local so the wrapper does not need uuid.lib. */
 static const GUID g_clsid_mmdevice_enumerator = {
@@ -160,14 +165,89 @@ static void initialize_output_meter(void) {
 
 static int mci_command(const char *command, char *result, unsigned capacity,
                        int report_error) {
-    MCIERROR error = mciSendStringA(command, result, capacity, NULL);
+    MCIERROR error;
+    char message[256] = "unknown MCI error";
+    AcquireSRWLockExclusive(&g_mci_lock);
+    error = mciSendStringA(command, result, capacity, NULL);
     if (error && report_error) {
-        char message[256] = "unknown MCI error";
         mciGetErrorStringA(error, message, sizeof(message));
+    }
+    ReleaseSRWLockExclusive(&g_mci_lock);
+    if (error && report_error) {
         runtime_log("Audio MCI error %lu: %s | %s", (unsigned long)error,
                     message, command);
     }
     return error == 0;
+}
+
+static void mci_compatible_path(const char *path, char *destination,
+                                size_t capacity) {
+    char full[MAX_PATH * 2];
+    char current[MAX_PATH * 2];
+    DWORD full_length;
+    DWORD current_length;
+    DWORD short_length;
+    if (!path || !destination || !capacity) return;
+    full_length = GetFullPathNameA(path, (DWORD)sizeof(full), full, NULL);
+    if (!full_length || full_length >= sizeof(full)) {
+        snprintf(full, sizeof(full), "%s", path);
+    }
+    /* main.c pins the working directory to the folder containing the EXE.
+       Prefer a short relative path for anything inside that folder. Unlike
+       DOS 8.3 names, this remains available when short-name generation is
+       disabled on the C: volume. */
+    current_length = GetCurrentDirectoryA((DWORD)sizeof(current), current);
+    if (current_length && current_length < sizeof(current)) {
+        while (current_length > 0 &&
+               (current[current_length - 1] == '\\' ||
+                current[current_length - 1] == '/')) {
+            current[--current_length] = 0;
+        }
+        if (current_length &&
+            _strnicmp(full, current, current_length) == 0 &&
+            (full[current_length] == '\\' || full[current_length] == '/')) {
+            snprintf(destination, capacity, ".\\%s", full + current_length + 1);
+            if (InterlockedCompareExchange(&g_short_path_logged, 1, 0) == 0) {
+                runtime_log("Audio MCI: using compact executable-relative paths");
+            }
+            return;
+        }
+    }
+    short_length = GetShortPathNameA(full, destination, (DWORD)capacity);
+    if (short_length && short_length < capacity) {
+        if (_stricmp(destination, full) != 0 &&
+            InterlockedCompareExchange(&g_short_path_logged, 1, 0) == 0) {
+            runtime_log("Audio MCI: using a short Windows path to avoid path-length limits");
+        }
+        return;
+    }
+    snprintf(destination, capacity, "%s", full);
+}
+
+static int mci_open_path(const char *path, const char *type,
+                         const char *alias, int report_error) {
+    char compatible[MAX_PATH * 2];
+    char command[MAX_PATH * 2 + 96];
+    int different;
+    mci_compatible_path(path, compatible, sizeof(compatible));
+    different = _stricmp(compatible, path) != 0;
+    if (type && type[0]) {
+        snprintf(command, sizeof(command), "open \"%s\" type %s alias %s",
+                 compatible, type, alias);
+    } else {
+        snprintf(command, sizeof(command), "open \"%s\" alias %s",
+                 compatible, alias);
+    }
+    if (mci_command(command, NULL, 0, different ? 0 : report_error)) return 1;
+    if (!different) return 0;
+    if (type && type[0]) {
+        snprintf(command, sizeof(command), "open \"%s\" type %s alias %s",
+                 path, type, alias);
+    } else {
+        snprintf(command, sizeof(command), "open \"%s\" alias %s", path,
+                 alias);
+    }
+    return mci_command(command, NULL, 0, report_error);
 }
 
 static const char *file_name_part(const char *path) {
@@ -204,6 +284,214 @@ static int write_cached_audio(const char *destination, const void *data,
     }
     DeleteFileA(temporary);
     return 0;
+}
+
+static void write_little_u16(unsigned char *destination, unsigned value) {
+    destination[0] = (unsigned char)value;
+    destination[1] = (unsigned char)(value >> 8);
+}
+
+static void write_little_u32(unsigned char *destination, uint32_t value) {
+    destination[0] = (unsigned char)value;
+    destination[1] = (unsigned char)(value >> 8);
+    destination[2] = (unsigned char)(value >> 16);
+    destination[3] = (unsigned char)(value >> 24);
+}
+
+static int write_pcm_wave(const char *destination, const short *samples,
+                          int samples_per_channel, int channels,
+                          int sample_rate) {
+    uint64_t sample_count;
+    uint64_t pcm_size_64;
+    size_t wave_size;
+    uint32_t pcm_size;
+    uint32_t byte_rate;
+    unsigned char *wave;
+    int result;
+    if (!samples || samples_per_channel <= 0 || channels <= 0 ||
+        channels > 8 || sample_rate <= 0) {
+        return 0;
+    }
+    sample_count = (uint64_t)(unsigned)samples_per_channel *
+                   (uint64_t)(unsigned)channels;
+    pcm_size_64 = sample_count * sizeof(short);
+    if (pcm_size_64 > UINT32_MAX || pcm_size_64 > SIZE_MAX - 44) return 0;
+    pcm_size = (uint32_t)pcm_size_64;
+    wave_size = (size_t)pcm_size + 44;
+    byte_rate = (uint32_t)sample_rate * (uint32_t)channels * 2u;
+    wave = (unsigned char *)malloc(wave_size);
+    if (!wave) return 0;
+    memcpy(wave, "RIFF", 4);
+    write_little_u32(wave + 4, 36u + pcm_size);
+    memcpy(wave + 8, "WAVEfmt ", 8);
+    write_little_u32(wave + 16, 16);
+    write_little_u16(wave + 20, 1); /* PCM */
+    write_little_u16(wave + 22, (unsigned)channels);
+    write_little_u32(wave + 24, (uint32_t)sample_rate);
+    write_little_u32(wave + 28, byte_rate);
+    write_little_u16(wave + 32, (unsigned)channels * 2u);
+    write_little_u16(wave + 34, 16);
+    memcpy(wave + 36, "data", 4);
+    write_little_u32(wave + 40, pcm_size);
+    memcpy(wave + 44, samples, pcm_size);
+    result = write_cached_audio(destination, wave, wave_size);
+    free(wave);
+    return result;
+}
+
+static int materialize_apk_effect(const char *name, char *destination,
+                                  size_t capacity) {
+    char member[MAX_PATH * 2];
+    char stem[MAX_PATH];
+    char *extension;
+    unsigned char *payload = NULL;
+    size_t payload_size = 0;
+    uLong checksum;
+    short *samples = NULL;
+    int channels = 0;
+    int sample_rate = 0;
+    int sample_count;
+    int result = 0;
+    if (!name || !name[0]) return 0;
+    extension = strrchr(name, '.');
+    if (!extension || (_stricmp(extension, ".ogg") != 0 &&
+                       _stricmp(extension, ".wav") != 0)) {
+        return 0;
+    }
+    snprintf(member, sizeof(member), "assets/%s", name);
+    if (!apk_extract_member(g_apk_path, member, &payload, &payload_size)) {
+        return 0;
+    }
+    checksum = crc32(0L, Z_NULL, 0);
+    checksum = crc32(checksum, payload, (uInt)payload_size);
+    snprintf(stem, sizeof(stem), "%s", name);
+    extension = strrchr(stem, '.');
+    if (extension) *extension = 0;
+    if (snprintf(destination, capacity, "%s\\%s-%08lx.wav",
+                 g_audio_cache_directory, stem,
+                 (unsigned long)checksum) < 0 ||
+        strlen(destination) + 1 >= capacity) {
+        free(payload);
+        return 0;
+    }
+    if (file_is_regular(destination)) {
+        free(payload);
+        return 1;
+    }
+    if (_stricmp(strrchr(name, '.'), ".wav") == 0) {
+        result = write_cached_audio(destination, payload, payload_size);
+    } else if (payload_size <= INT_MAX) {
+        sample_count = stb_vorbis_decode_memory(
+            payload, (int)payload_size, &channels, &sample_rate, &samples);
+        if (sample_count > 0) {
+            result = write_pcm_wave(destination, samples, sample_count,
+                                    channels, sample_rate);
+        }
+    }
+    free(samples);
+    free(payload);
+    if (result) {
+        runtime_log("Audio cache: decoded %s from current game.apk", name);
+    } else {
+        runtime_log("Audio cache: could not decode APK effect %s", name);
+    }
+    return result;
+}
+
+static uint64_t file_size_from_attributes(const WIN32_FILE_ATTRIBUTE_DATA *data) {
+    return ((uint64_t)data->nFileSizeHigh << 32) | data->nFileSizeLow;
+}
+
+static int prepare_id3_stripped_mp3(const char *source, char *destination,
+                                    size_t capacity,
+                                    uint32_t minimum_tag_size) {
+    WIN32_FILE_ATTRIBUTE_DATA source_data;
+    WIN32_FILE_ATTRIBUTE_DATA destination_data;
+    unsigned char header[10];
+    unsigned char buffer[64 * 1024];
+    char temporary[MAX_PATH * 2 + 32];
+    const char *name = file_name_part(source);
+    const char *extension = strrchr(name, '.');
+    uint64_t source_size;
+    uint64_t expected_size;
+    uint32_t tag_size;
+    size_t skip;
+    FILE *input;
+    FILE *output;
+    int ok = 1;
+    if (!extension || _stricmp(extension, ".mp3") != 0 ||
+        !GetFileAttributesExA(source, GetFileExInfoStandard, &source_data)) {
+        return 0;
+    }
+    input = fopen(source, "rb");
+    if (!input) return 0;
+    if (fread(header, 1, sizeof(header), input) != sizeof(header) ||
+        memcmp(header, "ID3", 3) != 0 ||
+        (header[6] | header[7] | header[8] | header[9]) & 0x80) {
+        fclose(input);
+        return 0;
+    }
+    tag_size = ((uint32_t)header[6] << 21) |
+               ((uint32_t)header[7] << 14) |
+               ((uint32_t)header[8] << 7) | header[9];
+    if (tag_size < minimum_tag_size) {
+        fclose(input);
+        return 0;
+    }
+    skip = 10u + tag_size;
+    if ((header[5] & 0x10) != 0) skip += 10u; /* ID3v2.4 footer */
+    source_size = file_size_from_attributes(&source_data);
+    if (skip >= source_size || skip > LONG_MAX) {
+        fclose(input);
+        return 0;
+    }
+    expected_size = source_size - skip;
+    if (snprintf(destination, capacity, "%s\\mci-%s",
+                 g_audio_cache_directory, name) < 0 ||
+        strlen(destination) + 1 >= capacity) {
+        fclose(input);
+        return 0;
+    }
+    if (GetFileAttributesExA(destination, GetFileExInfoStandard,
+                             &destination_data) &&
+        file_size_from_attributes(&destination_data) == expected_size &&
+        CompareFileTime(&destination_data.ftLastWriteTime,
+                        &source_data.ftLastWriteTime) >= 0) {
+        fclose(input);
+        return 1;
+    }
+    if (fseek(input, (long)skip, SEEK_SET) != 0) {
+        fclose(input);
+        return 0;
+    }
+    snprintf(temporary, sizeof(temporary), "%s.wrapper.tmp", destination);
+    output = fopen(temporary, "wb");
+    if (!output) {
+        fclose(input);
+        return 0;
+    }
+    for (;;) {
+        size_t count = fread(buffer, 1, sizeof(buffer), input);
+        if (count && fwrite(buffer, 1, count, output) != count) {
+            ok = 0;
+            break;
+        }
+        if (count < sizeof(buffer)) {
+            if (ferror(input)) ok = 0;
+            break;
+        }
+    }
+    if (fclose(input) != 0) ok = 0;
+    if (ok && (fflush(output) != 0 || _commit(_fileno(output)) != 0)) ok = 0;
+    if (fclose(output) != 0) ok = 0;
+    if (!ok || !MoveFileExA(temporary, destination,
+                            MOVEFILE_REPLACE_EXISTING |
+                            MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary);
+        return 0;
+    }
+    runtime_log("Audio MCI: stripped ID3 metadata from %s", name);
+    return 1;
 }
 
 static int materialize_embedded_effect(const char *name,
@@ -283,6 +571,9 @@ static int audio_asset_path(const char *requested, int effect,
             return 1;
         }
     }
+    if (effect && materialize_apk_effect(name, destination, capacity)) {
+        return 1;
+    }
     snprintf(destination, capacity, "%s\\%s", g_audio_cache_directory,
              converted);
     if (file_is_regular(destination)) return 1;
@@ -313,16 +604,40 @@ static void close_music(void) {
 
 static int open_music(const char *requested) {
     char path[MAX_PATH * 2];
-    char command[MAX_PATH * 2 + 96];
+    char sanitized[MAX_PATH * 2];
+    int have_sanitized;
+    int opened;
     if (!audio_asset_path(requested, 0, path, sizeof(path))) return 0;
     if (g_music_open && _stricmp(path, g_music_path) == 0) return 1;
     close_music();
-    snprintf(command, sizeof(command),
-             "open \"%s\" type mpegvideo alias gd18_music", path);
-    if (!mci_command(command, NULL, 0, 1)) {
-        snprintf(command, sizeof(command), "open \"%s\" alias gd18_music",
-                 path);
-        if (!mci_command(command, NULL, 0, 1)) return 0;
+    /* Large ID3 tags normally contain album art. Some Windows MCI versions
+       accept the file at open time but fail only when playback starts, so use
+       the metadata-free copy proactively instead of waiting for open to fail. */
+    have_sanitized = prepare_id3_stripped_mp3(
+        path, sanitized, sizeof(sanitized), 4096);
+    if (have_sanitized) {
+        opened = mci_open_path(sanitized, "mpegvideo", "gd18_music", 0) ||
+                 mci_open_path(sanitized, NULL, "gd18_music", 0);
+        if (!opened) {
+            mci_command("close gd18_music", NULL, 0, 0);
+            opened = mci_open_path(path, "mpegvideo", "gd18_music", 0) ||
+                     mci_open_path(path, NULL, "gd18_music", 0);
+        }
+    } else {
+        opened = mci_open_path(path, "mpegvideo", "gd18_music", 0) ||
+                 mci_open_path(path, NULL, "gd18_music", 0);
+    }
+    if (!opened && !have_sanitized &&
+        prepare_id3_stripped_mp3(path, sanitized, sizeof(sanitized), 0)) {
+        mci_command("close gd18_music", NULL, 0, 0);
+        opened = mci_open_path(sanitized, "mpegvideo", "gd18_music", 0) ||
+                 mci_open_path(sanitized, NULL, "gd18_music", 1);
+    }
+    if (!opened) {
+        /* Repeat once with diagnostics enabled so the log contains the actual
+           Windows codec/path error, not merely a silent preload failure. */
+        mci_command("close gd18_music", NULL, 0, 0);
+        if (!mci_open_path(path, NULL, "gd18_music", 1)) return 0;
     }
     snprintf(g_music_path, sizeof(g_music_path), "%s", path);
     g_music_open = 1;
@@ -367,6 +682,7 @@ void audio_initialize(const char *executable_directory) {
              executable_directory ? executable_directory : ".");
     CreateDirectoryA(g_audio_cache_directory, NULL);
     InterlockedExchange(&g_effect_log_count, 0);
+    InterlockedExchange(&g_short_path_logged, 0);
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
@@ -535,7 +851,7 @@ void audio_preload_effect(const char *path) {
 
 unsigned audio_play_effect(const char *path, int loop) {
     char resolved[MAX_PATH * 2];
-    char command[MAX_PATH * 2 + 96];
+    char command[96];
     EffectSlot *slot;
     unsigned identifier;
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return 0;
@@ -543,9 +859,7 @@ unsigned audio_play_effect(const char *path, int loop) {
     close_effect_slot(slot);
     identifier = g_next_effect_identifier++;
     if (!identifier) identifier = g_next_effect_identifier++;
-    snprintf(command, sizeof(command),
-             "open \"%s\" type waveaudio alias %s", resolved, slot->alias);
-    if (!mci_command(command, NULL, 0, 1)) return 0;
+    if (!mci_open_path(resolved, "waveaudio", slot->alias, 1)) return 0;
     slot->open = 1;
     slot->identifier = identifier;
     slot->volume = 1.0f;

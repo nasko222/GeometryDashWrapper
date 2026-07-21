@@ -8,6 +8,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <io.h>
 #include <limits.h>
 #include <math.h>
@@ -16,10 +17,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "runtime.h"
 #include "fmod_win.h"
+#include "storage_win.h"
 #include "../third_party/zlib/zlib.h"
 
 #define MAX_IMPORTS 1024
@@ -68,6 +71,63 @@ static const int16_t *g_toupper_pointer;
 static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
+
+/* OpenSSL in the Android game reads /dev/urandom before starting HTTPS.
+ * Keep this descriptor odd so it cannot collide with a Winsock HANDLE, which
+ * is aligned, and below the Android getdtablesize() result. */
+#define ANDROID_RANDOM_FD 2047
+static INIT_ONCE g_random_once = INIT_ONCE_STATIC_INIT;
+static BOOLEAN (WINAPI *g_system_random)(PVOID, ULONG);
+static volatile LONG g_random_open_count;
+typedef unsigned (WINAPI *IfNameToIndexFunction)(const char *);
+static INIT_ONCE g_if_name_index_once = INIT_ONCE_STATIC_INIT;
+static IfNameToIndexFunction g_if_name_to_index;
+
+static BOOL CALLBACK initialize_system_random(PINIT_ONCE once, PVOID parameter,
+                                               PVOID *context) {
+    HMODULE module;
+    (void)once;
+    (void)parameter;
+    (void)context;
+    module = LoadLibraryA("advapi32.dll");
+    if (module) {
+        g_system_random = (BOOLEAN (WINAPI *)(PVOID, ULONG))
+            GetProcAddress(module, "SystemFunction036");
+    }
+    if (g_system_random) {
+        runtime_log("Secure random: Windows /dev/urandom bridge initialized");
+    } else {
+        runtime_log("Secure random: Windows provider is unavailable");
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK initialize_if_name_index(PINIT_ONCE once, PVOID parameter,
+                                              PVOID *context) {
+    HMODULE module;
+    (void)once;
+    (void)parameter;
+    (void)context;
+    module = LoadLibraryA("iphlpapi.dll");
+    if (module) {
+        g_if_name_to_index = (IfNameToIndexFunction)GetProcAddress(
+            module, "if_nametoindex");
+    }
+    return TRUE;
+}
+
+static int fill_system_random(void *buffer, size_t length) {
+    unsigned char *cursor = (unsigned char *)buffer;
+    InitOnceExecuteOnce(&g_random_once, initialize_system_random, NULL, NULL);
+    if (!g_system_random || (!buffer && length)) return 0;
+    while (length) {
+        ULONG chunk = length > ULONG_MAX ? ULONG_MAX : (ULONG)length;
+        if (!g_system_random(cursor, chunk)) return 0;
+        cursor += chunk;
+        length -= chunk;
+    }
+    return 1;
+}
 
 /*
  * The Android/i386 signal ABI used by these APKs is a compact 16-byte
@@ -220,7 +280,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.3-alpha1");
+    runtime_log("Android x86 native compatibility wrapper 0.9.3-alpha3");
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
@@ -391,6 +451,29 @@ typedef struct {
     int32_t tv_usec;
 } AndroidTimeval;
 
+typedef struct {
+    int32_t time;
+    uint16_t millitm;
+    int16_t timezone;
+    int16_t dstflag;
+} AndroidTimeb;
+
+typedef struct {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+    int32_t tm_gmtoff;
+    const char *tm_zone;
+} AndroidTm;
+
+static SRWLOCK g_time_conversion_lock = SRWLOCK_INIT;
+
 static uint64_t windows_unix_100ns(void) {
     FILETIME file_time;
     ULARGE_INTEGER value;
@@ -432,6 +515,57 @@ static int shim_gettimeofday(AndroidTimeval *value, void *timezone) {
     value->tv_sec = (int32_t)(ticks / 10000000ULL);
     value->tv_usec = (int32_t)((ticks % 10000000ULL) / 10ULL);
     return 0;
+}
+
+static int shim_ftime(AndroidTimeb *value) {
+    TIME_ZONE_INFORMATION zone;
+    DWORD zone_state;
+    LONG bias;
+    uint64_t ticks;
+    if (!value) {
+        g_errno_value = 14;
+        return -1;
+    }
+    ticks = windows_unix_100ns();
+    zone_state = GetTimeZoneInformation(&zone);
+    bias = zone.Bias;
+    if (zone_state == TIME_ZONE_ID_DAYLIGHT) {
+        bias += zone.DaylightBias;
+    } else if (zone_state == TIME_ZONE_ID_STANDARD) {
+        bias += zone.StandardBias;
+    }
+    value->time = (int32_t)(ticks / 10000000ULL);
+    value->millitm = (uint16_t)((ticks % 10000000ULL) / 10000ULL);
+    value->timezone = (int16_t)bias;
+    value->dstflag = (int16_t)(zone_state == TIME_ZONE_ID_DAYLIGHT);
+    return 0;
+}
+
+static AndroidTm *shim_gmtime_r(const int32_t *timer, AndroidTm *result) {
+    __time32_t windows_time;
+    struct tm *windows_result;
+    if (!timer || !result) {
+        g_errno_value = 22;
+        return NULL;
+    }
+    windows_time = (__time32_t)*timer;
+    AcquireSRWLockExclusive(&g_time_conversion_lock);
+    windows_result = _gmtime32(&windows_time);
+    if (windows_result) {
+        memset(result, 0, sizeof(*result));
+        result->tm_sec = windows_result->tm_sec;
+        result->tm_min = windows_result->tm_min;
+        result->tm_hour = windows_result->tm_hour;
+        result->tm_mday = windows_result->tm_mday;
+        result->tm_mon = windows_result->tm_mon;
+        result->tm_year = windows_result->tm_year;
+        result->tm_wday = windows_result->tm_wday;
+        result->tm_yday = windows_result->tm_yday;
+        result->tm_isdst = windows_result->tm_isdst;
+        result->tm_zone = "UTC";
+    }
+    ReleaseSRWLockExclusive(&g_time_conversion_lock);
+    return windows_result ? result : NULL;
 }
 
 static int32_t shim_clock(void) {
@@ -495,6 +629,29 @@ static char *shim_basename(char *path) {
         slash = backslash;
     }
     return slash ? slash + 1 : path;
+}
+
+static char *shim_strtok_r(char *text, const char *delimiters,
+                           char **save_pointer) {
+    char *token;
+    char *end;
+    if (!delimiters || !save_pointer) {
+        g_errno_value = 22;
+        return NULL;
+    }
+    token = text ? text : *save_pointer;
+    if (!token) return NULL;
+    token += strspn(token, delimiters);
+    if (!*token) {
+        *save_pointer = token;
+        return NULL;
+    }
+    end = token + strcspn(token, delimiters);
+    if (*end) {
+        *end++ = 0;
+    }
+    *save_pointer = end;
+    return token;
 }
 
 static long long shim_strtoll(const char *text, char **end, int base) {
@@ -679,24 +836,6 @@ static int shim_sigprocmask(int how, const uint32_t *set, uint32_t *old_set) {
     return 0;
 }
 
-static int is_game_data_name(const char *name) {
-    static const char *const prefixes[] = {
-        "CCGameManager.dat", "CCLocalLevels.dat",
-        "CCGameStore.dat", "CCData.dat"
-    };
-    size_t index;
-    if (!name) return 0;
-    for (index = 0; index < sizeof(prefixes) / sizeof(prefixes[0]); ++index) {
-        size_t length = strlen(prefixes[index]);
-        if (strcmp(name, prefixes[index]) == 0 ||
-            (strncmp(name, prefixes[index], length) == 0 &&
-             strcmp(name + length, ".bak") == 0)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static const char *translate_game_path(const char *path, char *translated,
                                        size_t capacity) {
     const char *slash;
@@ -708,7 +847,7 @@ static const char *translate_game_path(const char *path, char *translated,
     name = slash && (!backslash || slash > backslash) ? slash + 1
                                                        : backslash ? backslash + 1
                                                                    : path;
-    if (is_game_data_name(name)) {
+    if (storage_is_game_file_name(name)) {
         snprintf(translated, capacity, "save/%s", name);
         return translated;
     }
@@ -949,6 +1088,18 @@ static int shim_rename(const char *old_path, const char *new_path) {
     return function ? function(old_resolved, new_resolved) : -1;
 }
 
+static int shim_access(const char *path, int mode) {
+    char translated[MAX_PATH * 2];
+    return _access(translate_game_path(path, translated, sizeof(translated)),
+                   mode);
+}
+
+static int shim_chmod(const char *path, int mode) {
+    char translated[MAX_PATH * 2];
+    return _chmod(translate_game_path(path, translated, sizeof(translated)),
+                  mode);
+}
+
 static int shim_remove(const char *path) {
     typedef int (__cdecl *CrtPathFunction)(const char *);
     static CrtPathFunction function;
@@ -1111,6 +1262,85 @@ static int shim_getdtablesize(void) {
     return 2048;
 }
 
+/* Android applications normally run under an app-specific, non-root UID.
+ * OpenSSL mixes these values into its entropy state after reading urandom.
+ * A stable synthetic app identity is sufficient on Windows and avoids
+ * routing these real call sites through the generic zero-return stub. */
+static unsigned shim_get_app_id(void) {
+    return 10000u;
+}
+
+static int is_android_random_path(const char *path) {
+    return path && (_stricmp(path, "/dev/urandom") == 0 ||
+                    _stricmp(path, "/dev/random") == 0 ||
+                    _stricmp(path, "/dev/srandom") == 0);
+}
+
+static int android_open_flags_to_windows(int flags) {
+    int result = flags & 3; /* O_RDONLY/O_WRONLY/O_RDWR are ABI-compatible. */
+    if (flags & 0x0040) result |= _O_CREAT;
+    if (flags & 0x0080) result |= _O_EXCL;
+    if (flags & 0x0200) result |= _O_TRUNC;
+    if (flags & 0x0400) result |= _O_APPEND;
+    result |= _O_BINARY;
+    return result;
+}
+
+static int shim_open(const char *path, int flags, ...) {
+    char translated[MAX_PATH * 2];
+    const char *resolved;
+    int mode = 0;
+    if (is_android_random_path(path)) {
+        InitOnceExecuteOnce(&g_random_once, initialize_system_random, NULL,
+                            NULL);
+        if (!g_system_random) {
+            g_errno_value = 5;
+            return -1;
+        }
+        InterlockedIncrement(&g_random_open_count);
+        return ANDROID_RANDOM_FD;
+    }
+    resolved = translate_game_path(path, translated, sizeof(translated));
+    if (flags & 0x0040) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = va_arg(arguments, int);
+        va_end(arguments);
+        return _open(resolved, android_open_flags_to_windows(flags), mode);
+    }
+    return _open(resolved, android_open_flags_to_windows(flags));
+}
+
+static int shim_read(int descriptor, void *buffer, size_t length) {
+    if (descriptor == ANDROID_RANDOM_FD &&
+        InterlockedCompareExchange(&g_random_open_count, 0, 0) > 0) {
+        if (length > INT_MAX) length = INT_MAX;
+        if (!fill_system_random(buffer, length)) {
+            g_errno_value = 5;
+            return -1;
+        }
+        return (int)length;
+    }
+    if (length > INT_MAX) length = INT_MAX;
+    return _read(descriptor, buffer, (unsigned)length);
+}
+
+static int shim_fstat(int descriptor, void *status) {
+    if (descriptor == ANDROID_RANDOM_FD &&
+        InterlockedCompareExchange(&g_random_open_count, 0, 0) > 0) {
+        if (!status) {
+            g_errno_value = 14;
+            return -1;
+        }
+        /* Legacy Bionic/i386 struct stat is 96 bytes. RAND_poll only compares
+           the device/inode fields for its second and third candidate; the
+           first secure-random device can safely use a zeroed record. */
+        memset(status, 0, 96);
+        return 0;
+    }
+    return _fstat32(descriptor, (struct _stat32 *)status);
+}
+
 /*
  * Bionic/i386 calls imported functions with cdecl. Winsock uses stdcall on
  * 32-bit Windows, and several constants/layout details differ as well. These
@@ -1133,6 +1363,11 @@ typedef struct {
     short events;
     short returned_events;
 } AndroidPollFd;
+
+typedef struct {
+    void *base;
+    uint32_t length;
+} AndroidIovec;
 
 enum {
     ANDROID_AF_INET6 = 10,
@@ -1255,20 +1490,19 @@ static void address_from_windows(struct sockaddr *destination,
 
 static int android_ai_flags_to_windows(int flags) {
     int result = 0;
+    /* These APKs use the legacy Bionic/FreeBSD values, not glibc's values. */
     if (flags & 0x0001) result |= AI_PASSIVE;
     if (flags & 0x0002) result |= AI_CANONNAME;
     if (flags & 0x0004) result |= AI_NUMERICHOST;
+    if (flags & 0x0008) result |= AI_NUMERICSERV;
 #ifdef AI_V4MAPPED
-    if (flags & 0x0008) result |= AI_V4MAPPED;
+    if (flags & 0x0800) result |= AI_V4MAPPED;
 #endif
 #ifdef AI_ALL
-    if (flags & 0x0010) result |= AI_ALL;
+    if (flags & 0x0100) result |= AI_ALL;
 #endif
 #ifdef AI_ADDRCONFIG
-    if (flags & 0x0020) result |= AI_ADDRCONFIG;
-#endif
-#ifdef AI_NUMERICSERV
-    if (flags & 0x0400) result |= AI_NUMERICSERV;
+    if (flags & 0x0400) result |= AI_ADDRCONFIG;
 #endif
     return result;
 }
@@ -1375,7 +1609,10 @@ static void shim_freeaddrinfo(AndroidAddrInfo *result) {
     free_android_addrinfo(result);
 }
 
+static void socket_trace_reset(int descriptor);
+
 static int shim_socket(int family, int type, int protocol) {
+    static LONG trace_count;
     int windows_type = type & 0x0f;
     SOCKET descriptor = socket(android_family_to_windows(family), windows_type,
                                protocol);
@@ -1394,6 +1631,15 @@ static int shim_socket(int family, int type, int protocol) {
     /* Windows handles are non-inheritable by default; SOCK_CLOEXEC needs no
        additional operation. */
     (void)ANDROID_SOCK_CLOEXEC;
+    socket_trace_reset((int)(uintptr_t)descriptor);
+    {
+        LONG trace = InterlockedIncrement(&trace_count);
+        if (trace <= 64) {
+            runtime_log("Network socket #%ld: fd=%d family=%d type=0x%x protocol=%d",
+                        (long)trace, (int)(uintptr_t)descriptor, family, type,
+                        protocol);
+        }
+    }
     return (int)(uintptr_t)descriptor;
 }
 
@@ -1414,7 +1660,10 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
     struct sockaddr_storage storage;
     int windows_length = length;
     LONG trace = InterlockedIncrement(&trace_count);
-    const char *family = address && address->sa_family == ANDROID_AF_INET6
+    int raw_family = address ? (int)address->sa_family : -1;
+    const char *family = address &&
+                                 (address->sa_family == ANDROID_AF_INET6 ||
+                                  address->sa_family == AF_INET6)
                              ? "IPv6"
                              : address && address->sa_family == AF_INET
                                    ? "IPv4"
@@ -1428,13 +1677,15 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
         if (trace <= 64) {
             if (windows_error == WSAEWOULDBLOCK ||
                 windows_error == WSAEINPROGRESS) {
-                runtime_log("Network connect #%ld: fd=%d %s pending",
-                            (long)trace, descriptor, family);
+                runtime_log("Network connect #%ld: fd=%d %s pending "
+                            "(family=%d length=%d)",
+                            (long)trace, descriptor, family, raw_family,
+                            length);
             } else {
                 runtime_log("Network connect #%ld: fd=%d %s failed "
-                            "(Winsock=%d Android errno=%d)",
-                            (long)trace, descriptor, family, windows_error,
-                            android_error);
+                            "(family=%d length=%d Winsock=%d Android errno=%d)",
+                            (long)trace, descriptor, family, raw_family,
+                            length, windows_error, android_error);
             }
         }
         g_errno_value = android_error;
@@ -1442,8 +1693,9 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
         return -1;
     }
     if (trace <= 64) {
-        runtime_log("Network connect #%ld: fd=%d %s connected immediately",
-                    (long)trace, descriptor, family);
+        runtime_log("Network connect #%ld: fd=%d %s connected immediately "
+                    "(family=%d length=%d)",
+                    (long)trace, descriptor, family, raw_family, length);
     }
     return 0;
 }
@@ -1607,6 +1859,141 @@ static int shim_shutdown(int descriptor, int how) {
     return 0;
 }
 
+#define HTTP_TRACE_SLOT_COUNT 64
+typedef struct {
+    int used;
+    int descriptor;
+    int headers_seen;
+    int body_logged;
+    int chunked;
+    int tls;
+    uint64_t sent_bytes;
+    uint64_t received_bytes;
+    char path[192];
+} HttpTraceState;
+
+static SRWLOCK g_http_trace_lock = SRWLOCK_INIT;
+static HttpTraceState g_http_trace_states[HTTP_TRACE_SLOT_COUNT];
+
+static HttpTraceState *http_trace_state_locked(int descriptor, int create) {
+    HttpTraceState *empty = NULL;
+    unsigned index;
+    for (index = 0; index < HTTP_TRACE_SLOT_COUNT; ++index) {
+        HttpTraceState *state = &g_http_trace_states[index];
+        if (state->used && state->descriptor == descriptor) return state;
+        if (!state->used && !empty) empty = state;
+    }
+    if (!create) return NULL;
+    if (!empty) {
+        empty = &g_http_trace_states[(unsigned)descriptor %
+                                     HTTP_TRACE_SLOT_COUNT];
+    }
+    memset(empty, 0, sizeof(*empty));
+    empty->used = 1;
+    empty->descriptor = descriptor;
+    return empty;
+}
+
+static void socket_trace_reset(int descriptor) {
+    HttpTraceState *state;
+    AcquireSRWLockExclusive(&g_http_trace_lock);
+    state = http_trace_state_locked(descriptor, 1);
+    memset(state, 0, sizeof(*state));
+    state->used = 1;
+    state->descriptor = descriptor;
+    ReleaseSRWLockExclusive(&g_http_trace_lock);
+}
+
+static void socket_trace_traffic(int descriptor, const void *buffer,
+                                 size_t length, int outgoing) {
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    HttpTraceState *state;
+    if (!length) return;
+    AcquireSRWLockExclusive(&g_http_trace_lock);
+    state = http_trace_state_locked(descriptor, 1);
+    if (outgoing) {
+        if (UINT64_MAX - state->sent_bytes < length) {
+            state->sent_bytes = UINT64_MAX;
+        } else {
+            state->sent_bytes += length;
+        }
+    } else if (UINT64_MAX - state->received_bytes < length) {
+        state->received_bytes = UINT64_MAX;
+    } else {
+        state->received_bytes += length;
+    }
+    if (length >= 3 && bytes[0] >= 0x14 && bytes[0] <= 0x17 &&
+        bytes[1] == 0x03) {
+        state->tls = 1;
+    }
+    ReleaseSRWLockExclusive(&g_http_trace_lock);
+}
+
+static void socket_trace_close(int descriptor) {
+    uint64_t sent = 0;
+    uint64_t received = 0;
+    int tls = 0;
+    HttpTraceState *state;
+    AcquireSRWLockExclusive(&g_http_trace_lock);
+    state = http_trace_state_locked(descriptor, 0);
+    if (state) {
+        sent = state->sent_bytes;
+        received = state->received_bytes;
+        tls = state->tls;
+        memset(state, 0, sizeof(*state));
+    }
+    ReleaseSRWLockExclusive(&g_http_trace_lock);
+    if (tls) {
+        runtime_log("Network TLS socket closed: fd=%d sent=%llu received=%llu",
+                    descriptor, (unsigned long long)sent,
+                    (unsigned long long)received);
+    }
+}
+
+static int ascii_contains_case_insensitive(const unsigned char *bytes,
+                                           size_t length,
+                                           const char *needle) {
+    size_t needle_length = strlen(needle);
+    size_t offset;
+    if (!needle_length || needle_length > length) return 0;
+    for (offset = 0; offset + needle_length <= length; ++offset) {
+        size_t index;
+        for (index = 0; index < needle_length; ++index) {
+            if (tolower(bytes[offset + index]) !=
+                tolower((unsigned char)needle[index])) {
+                break;
+            }
+        }
+        if (index == needle_length) return 1;
+    }
+    return 0;
+}
+
+static const char *classify_http_body(const unsigned char *bytes,
+                                      size_t length) {
+    size_t offset = 0;
+    while (offset < length &&
+           (bytes[offset] == '\r' || bytes[offset] == '\n' ||
+            bytes[offset] == ' ' || bytes[offset] == '\t')) {
+        ++offset;
+    }
+    if (offset >= length) return "empty body chunk";
+    if (bytes[offset] == '-' && offset + 1 < length &&
+        isdigit(bytes[offset + 1])) {
+        if (bytes[offset + 1] == '1' &&
+            (offset + 2 >= length || !isdigit(bytes[offset + 2]))) {
+            return "server result -1";
+        }
+        return "negative numeric result";
+    }
+    if (isdigit(bytes[offset])) return "numeric/text result";
+    if (bytes[offset] == '<') return "HTML/text result";
+    if (bytes[offset] >= 0x20 && bytes[offset] <= 0x7e) {
+        return "text result";
+    }
+    return "binary result";
+}
+
 static void trace_http_request(int descriptor, const void *buffer, int length) {
     static LONG request_count;
     static const char *const methods[] = {
@@ -1643,6 +2030,16 @@ static void trace_http_request(int descriptor, const void *buffer, int length) {
         path[path_length++] = (char)character;
     }
     path[path_length] = 0;
+    AcquireSRWLockExclusive(&g_http_trace_lock);
+    {
+        HttpTraceState *state = http_trace_state_locked(descriptor, 1);
+        state->headers_seen = 0;
+        state->body_logged = 0;
+        state->chunked = 0;
+        snprintf(state->path, sizeof(state->path), "%s",
+                 path_length ? path : "<path unavailable>");
+    }
+    ReleaseSRWLockExclusive(&g_http_trace_lock);
     trace = InterlockedIncrement(&request_count);
     if (trace <= 64) {
         runtime_log("Network HTTP request #%ld: fd=%d %s %s (%d bytes)",
@@ -1655,22 +2052,73 @@ static void trace_http_response(int descriptor, const void *buffer, int length) 
     static LONG response_count;
     const unsigned char *bytes = (const unsigned char *)buffer;
     char status[128];
+    char path[192] = "<request unavailable>";
+    const unsigned char *body = NULL;
+    size_t body_length = 0;
     size_t status_length = 0;
+    size_t offset;
+    int should_log_body = 0;
     LONG trace;
-    if (!bytes || length < 5 || memcmp(bytes, "HTTP/", 5) != 0) return;
-    while (status_length < (size_t)length &&
-           status_length + 1 < sizeof(status)) {
-        unsigned char character = bytes[status_length];
-        if (character == '\r' || character == '\n') break;
-        status[status_length++] =
-            character >= 0x20 && character <= 0x7e ? (char)character : '?';
+    int is_header = bytes && length >= 5 && memcmp(bytes, "HTTP/", 5) == 0;
+    if (!bytes || length <= 0) return;
+    if (is_header) {
+        while (status_length < (size_t)length &&
+               status_length + 1 < sizeof(status)) {
+            unsigned char character = bytes[status_length];
+            if (character == '\r' || character == '\n') break;
+            status[status_length++] =
+                character >= 0x20 && character <= 0x7e ? (char)character : '?';
+        }
+        status[status_length] = 0;
+        trace = InterlockedIncrement(&response_count);
+        if (trace <= 64) {
+            runtime_log("Network HTTP response #%ld: fd=%d %s",
+                        (long)trace, descriptor,
+                        status_length ? status : "<status unavailable>");
+        }
     }
-    status[status_length] = 0;
-    trace = InterlockedIncrement(&response_count);
-    if (trace <= 64) {
-        runtime_log("Network HTTP response #%ld: fd=%d %s",
-                    (long)trace, descriptor,
-                    status_length ? status : "<status unavailable>");
+
+    AcquireSRWLockExclusive(&g_http_trace_lock);
+    {
+        HttpTraceState *state = http_trace_state_locked(descriptor, 0);
+        if (state) {
+            snprintf(path, sizeof(path), "%s", state->path);
+            if (is_header) {
+                state->headers_seen = 1;
+                state->chunked = ascii_contains_case_insensitive(
+                    bytes, (size_t)length, "transfer-encoding: chunked");
+                for (offset = 0; offset + 3 < (size_t)length; ++offset) {
+                    if (bytes[offset] == '\r' && bytes[offset + 1] == '\n' &&
+                        bytes[offset + 2] == '\r' &&
+                        bytes[offset + 3] == '\n') {
+                        body = bytes + offset + 4;
+                        body_length = (size_t)length - offset - 4;
+                        break;
+                    }
+                }
+            } else if (state->headers_seen && !state->body_logged) {
+                body = bytes;
+                body_length = (size_t)length;
+            }
+            if (body && body_length && state->chunked) {
+                for (offset = 0; offset + 1 < body_length; ++offset) {
+                    if (body[offset] == '\r' && body[offset + 1] == '\n') {
+                        body += offset + 2;
+                        body_length -= offset + 2;
+                        break;
+                    }
+                }
+            }
+            if (body && body_length && !state->body_logged) {
+                state->body_logged = 1;
+                should_log_body = 1;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_http_trace_lock);
+    if (should_log_body) {
+        runtime_log("Network HTTP body: fd=%d %s -> %s", descriptor, path,
+                    classify_http_body(body, body_length));
     }
 }
 
@@ -1681,6 +2129,7 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
+        socket_trace_traffic(descriptor, buffer, (size_t)result, 0);
         trace_http_response(descriptor, buffer, result);
         return result;
     }
@@ -1706,6 +2155,7 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     result = send((SOCKET)(uintptr_t)(uint32_t)descriptor, (const char *)buffer,
                   (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
+        socket_trace_traffic(descriptor, buffer, (size_t)result, 1);
         trace_http_request(descriptor, buffer, result);
         return result;
     }
@@ -1722,6 +2172,63 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
         return -1;
     }
     return result;
+}
+
+static int shim_writev(int descriptor, const AndroidIovec *vectors,
+                       int vector_count) {
+    int socket_type;
+    int socket_type_length = sizeof(socket_type);
+    if (!vectors || vector_count < 0 || vector_count > 1024) {
+        g_errno_value = 22;
+        return -1;
+    }
+    if (getsockopt((SOCKET)(uintptr_t)(uint32_t)descriptor, SOL_SOCKET,
+                   SO_TYPE, (char *)&socket_type,
+                   &socket_type_length) == 0) {
+        WSABUF *buffers;
+        DWORD sent = 0;
+        int index;
+        int status;
+        buffers = (WSABUF *)calloc((size_t)vector_count, sizeof(*buffers));
+        if (!buffers && vector_count) {
+            g_errno_value = 12;
+            return -1;
+        }
+        for (index = 0; index < vector_count; ++index) {
+            buffers[index].buf = (char *)vectors[index].base;
+            buffers[index].len = vectors[index].length;
+        }
+        status = WSASend((SOCKET)(uintptr_t)(uint32_t)descriptor, buffers,
+                         (DWORD)vector_count, &sent, 0, NULL, NULL);
+        free(buffers);
+        if (status == SOCKET_ERROR) return set_socket_error();
+        if (sent) {
+            size_t remaining = sent;
+            for (index = 0; index < vector_count && remaining; ++index) {
+                size_t count = vectors[index].length;
+                if (count > remaining) count = remaining;
+                socket_trace_traffic(descriptor, vectors[index].base, count,
+                                     1);
+                remaining -= count;
+            }
+        }
+        return sent > INT_MAX ? INT_MAX : (int)sent;
+    }
+    {
+        int total = 0;
+        int index;
+        for (index = 0; index < vector_count; ++index) {
+            unsigned length = vectors[index].length > INT_MAX
+                                  ? INT_MAX
+                                  : (unsigned)vectors[index].length;
+            int written = _write(descriptor, vectors[index].base, length);
+            if (written < 0) return total ? total : -1;
+            if (written > INT_MAX - total) return INT_MAX;
+            total += written;
+            if ((unsigned)written < length || total == INT_MAX) break;
+        }
+        return total;
+    }
 }
 
 static int shim_recvfrom(int descriptor, void *buffer, size_t length, int flags,
@@ -1786,7 +2293,10 @@ static int shim_poll(AndroidPollFd *descriptors, uint32_t count, int timeout) {
     static LONG logged_translation;
     static LONG logged_ready;
     WSAPOLLFD *windows_descriptors;
+    uint32_t *windows_indices;
+    uint32_t windows_count = 0;
     uint32_t index;
+    int special_ready = 0;
     int result;
     if (!count) {
         Sleep(timeout < 0 ? INFINITE : (DWORD)timeout);
@@ -1798,33 +2308,54 @@ static int shim_poll(AndroidPollFd *descriptors, uint32_t count, int timeout) {
     }
     windows_descriptors = (WSAPOLLFD *)calloc(
         count, sizeof(*windows_descriptors));
-    if (!windows_descriptors) {
+    windows_indices = (uint32_t *)calloc(count, sizeof(*windows_indices));
+    if (!windows_descriptors || !windows_indices) {
+        free(windows_descriptors);
+        free(windows_indices);
         g_errno_value = 12;
         return -1;
     }
     for (index = 0; index < count; ++index) {
-        windows_descriptors[index].fd =
-            (SOCKET)(uintptr_t)(uint32_t)descriptors[index].descriptor;
-        windows_descriptors[index].events =
-            android_poll_to_windows(descriptors[index].events);
         descriptors[index].returned_events = 0;
+        if (descriptors[index].descriptor == ANDROID_RANDOM_FD &&
+            InterlockedCompareExchange(&g_random_open_count, 0, 0) > 0) {
+            if (descriptors[index].events &
+                (ANDROID_POLLIN | ANDROID_POLLRDNORM)) {
+                descriptors[index].returned_events =
+                    ANDROID_POLLIN | ANDROID_POLLRDNORM;
+                ++special_ready;
+            }
+            continue;
+        }
+        windows_descriptors[windows_count].fd =
+            (SOCKET)(uintptr_t)(uint32_t)descriptors[index].descriptor;
+        windows_descriptors[windows_count].events =
+            android_poll_to_windows(descriptors[index].events);
+        windows_indices[windows_count++] = index;
     }
     if (InterlockedCompareExchange(&logged_translation, 1, 0) == 0) {
         runtime_log("Network poll ABI: translating Android readiness masks to Winsock");
     }
-    result = WSAPoll(windows_descriptors, count, timeout);
+    result = windows_count
+                 ? WSAPoll(windows_descriptors, windows_count,
+                           special_ready ? 0 : timeout)
+                 : 0;
     if (result != SOCKET_ERROR) {
-        for (index = 0; index < count; ++index) {
+        uint32_t windows_index;
+        for (windows_index = 0; windows_index < windows_count;
+             ++windows_index) {
+            index = windows_indices[windows_index];
             descriptors[index].returned_events = windows_poll_to_android(
-                windows_descriptors[index].revents);
+                windows_descriptors[windows_index].revents);
         }
-        if (result > 0 &&
+        if ((result > 0 || special_ready > 0) &&
             InterlockedCompareExchange(&logged_ready, 1, 0) == 0) {
             runtime_log("Network poll: first translated readiness event delivered");
         }
     }
     free(windows_descriptors);
-    return result == SOCKET_ERROR ? set_socket_error() : result;
+    free(windows_indices);
+    return result == SOCKET_ERROR ? set_socket_error() : result + special_ready;
 }
 
 static int shim_fcntl(int descriptor, int command, ...) {
@@ -1875,7 +2406,19 @@ static int shim_ioctl(int descriptor, unsigned long request, ...) {
 }
 
 static int shim_close(int descriptor) {
+    if (descriptor == ANDROID_RANDOM_FD) {
+        LONG count = InterlockedCompareExchange(&g_random_open_count, 0, 0);
+        while (count > 0) {
+            LONG previous = InterlockedCompareExchange(
+                &g_random_open_count, count - 1, count);
+            if (previous == count) return 0;
+            count = previous;
+        }
+        g_errno_value = 9;
+        return -1;
+    }
     if (closesocket((SOCKET)(uintptr_t)(uint32_t)descriptor) == 0) {
+        socket_trace_close(descriptor);
         return 0;
     }
     if (WSAGetLastError() != WSAENOTSOCK) {
@@ -1942,6 +2485,27 @@ static struct hostent *shim_gethostbyaddr(const void *address, int length,
 static int shim_gethostname(char *name, size_t length) {
     int result = gethostname(name, length > INT_MAX ? INT_MAX : (int)length);
     return result == SOCKET_ERROR ? set_socket_error() : result;
+}
+
+static unsigned shim_if_nametoindex(const char *name) {
+    InitOnceExecuteOnce(&g_if_name_index_once, initialize_if_name_index, NULL,
+                        NULL);
+    return g_if_name_to_index && name ? g_if_name_to_index(name) : 0u;
+}
+
+static int shim_getnameinfo(const struct sockaddr *address, int address_length,
+                            char *host, size_t host_length, char *service,
+                            size_t service_length, int flags) {
+    struct sockaddr_storage storage;
+    int windows_length = address_length;
+    const struct sockaddr *windows_address = address_to_windows(
+        address, address_length, &storage, &windows_length);
+    int status = getnameinfo(
+        windows_address, windows_length, host,
+        host_length > UINT32_MAX ? UINT32_MAX : (DWORD)host_length, service,
+        service_length > UINT32_MAX ? UINT32_MAX : (DWORD)service_length,
+        flags);
+    return status == 0 ? 0 : EAI_FAIL;
 }
 
 static struct servent *shim_getservbyname(const char *name, const char *protocol) {
@@ -2394,10 +2958,13 @@ static void *custom_function(const char *name) {
     CUSTOM("clock_gettime", shim_clock_gettime);
     CUSTOM("clock", shim_clock);
     CUSTOM("gettimeofday", shim_gettimeofday);
+    CUSTOM("ftime", shim_ftime);
+    CUSTOM("gmtime_r", shim_gmtime_r);
     CUSTOM("usleep", shim_usleep);
     CUSTOM("strlcat", shim_strlcat);
     CUSTOM("memrchr", shim_memrchr);
     CUSTOM("basename", shim_basename);
+    CUSTOM("strtok_r", shim_strtok_r);
     CUSTOM("strerror", shim_strerror);
     CUSTOM("strerror_r", shim_strerror_r);
     CUSTOM("gai_strerror", shim_gai_strerror);
@@ -2417,6 +2984,8 @@ static void *custom_function(const char *name) {
     CUSTOM("setvbuf", shim_setvbuf);
     CUSTOM("ungetc", shim_ungetc);
     CUSTOM("vfprintf", shim_vfprintf);
+    CUSTOM("access", shim_access);
+    CUSTOM("chmod", shim_chmod);
     CUSTOM("rename", shim_rename);
     CUSTOM("remove", shim_remove);
     CUSTOM("unlink", shim_unlink);
@@ -2445,6 +3014,13 @@ static void *custom_function(const char *name) {
     CUSTOM("wmemmove", shim_wmemmove);
     CUSTOM("wmemset", shim_wmemset);
     CUSTOM("getdtablesize", shim_getdtablesize);
+    CUSTOM("getuid", shim_get_app_id);
+    CUSTOM("geteuid", shim_get_app_id);
+    CUSTOM("getgid", shim_get_app_id);
+    CUSTOM("getegid", shim_get_app_id);
+    CUSTOM("open", shim_open);
+    CUSTOM("read", shim_read);
+    CUSTOM("fstat", shim_fstat);
     CUSTOM("accept", shim_accept);
     CUSTOM("bind", shim_bind);
     CUSTOM("close", shim_close);
@@ -2455,6 +3031,8 @@ static void *custom_function(const char *name) {
     CUSTOM("gethostbyaddr", shim_gethostbyaddr);
     CUSTOM("gethostbyname", shim_gethostbyname);
     CUSTOM("gethostname", shim_gethostname);
+    CUSTOM("getnameinfo", shim_getnameinfo);
+    CUSTOM("if_nametoindex", shim_if_nametoindex);
     CUSTOM("getpeername", shim_getpeername);
     CUSTOM("getservbyname", shim_getservbyname);
     CUSTOM("getsockname", shim_getsockname);
@@ -2468,6 +3046,7 @@ static void *custom_function(const char *name) {
     CUSTOM("recvfrom", shim_recvfrom);
     CUSTOM("send", shim_send);
     CUSTOM("sendto", shim_sendto);
+    CUSTOM("writev", shim_writev);
     CUSTOM("setsockopt", shim_setsockopt);
     CUSTOM("shutdown", shim_shutdown);
     CUSTOM("socket", shim_socket);

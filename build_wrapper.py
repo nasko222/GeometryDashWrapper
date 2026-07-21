@@ -53,8 +53,8 @@ def locate_ffmpeg(value: str | None) -> Path:
     candidate = value or os.environ.get("FFMPEG") or shutil.which("ffmpeg")
     if not candidate or not Path(candidate).is_file():
         raise RuntimeError(
-            "FFmpeg is required to convert the APK's six Ogg effects to "
-            "Windows PCM WAV files. Pass --ffmpeg or set FFMPEG."
+            "FFmpeg is required when --effects-apk is used to embed fallback "
+            "Ogg effects. Pass --ffmpeg or set FFMPEG."
         )
     return Path(candidate).resolve()
 
@@ -170,7 +170,6 @@ def main() -> int:
     ffmpeg = None
     if apk:
         validate_apk(apk)
-        effect_apks.insert(0, apk)
     for effect_apk in effect_apks:
         if not effect_apk.is_file():
             raise RuntimeError(f"Effects APK was not found: {effect_apk}")
@@ -193,6 +192,7 @@ def main() -> int:
         root / "src/fmod_win.c",
         root / "src/storage_win.c",
         embedded_effects,
+        root / "third_party/stb/stb_vorbis.c",
         *sorted((root / "third_party/zlib").glob("*.c")),
     ]
     command = [

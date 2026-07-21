@@ -7,6 +7,10 @@
 void storage_initialize(const char *writable_directory);
 void storage_shutdown(void);
 
+/* Recognize RobTop's Cocos save-file families, including numbered variants
+   such as CCGameManager2.dat and optional .bak files. */
+int storage_is_game_file_name(const char *name);
+
 char *storage_get_string_copy(const char *key, const char *default_value);
 int storage_get_bool(const char *key, int default_value);
 int32_t storage_get_integer(const char *key, int32_t default_value);

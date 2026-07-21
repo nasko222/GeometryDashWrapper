@@ -39,6 +39,27 @@ static PreferenceEntry *g_preferences;
 static CRITICAL_SECTION g_preferences_lock;
 static int g_storage_initialized;
 
+int storage_is_game_file_name(const char *name) {
+    static const char *const families[] = {
+        "CCGameManager", "CCLocalLevels", "CCGameStore", "CCData",
+        "CCGameSave", "CCGameStatistics"
+    };
+    size_t index;
+    if (!name || !name[0]) return 0;
+    for (index = 0; index < sizeof(families) / sizeof(families[0]); ++index) {
+        const char *suffix;
+        size_t family_length = strlen(families[index]);
+        if (strncmp(name, families[index], family_length) != 0) continue;
+        suffix = name + family_length;
+        while (*suffix >= '0' && *suffix <= '9') ++suffix;
+        if (strcmp(suffix, ".dat") == 0 ||
+            strcmp(suffix, ".dat.bak") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static char *copy_string(const char *value) {
     size_t length;
     char *result;
@@ -102,16 +123,12 @@ static void migrate_legacy_root_file(const char *root, const char *name) {
 }
 
 static void migrate_legacy_root_saves(void) {
-    static const char *const names[] = {
-        "CCGameManager.dat", "CCGameManager.dat.bak",
-        "CCLocalLevels.dat", "CCLocalLevels.dat.bak",
-        "CCGameStore.dat", "CCGameStore.dat.bak",
-        "CCData.dat", "CCData.dat.bak"
-    };
     char root[MAX_PATH * 2];
+    char pattern[MAX_PATH * 2];
     char *separator;
     size_t length;
-    size_t index;
+    WIN32_FIND_DATAA entry;
+    HANDLE search;
     snprintf(root, sizeof(root), "%s", g_writable_directory);
     length = strlen(root);
     while (length && (root[length - 1] == '/' || root[length - 1] == '\\')) {
@@ -121,9 +138,16 @@ static void migrate_legacy_root_saves(void) {
     if (!separator) separator = strrchr(root, '\\');
     if (!separator || strcmp(separator + 1, "save") != 0) return;
     *separator = 0;
-    for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
-        migrate_legacy_root_file(root, names[index]);
-    }
+    snprintf(pattern, sizeof(pattern), "%s\\CC*.dat*", root);
+    search = FindFirstFileA(pattern, &entry);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            storage_is_game_file_name(entry.cFileName)) {
+            migrate_legacy_root_file(root, entry.cFileName);
+        }
+    } while (FindNextFileA(search, &entry));
+    FindClose(search);
 }
 
 static void create_parent_directories(const char *path) {
