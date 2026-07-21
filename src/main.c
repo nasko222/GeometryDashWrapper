@@ -22,6 +22,9 @@ typedef void (*NativeTouchFunction)(void *environment, void *object, int id,
 typedef void (*NativeTouchesFunction)(void *environment, void *object,
                                       void *ids, void *xs, void *ys);
 typedef int (*NativeKeyFunction)(void *environment, void *object, int key);
+typedef void (*NativeInsertTextFunction)(void *environment, void *object,
+                                         void *text);
+typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 
 typedef struct {
     HWND window;
@@ -32,6 +35,8 @@ typedef struct {
     NativeTouchFunction touch_end;
     NativeTouchesFunction touch_move;
     NativeKeyFunction key_down;
+    NativeInsertTextFunction insert_text;
+    NativeDeleteBackwardFunction delete_backward;
     int native_ready;
     int mouse_down;
     int keyboard_down;
@@ -65,6 +70,33 @@ static void send_touch_move(float x, float y) {
     g_host.touch_move(jni_shim_env(), NULL, ids, xs, ys);
 }
 
+static void send_text_character(WPARAM character) {
+    WCHAR utf16[3] = {0, 0, 0};
+    char utf8[12];
+    int utf16_length = 1;
+    int utf8_length;
+    void *text;
+    if (!g_host.native_ready || !g_host.insert_text) return;
+    if (character == '\r') character = '\n';
+    if (character < 0x20 && character != '\n' && character != '\t') return;
+    if (character <= 0xffff) {
+        utf16[0] = (WCHAR)character;
+    } else if (character <= 0x10ffff) {
+        character -= 0x10000;
+        utf16[0] = (WCHAR)(0xd800 + (character >> 10));
+        utf16[1] = (WCHAR)(0xdc00 + (character & 0x3ff));
+        utf16_length = 2;
+    } else {
+        return;
+    }
+    utf8_length = WideCharToMultiByte(CP_UTF8, 0, utf16, utf16_length,
+                                      utf8, sizeof(utf8) - 1, NULL, NULL);
+    if (utf8_length <= 0) return;
+    utf8[utf8_length] = 0;
+    text = jni_shim_new_string(utf8);
+    g_host.insert_text(jni_shim_env(), NULL, text);
+}
+
 static LRESULT CALLBACK window_procedure(HWND window, UINT message,
                                          WPARAM wparam, LPARAM lparam) {
     float x = (float)GET_X_LPARAM(lparam);
@@ -78,6 +110,19 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_CHAR:
+        if (wparam == '\b') {
+            if (g_host.native_ready && g_host.delete_backward) {
+                g_host.delete_backward(jni_shim_env(), NULL);
+            }
+        } else {
+            send_text_character(wparam);
+        }
+        return 0;
+    case WM_UNICHAR:
+        if (wparam == UNICODE_NOCHAR) return TRUE;
+        send_text_character(wparam);
+        return 0;
     case WM_LBUTTONDOWN:
         g_host.mouse_down = 1;
         SetCapture(window);
@@ -100,7 +145,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
         }
-        if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down) {
+        if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
+            !jni_shim_text_input_active()) {
             RECT area;
             GetClientRect(window, &area);
             g_host.keyboard_down = 1;
@@ -144,7 +190,7 @@ static int create_opengl_window(int client_width, int client_height) {
 
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     g_host.window = CreateWindowExA(
-        0, window_class.lpszClassName, "Geometry Dash 1.8 — native wrapper",
+        0, window_class.lpszClassName, "Geometry Dash 1.8 - native wrapper",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -333,8 +379,13 @@ int main(int argc, char **argv) {
         &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeTouchesMove");
     g_host.key_down = (NativeKeyFunction)required_export(
         &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeKeyDown");
+    g_host.insert_text = (NativeInsertTextFunction)required_export(
+        &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInsertText");
+    g_host.delete_backward = (NativeDeleteBackwardFunction)required_export(
+        &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeDeleteBackward");
     if (!set_apk_path || !native_init || !g_host.render || !g_host.touch_begin ||
-        !g_host.touch_end || !g_host.touch_move || !g_host.key_down) {
+        !g_host.touch_end || !g_host.touch_move || !g_host.key_down ||
+        !g_host.insert_text || !g_host.delete_backward) {
         runtime_shutdown();
         return 7;
     }
@@ -358,6 +409,7 @@ int main(int argc, char **argv) {
 
     g_host.native_ready = 0;
     destroy_opengl_window();
+    jni_shim_shutdown();
     elf_image_unload(&image);
     runtime_shutdown();
     return 0;

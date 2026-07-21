@@ -8,6 +8,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -54,9 +55,46 @@ def extract_library(apk: Path, destination: Path) -> None:
         )
 
 
+def locate_ffmpeg(value: str | None) -> Path:
+    candidate = value or os.environ.get("FFMPEG") or shutil.which("ffmpeg")
+    if not candidate or not Path(candidate).is_file():
+        raise RuntimeError(
+            "FFmpeg is required to convert the APK's six Ogg effects to "
+            "Windows PCM WAV files. Pass --ffmpeg or set FFMPEG."
+        )
+    return Path(candidate).resolve()
+
+
+def extract_audio(apk: Path, destination: Path, ffmpeg: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(apk) as archive, tempfile.TemporaryDirectory() as temporary:
+        temporary_path = Path(temporary)
+        members = sorted(
+            name for name in archive.namelist()
+            if name.startswith("assets/") and name.lower().endswith((".mp3", ".ogg"))
+        )
+        for member in members:
+            name = Path(member).name
+            payload = archive.read(member)
+            if name.lower().endswith(".mp3"):
+                (destination / name).write_bytes(payload)
+                continue
+            source = temporary_path / name
+            target = destination / (Path(name).stem + ".wav")
+            source.write_bytes(payload)
+            subprocess.run(
+                [
+                    str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(source), "-vn", "-c:a", "pcm_s16le", str(target),
+                ],
+                check=True,
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--zig", help="Path to Zig")
+    parser.add_argument("--ffmpeg", help="Path to FFmpeg for Ogg effect conversion")
     parser.add_argument("--apk", type=Path, help="Optional original 1.8 APK")
     parser.add_argument("--out", type=Path, default=Path("dist"))
     args = parser.parse_args()
@@ -73,6 +111,7 @@ def main() -> int:
         root / "src/loader.c",
         root / "src/runtime.c",
         root / "src/jni_shim.c",
+        root / "src/audio_win.c",
         *sorted((root / "third_party/zlib").glob("*.c")),
     ]
     command = [
@@ -95,6 +134,7 @@ def main() -> int:
         "-lopengl32",
         "-lgdi32",
         "-luser32",
+        "-lwinmm",
     ]
     environment = os.environ.copy()
     environment["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")
@@ -105,6 +145,7 @@ def main() -> int:
         apk = args.apk.resolve()
         extract_library(apk, output / "libcocos2dcpp.so")
         shutil.copy2(apk, output / "game.apk")
+        extract_audio(apk, output / "audio", locate_ffmpeg(args.ffmpeg))
 
     print(output / "GeometryDash18Wrapper.exe")
     return 0

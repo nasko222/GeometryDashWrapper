@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audio_win.h"
 #include "jni_shim.h"
 #include "runtime.h"
 
@@ -50,7 +51,7 @@ static FakeJNIEnv g_environment = {g_jni_table};
 static FakeJavaVM g_java_vm = {g_vm_table};
 static char g_writable_path[MAX_PATH * 2];
 static double g_frame_interval = 1.0 / 60.0;
-static unsigned g_effect_id = 1;
+static int g_text_input_active;
 
 static char *duplicate_string(const char *value) {
     size_t length;
@@ -241,6 +242,9 @@ static int dispatch_boolean(FakeRef *method, va_list arguments) {
     if (strcmp(name, "shouldResumeSound") == 0) {
         return 1;
     }
+    if (strcmp(name, "isBackgroundMusicPlaying") == 0) {
+        return audio_is_background_playing();
+    }
     if (strcmp(name, "doesFileExist") == 0) {
         FakeRef *path = checked_reference(va_arg(arguments, void *));
         return path && path->data &&
@@ -262,8 +266,11 @@ static int dispatch_int(FakeRef *method, va_list arguments) {
     if (strcmp(name, "getFontSizeAccordingHeight") == 0) {
         return va_arg(arguments, int);
     }
-    if (strcmp(name, "playEffect") == 0 || strcmp(name, "preloadEffect") == 0) {
-        return (int)g_effect_id++;
+    if (strcmp(name, "playEffect") == 0) {
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        int loop = va_arg(arguments, int);
+        return (int)audio_play_effect(
+            path && path->data ? (const char *)path->data : "", loop);
     }
     return 0;
 }
@@ -275,9 +282,12 @@ static float dispatch_float(FakeRef *method, va_list arguments) {
         (void)va_arg(arguments, void *);
         return (float)va_arg(arguments, double);
     }
-    if (strstr(name, "Volume")) {
-        return 1.0f;
-    }
+    if (strcmp(name, "getBackgroundMusicVolume") == 0)
+        return audio_get_background_volume();
+    if (strcmp(name, "getBackgroundMusicTime") == 0)
+        return audio_get_background_time();
+    if (strcmp(name, "getEffectsVolume") == 0)
+        return audio_get_effects_volume();
     return 0.0f;
 }
 
@@ -308,11 +318,64 @@ static void dispatch_void(FakeRef *method, va_list arguments) {
         runtime_log("Dialog requested: %s - %s",
                     title && title->data ? (char *)title->data : "",
                     message && message->data ? (char *)message->data : "");
-    } else if (strcmp(name, "playBackgroundMusic") == 0 ||
-               strcmp(name, "preloadBackgroundMusic") == 0) {
+    } else if (strcmp(name, "openIMEKeyboard") == 0) {
+        g_text_input_active = 1;
+        runtime_log("Text input bridge: active");
+    } else if (strcmp(name, "closeIMEKeyboard") == 0) {
+        g_text_input_active = 0;
+        runtime_log("Text input bridge: inactive");
+    } else if (strcmp(name, "setKeyboardState") == 0) {
+        g_text_input_active = va_arg(arguments, int) != 0;
+        runtime_log("Text input bridge: %s",
+                    g_text_input_active ? "active" : "inactive");
+    } else if (strcmp(name, "showEditTextDialog") == 0) {
+        g_text_input_active = 1;
+        runtime_log("Text input bridge: edit dialog active");
+    } else if (strcmp(name, "playBackgroundMusic") == 0) {
         FakeRef *path = checked_reference(va_arg(arguments, void *));
-        runtime_log("Audio requested (currently silent): %s",
-                    path && path->data ? (char *)path->data : "");
+        int loop = va_arg(arguments, int);
+        audio_play_background(
+            path && path->data ? (const char *)path->data : "", loop);
+    } else if (strcmp(name, "preloadBackgroundMusic") == 0) {
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        audio_preload_background(
+            path && path->data ? (const char *)path->data : "");
+    } else if (strcmp(name, "stopBackgroundMusic") == 0) {
+        audio_stop_background();
+    } else if (strcmp(name, "pauseBackgroundMusic") == 0) {
+        audio_pause_background();
+    } else if (strcmp(name, "resumeBackgroundMusic") == 0) {
+        audio_resume_background();
+    } else if (strcmp(name, "rewindBackgroundMusic") == 0) {
+        audio_rewind_background();
+    } else if (strcmp(name, "setBackgroundMusicTime") == 0) {
+        audio_set_background_time((float)va_arg(arguments, double));
+    } else if (strcmp(name, "setBackgroundMusicVolume") == 0) {
+        audio_set_background_volume((float)va_arg(arguments, double));
+    } else if (strcmp(name, "preloadEffect") == 0) {
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        audio_preload_effect(
+            path && path->data ? (const char *)path->data : "");
+    } else if (strcmp(name, "pauseEffect") == 0) {
+        audio_pause_effect((unsigned)va_arg(arguments, int));
+    } else if (strcmp(name, "resumeEffect") == 0) {
+        audio_resume_effect((unsigned)va_arg(arguments, int));
+    } else if (strcmp(name, "stopEffect") == 0) {
+        audio_stop_effect((unsigned)va_arg(arguments, int));
+    } else if (strcmp(name, "pauseAllEffects") == 0) {
+        audio_pause_all_effects();
+    } else if (strcmp(name, "resumeAllEffects") == 0) {
+        audio_resume_all_effects();
+    } else if (strcmp(name, "stopAllEffects") == 0) {
+        audio_stop_all_effects();
+    } else if (strcmp(name, "unloadEffect") == 0) {
+        FakeRef *path = checked_reference(va_arg(arguments, void *));
+        audio_unload_effect(
+            path && path->data ? (const char *)path->data : "");
+    } else if (strcmp(name, "setEffectsVolume") == 0) {
+        audio_set_effects_volume((float)va_arg(arguments, double));
+    } else if (strcmp(name, "end") == 0) {
+        audio_shutdown();
     }
 }
 
@@ -550,6 +613,7 @@ void jni_shim_initialize(const char *executable_directory) {
         }
     }
     CreateDirectoryA(g_writable_path, NULL);
+    audio_initialize(executable_directory);
 
     for (i = 0; i < JNI_TABLE_SIZE; ++i) {
         g_jni_table[i] = (void *)jni_stub_zero;
@@ -621,6 +685,10 @@ void jni_shim_initialize(const char *executable_directory) {
     runtime_log("JNI shim initialized; writable path: %s", g_writable_path);
 }
 
+void jni_shim_shutdown(void) {
+    audio_shutdown();
+}
+
 void *jni_shim_env(void) {
     return &g_environment;
 }
@@ -631,4 +699,8 @@ void *jni_shim_vm(void) {
 
 double jni_shim_frame_interval(void) {
     return g_frame_interval;
+}
+
+int jni_shim_text_input_active(void) {
+    return g_text_input_active;
 }
