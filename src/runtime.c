@@ -157,7 +157,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype + 128;
     g_tolower_pointer = g_tolower + 128;
     g_toupper_pointer = g_toupper + 128;
-    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha1");
+    runtime_log("Geometry Dash Android native compatibility wrapper 0.9.2-alpha2");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
                 g_msvcrt ? "yes" : "no", g_ws2 ? "yes" : "no",
                 g_opengl ? "yes" : "no");
@@ -369,6 +369,26 @@ static int shim_gettimeofday(AndroidTimeval *value, void *timezone) {
     return 0;
 }
 
+static int32_t shim_clock(void) {
+    FILETIME creation;
+    FILETIME exit_time;
+    FILETIME kernel;
+    FILETIME user;
+    ULARGE_INTEGER kernel_ticks;
+    ULARGE_INTEGER user_ticks;
+    uint64_t microseconds;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit_time, &kernel,
+                         &user)) {
+        return -1;
+    }
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    microseconds = (kernel_ticks.QuadPart + user_ticks.QuadPart) / 10u;
+    return (int32_t)(uint32_t)microseconds;
+}
+
 static int shim_usleep(uint32_t microseconds) {
     Sleep((microseconds + 999u) / 1000u);
     return 0;
@@ -522,6 +542,14 @@ static void shim_srand48(long seed) {
 static long shim_lrand48(void) {
     g_lcg_state = g_lcg_state * 1103515245u + 12345u;
     return (long)((g_lcg_state >> 1) & 0x7fffffffu);
+}
+
+static uint32_t shim_arc4random(void) {
+    /* Game-side random selection does not require cryptographic entropy. */
+    g_lcg_state ^= g_lcg_state << 13;
+    g_lcg_state ^= g_lcg_state >> 17;
+    g_lcg_state ^= g_lcg_state << 5;
+    return g_lcg_state;
 }
 
 enum {
@@ -1441,6 +1469,51 @@ static int shim_pthread_once(volatile LONG *control, void (*function)(void)) {
     return 0;
 }
 
+static int shim_sem_init(void *semaphore, int process_shared,
+                         unsigned initial_value) {
+    HANDLE object;
+    if (!semaphore || process_shared || initial_value > (unsigned)LONG_MAX) {
+        g_errno_value = 22;
+        return -1;
+    }
+    object = CreateSemaphoreA(NULL, (LONG)initial_value, LONG_MAX, NULL);
+    if (!object) {
+        g_errno_value = 12;
+        return -1;
+    }
+    *(HANDLE *)semaphore = object;
+    return 0;
+}
+
+static int shim_sem_destroy(void *semaphore) {
+    HANDLE object;
+    if (!semaphore) {
+        g_errno_value = 22;
+        return -1;
+    }
+    object = (HANDLE)InterlockedExchangePointer((void *volatile *)semaphore,
+                                                NULL);
+    if (object && CloseHandle(object)) return 0;
+    g_errno_value = 22;
+    return -1;
+}
+
+static int shim_sem_post(void *semaphore) {
+    HANDLE object = semaphore ? *(HANDLE *)semaphore : NULL;
+    if (object && ReleaseSemaphore(object, 1, NULL)) return 0;
+    g_errno_value = 22;
+    return -1;
+}
+
+static int shim_sem_wait(void *semaphore) {
+    HANDLE object = semaphore ? *(HANDLE *)semaphore : NULL;
+    if (object && WaitForSingleObject(object, INFINITE) == WAIT_OBJECT_0) {
+        return 0;
+    }
+    g_errno_value = 22;
+    return -1;
+}
+
 static unsigned shim_alarm(unsigned seconds) {
     (void)seconds;
     return 0;
@@ -1479,6 +1552,9 @@ static float shim_powf(float x, float y) {
 static float shim_roundf(float value) {
     return value < 0.0f ? (float)ceil((double)value - 0.5)
                         : (float)floor((double)value + 0.5);
+}
+static double shim_round(double value) {
+    return value < 0.0 ? ceil(value - 0.5) : floor(value + 0.5);
 }
 static float shim_sinf(float value) { return (float)sin((double)value); }
 static float shim_sqrtf(float value) { return (float)sqrt((double)value); }
@@ -1608,6 +1684,7 @@ static const Alias aliases[] = {
     {"time", "_time32", MOD_CRT}, {"umask", "_umask", MOD_CRT},
     {"write", "_write", MOD_CRT}, {"gmtime", "_gmtime32", MOD_CRT},
     {"localtime", "_localtime32", MOD_CRT},
+    {"getcwd", "_getcwd", MOD_CRT},
 };
 
 static void *module_symbol(int module, const char *name) {
@@ -1638,6 +1715,7 @@ static void *custom_function(const char *name) {
     CUSTOM("mmap", shim_mmap);
     CUSTOM("munmap", shim_munmap);
     CUSTOM("clock_gettime", shim_clock_gettime);
+    CUSTOM("clock", shim_clock);
     CUSTOM("gettimeofday", shim_gettimeofday);
     CUSTOM("usleep", shim_usleep);
     CUSTOM("strlcat", shim_strlcat);
@@ -1649,6 +1727,7 @@ static void *custom_function(const char *name) {
     CUSTOM("unlink", shim_unlink);
     CUSTOM("srand48", shim_srand48);
     CUSTOM("lrand48", shim_lrand48);
+    CUSTOM("arc4random", shim_arc4random);
     CUSTOM("setjmp", shim_bionic_setjmp);
     CUSTOM("_setjmp", shim_bionic_setjmp);
     CUSTOM("sigsetjmp", shim_bionic_sigsetjmp);
@@ -1712,6 +1791,7 @@ static void *custom_function(const char *name) {
     CUSTOM("logf", shim_logf);
     CUSTOM("powf", shim_powf);
     CUSTOM("roundf", shim_roundf);
+    CUSTOM("round", shim_round);
     CUSTOM("sinf", shim_sinf);
     CUSTOM("sqrtf", shim_sqrtf);
     CUSTOM("tanf", shim_tanf);
@@ -1735,6 +1815,10 @@ static void *custom_function(const char *name) {
     CUSTOM("pthread_mutex_unlock", shim_pthread_mutex_unlock);
     CUSTOM("pthread_once", shim_pthread_once);
     CUSTOM("pthread_setspecific", shim_pthread_setspecific);
+    CUSTOM("sem_destroy", shim_sem_destroy);
+    CUSTOM("sem_init", shim_sem_init);
+    CUSTOM("sem_post", shim_sem_post);
+    CUSTOM("sem_wait", shim_sem_wait);
     CUSTOM("crc32", crc32);
     CUSTOM("deflate", deflate);
     CUSTOM("deflateEnd", deflateEnd);

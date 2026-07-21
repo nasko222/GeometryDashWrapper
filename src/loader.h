@@ -22,6 +22,7 @@ typedef struct {
 int elf_image_load(ElfImage *image, const char *path);
 int elf_image_load_from_apk(ElfImage *image, const char *apk_path,
                             const char *member_name);
+int elf_image_load_game_from_apk(ElfImage *image, const char *apk_path);
 int apk_extract_member(const char *apk_path, const char *member_name,
                        unsigned char **output, size_t *output_size);
 void elf_image_unload(ElfImage *image);

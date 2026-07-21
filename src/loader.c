@@ -56,8 +56,11 @@ static uint32_t read_u32(const unsigned char *value) {
            ((uint32_t)value[2] << 16) | ((uint32_t)value[3] << 24);
 }
 
-int apk_extract_member(const char *apk_path, const char *member_name,
-                       unsigned char **output, size_t *output_size) {
+static int apk_extract_member_internal(const char *apk_path,
+                                       const char *member_name,
+                                       unsigned char **output,
+                                       size_t *output_size,
+                                       int report_missing) {
     unsigned char *apk = NULL;
     size_t apk_size = 0;
     size_t eocd_position;
@@ -201,9 +204,17 @@ int apk_extract_member(const char *apk_path, const char *member_name,
         free(apk);
         return 1;
     }
-    runtime_log("ERROR: APK does not contain a usable %s", member_name);
+    if (report_missing) {
+        runtime_log("ERROR: APK does not contain a usable %s", member_name);
+    }
     free(apk);
     return 0;
+}
+
+int apk_extract_member(const char *apk_path, const char *member_name,
+                       unsigned char **output, size_t *output_size) {
+    return apk_extract_member_internal(apk_path, member_name, output,
+                                       output_size, 1);
 }
 
 static int validate_headers(ElfImage *image) {
@@ -433,6 +444,44 @@ int elf_image_load_from_apk(ElfImage *image, const char *apk_path,
     if (!apk_extract_member(apk_path, member_name, &image->file_data,
                             &image->file_size) ||
         !validate_headers(image) || !map_segments(image)) {
+        elf_image_unload(image);
+        return 0;
+    }
+    runtime_set_elf_info(image->base, image->mapped_size, apk_path,
+                         (const Elf32_Phdr *)(image->base + image->header->e_phoff),
+                         image->header->e_phnum);
+    if (!apply_relocations(image)) {
+        elf_image_unload(image);
+        return 0;
+    }
+    return 1;
+}
+
+int elf_image_load_game_from_apk(ElfImage *image, const char *apk_path) {
+    static const char *const members[] = {
+        "lib/x86/libcocos2dcpp.so",
+        "lib/x86/libgame.so",
+    };
+    const char *selected = NULL;
+    size_t index;
+    memset(image, 0, sizeof(*image));
+    runtime_log("Opening Android game APK: %s", apk_path);
+    for (index = 0; index < sizeof(members) / sizeof(members[0]); ++index) {
+        if (apk_extract_member_internal(apk_path, members[index],
+                                        &image->file_data, &image->file_size,
+                                        0)) {
+            selected = members[index];
+            break;
+        }
+    }
+    if (!selected) {
+        runtime_log("ERROR: APK has no supported x86 game library "
+                    "(expected libcocos2dcpp.so or libgame.so)");
+        elf_image_unload(image);
+        return 0;
+    }
+    runtime_log("Selected Android x86 game library: %s", selected);
+    if (!validate_headers(image) || !map_segments(image)) {
         elf_image_unload(image);
         return 0;
     }

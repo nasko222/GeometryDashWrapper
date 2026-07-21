@@ -30,13 +30,16 @@ def locate_zig(value: str | None) -> Path:
 
 
 def validate_apk(apk: Path) -> None:
+    members = ("lib/x86/libcocos2dcpp.so", "lib/x86/libgame.so")
     with zipfile.ZipFile(apk) as archive:
-        member = "lib/x86/libcocos2dcpp.so"
-        try:
-            with archive.open(member) as stream:
-                header = stream.read(20)
-        except KeyError as error:
-            raise RuntimeError(f"APK does not contain the required {member}") from error
+        member = next((name for name in members if name in archive.namelist()), None)
+        if member is None:
+            raise RuntimeError(
+                "APK does not contain lib/x86/libcocos2dcpp.so or "
+                "lib/x86/libgame.so"
+            )
+        with archive.open(member) as stream:
+            header = stream.read(20)
     if (
         len(header) < 20
         or header[:6] != b"\x7fELF\x01\x01"
@@ -202,6 +205,7 @@ def main() -> int:
     (output / "GeometryDash18Wrapper.exe").unlink(missing_ok=True)
     (output / "GeometryDash18Wrapper.pdb").unlink(missing_ok=True)
     (output / "libcocos2dcpp.so").unlink(missing_ok=True)
+    (output / "libgame.so").unlink(missing_ok=True)
     shutil.rmtree(output / "audio", ignore_errors=True)
 
     if apk:

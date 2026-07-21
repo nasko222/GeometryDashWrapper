@@ -405,8 +405,7 @@ int main(int argc, char **argv) {
     runtime_log("Mode: %s", mode == 0 ? "relocation only" :
                 mode == 1 ? "constructors + JNI_OnLoad" : "graphical native boot");
     if (!(library_path ? elf_image_load(&image, library_path)
-                       : elf_image_load_from_apk(
-                             &image, apk_path, "lib/x86/libcocos2dcpp.so"))) {
+                       : elf_image_load_game_from_apk(&image, apk_path))) {
         runtime_log("RESULT: ELF_LOAD_FAILED");
         runtime_shutdown();
         return 2;
@@ -448,8 +447,19 @@ int main(int argc, char **argv) {
         runtime_shutdown();
         return 6;
     }
-    set_apk_path = (NativeSetApkPathFunction)required_export(
+    set_apk_path = (NativeSetApkPathFunction)elf_image_find_export(
         &image, "Java_org_cocos2dx_lib_Cocos2dxHelper_nativeSetApkPath");
+    if (set_apk_path) {
+        runtime_log("APK path bridge: Cocos2dxHelper.nativeSetApkPath");
+    } else {
+        set_apk_path = (NativeSetApkPathFunction)elf_image_find_export(
+            &image, "Java_org_cocos2dx_lib_Cocos2dxActivity_nativeSetPaths");
+        if (set_apk_path) {
+            runtime_log("APK path bridge: legacy Cocos2dxActivity.nativeSetPaths");
+        } else {
+            runtime_log("ERROR: required APK path setter export is missing");
+        }
+    }
     native_init = (NativeInitFunction)required_export(
         &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInit");
     g_host.render = (NativeRenderFunction)required_export(
