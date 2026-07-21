@@ -189,6 +189,7 @@ def main() -> int:
         "-lopengl32",
         "-lgdi32",
         "-luser32",
+        "-lshell32",
         "-lwinmm",
     ]
     environment = os.environ.copy()

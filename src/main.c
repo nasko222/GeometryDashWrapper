@@ -25,6 +25,7 @@ typedef int (*NativeKeyFunction)(void *environment, void *object, int key);
 typedef void (*NativeInsertTextFunction)(void *environment, void *object,
                                          void *text);
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
+typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 
 typedef struct {
     HWND window;
@@ -37,6 +38,8 @@ typedef struct {
     NativeKeyFunction key_down;
     NativeInsertTextFunction insert_text;
     NativeDeleteBackwardFunction delete_backward;
+    NativeLifecycleFunction pause;
+    NativeLifecycleFunction resume;
     void *touch_ids;
     void *touch_xs;
     void *touch_ys;
@@ -47,9 +50,31 @@ typedef struct {
     int native_ready;
     int mouse_down;
     int keyboard_down;
+    int native_paused;
+    int closing;
 } GameHost;
 
 static GameHost g_host;
+
+static void pause_native_game(const char *reason) {
+    if (!g_host.native_ready || g_host.native_paused || !g_host.pause) return;
+    runtime_log("Android lifecycle: nativeOnPause (%s)",
+                reason ? reason : "unspecified");
+    g_host.pause(jni_shim_env(), NULL);
+    g_host.native_paused = 1;
+    runtime_log("Android lifecycle: nativeOnPause returned");
+}
+
+static void resume_native_game(const char *reason) {
+    if (!g_host.native_ready || !g_host.native_paused || !g_host.resume ||
+        g_host.closing) {
+        return;
+    }
+    runtime_log("Android lifecycle: nativeOnResume (%s)",
+                reason ? reason : "unspecified");
+    g_host.resume(jni_shim_env(), NULL);
+    g_host.native_paused = 0;
+}
 
 static void client_to_native(HWND window, float *x, float *y) {
     RECT area;
@@ -132,10 +157,28 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
     }
     switch (message) {
     case WM_CLOSE:
+        g_host.closing = 1;
+        pause_native_game("window close");
         DestroyWindow(window);
+        return 0;
+    case WM_QUERYENDSESSION:
+        pause_native_game("Windows session ending");
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wparam) {
+            g_host.closing = 1;
+            pause_native_game("Windows session ended");
+        }
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
+        return 0;
+    case WM_ACTIVATEAPP:
+        if (wparam) {
+            resume_native_game("window activated");
+        } else {
+            pause_native_game("window deactivated");
+        }
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -423,6 +466,12 @@ int main(int argc, char **argv) {
         &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInsertText");
     g_host.delete_backward = (NativeDeleteBackwardFunction)required_export(
         &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeDeleteBackward");
+    g_host.pause = (NativeLifecycleFunction)elf_image_find_export(
+        &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause");
+    g_host.resume = (NativeLifecycleFunction)elf_image_find_export(
+        &image, "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume");
+    runtime_log("Android lifecycle exports: pause=%s resume=%s",
+                g_host.pause ? "yes" : "no", g_host.resume ? "yes" : "no");
     if (!set_apk_path || !native_init || !g_host.render || !g_host.touch_begin ||
         !g_host.touch_end || !g_host.touch_move || !g_host.key_down ||
         !g_host.insert_text || !g_host.delete_backward) {
@@ -449,6 +498,7 @@ int main(int argc, char **argv) {
     runtime_log("RESULT: NATIVE_INIT_RETURNED");
     run_message_loop();
 
+    pause_native_game("wrapper shutdown");
     g_host.native_ready = 0;
     destroy_opengl_window();
     jni_shim_shutdown();

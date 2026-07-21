@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -233,6 +234,39 @@ static const char *reference_string(FakeRef *reference) {
                : "";
 }
 
+static int has_prefix(const char *value, const char *prefix) {
+    return value && prefix && strncmp(value, prefix, strlen(prefix)) == 0;
+}
+
+static void open_external_target(const char *target) {
+    char translated[2048];
+    const char *open_target = target;
+    HINSTANCE result;
+    if (!target || !target[0]) {
+        runtime_log("External link: ignored empty target");
+        return;
+    }
+    if (has_prefix(target, "market://details?id=")) {
+        snprintf(translated, sizeof(translated),
+                 "https://play.google.com/store/apps/details?id=%s",
+                 target + strlen("market://details?id="));
+        open_target = translated;
+    }
+    if (!has_prefix(open_target, "http://") &&
+        !has_prefix(open_target, "https://") &&
+        !has_prefix(open_target, "mailto:")) {
+        runtime_log("External link: blocked unsupported target: %s", open_target);
+        return;
+    }
+    result = ShellExecuteA(NULL, "open", open_target, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)result > 32) {
+        runtime_log("External link: opened %s", open_target);
+    } else {
+        runtime_log("External link: Windows open failed (%ld): %s",
+                    (long)(INT_PTR)result, open_target);
+    }
+}
+
 static void *dispatch_object(FakeRef *method, va_list arguments) {
     const char *name = method && method->name ? method->name : "";
     log_first_call(method);
@@ -382,6 +416,12 @@ static void dispatch_void(FakeRef *method, va_list arguments) {
         FakeRef *path = checked_reference(va_arg(arguments, void *));
         storage_write_game_file(reference_string(path), reference_string(value),
                                 value ? value->length : 0);
+    } else if (strcmp(name, "openURL") == 0) {
+        FakeRef *url = checked_reference(va_arg(arguments, void *));
+        open_external_target(reference_string(url));
+    } else if (strcmp(name, "openAppPage") == 0) {
+        open_external_target(
+            "https://play.google.com/store/apps/details?id=com.robtopx.geometryjump");
     } else if (strcmp(name, "terminateProcess") == 0) {
         PostQuitMessage(0);
     } else if (strcmp(name, "showDialog") == 0) {
