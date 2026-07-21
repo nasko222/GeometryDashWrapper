@@ -1,0 +1,27 @@
+#ifndef GD18_LOADER_H
+#define GD18_LOADER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "elf32.h"
+
+typedef struct {
+    unsigned char *file_data;
+    size_t file_size;
+    unsigned char *base;
+    size_t mapped_size;
+    const Elf32_Ehdr *header;
+    const Elf32_Phdr *program_headers;
+    const Elf32_Shdr *section_headers;
+    const char *section_names;
+    uint32_t imported_functions;
+    uint32_t imported_objects;
+} ElfImage;
+
+int elf_image_load(ElfImage *image, const char *path);
+void elf_image_unload(ElfImage *image);
+void *elf_image_find_export(const ElfImage *image, const char *name);
+int elf_image_run_constructors(const ElfImage *image);
+
+#endif
