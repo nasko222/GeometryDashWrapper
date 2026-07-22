@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-bootstrap1
+# GD Wrapper 0.9.4-arm-bootstrap5
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
@@ -8,7 +8,7 @@ keeps the familiar `GeometryDashWrapper` filename. This source release also
 adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
 Dash 1.0 through 1.4 APKs.
 
-Version `0.9.4-arm-bootstrap1` promotes the successful ARM relocation,
+Version `0.9.4-arm-bootstrap5` promotes the successful ARM relocation,
 constructor, and `JNI_OnLoad` probe into a first graphical bootstrap. It creates
 a real Win32/OpenGL window, captures registered JNI natives, invokes the guest
 Cocos `nativeInit` and render callbacks, delivers lifecycle/input events, and
@@ -239,7 +239,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap1` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap5` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;

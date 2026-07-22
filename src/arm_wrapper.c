@@ -69,11 +69,14 @@
 #define MAX_GUEST_ZSTREAMS 64
 #define MAX_REGISTERED_NATIVES 512
 #define MAX_GL_VERTEX_ATTRIBS 32
+#define MAX_DS_SEEN_NODES 4096
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
 #define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
+#define GUEST_ALLOCATION_FREE 0x80000000u
+#define GUEST_ALLOCATION_SIZE_MASK 0x7fffffffu
 #define DEFAULT_GUEST_INSTRUCTION_LIMIT 20000000u
 #define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
-#define NATIVE_RENDER_INSTRUCTION_LIMIT 250000000u
+#define NATIVE_RENDER_INSTRUCTION_LIMIT 1000000000u
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004u
 #define GUEST_ENV_OBJECT (GUEST_JNI_BASE + 0x1000u)
@@ -291,6 +294,14 @@ typedef struct {
     unsigned gl_draw_logs;
     unsigned native_render_calls;
     unsigned png_filter_rows;
+    unsigned allocation_failures;
+    unsigned free_allocation_count;
+    uint64_t ds_step_calls;
+    uint64_t ds_step_iterations;
+    uint64_t ds_step_cycles;
+    uint32_t ds_seen_nodes[MAX_DS_SEEN_NODES];
+    unsigned ds_seen_count;
+    char ds_step_key[128];
     int text_input_active;
     int returned;
     int failed;
@@ -831,10 +842,29 @@ static int apply_relocations(ArmProbe *probe) {
 
 static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
     uint32_t address;
+    unsigned index;
     if (!size) size = 1;
+    if (size > UINT32_MAX - 15u) return 0;
     size = align_up(size, 16u);
-    if (probe->allocation_count >= MAX_ALLOCS ||
+    if (probe->free_allocation_count) {
+        for (index = 0; index < probe->allocation_count; ++index) {
+            GuestAllocation *allocation = &probe->allocations[index];
+            if ((allocation->size & GUEST_ALLOCATION_FREE) != 0u &&
+                (allocation->size & GUEST_ALLOCATION_SIZE_MASK) >= size) {
+                allocation->size &= GUEST_ALLOCATION_SIZE_MASK;
+                --probe->free_allocation_count;
+                return allocation->address;
+            }
+        }
+    }
+    if (size > GUEST_HEAP_SIZE || probe->allocation_count >= MAX_ALLOCS ||
         probe->heap_next > GUEST_HEAP_BASE + GUEST_HEAP_SIZE - size) {
+        ++probe->allocation_failures;
+        if (probe->allocation_failures <= 8u)
+            probe_log("ARM guest allocation failed: size=%u heap_used=%u "
+                      "records=%u/%u",
+                      size, probe->heap_next - GUEST_HEAP_BASE,
+                      probe->allocation_count, MAX_ALLOCS);
         return 0;
     }
     address = probe->heap_next;
@@ -848,10 +878,38 @@ static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
 static uint32_t guest_allocation_size(const ArmProbe *probe, uint32_t address) {
     unsigned index;
     for (index = 0; index < probe->allocation_count; ++index) {
-        if (probe->allocations[index].address == address)
+        if ((probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u &&
+            probe->allocations[index].address == address)
             return probe->allocations[index].size;
     }
     return 0;
+}
+
+static void guest_free(ArmProbe *probe, uint32_t address) {
+    unsigned index;
+    if (!address) return;
+    for (index = 0; index < probe->allocation_count; ++index) {
+        if ((probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u &&
+            probe->allocations[index].address == address) {
+            probe->allocations[index].size |= GUEST_ALLOCATION_FREE;
+            ++probe->free_allocation_count;
+            return;
+        }
+    }
+}
+
+static int guest_zero_memory(ArmProbe *probe, uint32_t address,
+                             uint32_t size) {
+    static const unsigned char zero[4096] = {0};
+    uint32_t offset = 0;
+    while (offset < size) {
+        uint32_t part = size - offset;
+        if (part > sizeof(zero)) part = sizeof(zero);
+        if (uc_mem_write(probe->uc, address + offset, zero, part) != UC_ERR_OK)
+            return 0;
+        offset += part;
+    }
+    return 1;
 }
 
 static int guest_read_string(ArmProbe *probe, uint32_t address,
@@ -3438,15 +3496,37 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         result = guest_alloc(probe, r0);
     } else if (strcmp(name, "calloc") == 0) {
         uint64_t size = (uint64_t)r0 * r1;
-        result = size <= UINT32_MAX ? guest_alloc(probe, (uint32_t)size) : 0;
+        if (size <= UINT32_MAX) {
+            uint32_t bytes = size ? (uint32_t)size : 1u;
+            result = guest_alloc(probe, bytes);
+            if (result && !guest_zero_memory(probe, result, bytes)) {
+                guest_free(probe, result);
+                result = 0;
+            }
+        }
     } else if (strcmp(name, "realloc") == 0) {
         uint32_t old_size = guest_allocation_size(probe, r0);
-        result = guest_alloc(probe, r1);
-        if (r0 && result)
-            guest_copy_memory(probe, result, r0,
-                              old_size < r1 ? old_size : r1);
-    } else if (strcmp(name, "free") == 0 ||
-               strcmp(name, "__cxa_finalize") == 0) {
+        if (!r0) {
+            result = guest_alloc(probe, r1);
+        } else if (!r1) {
+            guest_free(probe, r0);
+            result = 0;
+        } else if (old_size >= r1) {
+            result = r0;
+        } else {
+            result = guest_alloc(probe, r1);
+            if (result && old_size &&
+                guest_copy_memory(probe, result, r0, old_size)) {
+                guest_free(probe, r0);
+            } else if (result && old_size) {
+                guest_free(probe, result);
+                result = 0;
+            }
+        }
+    } else if (strcmp(name, "free") == 0) {
+        guest_free(probe, r0);
+        result = 0;
+    } else if (strcmp(name, "__cxa_finalize") == 0) {
         result = 0;
     } else if (strcmp(name, "__cxa_atexit") == 0) {
         result = 0;
@@ -3858,9 +3938,34 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
     } else if (strcmp(name, "fwrite") == 0) {
         GuestFile *file = guest_file(probe, r3);
         uint64_t requested = (uint64_t)r1 * r2;
-        size_t actual = requested <= SIZE_MAX
-                            ? guest_file_write(probe, file, r0, (size_t)requested) : 0;
-        result = r1 ? (uint32_t)(actual / r1) : 0;
+        if (file) {
+            size_t actual = requested <= SIZE_MAX
+                                ? guest_file_write(probe, file, r0,
+                                                   (size_t)requested) : 0;
+            result = r1 ? (uint32_t)(actual / r1) : 0;
+        } else if (requested && r0) {
+            size_t captured = requested < sizeof(first)
+                                  ? (size_t)requested : sizeof(first) - 1u;
+            if (uc_mem_read(probe->uc, r0, first, captured) == UC_ERR_OK) {
+                size_t character;
+                first[captured] = 0;
+                for (character = 0; character < captured; ++character) {
+                    unsigned char value = (unsigned char)first[character];
+                    if (!value) break;
+                    if (value == '\r' || value == '\n' || value == '\t')
+                        first[character] = ' ';
+                    else if (value < 0x20u || value == 0x7fu)
+                        first[character] = '.';
+                }
+                probe_log("  guest stdio fwrite stream=0x%08x: %s%s",
+                          r3, first,
+                          requested > captured ? " [truncated]" : "");
+            }
+            /* Bionic's __sF stdin/stdout/stderr objects are guest pointers,
+               not handles returned by guest_open_file.  Treat writes to
+               those streams as successfully consumed by the wrapper log. */
+            result = r1 ? r2 : 0;
+        }
     } else if (strcmp(name, "fseek") == 0) {
         result = (uint32_t)guest_file_seek(guest_file(probe, r0), (long)(int32_t)r1, (int)r2);
     } else if (strcmp(name, "ftell") == 0) {
@@ -4101,9 +4206,26 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
                strcmp(name, "longjmp") == 0 ||
                strcmp(name, "siglongjmp") == 0 ||
                strcmp(name, "pthread_exit") == 0) {
+        uint32_t pc = 0, lr = 0;
+        uint32_t stack_words[6] = {0, 0, 0, 0, 0, 0};
+        int have_stack = sp &&
+            uc_mem_read(probe->uc, sp, stack_words,
+                        sizeof(stack_words)) == UC_ERR_OK;
+        uc_reg_read(probe->uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(probe->uc, UC_ARM_REG_LR, &lr);
+        probe_log("ARM fatal import %s: pc=0x%08x lr=0x%08x "
+                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                  "sp=0x%08x stack=%08x,%08x,%08x,%08x,%08x,%08x%s",
+                  name, pc, lr, r0, r1, r2, r3, sp,
+                  stack_words[0], stack_words[1], stack_words[2],
+                  stack_words[3], stack_words[4], stack_words[5],
+                  have_stack ? "" : " [unreadable]");
         probe->failed = 1;
         snprintf(probe->failure, sizeof(probe->failure),
-                 "guest called fatal import %s", name);
+                 "guest called fatal import %s pc=0x%08x lr=0x%08x "
+                 "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                 "sp=0x%08x",
+                 name, pc, lr, r0, r1, r2, r3, sp);
         uc_emu_stop(probe->uc);
         return;
     } else {
@@ -4248,6 +4370,86 @@ static void png_filter_hook(uc_engine *uc, uint64_t address, uint32_t size,
     }
 }
 
+static void png_error_hook(uc_engine *uc, uint64_t address, uint32_t size,
+                           void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t png = 0, message_address = 0, lr = 0;
+    char message[2048];
+    unsigned active = 0;
+    unsigned index;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R0, &png);
+    uc_reg_read(uc, UC_ARM_REG_R1, &message_address);
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    for (index = 0; index < probe->allocation_count; ++index)
+        if ((probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u)
+            ++active;
+    if (!guest_read_string(probe, message_address, message, sizeof(message)))
+        snprintf(message, sizeof(message), "<unreadable at 0x%08x>",
+                 message_address);
+    probe_log("ARM libpng error: png=0x%08x caller=0x%08x message=%s "
+              "heap_used=%u active_allocations=%u records=%u failures=%u",
+              png, lr, message, probe->heap_next - GUEST_HEAP_BASE,
+              active, probe->allocation_count, probe->allocation_failures);
+}
+
+static void ds_step_entry_hook(uc_engine *uc, uint64_t address, uint32_t size,
+                               void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t key_address = 0, lr = 0;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R1, &key_address);
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    ++probe->ds_step_calls;
+    probe->ds_seen_count = 0;
+    memset(probe->ds_seen_nodes, 0, sizeof(probe->ds_seen_nodes));
+    if (!guest_read_string(probe, key_address, probe->ds_step_key,
+                           sizeof(probe->ds_step_key)))
+        snprintf(probe->ds_step_key, sizeof(probe->ds_step_key),
+                 "<unreadable at 0x%08x>", key_address);
+    if (probe->ds_step_calls <= 12u)
+        probe_log("ARM DS_Dictionary step: call=%llu key=%s caller=0x%08x",
+                  (unsigned long long)probe->ds_step_calls,
+                  probe->ds_step_key, lr);
+}
+
+static void ds_step_loop_hook(uc_engine *uc, uint64_t address, uint32_t size,
+                              void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t sp = 0, node = 0;
+    uint32_t slot;
+    unsigned probes;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+    ++probe->ds_step_iterations;
+    ++probe->ds_seen_count;
+    if (!sp || uc_mem_read(uc, sp + 0x1cu, &node, sizeof(node)) != UC_ERR_OK ||
+        !node)
+        return;
+    slot = (node >> 4u) & (MAX_DS_SEEN_NODES - 1u);
+    for (probes = 0; probes < MAX_DS_SEEN_NODES; ++probes) {
+        uint32_t *seen = &probe->ds_seen_nodes[slot];
+        if (!*seen) {
+            *seen = node;
+            return;
+        }
+        if (*seen == node) {
+            uint32_t zero = 0;
+            ++probe->ds_step_cycles;
+            probe_log("ARM DS_Dictionary XML cycle stopped: key=%s "
+                      "node=0x%08x iteration=%u cycles=%llu",
+                      probe->ds_step_key, node, probe->ds_seen_count,
+                      (unsigned long long)probe->ds_step_cycles);
+            uc_mem_write(uc, sp + 0x1cu, &zero, sizeof(zero));
+            return;
+        }
+        slot = (slot + 1u) & (MAX_DS_SEEN_NODES - 1u);
+    }
+}
+
 static void kuser_hook(uc_engine *uc, uint64_t address, uint32_t size,
                        void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -4343,6 +4545,9 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook jni_trace;
     uc_hook vm_trace;
     uc_hook png_filter_trace;
+    uc_hook png_error_trace;
+    uc_hook ds_step_entry_trace;
+    uc_hook ds_step_loop_trace;
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
@@ -4402,6 +4607,25 @@ static int initialize_unicorn(ArmProbe *probe) {
             return 0;
         }
     }
+    {
+        uint32_t ds_step_address =
+            find_export(probe,
+                        "_ZN13DS_Dictionary22stepIntoSubDictWithKeyEPKc") &
+            ~1u;
+        if (ds_step_address) {
+            if (uc_hook_add(probe->uc, &ds_step_entry_trace, UC_HOOK_CODE,
+                            ds_step_entry_hook, probe, ds_step_address,
+                            ds_step_address) != UC_ERR_OK ||
+                uc_hook_add(probe->uc, &ds_step_loop_trace, UC_HOOK_CODE,
+                            ds_step_loop_hook, probe, ds_step_address + 0x40u,
+                            ds_step_address + 0x40u) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM DS_Dictionary hooks");
+                return 0;
+            }
+            probe_log("ARM DS_Dictionary diagnostics ready: guest 0x%08x",
+                      ds_step_address | 1u);
+        }
+    }
     probe->errno_address = GUEST_OBJECT_BASE + GUEST_OBJECT_SIZE - 0x1000u;
     object_value = 0;
     uc_mem_write(probe->uc, probe->errno_address, &object_value,
@@ -4435,8 +4659,19 @@ static int initialize_unicorn(ArmProbe *probe) {
         static const unsigned char thumb_return[] = {
             0x70, 0x47, 0xc0, 0x46 /* bx lr; nop */
         };
+        uint32_t png_error_address = find_export(probe, "png_error") & ~1u;
         uint32_t png_filter_address =
             find_export(probe, "png_read_filter_row") & ~1u;
+        if (png_error_address) {
+            if (uc_hook_add(probe->uc, &png_error_trace, UC_HOOK_CODE,
+                            png_error_hook, probe, png_error_address,
+                            png_error_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM libpng error hook");
+                return 0;
+            }
+            probe_log("ARM libpng error diagnostics ready: guest 0x%08x",
+                      png_error_address | 1u);
+        }
         if (png_filter_address) {
             if (uc_mem_write(probe->uc, png_filter_address,
                              thumb_return, sizeof(thumb_return)) != UC_ERR_OK ||
@@ -4529,6 +4764,9 @@ static int run_guest(ArmProbe *probe, uint32_t entry,
     }
     if (!probe->returned) {
         uint32_t pc = 0, lr = 0, r0 = 0, r1 = 0, r2 = 0, r3 = 0, sp = 0;
+        uint32_t cpsr = 0;
+        uint32_t stack_dump[12] = {0};
+        int have_stack;
         uc_reg_read(probe->uc, UC_ARM_REG_PC, &pc);
         uc_reg_read(probe->uc, UC_ARM_REG_LR, &lr);
         uc_reg_read(probe->uc, UC_ARM_REG_R0, &r0);
@@ -4536,11 +4774,25 @@ static int run_guest(ArmProbe *probe, uint32_t entry,
         uc_reg_read(probe->uc, UC_ARM_REG_R2, &r2);
         uc_reg_read(probe->uc, UC_ARM_REG_R3, &r3);
         uc_reg_read(probe->uc, UC_ARM_REG_SP, &sp);
+        uc_reg_read(probe->uc, UC_ARM_REG_CPSR, &cpsr);
+        have_stack = sp &&
+            uc_mem_read(probe->uc, sp, stack_dump,
+                        sizeof(stack_dump)) == UC_ERR_OK;
         probe_log("ERROR: ARM call hit instruction limit=%llu without "
                   "returning entry=0x%08x pc=0x%08x lr=0x%08x "
-                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x",
+                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x "
+                  "cpsr=0x%08x mode=%s",
                   (unsigned long long)instruction_limit, entry, pc, lr,
-                  r0, r1, r2, r3, sp);
+                  r0, r1, r2, r3, sp, cpsr,
+                  (cpsr & (1u << 5u)) ? "Thumb" : "ARM");
+        probe_log("ARM instruction-limit stack: "
+                  "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,"
+                  "%08x,%08x,%08x,%08x%s",
+                  stack_dump[0], stack_dump[1], stack_dump[2],
+                  stack_dump[3], stack_dump[4], stack_dump[5],
+                  stack_dump[6], stack_dump[7], stack_dump[8],
+                  stack_dump[9], stack_dump[10], stack_dump[11],
+                  have_stack ? "" : " [unreadable]");
         return 0;
     }
     return 1;
@@ -4643,6 +4895,10 @@ static int host_call(ArmProbe *probe, uint32_t address,
                      const uint32_t *arguments, unsigned count,
                      const char *label) {
     int render_call = label && strcmp(label, "nativeRender") == 0;
+    uint64_t ds_calls_before = probe->ds_step_calls;
+    uint64_t ds_iterations_before = probe->ds_step_iterations;
+    uint64_t ds_cycles_before = probe->ds_step_cycles;
+    int call_ok;
     size_t instruction_limit = label && strcmp(label, "nativeInit") == 0
                                    ? NATIVE_INIT_INSTRUCTION_LIMIT
                                    : render_call
@@ -4654,8 +4910,19 @@ static int host_call(ArmProbe *probe, uint32_t address,
         probe_log("ARM call instruction budget: %s -> %llu",
                   label, (unsigned long long)instruction_limit);
     if (render_call) ++probe->native_render_calls;
-    if (!run_guest(probe, address, arguments, count, instruction_limit,
-                   NULL)) {
+    call_ok = run_guest(probe, address, arguments, count, instruction_limit,
+                        NULL);
+    if (render_call &&
+        (probe->native_render_calls <= 24u ||
+         probe->ds_step_cycles != ds_cycles_before))
+        probe_log("ARM render dictionary work: frame=%u calls=%llu "
+                  "iterations=%llu cycles=%llu",
+                  probe->native_render_calls,
+                  (unsigned long long)(probe->ds_step_calls - ds_calls_before),
+                  (unsigned long long)(probe->ds_step_iterations -
+                                       ds_iterations_before),
+                  (unsigned long long)(probe->ds_step_cycles - ds_cycles_before));
+    if (!call_ok) {
         probe_log("ERROR: ARM native call failed: %s", label ? label : "?");
         return 0;
     }
@@ -4897,7 +5164,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap4",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap5",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5056,7 +5323,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap4");
+              "0.9.4-arm-bootstrap5");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
