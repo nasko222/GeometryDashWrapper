@@ -1,0 +1,65 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -110,6 +110,7 @@
+     qemu/include
+     include
+     qemu/tcg
++    qemu/tcg/i386
+ )
+ 
+ # QEMU logging facility
+@@ -1208,13 +1209,13 @@
+ )
+ 
+ # A workaround to avoid circle dependency between unicorn and *-softmmu
+-if(MSVC)
++if(WIN32)
+     set(UNICORN_COMMON_SRCS
+         ${UNICORN_COMMON_SRCS}
+         qemu/util/oslib-win32.c
+         qemu/util/qemu-thread-win32.c
+     )
+-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
++    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+         if(MSVC_VERSION LESS 1600 AND MSVC_IDE)
+             add_custom_command(OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/build/setjmp-wrapper-win32.dir/setjmp-wrapper-win32.obj"
+                 COMMAND ml64 /c /nologo /Fo"${CMAKE_CURRENT_SOURCE_DIR}/build/setjmp-wrapper-win32.dir/setjmp-wrapper-win32.obj" /W3 /errorReport:prompt /Ta"${CMAKE_CURRENT_SOURCE_DIR}/qemu/util/setjmp-wrapper-win32.asm"
+@@ -1244,7 +1245,7 @@
+                       C_VISIBILITY_PRESET
+                       hidden)
+ 
+-if(NOT MSVC AND NOT ANDROID_ABI)
++if(NOT WIN32 AND NOT ANDROID_ABI)
+     target_link_libraries(unicorn-common PRIVATE pthread)
+ endif()
+ 
+@@ -1367,7 +1368,8 @@
+ endif()
+ 
+ if(MINGW)
+-    set(UNICORN_LINK_LIBRARIES ${UNICORN_LINK_LIBRARIES} pthread)
++    # The wrapper builds Unicorn with Zig's MinGW CRT, which has native Win32
++    # threading but intentionally does not ship winpthreads.
+ endif()
+ 
+ if(ATOMIC_LINKAGE_FIX)
+@@ -1425,7 +1427,7 @@
+     set(SAMPLES_LIB
+         unicorn
+     )
+-elseif(NOT ANDROID_ABI)
++elseif(NOT ANDROID_ABI AND NOT WIN32)
+     set(SAMPLES_LIB
+         unicorn
+         pthread
+--- a/qemu/include/qemu/thread.h
++++ b/qemu/include/qemu/thread.h
+@@ -7,7 +7,7 @@
+ struct uc_struct;
+ typedef struct QemuThread QemuThread;
+ 
+-#if defined(_WIN32) && !defined(__MINGW32__)
++#if defined(_WIN32)
+ #include "qemu/thread-win32.h"
+ #else
+ #include "qemu/thread-posix.h"

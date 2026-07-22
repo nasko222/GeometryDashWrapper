@@ -215,6 +215,27 @@ private servers need retesting with 0.9.3-alpha3. JNI
 methods, Cocos exports, audio assets, and OS APIs changed across releases, so
 this is not yet a claim that every historical or later APK works.
 
+## Experimental ARM-only bootstrap branch
+
+`src/arm_probe.c` is a separate proof backend for the ARMv5/Thumb-1 libraries
+in Geometry Dash 1.0 through 1.4. It uses a statically linked Unicorn 2.1.4
+translator; it does not cast ARM addresses to x86 function pointers and it does
+not launch an Android emulator. The probe reads `lib/armeabi/libgame.so`
+directly from an APK, maps the guest address space, applies `R_ARM_*`
+relocations, supplies Android kuser atomics/TLS, executes every authentic ELF
+constructor, and calls the authentic `JNI_OnLoad`.
+
+The native Linux oracle has completed that sequence for the exact supplied
+1.000, 1.010, 1.300, and 1.400 APKs, plus the ARM half of the dual-ABI 1.600
+APK. This proves that a native compatibility route is technically viable. It
+does **not** mean the ARM-only releases are playable yet: the guest JNI table,
+callback/thread re-entry, Cocos nativeInit/render calls, OpenGL, input, storage,
+and audio bridges still need to be connected to this backend.
+
+See `BUILDING-ARM.md` for the reproducible Win32 translator build. The ARM
+probe EXE is a console diagnostic and requires only an APK at runtime; it does
+not require a loose `.so`.
+
 ## Rebuilding
 
 The complete buildable source is included in `source/`. Install Zig, then run:
