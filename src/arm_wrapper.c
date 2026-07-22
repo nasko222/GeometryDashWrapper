@@ -182,6 +182,18 @@ _Static_assert(sizeof(GuestTimebLayout) == 12,
                "ARM/Bionic struct timeb layout must remain 32-bit");
 
 typedef struct {
+    uint32_t width;
+    uint32_t rowbytes;
+    uint8_t color_type;
+    uint8_t bit_depth;
+    uint8_t channels;
+    uint8_t pixel_depth;
+} GuestPngRowInfo;
+
+_Static_assert(sizeof(GuestPngRowInfo) == 12,
+               "ARM libpng row-info layout must remain 32-bit");
+
+typedef struct {
     uint32_t guest_address;
     z_stream host;
     GuestZStreamKind kind;
@@ -278,11 +290,14 @@ typedef struct {
     GuestGlVertexAttrib gl_vertex_attribs[MAX_GL_VERTEX_ATTRIBS];
     unsigned gl_draw_logs;
     unsigned native_render_calls;
+    unsigned png_filter_rows;
     int text_input_active;
     int returned;
     int failed;
     char failure[256];
 } ArmProbe;
+
+static uint32_t find_export(const ArmProbe *probe, const char *name);
 
 static ArmProbe *g_active_probe;
 static FILE *g_log_stream;
@@ -4121,6 +4136,118 @@ static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
     dispatch_import(probe, &probe->imports[index], r0, r1, r2, r3, sp);
 }
 
+static unsigned char png_paeth_predictor(unsigned char left,
+                                         unsigned char above,
+                                         unsigned char upper_left) {
+    int prediction = (int)left + (int)above - (int)upper_left;
+    int left_distance = abs(prediction - (int)left);
+    int above_distance = abs(prediction - (int)above);
+    int upper_left_distance = abs(prediction - (int)upper_left);
+    if (left_distance <= above_distance &&
+        left_distance <= upper_left_distance)
+        return left;
+    if (above_distance <= upper_left_distance) return above;
+    return upper_left;
+}
+
+static int png_filter_guest_row(ArmProbe *probe, uint32_t row_info_address,
+                                uint32_t row_address,
+                                uint32_t previous_address,
+                                uint32_t filter) {
+    GuestPngRowInfo row_info;
+    unsigned char *row = NULL;
+    unsigned char *previous = NULL;
+    uint32_t bytes_per_pixel;
+    uint32_t index;
+    if (!row_info_address ||
+        uc_mem_read(probe->uc, row_info_address, &row_info,
+                    sizeof(row_info)) != UC_ERR_OK ||
+        row_info.rowbytes > MAX_GL_CLIENT_ARRAY_BYTES ||
+        !row_info.pixel_depth || filter > 4u)
+        return 0;
+    if (!row_info.rowbytes || filter == 0u) return 1;
+    if (!row_address) return 0;
+    bytes_per_pixel = ((uint32_t)row_info.pixel_depth + 7u) >> 3u;
+    if (!bytes_per_pixel) bytes_per_pixel = 1u;
+    row = (unsigned char *)guest_buffer_copy(
+        probe, row_address, row_info.rowbytes);
+    if (!row) return 0;
+    if (previous_address && filter >= 2u) {
+        previous = (unsigned char *)guest_buffer_copy(
+            probe, previous_address, row_info.rowbytes);
+        if (!previous) goto failed;
+    }
+
+    if (filter == 1u) { /* PNG_FILTER_VALUE_SUB */
+        for (index = bytes_per_pixel; index < row_info.rowbytes; ++index)
+            row[index] = (unsigned char)(row[index] +
+                                         row[index - bytes_per_pixel]);
+    } else if (filter == 2u) { /* PNG_FILTER_VALUE_UP */
+        if (previous)
+            for (index = 0; index < row_info.rowbytes; ++index)
+                row[index] = (unsigned char)(row[index] + previous[index]);
+    } else if (filter == 3u) { /* PNG_FILTER_VALUE_AVG */
+        for (index = 0; index < row_info.rowbytes; ++index) {
+            unsigned left = index >= bytes_per_pixel
+                                ? row[index - bytes_per_pixel] : 0u;
+            unsigned above = previous ? previous[index] : 0u;
+            row[index] = (unsigned char)(row[index] +
+                                         ((left + above) >> 1u));
+        }
+    } else { /* PNG_FILTER_VALUE_PAETH */
+        for (index = 0; index < row_info.rowbytes; ++index) {
+            unsigned char left = index >= bytes_per_pixel
+                                     ? row[index - bytes_per_pixel] : 0;
+            unsigned char above = previous ? previous[index] : 0;
+            unsigned char upper_left =
+                previous && index >= bytes_per_pixel
+                    ? previous[index - bytes_per_pixel] : 0;
+            row[index] = (unsigned char)(
+                row[index] + png_paeth_predictor(left, above, upper_left));
+        }
+    }
+    if (uc_mem_write(probe->uc, row_address, row,
+                     row_info.rowbytes) != UC_ERR_OK)
+        goto failed;
+    ++probe->png_filter_rows;
+    if (probe->png_filter_rows == 1u)
+        probe_log("ARM libpng row-filter acceleration active: "
+                  "rowbytes=%u bpp=%u filter=%u",
+                  row_info.rowbytes, bytes_per_pixel, filter);
+    else if ((probe->png_filter_rows & 2047u) == 0u)
+        probe_log("ARM libpng accelerated rows: %u",
+                  probe->png_filter_rows);
+    free(previous);
+    free(row);
+    return 1;
+
+failed:
+    free(previous);
+    free(row);
+    return 0;
+}
+
+static void png_filter_hook(uc_engine *uc, uint64_t address, uint32_t size,
+                            void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t row_info = 0, row = 0, previous = 0, sp = 0, filter = 0;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R1, &row_info);
+    uc_reg_read(uc, UC_ARM_REG_R2, &row);
+    uc_reg_read(uc, UC_ARM_REG_R3, &previous);
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+    if (!sp || uc_mem_read(uc, sp, &filter, sizeof(filter)) != UC_ERR_OK ||
+        !png_filter_guest_row(probe, row_info, row, previous, filter)) {
+        probe->failed = 1;
+        snprintf(probe->failure, sizeof(probe->failure),
+                 "libpng row-filter bridge failed row_info=0x%08x "
+                 "row=0x%08x previous=0x%08x filter=%u",
+                 row_info, row, previous, filter);
+        uc_emu_stop(uc);
+    }
+}
+
 static void kuser_hook(uc_engine *uc, uint64_t address, uint32_t size,
                        void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -4215,6 +4342,7 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook kuser_trace;
     uc_hook jni_trace;
     uc_hook vm_trace;
+    uc_hook png_filter_trace;
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
@@ -4302,6 +4430,25 @@ static int initialize_unicorn(ArmProbe *probe) {
                     invalid_memory_hook, probe, 1, 0) != UC_ERR_OK) {
         probe_log("ERROR: cannot install ARM guest hooks");
         return 0;
+    }
+    {
+        static const unsigned char thumb_return[] = {
+            0x70, 0x47, 0xc0, 0x46 /* bx lr; nop */
+        };
+        uint32_t png_filter_address =
+            find_export(probe, "png_read_filter_row") & ~1u;
+        if (png_filter_address) {
+            if (uc_mem_write(probe->uc, png_filter_address,
+                             thumb_return, sizeof(thumb_return)) != UC_ERR_OK ||
+                uc_hook_add(probe->uc, &png_filter_trace, UC_HOOK_CODE,
+                            png_filter_hook, probe, png_filter_address,
+                            png_filter_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM libpng row-filter hook");
+                return 0;
+            }
+            probe_log("ARM libpng row-filter accelerator ready: guest 0x%08x",
+                      png_filter_address | 1u);
+        }
     }
     probe->heap_next = GUEST_HEAP_BASE;
     probe_log("Unicorn ARMv5/Thumb guest initialized");
@@ -4750,7 +4897,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap3",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap4",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -4909,7 +5056,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap3");
+              "0.9.4-arm-bootstrap4");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
