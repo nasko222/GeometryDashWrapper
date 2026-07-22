@@ -66,7 +66,14 @@
 #define MAX_STRING 65536
 #define MAX_GUEST_REFS 4096
 #define MAX_GUEST_FILES 256
+#define MAX_GUEST_ZSTREAMS 64
 #define MAX_REGISTERED_NATIVES 512
+#define MAX_GL_VERTEX_ATTRIBS 32
+#define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
+#define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
+#define DEFAULT_GUEST_INSTRUCTION_LIMIT 20000000u
+#define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
+#define NATIVE_RENDER_INSTRUCTION_LIMIT 250000000u
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004u
 #define GUEST_ENV_OBJECT (GUEST_JNI_BASE + 0x1000u)
@@ -118,6 +125,79 @@ typedef struct {
     int writable;
     int eof;
 } GuestFile;
+
+typedef enum {
+    GUEST_ZSTREAM_NONE = 0,
+    GUEST_ZSTREAM_INFLATE,
+    GUEST_ZSTREAM_DEFLATE
+} GuestZStreamKind;
+
+typedef struct {
+    uint32_t next_in;
+    uint32_t avail_in;
+    uint32_t total_in;
+    uint32_t next_out;
+    uint32_t avail_out;
+    uint32_t total_out;
+    uint32_t msg;
+    uint32_t state;
+    uint32_t zalloc;
+    uint32_t zfree;
+    uint32_t opaque;
+    int32_t data_type;
+    uint32_t adler;
+    uint32_t reserved;
+} GuestZStreamLayout;
+
+_Static_assert(sizeof(GuestZStreamLayout) == 56,
+               "ARM z_stream layout must remain 32-bit");
+
+/* Android/Bionic's 32-bit struct tm includes the BSD timezone extensions. */
+typedef struct {
+    int32_t tm_sec;
+    int32_t tm_min;
+    int32_t tm_hour;
+    int32_t tm_mday;
+    int32_t tm_mon;
+    int32_t tm_year;
+    int32_t tm_wday;
+    int32_t tm_yday;
+    int32_t tm_isdst;
+    int32_t tm_gmtoff;
+    uint32_t tm_zone;
+} GuestTmLayout;
+
+_Static_assert(sizeof(GuestTmLayout) == 44,
+               "ARM/Bionic struct tm layout must remain 32-bit");
+
+typedef struct {
+    int32_t time;
+    uint16_t millitm;
+    int16_t timezone;
+    int16_t dstflag;
+    uint16_t padding;
+} GuestTimebLayout;
+
+_Static_assert(sizeof(GuestTimebLayout) == 12,
+               "ARM/Bionic struct timeb layout must remain 32-bit");
+
+typedef struct {
+    uint32_t guest_address;
+    z_stream host;
+    GuestZStreamKind kind;
+    int active;
+} GuestZStream;
+
+typedef struct {
+    uint32_t size;
+    uint32_t type;
+    uint32_t normalized;
+    uint32_t stride;
+    uint32_t guest_pointer;
+    int enabled;
+    int client_memory;
+    int logged;
+} GuestGlVertexAttrib;
 
 typedef struct {
     char *class_name;
@@ -180,6 +260,8 @@ typedef struct {
     unsigned ref_count;
     GuestFile files[MAX_GUEST_FILES];
     unsigned file_count;
+    GuestZStream zstreams[MAX_GUEST_ZSTREAMS];
+    unsigned zstream_count;
     RegisteredNative natives[MAX_REGISTERED_NATIVES];
     unsigned native_count;
     ArmHost host;
@@ -187,6 +269,15 @@ typedef struct {
     char executable_directory[MAX_PATH * 2];
     char writable_path[MAX_PATH * 2];
     double frame_interval;
+    uint64_t lrand48_state;
+    uint32_t strtok_next;
+    uint32_t tm_storage;
+    uint32_t tm_zone_storage;
+    uint32_t gl_array_buffer_binding;
+    uint32_t gl_element_array_buffer_binding;
+    GuestGlVertexAttrib gl_vertex_attribs[MAX_GL_VERTEX_ATTRIBS];
+    unsigned gl_draw_logs;
+    unsigned native_render_calls;
     int text_input_active;
     int returned;
     int failed;
@@ -215,6 +306,17 @@ static void probe_log(const char *format, ...) {
     va_start(arguments, format);
     log_v(format, arguments);
     va_end(arguments);
+}
+
+static LONG WINAPI log_unhandled_exception(EXCEPTION_POINTERS *exception) {
+    if (exception && exception->ExceptionRecord) {
+        probe_log("ERROR: unhandled host exception code=0x%08lx address=%p",
+                  (unsigned long)exception->ExceptionRecord->ExceptionCode,
+                  exception->ExceptionRecord->ExceptionAddress);
+    } else {
+        probe_log("ERROR: unhandled host exception");
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 void runtime_log(const char *format, ...) {
@@ -512,17 +614,95 @@ static uint32_t ensure_import(ArmProbe *probe, const char *name) {
     return probe->imports[index].address;
 }
 
-static void initialize_object(ArmProbe *probe, const char *name,
-                              uint32_t address) {
+static int initialize_bionic_ctype_object(ArmProbe *probe, const char *name,
+                                          uint32_t address) {
+    uint32_t table_address = address + sizeof(uint32_t);
+    unsigned index;
+
+    if (uc_mem_write(probe->uc, address, &table_address,
+                     sizeof(table_address)) != UC_ERR_OK)
+        return 0;
+
+    if (strcmp(name, "_ctype_") == 0) {
+        unsigned char table[257] = {0};
+        enum {
+            BIONIC_CTYPE_UPPER = 0x01,
+            BIONIC_CTYPE_LOWER = 0x02,
+            BIONIC_CTYPE_NUMBER = 0x04,
+            BIONIC_CTYPE_SPACE = 0x08,
+            BIONIC_CTYPE_PUNCT = 0x10,
+            BIONIC_CTYPE_CONTROL = 0x20,
+            BIONIC_CTYPE_HEX = 0x40,
+            BIONIC_CTYPE_BLANK = 0x80
+        };
+
+        for (index = 0; index < 256u; ++index) {
+            unsigned char flags = 0;
+            if (index <= 0x1fu || (index >= 0x7fu && index <= 0x9fu))
+                flags |= BIONIC_CTYPE_CONTROL;
+            if (index >= 0xa0u)
+                flags |= BIONIC_CTYPE_PUNCT;
+            if (index == ' ')
+                flags |= BIONIC_CTYPE_SPACE | BIONIC_CTYPE_BLANK;
+            else if (index >= '\t' && index <= '\r')
+                flags |= BIONIC_CTYPE_SPACE;
+            if (index >= '0' && index <= '9')
+                flags |= BIONIC_CTYPE_NUMBER;
+            if (index >= 'A' && index <= 'Z')
+                flags |= BIONIC_CTYPE_UPPER;
+            if (index >= 'a' && index <= 'z')
+                flags |= BIONIC_CTYPE_LOWER;
+            if ((index >= 'A' && index <= 'F') ||
+                (index >= 'a' && index <= 'f'))
+                flags |= BIONIC_CTYPE_HEX;
+            if ((index >= 0x21u && index <= 0x2fu) ||
+                (index >= 0x3au && index <= 0x40u) ||
+                (index >= 0x5bu && index <= 0x60u) ||
+                (index >= 0x7bu && index <= 0x7eu))
+                flags |= BIONIC_CTYPE_PUNCT;
+            table[index + 1u] = flags;
+        }
+        return uc_mem_write(probe->uc, table_address, table,
+                            sizeof(table)) == UC_ERR_OK;
+    }
+
+    {
+        int16_t table[257];
+        int make_lower = strcmp(name, "_tolower_tab_") == 0;
+        table[0] = -1;
+        for (index = 0; index < 256u; ++index) {
+            unsigned value = index;
+            if (make_lower && index >= 'A' && index <= 'Z')
+                value = index + ('a' - 'A');
+            else if (!make_lower && index >= 'a' && index <= 'z')
+                value = index - ('a' - 'A');
+            table[index + 1u] = (int16_t)value;
+        }
+        return uc_mem_write(probe->uc, table_address, table,
+                            sizeof(table)) == UC_ERR_OK;
+    }
+}
+
+static int initialize_object(ArmProbe *probe, const char *name,
+                             uint32_t address) {
     uint32_t value;
     probe_log("ARM imported object: %s at 0x%08x", name, address);
     if (strcmp(name, "__stack_chk_guard") == 0) {
         value = 0xa59c71e3u;
-        uc_mem_write(probe->uc, address, &value, sizeof(value));
+        return uc_mem_write(probe->uc, address, &value,
+                            sizeof(value)) == UC_ERR_OK;
     } else if (strcmp(name, "optind") == 0) {
         value = 1;
-        uc_mem_write(probe->uc, address, &value, sizeof(value));
+        return uc_mem_write(probe->uc, address, &value,
+                            sizeof(value)) == UC_ERR_OK;
+    } else if (strcmp(name, "_ctype_") == 0 ||
+               strcmp(name, "_tolower_tab_") == 0 ||
+               strcmp(name, "_toupper_tab_") == 0) {
+        if (!initialize_bionic_ctype_object(probe, name, address)) return 0;
+        probe_log("ARM Bionic character table ready: %s -> 0x%08x",
+                  name, address + (uint32_t)sizeof(uint32_t));
     }
+    return 1;
 }
 
 static uint32_t ensure_object(ArmProbe *probe, const char *name) {
@@ -683,6 +863,119 @@ static int guest_write_string(ArmProbe *probe, uint32_t address,
         const char zero = 0;
         return uc_mem_write(probe->uc, address + length, &zero, 1) == UC_ERR_OK;
     }
+}
+
+static uint32_t guest_tm_zone(ArmProbe *probe, const char *zone) {
+    if (!probe->tm_zone_storage)
+        probe->tm_zone_storage = guest_alloc(probe, 16u);
+    if (!probe->tm_zone_storage ||
+        !guest_write_string(probe, probe->tm_zone_storage, zone, 16u))
+        return 0;
+    return probe->tm_zone_storage;
+}
+
+static int guest_tm_write(ArmProbe *probe, uint32_t destination,
+                          const struct tm *source, const char *zone) {
+    GuestTmLayout value;
+    uint32_t zone_address;
+    if (!destination || !source) return 0;
+    zone_address = guest_tm_zone(probe, zone);
+    if (!zone_address) return 0;
+    value.tm_sec = source->tm_sec;
+    value.tm_min = source->tm_min;
+    value.tm_hour = source->tm_hour;
+    value.tm_mday = source->tm_mday;
+    value.tm_mon = source->tm_mon;
+    value.tm_year = source->tm_year;
+    value.tm_wday = source->tm_wday;
+    value.tm_yday = source->tm_yday;
+    value.tm_isdst = source->tm_isdst;
+    value.tm_gmtoff = 0;
+    value.tm_zone = zone_address;
+    return uc_mem_write(probe->uc, destination, &value, sizeof(value)) ==
+           UC_ERR_OK;
+}
+
+static int guest_tm_read(ArmProbe *probe, uint32_t source,
+                         struct tm *destination) {
+    GuestTmLayout value;
+    if (!source || !destination ||
+        uc_mem_read(probe->uc, source, &value, sizeof(value)) != UC_ERR_OK)
+        return 0;
+    memset(destination, 0, sizeof(*destination));
+    destination->tm_sec = value.tm_sec;
+    destination->tm_min = value.tm_min;
+    destination->tm_hour = value.tm_hour;
+    destination->tm_mday = value.tm_mday;
+    destination->tm_mon = value.tm_mon;
+    destination->tm_year = value.tm_year;
+    destination->tm_wday = value.tm_wday;
+    destination->tm_yday = value.tm_yday;
+    destination->tm_isdst = value.tm_isdst;
+    return 1;
+}
+
+static uint32_t guest_time_to_tm(ArmProbe *probe, uint32_t time_address,
+                                 uint32_t destination, int local) {
+    int32_t guest_seconds;
+    time_t host_seconds;
+    struct tm *host_value;
+    struct tm copied_value;
+    if (!time_address ||
+        uc_mem_read(probe->uc, time_address, &guest_seconds,
+                    sizeof(guest_seconds)) != UC_ERR_OK)
+        return 0;
+    host_seconds = (time_t)guest_seconds;
+    host_value = local ? localtime(&host_seconds) : gmtime(&host_seconds);
+    if (!host_value) return 0;
+    copied_value = *host_value;
+    if (!destination) {
+        if (!probe->tm_storage)
+            probe->tm_storage = guest_alloc(probe, sizeof(GuestTmLayout));
+        destination = probe->tm_storage;
+    }
+    if (!guest_tm_write(probe, destination, &copied_value,
+                        local ? "local" : "UTC"))
+        return 0;
+    return destination;
+}
+
+static uint64_t host_unix_milliseconds(void) {
+    FILETIME file_time;
+    uint64_t ticks;
+    const uint64_t epoch = UINT64_C(116444736000000000);
+    GetSystemTimeAsFileTime(&file_time);
+    ticks = (uint64_t)file_time.dwLowDateTime |
+            ((uint64_t)file_time.dwHighDateTime << 32u);
+    return ticks >= epoch ? (ticks - epoch) / UINT64_C(10000) : 0;
+}
+
+static int guest_ftime(ArmProbe *probe, uint32_t destination) {
+    GuestTimebLayout value;
+    TIME_ZONE_INFORMATION zone;
+    DWORD zone_state;
+    LONG bias;
+    uint64_t milliseconds;
+    if (!destination) return -1;
+    milliseconds = host_unix_milliseconds();
+    memset(&zone, 0, sizeof(zone));
+    zone_state = GetTimeZoneInformation(&zone);
+    bias = zone_state == TIME_ZONE_ID_INVALID ? 0 : zone.Bias;
+    if (zone_state == TIME_ZONE_ID_DAYLIGHT)
+        bias += zone.DaylightBias;
+    else if (zone_state == TIME_ZONE_ID_STANDARD)
+        bias += zone.StandardBias;
+    if (bias < INT16_MIN) bias = INT16_MIN;
+    if (bias > INT16_MAX) bias = INT16_MAX;
+    memset(&value, 0, sizeof(value));
+    value.time = (int32_t)(milliseconds / 1000u);
+    value.millitm = (uint16_t)(milliseconds % 1000u);
+    value.timezone = (int16_t)bias;
+    value.dstflag = zone_state == TIME_ZONE_ID_DAYLIGHT;
+    return uc_mem_write(probe->uc, destination, &value, sizeof(value)) ==
+                   UC_ERR_OK
+               ? 0
+               : -1;
 }
 
 static void set_r0(uc_engine *uc, uint32_t value) {
@@ -877,7 +1170,10 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
             apk_extract_member(probe->input_path, with_assets, &payload, &payload_size);
         }
     }
-    if (!host && !payload) return 0;
+    if (!host && !payload) {
+        probe_log("ARM file open failed: %s mode=%s", path, mode);
+        return 0;
+    }
     file = &probe->files[probe->file_count];
     memset(file, 0, sizeof(*file));
     file->handle = GUEST_FILE_BASE + probe->file_count * 0x100u;
@@ -887,6 +1183,11 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
     file->writable = writable;
     if (host && strchr(mode, 'a')) fseek(host, 0, SEEK_END);
     ++probe->file_count;
+    if (host)
+        probe_log("ARM file open: %s mode=%s source=host", path, mode);
+    else
+        probe_log("ARM file open: %s mode=%s source=APK bytes=%u",
+                  path, mode, (unsigned)payload_size);
     return file->handle;
 }
 
@@ -954,6 +1255,304 @@ static int guest_file_close(GuestFile *file) {
     file->host = NULL;
     file->payload = NULL;
     file->handle = 0;
+    return result;
+}
+
+static GuestZStream *guest_zstream(ArmProbe *probe, uint32_t guest_address) {
+    unsigned index;
+    for (index = 0; index < probe->zstream_count; ++index) {
+        if (probe->zstreams[index].guest_address == guest_address)
+            return &probe->zstreams[index];
+    }
+    return NULL;
+}
+
+static void guest_zstream_release(GuestZStream *stream) {
+    if (!stream || !stream->active) return;
+    if (stream->kind == GUEST_ZSTREAM_INFLATE)
+        inflateEnd(&stream->host);
+    else if (stream->kind == GUEST_ZSTREAM_DEFLATE)
+        deflateEnd(&stream->host);
+    stream->active = 0;
+    stream->kind = GUEST_ZSTREAM_NONE;
+    memset(&stream->host, 0, sizeof(stream->host));
+}
+
+static GuestZStream *guest_zstream_prepare(ArmProbe *probe,
+                                           uint32_t guest_address,
+                                           GuestZStreamKind kind) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    if (!guest_address) return NULL;
+    if (!stream) {
+        if (probe->zstream_count >= MAX_GUEST_ZSTREAMS) return NULL;
+        stream = &probe->zstreams[probe->zstream_count++];
+        memset(stream, 0, sizeof(*stream));
+        stream->guest_address = guest_address;
+    } else {
+        guest_zstream_release(stream);
+    }
+    stream->kind = kind;
+    return stream;
+}
+
+static int guest_zstream_read_layout(ArmProbe *probe, uint32_t address,
+                                     GuestZStreamLayout *layout) {
+    return address && layout &&
+           uc_mem_read(probe->uc, address, layout, sizeof(*layout)) == UC_ERR_OK;
+}
+
+static int guest_zstream_write_layout(ArmProbe *probe, GuestZStream *stream,
+                                      GuestZStreamLayout *layout) {
+    layout->total_in = (uint32_t)stream->host.total_in;
+    layout->total_out = (uint32_t)stream->host.total_out;
+    layout->msg = 0;
+    layout->state = stream->active ? stream->guest_address : 0;
+    layout->data_type = stream->host.data_type;
+    layout->adler = (uint32_t)stream->host.adler;
+    layout->reserved = (uint32_t)stream->host.reserved;
+    return uc_mem_write(probe->uc, stream->guest_address, layout,
+                        sizeof(*layout)) == UC_ERR_OK;
+}
+
+static int guest_inflate_init(ArmProbe *probe, uint32_t guest_address,
+                              int use_window_bits, int window_bits) {
+    GuestZStreamLayout layout;
+    GuestZStream *stream;
+    int result;
+    if (!guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    stream = guest_zstream_prepare(probe, guest_address,
+                                   GUEST_ZSTREAM_INFLATE);
+    if (!stream) return Z_MEM_ERROR;
+    result = use_window_bits
+                 ? inflateInit2_(&stream->host, window_bits, ZLIB_VERSION,
+                                 (int)sizeof(z_stream))
+                 : inflateInit_(&stream->host, ZLIB_VERSION,
+                                (int)sizeof(z_stream));
+    stream->active = result == Z_OK;
+    if (!guest_zstream_write_layout(probe, stream, &layout)) {
+        guest_zstream_release(stream);
+        return Z_STREAM_ERROR;
+    }
+    if (result == Z_OK)
+        probe_log("ARM zlib inflate stream ready: guest=0x%08x window=%d",
+                  guest_address, use_window_bits ? window_bits : MAX_WBITS);
+    return result;
+}
+
+static int guest_deflate_init(ArmProbe *probe, uint32_t guest_address,
+                              int level, int extended, int method,
+                              int window_bits, int mem_level, int strategy) {
+    GuestZStreamLayout layout;
+    GuestZStream *stream;
+    int result;
+    if (!guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    stream = guest_zstream_prepare(probe, guest_address,
+                                   GUEST_ZSTREAM_DEFLATE);
+    if (!stream) return Z_MEM_ERROR;
+    result = extended
+                 ? deflateInit2_(&stream->host, level, method, window_bits,
+                                 mem_level, strategy, ZLIB_VERSION,
+                                 (int)sizeof(z_stream))
+                 : deflateInit_(&stream->host, level, ZLIB_VERSION,
+                                (int)sizeof(z_stream));
+    stream->active = result == Z_OK;
+    if (!guest_zstream_write_layout(probe, stream, &layout)) {
+        guest_zstream_release(stream);
+        return Z_STREAM_ERROR;
+    }
+    if (result == Z_OK)
+        probe_log("ARM zlib deflate stream ready: guest=0x%08x",
+                  guest_address);
+    return result;
+}
+
+static int guest_zstream_process(ArmProbe *probe, uint32_t guest_address,
+                                 GuestZStreamKind kind, int flush) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    GuestZStreamLayout layout;
+    unsigned char *input = NULL;
+    unsigned char *output = NULL;
+    uint32_t input_size;
+    uint32_t output_size;
+    uint32_t consumed = 0;
+    uint32_t produced = 0;
+    int result = Z_STREAM_ERROR;
+    if (!stream || !stream->active || stream->kind != kind ||
+        !guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    input_size = layout.avail_in;
+    output_size = layout.avail_out;
+    if (input_size > MAX_GUEST_ZLIB_BUFFER ||
+        output_size > MAX_GUEST_ZLIB_BUFFER)
+        return Z_MEM_ERROR;
+    if (input_size) {
+        if (!layout.next_in || !(input = (unsigned char *)malloc(input_size)) ||
+            uc_mem_read(probe->uc, layout.next_in, input, input_size) != UC_ERR_OK)
+            goto finished;
+    }
+    if (output_size) {
+        if (!layout.next_out || !(output = (unsigned char *)malloc(output_size)))
+            goto finished;
+    }
+    stream->host.next_in = input;
+    stream->host.avail_in = input_size;
+    stream->host.next_out = output;
+    stream->host.avail_out = output_size;
+    result = kind == GUEST_ZSTREAM_INFLATE
+                 ? inflate(&stream->host, flush)
+                 : deflate(&stream->host, flush);
+    consumed = input_size - stream->host.avail_in;
+    produced = output_size - stream->host.avail_out;
+    if (produced &&
+        uc_mem_write(probe->uc, layout.next_out, output, produced) != UC_ERR_OK) {
+        result = Z_STREAM_ERROR;
+        goto finished;
+    }
+    layout.next_in += consumed;
+    layout.avail_in -= consumed;
+    layout.next_out += produced;
+    layout.avail_out -= produced;
+    if (!guest_zstream_write_layout(probe, stream, &layout))
+        result = Z_STREAM_ERROR;
+
+finished:
+    stream->host.next_in = Z_NULL;
+    stream->host.avail_in = 0;
+    stream->host.next_out = Z_NULL;
+    stream->host.avail_out = 0;
+    free(input);
+    free(output);
+    return result;
+}
+
+static int guest_zstream_reset(ArmProbe *probe, uint32_t guest_address,
+                               GuestZStreamKind kind) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    GuestZStreamLayout layout;
+    int result;
+    if (!stream || !stream->active || stream->kind != kind ||
+        !guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    result = kind == GUEST_ZSTREAM_INFLATE
+                 ? inflateReset(&stream->host) : deflateReset(&stream->host);
+    if (!guest_zstream_write_layout(probe, stream, &layout))
+        return Z_STREAM_ERROR;
+    return result;
+}
+
+static int guest_zstream_end(ArmProbe *probe, uint32_t guest_address,
+                             GuestZStreamKind kind) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    GuestZStreamLayout layout;
+    int result;
+    if (!stream || !stream->active || stream->kind != kind ||
+        !guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    result = kind == GUEST_ZSTREAM_INFLATE
+                 ? inflateEnd(&stream->host) : deflateEnd(&stream->host);
+    stream->active = 0;
+    stream->kind = GUEST_ZSTREAM_NONE;
+    if (!guest_zstream_write_layout(probe, stream, &layout))
+        return Z_STREAM_ERROR;
+    memset(&stream->host, 0, sizeof(stream->host));
+    return result;
+}
+
+static int guest_inflate_sync(ArmProbe *probe, uint32_t guest_address) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    GuestZStreamLayout layout;
+    unsigned char *input = NULL;
+    uint32_t input_size;
+    uint32_t consumed = 0;
+    int result = Z_STREAM_ERROR;
+    if (!stream || !stream->active ||
+        stream->kind != GUEST_ZSTREAM_INFLATE ||
+        !guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    input_size = layout.avail_in;
+    if (input_size > MAX_GUEST_ZLIB_BUFFER) return Z_MEM_ERROR;
+    if (input_size) {
+        input = (unsigned char *)malloc(input_size);
+        if (!input || !layout.next_in ||
+            uc_mem_read(probe->uc, layout.next_in, input, input_size) != UC_ERR_OK)
+            goto finished;
+    }
+    stream->host.next_in = input;
+    stream->host.avail_in = input_size;
+    result = inflateSync(&stream->host);
+    consumed = input_size - stream->host.avail_in;
+    layout.next_in += consumed;
+    layout.avail_in -= consumed;
+    if (!guest_zstream_write_layout(probe, stream, &layout))
+        result = Z_STREAM_ERROR;
+
+finished:
+    stream->host.next_in = Z_NULL;
+    stream->host.avail_in = 0;
+    free(input);
+    return result;
+}
+
+static int guest_inflate_copy(ArmProbe *probe, uint32_t destination_address,
+                              uint32_t source_address) {
+    GuestZStream *source = guest_zstream(probe, source_address);
+    GuestZStream *destination;
+    GuestZStreamLayout layout;
+    int result;
+    if (!source || !source->active ||
+        source->kind != GUEST_ZSTREAM_INFLATE ||
+        !guest_zstream_read_layout(probe, source_address, &layout))
+        return Z_STREAM_ERROR;
+    destination = guest_zstream_prepare(probe, destination_address,
+                                        GUEST_ZSTREAM_INFLATE);
+    if (!destination) return Z_MEM_ERROR;
+    result = inflateCopy(&destination->host, &source->host);
+    destination->active = result == Z_OK;
+    if (!guest_zstream_write_layout(probe, destination, &layout)) {
+        guest_zstream_release(destination);
+        return Z_STREAM_ERROR;
+    }
+    return result;
+}
+
+static int guest_deflate_params(ArmProbe *probe, uint32_t guest_address,
+                                int level, int strategy) {
+    GuestZStream *stream = guest_zstream(probe, guest_address);
+    GuestZStreamLayout layout;
+    unsigned char *output = NULL;
+    uint32_t output_size;
+    uint32_t produced = 0;
+    int result = Z_STREAM_ERROR;
+    if (!stream || !stream->active ||
+        stream->kind != GUEST_ZSTREAM_DEFLATE ||
+        !guest_zstream_read_layout(probe, guest_address, &layout))
+        return Z_STREAM_ERROR;
+    output_size = layout.avail_out;
+    if (output_size > MAX_GUEST_ZLIB_BUFFER) return Z_MEM_ERROR;
+    if (output_size) {
+        if (!layout.next_out || !(output = (unsigned char *)malloc(output_size)))
+            goto finished;
+    }
+    stream->host.next_out = output;
+    stream->host.avail_out = output_size;
+    result = deflateParams(&stream->host, level, strategy);
+    produced = output_size - stream->host.avail_out;
+    if (produced &&
+        uc_mem_write(probe->uc, layout.next_out, output, produced) != UC_ERR_OK) {
+        result = Z_STREAM_ERROR;
+        goto finished;
+    }
+    layout.next_out += produced;
+    layout.avail_out -= produced;
+    if (!guest_zstream_write_layout(probe, stream, &layout))
+        result = Z_STREAM_ERROR;
+
+finished:
+    stream->host.next_out = Z_NULL;
+    stream->host.avail_out = 0;
+    free(output);
     return result;
 }
 
@@ -1220,6 +1819,362 @@ static int guest_vformat(ArmProbe *probe, char *destination, size_t capacity,
     return output.total > INT32_MAX ? INT32_MAX : (int)output.total;
 }
 
+typedef enum {
+    GUEST_SCAN_LENGTH_DEFAULT = 0,
+    GUEST_SCAN_LENGTH_HH,
+    GUEST_SCAN_LENGTH_H,
+    GUEST_SCAN_LENGTH_L,
+    GUEST_SCAN_LENGTH_LL,
+    GUEST_SCAN_LENGTH_J,
+    GUEST_SCAN_LENGTH_Z,
+    GUEST_SCAN_LENGTH_T,
+    GUEST_SCAN_LENGTH_CAPITAL_L
+} GuestScanLength;
+
+static size_t guest_scan_integer_size(GuestScanLength length) {
+    switch (length) {
+    case GUEST_SCAN_LENGTH_HH: return 1u;
+    case GUEST_SCAN_LENGTH_H: return 2u;
+    case GUEST_SCAN_LENGTH_LL:
+    case GUEST_SCAN_LENGTH_J: return 8u;
+    case GUEST_SCAN_LENGTH_DEFAULT:
+    case GUEST_SCAN_LENGTH_L:
+    case GUEST_SCAN_LENGTH_Z:
+    case GUEST_SCAN_LENGTH_T:
+    case GUEST_SCAN_LENGTH_CAPITAL_L:
+    default: return 4u;
+    }
+}
+
+static int guest_scan_write_integer(ArmProbe *probe, uint32_t address,
+                                    uint64_t value, GuestScanLength length) {
+    size_t size = guest_scan_integer_size(length);
+    if (!address) return 0;
+    if (size == 1u) {
+        uint8_t narrowed = (uint8_t)value;
+        return uc_mem_write(probe->uc, address, &narrowed,
+                            sizeof(narrowed)) == UC_ERR_OK;
+    }
+    if (size == 2u) {
+        uint16_t narrowed = (uint16_t)value;
+        return uc_mem_write(probe->uc, address, &narrowed,
+                            sizeof(narrowed)) == UC_ERR_OK;
+    }
+    if (size == 8u)
+        return uc_mem_write(probe->uc, address, &value,
+                            sizeof(value)) == UC_ERR_OK;
+    {
+        uint32_t narrowed = (uint32_t)value;
+        return uc_mem_write(probe->uc, address, &narrowed,
+                            sizeof(narrowed)) == UC_ERR_OK;
+    }
+}
+
+static int guest_scan_write_float(ArmProbe *probe, uint32_t address,
+                                  double value, GuestScanLength length) {
+    if (!address) return 0;
+    if (length == GUEST_SCAN_LENGTH_L ||
+        length == GUEST_SCAN_LENGTH_CAPITAL_L) {
+        return uc_mem_write(probe->uc, address, &value,
+                            sizeof(value)) == UC_ERR_OK;
+    }
+    {
+        float narrowed = (float)value;
+        return uc_mem_write(probe->uc, address, &narrowed,
+                            sizeof(narrowed)) == UC_ERR_OK;
+    }
+}
+
+static int guest_scan_write_text(ArmProbe *probe, uint32_t address,
+                                 const char *text, size_t length,
+                                 int terminate, int wide) {
+    if (!address) return 0;
+    if (!wide) {
+        unsigned char zero = 0;
+        if (length && uc_mem_write(probe->uc, address, text, length) != UC_ERR_OK)
+            return 0;
+        return !terminate ||
+               uc_mem_write(probe->uc, address + (uint32_t)length,
+                            &zero, sizeof(zero)) == UC_ERR_OK;
+    }
+    {
+        size_t elements = length + (terminate ? 1u : 0u);
+        uint32_t *wide_text;
+        size_t index;
+        if (elements > UINT32_MAX / sizeof(*wide_text)) return 0;
+        wide_text = (uint32_t *)calloc(elements ? elements : 1u,
+                                       sizeof(*wide_text));
+        if (!wide_text) return 0;
+        for (index = 0; index < length; ++index)
+            wide_text[index] = (unsigned char)text[index];
+        index = uc_mem_write(probe->uc, address, wide_text,
+                             elements * sizeof(*wide_text)) == UC_ERR_OK;
+        free(wide_text);
+        return (int)index;
+    }
+}
+
+static int guest_scan_set_contains(unsigned char value, const char *begin,
+                                   const char *end) {
+    const char *cursor = begin;
+    while (cursor < end) {
+        if (cursor + 2 < end && cursor[1] == '-') {
+            unsigned char first = (unsigned char)cursor[0];
+            unsigned char last = (unsigned char)cursor[2];
+            if ((first <= value && value <= last) ||
+                (last <= value && value <= first))
+                return 1;
+            cursor += 3;
+        } else {
+            if ((unsigned char)*cursor == value) return 1;
+            ++cursor;
+        }
+    }
+    return 0;
+}
+
+static int guest_vscan(ArmProbe *probe, const char *input, const char *format,
+                       GuestArgCursor *arguments) {
+    const char *input_begin = input ? input : "";
+    const char *input_cursor = input_begin;
+    const char *format_cursor = format ? format : "";
+    int assignments = 0;
+    int input_failure = 0;
+
+    while (*format_cursor) {
+        int suppress = 0;
+        size_t width = 0;
+        int has_width = 0;
+        GuestScanLength length = GUEST_SCAN_LENGTH_DEFAULT;
+        char specifier;
+
+        if (isspace((unsigned char)*format_cursor)) {
+            while (isspace((unsigned char)*format_cursor)) ++format_cursor;
+            while (isspace((unsigned char)*input_cursor)) ++input_cursor;
+            continue;
+        }
+        if (*format_cursor != '%') {
+            if (!*input_cursor) {
+                input_failure = 1;
+                break;
+            }
+            if (*input_cursor != *format_cursor) break;
+            ++input_cursor;
+            ++format_cursor;
+            continue;
+        }
+        ++format_cursor;
+        if (*format_cursor == '%') {
+            if (!*input_cursor) {
+                input_failure = 1;
+                break;
+            }
+            if (*input_cursor != '%') break;
+            ++input_cursor;
+            ++format_cursor;
+            continue;
+        }
+        if (*format_cursor == '*') {
+            suppress = 1;
+            ++format_cursor;
+        }
+        if (isdigit((unsigned char)*format_cursor)) {
+            has_width = 1;
+            while (isdigit((unsigned char)*format_cursor)) {
+                if (width < MAX_STRING)
+                    width = width * 10u + (unsigned)(*format_cursor - '0');
+                if (width >= MAX_STRING) width = MAX_STRING - 1u;
+                ++format_cursor;
+            }
+            if (!width) break;
+        }
+        if (*format_cursor == 'h') {
+            ++format_cursor;
+            if (*format_cursor == 'h') {
+                length = GUEST_SCAN_LENGTH_HH;
+                ++format_cursor;
+            } else length = GUEST_SCAN_LENGTH_H;
+        } else if (*format_cursor == 'l') {
+            ++format_cursor;
+            if (*format_cursor == 'l') {
+                length = GUEST_SCAN_LENGTH_LL;
+                ++format_cursor;
+            } else length = GUEST_SCAN_LENGTH_L;
+        } else if (*format_cursor == 'j') {
+            length = GUEST_SCAN_LENGTH_J;
+            ++format_cursor;
+        } else if (*format_cursor == 'z') {
+            length = GUEST_SCAN_LENGTH_Z;
+            ++format_cursor;
+        } else if (*format_cursor == 't') {
+            length = GUEST_SCAN_LENGTH_T;
+            ++format_cursor;
+        } else if (*format_cursor == 'L') {
+            length = GUEST_SCAN_LENGTH_CAPITAL_L;
+            ++format_cursor;
+        }
+        specifier = *format_cursor;
+        if (!specifier) break;
+        ++format_cursor;
+
+        if (specifier != 'c' && specifier != '[' && specifier != 'n')
+            while (isspace((unsigned char)*input_cursor)) ++input_cursor;
+
+        if (specifier == 'n') {
+            if (!suppress) {
+                uint32_t destination = cursor_word(arguments);
+                if (!guest_scan_write_integer(
+                        probe, destination,
+                        (uint64_t)(size_t)(input_cursor - input_begin),
+                        length))
+                    break;
+            }
+            continue;
+        }
+
+        if (specifier == 'c' || specifier == 's' || specifier == '[') {
+            const char *text_begin = input_cursor;
+            size_t text_length = 0;
+            size_t limit = has_width ? width : MAX_STRING - 1u;
+            int terminate = specifier != 'c';
+            int wide = length == GUEST_SCAN_LENGTH_L;
+
+            if (specifier == 'c') {
+                if (!has_width) limit = 1u;
+                while (text_length < limit && input_cursor[text_length])
+                    ++text_length;
+                if (text_length != limit) {
+                    input_failure = 1;
+                    break;
+                }
+            } else if (specifier == 's') {
+                while (text_length < limit && input_cursor[text_length] &&
+                       !isspace((unsigned char)input_cursor[text_length]))
+                    ++text_length;
+                if (!text_length) {
+                    if (!*input_cursor) input_failure = 1;
+                    break;
+                }
+            } else {
+                const char *set_begin = format_cursor;
+                const char *set_end;
+                int negate = 0;
+                if (*set_begin == '^') {
+                    negate = 1;
+                    ++set_begin;
+                }
+                set_end = set_begin;
+                if (*set_end == ']') ++set_end;
+                while (*set_end && *set_end != ']') ++set_end;
+                if (*set_end != ']') break;
+                format_cursor = set_end + 1;
+                while (text_length < limit && input_cursor[text_length]) {
+                    int contains = guest_scan_set_contains(
+                        (unsigned char)input_cursor[text_length], set_begin,
+                        set_end);
+                    if (contains == negate) break;
+                    ++text_length;
+                }
+                if (!text_length) {
+                    if (!*input_cursor) input_failure = 1;
+                    break;
+                }
+            }
+            if (!suppress) {
+                uint32_t destination = cursor_word(arguments);
+                if (!guest_scan_write_text(probe, destination, text_begin,
+                                           text_length, terminate, wide))
+                    break;
+                ++assignments;
+            }
+            input_cursor += text_length;
+            continue;
+        }
+
+        if (strchr("diouxXp", specifier) != NULL) {
+            size_t available = strlen(input_cursor);
+            size_t limit = has_width && width < available ? width : available;
+            char *number;
+            char *end = NULL;
+            uint64_t value;
+            int base;
+            int signed_conversion = specifier == 'd' || specifier == 'i';
+            if (!limit) {
+                input_failure = 1;
+                break;
+            }
+            number = (char *)malloc(limit + 1u);
+            if (!number) break;
+            memcpy(number, input_cursor, limit);
+            number[limit] = 0;
+            if (specifier == 'i') base = 0;
+            else if (specifier == 'o') base = 8;
+            else if (specifier == 'x' || specifier == 'X' || specifier == 'p')
+                base = 16;
+            else base = 10;
+            errno = 0;
+            if (signed_conversion)
+                value = (uint64_t)strtoll(number, &end, base);
+            else value = strtoull(number, &end, base);
+            if (end == number) {
+                free(number);
+                break;
+            }
+            limit = (size_t)(end - number);
+            free(number);
+            if (!suppress) {
+                uint32_t destination = cursor_word(arguments);
+                GuestScanLength store_length = specifier == 'p'
+                                                   ? GUEST_SCAN_LENGTH_DEFAULT
+                                                   : length;
+                if (!guest_scan_write_integer(probe, destination, value,
+                                               store_length))
+                    break;
+                ++assignments;
+            }
+            input_cursor += limit;
+            continue;
+        }
+
+        if (strchr("fFeEgGaA", specifier) != NULL) {
+            size_t available = strlen(input_cursor);
+            size_t limit = has_width && width < available ? width : available;
+            char *number;
+            char *end = NULL;
+            double value;
+            if (!limit) {
+                input_failure = 1;
+                break;
+            }
+            number = (char *)malloc(limit + 1u);
+            if (!number) break;
+            memcpy(number, input_cursor, limit);
+            number[limit] = 0;
+            errno = 0;
+            value = strtod(number, &end);
+            if (end == number) {
+                free(number);
+                break;
+            }
+            limit = (size_t)(end - number);
+            free(number);
+            if (!suppress) {
+                uint32_t destination = cursor_word(arguments);
+                if (!guest_scan_write_float(probe, destination, value, length))
+                    break;
+                ++assignments;
+            }
+            input_cursor += limit;
+            continue;
+        }
+
+        break;
+    }
+
+    if (input_failure && assignments == 0) return -1;
+    return assignments;
+}
+
 static uint32_t guest_format_to_memory(ArmProbe *probe, uint32_t destination,
                                        uint32_t capacity, uint32_t format_address,
                                        GuestArgCursor *arguments) {
@@ -1453,6 +2408,12 @@ static void jni_dispatch_void(ArmProbe *probe, GuestRef *method,
         probe->text_input_active = 0;
     } else if (strcmp(name, "setKeyboardState") == 0) {
         probe->text_input_active = cursor_word(arguments) != 0;
+    } else if (strcmp(name, "showMessageBox") == 0) {
+        uint32_t first_ref = cursor_word(arguments);
+        uint32_t second_ref = cursor_word(arguments);
+        probe_log("JNI message box: %s | %s",
+                  guest_ref_string(probe, first_ref, first, sizeof(first)),
+                  guest_ref_string(probe, second_ref, second, sizeof(second)));
     } else if (strcmp(name, "playBackgroundMusic") == 0) {
         uint32_t path = cursor_word(arguments);
         audio_play_background(guest_ref_string(probe, path, first, sizeof(first)),
@@ -1777,6 +2738,70 @@ static int guest_copy_memory(ArmProbe *probe, uint32_t destination,
     return 1;
 }
 
+static uint32_t guest_find_byte(ArmProbe *probe, uint32_t address,
+                                unsigned char value, uint32_t size,
+                                int reverse) {
+    unsigned char block[4096];
+    if (!size) return 0;
+    if (!reverse) {
+        uint32_t offset = 0;
+        while (offset < size) {
+            uint32_t part = size - offset;
+            unsigned char *found;
+            if (part > sizeof(block)) part = sizeof(block);
+            if ((uint64_t)address + offset + part > (uint64_t)UINT32_MAX + 1u ||
+                uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
+                return 0;
+            found = (unsigned char *)memchr(block, value, part);
+            if (found)
+                return address + offset + (uint32_t)(found - block);
+            offset += part;
+        }
+    } else {
+        uint32_t remaining = size;
+        while (remaining) {
+            uint32_t part = remaining;
+            uint32_t offset;
+            uint32_t index;
+            if (part > sizeof(block)) part = sizeof(block);
+            offset = remaining - part;
+            if ((uint64_t)address + offset + part > (uint64_t)UINT32_MAX + 1u ||
+                uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
+                return 0;
+            for (index = part; index > 0; --index)
+                if (block[index - 1u] == value)
+                    return address + offset + index - 1u;
+            remaining = offset;
+        }
+    }
+    return 0;
+}
+
+static uint32_t guest_find_wide_character(ArmProbe *probe, uint32_t address,
+                                          uint32_t value, uint32_t count) {
+    uint32_t block[1024];
+    uint32_t offset = 0;
+    while (offset < count) {
+        uint32_t part = count - offset;
+        uint32_t index;
+        uint64_t byte_offset = (uint64_t)offset * sizeof(uint32_t);
+        uint64_t bytes;
+        if (part > sizeof(block) / sizeof(block[0]))
+            part = sizeof(block) / sizeof(block[0]);
+        bytes = (uint64_t)part * sizeof(uint32_t);
+        if ((uint64_t)address + byte_offset + bytes >
+                (uint64_t)UINT32_MAX + 1u ||
+            uc_mem_read(probe->uc, address + (uint32_t)byte_offset,
+                        block, (size_t)bytes) != UC_ERR_OK)
+            return 0;
+        for (index = 0; index < part; ++index)
+            if (block[index] == value)
+                return address + (offset + index) * sizeof(uint32_t);
+        offset += part;
+    }
+    return 0;
+}
+
 static uint32_t import_argument(ArmProbe *probe, uint32_t r0, uint32_t r1,
                                 uint32_t r2, uint32_t r3, uint32_t sp,
                                 unsigned index) {
@@ -1795,6 +2820,34 @@ static PROC resolve_gl(ArmProbe *probe, const char *name) {
     if (!function && probe->host.context)
         function = wglGetProcAddress(name);
     return function;
+}
+
+static size_t gl_get_value_count(ArmProbe *probe, uint32_t parameter) {
+    switch (parameter) {
+    case 0x0ba2u: /* GL_VIEWPORT */
+    case 0x0c10u: /* GL_SCISSOR_BOX */
+    case 0x0c22u: /* GL_COLOR_CLEAR_VALUE */
+    case 0x0c23u: /* GL_COLOR_WRITEMASK */
+    case 0x8005u: /* GL_BLEND_COLOR */
+        return 4u;
+    case 0x0b70u: /* GL_DEPTH_RANGE */
+    case 0x0d3au: /* GL_MAX_VIEWPORT_DIMS */
+    case 0x846du: /* GL_ALIASED_POINT_SIZE_RANGE */
+    case 0x846eu: /* GL_ALIASED_LINE_WIDTH_RANGE */
+        return 2u;
+    case 0x86a3u: /* GL_COMPRESSED_TEXTURE_FORMATS */
+    case 0x8df8u: { /* GL_SHADER_BINARY_FORMATS */
+        typedef void (WINAPI *GetIntegerFunction)(uint32_t, int *);
+        GetIntegerFunction getter =
+            (GetIntegerFunction)resolve_gl(probe, "glGetIntegerv");
+        int count = 0;
+        uint32_t count_parameter = parameter == 0x86a3u ? 0x86a2u : 0x8df9u;
+        if (getter) getter(count_parameter, &count);
+        if (count > 0 && count <= 4096) return (size_t)count;
+        return 1u;
+    }
+    default: return 1u;
+    }
 }
 
 typedef uint32_t (WINAPI *GlCall0)(void);
@@ -1856,7 +2909,8 @@ static const GlDescriptor g_gl_descriptors[] = {
     {"glPolygonOffset",2},{"glReadPixels",7},{"glRenderbufferStorage",4},
     {"glSampleCoverage",2},{"glScissor",4},{"glStencilFunc",3},
     {"glStencilFuncSeparate",4},{"glStencilMask",1},{"glStencilMaskSeparate",2},
-    {"glStencilOp",3},{"glStencilOpSeparate",4},{"glTexImage2D",9},
+    {"glStencilOp",3},{"glStencilOpSeparate",4},{"glShaderSource",4},
+    {"glTexImage2D",9},
     {"glTexParameteri",3},{"glTexParameterf",3},{"glTexSubImage2D",9},
     {"glUniform1f",2},{"glUniform1fv",3},{"glUniform1i",2},{"glUniform1iv",3},
     {"glUniform2f",3},{"glUniform2fv",3},{"glUniform2i",3},{"glUniform2iv",3},
@@ -1906,6 +2960,120 @@ static void *guest_buffer_copy(ArmProbe *probe, uint32_t address, size_t size) {
     return buffer;
 }
 
+static size_t gl_vertex_element_bytes(uint32_t components, uint32_t type) {
+    size_t component_size;
+    if (components < 1u || components > 4u) return 0;
+    switch (type) {
+    case 0x1400u: /* GL_BYTE */
+    case 0x1401u: /* GL_UNSIGNED_BYTE */
+        component_size = 1u;
+        break;
+    case 0x1402u: /* GL_SHORT */
+    case 0x1403u: /* GL_UNSIGNED_SHORT */
+    case 0x140bu: /* GL_HALF_FLOAT */
+        component_size = 2u;
+        break;
+    case 0x1404u: /* GL_INT */
+    case 0x1405u: /* GL_UNSIGNED_INT */
+    case 0x1406u: /* GL_FLOAT */
+    case 0x140cu: /* GL_FIXED */
+        component_size = 4u;
+        break;
+    default:
+        return 0;
+    }
+    return (size_t)components * component_size;
+}
+
+static int gl_prepare_client_arrays(ArmProbe *probe, uint32_t vertex_limit,
+                                    void **copies, unsigned *prepared_count) {
+    PROC vertex_pointer = resolve_gl(probe, "glVertexAttribPointer");
+    PROC bind_buffer = resolve_gl(probe, "glBindBuffer");
+    unsigned index;
+    if (prepared_count) *prepared_count = 0;
+    if (!vertex_limit) return 1;
+    if (!vertex_pointer || !bind_buffer) return 0;
+
+    if (probe->gl_array_buffer_binding) {
+        uint32_t bind_arguments[2] = {0x8892u, 0}; /* GL_ARRAY_BUFFER */
+        call_gl_raw(bind_buffer, bind_arguments, 2);
+    }
+    for (index = 0; index < MAX_GL_VERTEX_ATTRIBS; ++index) {
+        GuestGlVertexAttrib *attribute = &probe->gl_vertex_attribs[index];
+        size_t element_size;
+        size_t stride;
+        uint64_t required;
+        uint32_t pointer_arguments[6];
+        if (!attribute->enabled || !attribute->client_memory) continue;
+        element_size = gl_vertex_element_bytes(attribute->size, attribute->type);
+        stride = attribute->stride ? attribute->stride : element_size;
+        if (!element_size || stride < element_size) goto failed;
+        required = (uint64_t)(vertex_limit - 1u) * stride + element_size;
+        if (required > MAX_GL_CLIENT_ARRAY_BYTES) goto failed;
+        copies[index] = guest_buffer_copy(
+            probe, attribute->guest_pointer, (size_t)required);
+        if (!copies[index]) goto failed;
+        pointer_arguments[0] = index;
+        pointer_arguments[1] = attribute->size;
+        pointer_arguments[2] = attribute->type;
+        pointer_arguments[3] = attribute->normalized;
+        pointer_arguments[4] = attribute->stride;
+        pointer_arguments[5] = (uint32_t)(uintptr_t)copies[index];
+        call_gl_raw(vertex_pointer, pointer_arguments, 6);
+        if (prepared_count) ++*prepared_count;
+    }
+    if (probe->gl_array_buffer_binding) {
+        uint32_t bind_arguments[2] = {
+            0x8892u, probe->gl_array_buffer_binding
+        };
+        call_gl_raw(bind_buffer, bind_arguments, 2);
+    }
+    return 1;
+
+failed:
+    if (probe->gl_array_buffer_binding) {
+        uint32_t bind_arguments[2] = {
+            0x8892u, probe->gl_array_buffer_binding
+        };
+        call_gl_raw(bind_buffer, bind_arguments, 2);
+    }
+    probe_log("ERROR: OpenGL client vertex array could not be read "
+              "attrib=%u guest=0x%08x vertices=%u",
+              index, probe->gl_vertex_attribs[index].guest_pointer,
+              vertex_limit);
+    return 0;
+}
+
+static size_t gl_index_element_bytes(uint32_t type) {
+    if (type == 0x1401u) return 1u; /* GL_UNSIGNED_BYTE */
+    if (type == 0x1403u) return 2u; /* GL_UNSIGNED_SHORT */
+    if (type == 0x1405u) return 4u; /* GL_UNSIGNED_INT */
+    return 0;
+}
+
+static uint32_t gl_index_vertex_limit(const void *indices, uint32_t count,
+                                      uint32_t type) {
+    uint32_t maximum = 0;
+    uint32_t index;
+    for (index = 0; index < count; ++index) {
+        uint32_t value;
+        if (type == 0x1401u)
+            value = ((const uint8_t *)indices)[index];
+        else if (type == 0x1403u)
+            value = ((const uint16_t *)indices)[index];
+        else
+            value = ((const uint32_t *)indices)[index];
+        if (value > maximum) maximum = value;
+    }
+    return count && maximum != UINT32_MAX ? maximum + 1u : 0;
+}
+
+static void gl_free_client_arrays(void **copies) {
+    unsigned index;
+    for (index = 0; index < MAX_GL_VERTEX_ATTRIBS; ++index)
+        free(copies[index]);
+}
+
 static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
                             uint32_t r0, uint32_t r1, uint32_t r2,
                             uint32_t r3, uint32_t sp) {
@@ -1930,6 +3098,103 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
     if (!function) {
         probe_log("OpenGL host function unavailable: %s", name);
         return 0;
+    }
+    if (strcmp(name, "glBindBuffer") == 0) {
+        if (arguments[0] == 0x8892u) /* GL_ARRAY_BUFFER */
+            probe->gl_array_buffer_binding = arguments[1];
+        else if (arguments[0] == 0x8893u) /* GL_ELEMENT_ARRAY_BUFFER */
+            probe->gl_element_array_buffer_binding = arguments[1];
+        return call_gl_raw(function, arguments, 2);
+    }
+    if (strcmp(name, "glEnableVertexAttribArray") == 0 ||
+        strcmp(name, "glDisableVertexAttribArray") == 0) {
+        if (arguments[0] < MAX_GL_VERTEX_ATTRIBS)
+            probe->gl_vertex_attribs[arguments[0]].enabled =
+                strcmp(name, "glEnableVertexAttribArray") == 0;
+        return call_gl_raw(function, arguments, 1);
+    }
+    if (strcmp(name, "glVertexAttribPointer") == 0) {
+        if (arguments[0] < MAX_GL_VERTEX_ATTRIBS) {
+            GuestGlVertexAttrib *attribute =
+                &probe->gl_vertex_attribs[arguments[0]];
+            attribute->size = arguments[1];
+            attribute->type = arguments[2];
+            attribute->normalized = arguments[3];
+            attribute->stride = arguments[4];
+            attribute->guest_pointer = arguments[5];
+            attribute->client_memory = probe->gl_array_buffer_binding == 0;
+            if (attribute->client_memory && !attribute->logged) {
+                probe_log("OpenGL client vertex array captured: "
+                          "attrib=%u size=%u type=0x%04x stride=%u "
+                          "guest=0x%08x",
+                          arguments[0], arguments[1], arguments[2],
+                          arguments[4], arguments[5]);
+                attribute->logged = 1;
+            }
+            if (attribute->client_memory) return 0;
+        }
+        return call_gl_raw(function, arguments, 6);
+    }
+    if (strcmp(name, "glDrawArrays") == 0) {
+        void *copies[MAX_GL_VERTEX_ATTRIBS] = {0};
+        int32_t first = (int32_t)arguments[1];
+        int32_t draw_count = (int32_t)arguments[2];
+        uint64_t limit = first >= 0 && draw_count >= 0
+                             ? (uint64_t)(uint32_t)first +
+                                   (uint32_t)draw_count
+                             : UINT64_MAX;
+        unsigned prepared = 0;
+        unsigned log_draw = probe->gl_draw_logs++;
+        uint32_t draw_result = 0;
+        if (limit > UINT32_MAX ||
+            !gl_prepare_client_arrays(probe, (uint32_t)limit,
+                                      copies, &prepared)) {
+            gl_free_client_arrays(copies);
+            return 0;
+        }
+        if (log_draw < 8u)
+            probe_log("OpenGL draw begin: glDrawArrays first=%d count=%d "
+                      "client_attribs=%u", first, draw_count, prepared);
+        draw_result = call_gl_raw(function, arguments, 3);
+        if (log_draw < 8u) probe_log("OpenGL draw returned: glDrawArrays");
+        gl_free_client_arrays(copies);
+        return draw_result;
+    }
+    if (strcmp(name, "glDrawElements") == 0) {
+        void *copies[MAX_GL_VERTEX_ATTRIBS] = {0};
+        void *indices = NULL;
+        int32_t draw_count = (int32_t)arguments[1];
+        size_t index_size = gl_index_element_bytes(arguments[2]);
+        uint32_t vertex_limit = draw_count > 0 ? (uint32_t)draw_count : 0;
+        unsigned prepared = 0;
+        unsigned log_draw = probe->gl_draw_logs++;
+        uint32_t draw_result = 0;
+        if (draw_count < 0 || !index_size) return 0;
+        if (!probe->gl_element_array_buffer_binding && draw_count) {
+            uint64_t bytes = (uint64_t)(uint32_t)draw_count * index_size;
+            if (bytes > MAX_GL_CLIENT_ARRAY_BYTES ||
+                !(indices = guest_buffer_copy(
+                      probe, arguments[3], (size_t)bytes)))
+                return 0;
+            vertex_limit = gl_index_vertex_limit(
+                indices, (uint32_t)draw_count, arguments[2]);
+            arguments[3] = (uint32_t)(uintptr_t)indices;
+        }
+        if (!gl_prepare_client_arrays(probe, vertex_limit,
+                                      copies, &prepared)) {
+            free(indices);
+            gl_free_client_arrays(copies);
+            return 0;
+        }
+        if (log_draw < 8u)
+            probe_log("OpenGL draw begin: glDrawElements count=%d "
+                      "client_attribs=%u client_indices=%u",
+                      draw_count, prepared, indices != NULL);
+        draw_result = call_gl_raw(function, arguments, 4);
+        if (log_draw < 8u) probe_log("OpenGL draw returned: glDrawElements");
+        free(indices);
+        gl_free_client_arrays(copies);
+        return draw_result;
     }
     if (strcmp(name, "glGetString") == 0) {
         typedef const unsigned char *(WINAPI *Function)(uint32_t);
@@ -2025,11 +3290,16 @@ shader_done:
     }
     if (strcmp(name,"glGetBooleanv")==0 || strcmp(name,"glGetFloatv")==0 ||
         strcmp(name,"glGetIntegerv")==0) {
-        unsigned char values[64]={0};
+        size_t elements = gl_get_value_count(probe, arguments[0]);
+        size_t element_size = strcmp(name, "glGetBooleanv") == 0 ? 1u : 4u;
+        size_t bytes = elements * element_size;
+        void *values = calloc(elements, element_size);
         uint32_t destination=arguments[1];
+        if (!values) return 0;
         arguments[1]=(uint32_t)(uintptr_t)values;
         call_gl_raw(function,arguments,2);
-        uc_mem_write(probe->uc,destination,values,sizeof(values)); return 0;
+        if (destination) uc_mem_write(probe->uc,destination,values,bytes);
+        free(values); return 0;
     }
     if (strcmp(name,"glGetProgramiv")==0 || strcmp(name,"glGetShaderiv")==0) {
         int value=0; uint32_t destination=arguments[2];
@@ -2239,6 +3509,12 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
             offset += part;
         }
         result = r0;
+    } else if (strcmp(name, "memchr") == 0 ||
+               strcmp(name, "memrchr") == 0) {
+        result = guest_find_byte(probe, r0, (unsigned char)r1, r2,
+                                 strcmp(name, "memrchr") == 0);
+    } else if (strcmp(name, "wmemchr") == 0) {
+        result = guest_find_wide_character(probe, r0, r1, r2);
     } else if (strcmp(name, "memcmp") == 0) {
         unsigned char *a = (unsigned char *)malloc(r2 ? r2 : 1);
         unsigned char *b = (unsigned char *)malloc(r2 ? r2 : 1);
@@ -2267,6 +3543,43 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
             guest_read_string(probe, r1, second, sizeof(second)))
             result = (uint32_t)(strcmp(name, "strspn") == 0
                                     ? strspn(first, second) : strcspn(first, second));
+    } else if (strcmp(name, "strtok") == 0 ||
+               strcmp(name, "strtok_r") == 0) {
+        int reentrant = strcmp(name, "strtok_r") == 0;
+        uint32_t current = r0;
+        uint32_t next = 0;
+        if (!current) {
+            if (reentrant) {
+                if (!r2 || uc_mem_read(probe->uc, r2, &current,
+                                       sizeof(current)) != UC_ERR_OK)
+                    current = 0;
+            } else {
+                current = probe->strtok_next;
+            }
+        }
+        if (current &&
+            guest_read_string(probe, current, first, sizeof(first)) &&
+            guest_read_string(probe, r1, second, sizeof(second))) {
+            size_t skipped = strspn(first, second);
+            char *token = first + skipped;
+            if (*token) {
+                size_t length = strcspn(token, second);
+                const char zero = 0;
+                result = current + (uint32_t)skipped;
+                next = result + (uint32_t)length;
+                if (token[length]) {
+                    if (uc_mem_write(probe->uc, next, &zero, 1) == UC_ERR_OK)
+                        ++next;
+                    else
+                        result = next = 0;
+                }
+            }
+        }
+        if (reentrant) {
+            if (r2) uc_mem_write(probe->uc, r2, &next, sizeof(next));
+        } else {
+            probe->strtok_next = next;
+        }
     } else if (strcmp(name, "strcmp") == 0 ||
                strcmp(name, "strcasecmp") == 0 ||
                strcmp(name, "strncmp") == 0 ||
@@ -2369,6 +3682,86 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
             }
         }
         result = float_bits(value);
+    } else if (strcmp(name, "crc32") == 0) {
+        unsigned char *payload = NULL;
+        if (!r1) {
+            result = (uint32_t)crc32((uLong)r0, Z_NULL, 0);
+        } else if (!r2) {
+            result = r0;
+        } else if (r2 <= MAX_GUEST_ZLIB_BUFFER &&
+                   (payload = (unsigned char *)malloc(r2)) != NULL &&
+                   uc_mem_read(probe->uc, r1, payload, r2) == UC_ERR_OK) {
+            result = (uint32_t)crc32((uLong)r0, payload, (uInt)r2);
+        }
+        free(payload);
+    } else if (strcmp(name, "uncompress") == 0) {
+        uint32_t capacity = 0;
+        unsigned char *source = NULL;
+        unsigned char *destination = NULL;
+        uLongf destination_size;
+        int zresult = Z_STREAM_ERROR;
+        if (r1 && uc_mem_read(probe->uc, r1, &capacity, sizeof(capacity)) ==
+                      UC_ERR_OK &&
+            capacity <= MAX_GUEST_ZLIB_BUFFER &&
+            r3 <= MAX_GUEST_ZLIB_BUFFER &&
+            (!r3 || (r2 && (source = (unsigned char *)malloc(r3)) != NULL &&
+                            uc_mem_read(probe->uc, r2, source, r3) == UC_ERR_OK)) &&
+            (!capacity || (r0 &&
+                            (destination = (unsigned char *)malloc(capacity)) != NULL))) {
+            destination_size = capacity;
+            zresult = uncompress(destination, &destination_size, source, r3);
+            if (zresult == Z_OK && destination_size &&
+                uc_mem_write(probe->uc, r0, destination,
+                             destination_size) != UC_ERR_OK)
+                zresult = Z_STREAM_ERROR;
+            capacity = (uint32_t)destination_size;
+            uc_mem_write(probe->uc, r1, &capacity, sizeof(capacity));
+        }
+        free(source);
+        free(destination);
+        result = (uint32_t)zresult;
+    } else if (strcmp(name, "inflateInit_") == 0) {
+        result = (uint32_t)guest_inflate_init(probe, r0, 0, MAX_WBITS);
+    } else if (strcmp(name, "inflateInit2_") == 0) {
+        result = (uint32_t)guest_inflate_init(probe, r0, 1, (int32_t)r1);
+    } else if (strcmp(name, "inflate") == 0) {
+        result = (uint32_t)guest_zstream_process(
+            probe, r0, GUEST_ZSTREAM_INFLATE, (int32_t)r1);
+    } else if (strcmp(name, "inflateReset") == 0) {
+        result = (uint32_t)guest_zstream_reset(
+            probe, r0, GUEST_ZSTREAM_INFLATE);
+    } else if (strcmp(name, "inflateEnd") == 0) {
+        result = (uint32_t)guest_zstream_end(
+            probe, r0, GUEST_ZSTREAM_INFLATE);
+    } else if (strcmp(name, "inflateSync") == 0) {
+        result = (uint32_t)guest_inflate_sync(probe, r0);
+    } else if (strcmp(name, "inflateCopy") == 0) {
+        result = (uint32_t)guest_inflate_copy(probe, r0, r1);
+    } else if (strcmp(name, "deflateInit_") == 0) {
+        result = (uint32_t)guest_deflate_init(
+            probe, r0, (int32_t)r1, 0, Z_DEFLATED, MAX_WBITS,
+            8, Z_DEFAULT_STRATEGY);
+    } else if (strcmp(name, "deflateInit2_") == 0) {
+        uint32_t extra[4] = {0, 0, 0, 0};
+        if (uc_mem_read(probe->uc, sp, extra, sizeof(extra)) == UC_ERR_OK) {
+            result = (uint32_t)guest_deflate_init(
+                probe, r0, (int32_t)r1, 1, (int32_t)r2, (int32_t)r3,
+                (int32_t)extra[0], (int32_t)extra[1]);
+        } else {
+            result = (uint32_t)Z_STREAM_ERROR;
+        }
+    } else if (strcmp(name, "deflate") == 0) {
+        result = (uint32_t)guest_zstream_process(
+            probe, r0, GUEST_ZSTREAM_DEFLATE, (int32_t)r1);
+    } else if (strcmp(name, "deflateReset") == 0) {
+        result = (uint32_t)guest_zstream_reset(
+            probe, r0, GUEST_ZSTREAM_DEFLATE);
+    } else if (strcmp(name, "deflateEnd") == 0) {
+        result = (uint32_t)guest_zstream_end(
+            probe, r0, GUEST_ZSTREAM_DEFLATE);
+    } else if (strcmp(name, "deflateParams") == 0) {
+        result = (uint32_t)guest_deflate_params(
+            probe, r0, (int32_t)r1, (int32_t)r2);
     } else if (strcmp(name, "printf") == 0 || strcmp(name, "fprintf") == 0 ||
                strcmp(name, "vfprintf") == 0 || strcmp(name, "__android_log_print") == 0) {
         GuestArgCursor format_arguments;
@@ -2423,6 +3816,20 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         }
         result = guest_format_to_memory(probe, r0, capacity, format_address,
                                         &format_arguments);
+    } else if (strcmp(name, "sscanf") == 0 ||
+               strcmp(name, "vsscanf") == 0) {
+        GuestArgCursor scan_arguments;
+        int scan_result = 0;
+        if (guest_read_string(probe, r0, first, sizeof(first)) &&
+            guest_read_string(probe, r1, second, sizeof(second))) {
+            cursor_setup(&scan_arguments, probe, r0, r1, r2, r3, sp,
+                         2u, strcmp(name, "vsscanf") == 0 ? r2 : 0u);
+            scan_result = guest_vscan(probe, first, second, &scan_arguments);
+            result = (uint32_t)scan_result;
+            if (import->calls <= 4u)
+                probe_log("  ARM %s: assigned=%d format=%s", name,
+                          scan_result, second);
+        }
     } else if (strcmp(name, "fopen") == 0) {
         if (guest_read_string(probe, r0, first, sizeof(first)) &&
             guest_read_string(probe, r1, second, sizeof(second)))
@@ -2572,8 +3979,20 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         result = 0;
     } else if (strcmp(name, "pthread_getspecific") == 0) {
         result = 0;
+    } else if (strcmp(name, "srand48") == 0) {
+        probe->lrand48_state =
+            (((uint64_t)r0 << 16u) | UINT64_C(0x330e)) &
+            UINT64_C(0x0000ffffffffffff);
+        result = 0;
+    } else if (strcmp(name, "lrand48") == 0) {
+        if (!probe->lrand48_state)
+            probe->lrand48_state = UINT64_C(0x1234abcd330e);
+        probe->lrand48_state =
+            (UINT64_C(0x5deece66d) * probe->lrand48_state + UINT64_C(0xb)) &
+            UINT64_C(0x0000ffffffffffff);
+        result = (uint32_t)(probe->lrand48_state >> 17u);
     } else if (strcmp(name, "time") == 0 || strcmp(name, "clock") == 0 ||
-               strcmp(name, "arc4random") == 0 || strcmp(name, "lrand48") == 0) {
+               strcmp(name, "arc4random") == 0) {
         result = (uint32_t)time(NULL);
         if (r0 && strcmp(name, "time") == 0)
             uc_mem_write(probe->uc, r0, &result, sizeof(result));
@@ -2585,6 +4004,28 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         uint32_t values[2] = {(uint32_t)time(NULL), 0};
         if (r1) uc_mem_write(probe->uc, r1, values, sizeof(values));
         result = 0;
+    } else if (strcmp(name, "ftime") == 0) {
+        result = (uint32_t)guest_ftime(probe, r0);
+    } else if (strcmp(name, "localtime") == 0 ||
+               strcmp(name, "gmtime") == 0) {
+        result = guest_time_to_tm(probe, r0, 0,
+                                  strcmp(name, "localtime") == 0);
+    } else if (strcmp(name, "localtime_r") == 0 ||
+               strcmp(name, "gmtime_r") == 0) {
+        result = r1 ? guest_time_to_tm(
+                          probe, r0, r1,
+                          strcmp(name, "localtime_r") == 0) : 0;
+    } else if (strcmp(name, "strftime") == 0) {
+        struct tm host_tm;
+        size_t capacity = r1 < sizeof(second) ? (size_t)r1 : sizeof(second);
+        if (r0 && capacity &&
+            guest_read_string(probe, r2, first, sizeof(first)) &&
+            guest_tm_read(probe, r3, &host_tm)) {
+            second[0] = 0;
+            result = (uint32_t)strftime(second, capacity, first, &host_tm);
+            if (result || !first[0])
+                uc_mem_write(probe->uc, r0, second, (size_t)result + 1u);
+        }
     } else if (strcmp(name, "sinf") == 0 || strcmp(name, "cosf") == 0 ||
                strcmp(name, "tanf") == 0 || strcmp(name, "sqrtf") == 0 ||
                strcmp(name, "floorf") == 0 || strcmp(name, "ceilf") == 0 ||
@@ -2747,13 +4188,22 @@ static bool invalid_memory_hook(uc_engine *uc, uc_mem_type type,
     ArmProbe *probe = (ArmProbe *)user_data;
     uint32_t pc = 0;
     uint32_t lr = 0;
+    uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, sp = 0;
     (void)value;
     uc_reg_read(uc, UC_ARM_REG_PC, &pc);
     uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+    uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+    uc_reg_read(uc, UC_ARM_REG_R3, &r3);
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
     probe->failed = 1;
     snprintf(probe->failure, sizeof(probe->failure),
-             "invalid guest memory type=%d address=0x%08llx size=%d pc=0x%08x lr=0x%08x",
-             (int)type, (unsigned long long)address, size, pc, lr);
+             "invalid guest memory type=%d address=0x%08llx size=%d "
+             "pc=0x%08x lr=0x%08x r0=0x%08x r1=0x%08x "
+             "r2=0x%08x r3=0x%08x sp=0x%08x",
+             (int)type, (unsigned long long)address, size, pc, lr,
+             r0, r1, r2, r3, sp);
     return false;
 }
 
@@ -2816,9 +4266,14 @@ static int initialize_unicorn(ArmProbe *probe) {
         for (index = 0; index < sizeof(helpers) / sizeof(helpers[0]); ++index)
             uc_mem_write(probe->uc, helpers[index], bx_lr, sizeof(bx_lr));
     }
-    for (index = 0; index < probe->object_count; ++index)
-        initialize_object(probe, probe->objects[index].name,
-                          probe->objects[index].address);
+    for (index = 0; index < probe->object_count; ++index) {
+        if (!initialize_object(probe, probe->objects[index].name,
+                               probe->objects[index].address)) {
+            probe_log("ERROR: cannot initialize ARM imported object: %s",
+                      probe->objects[index].name);
+            return 0;
+        }
+    }
     probe->errno_address = GUEST_OBJECT_BASE + GUEST_OBJECT_SIZE - 0x1000u;
     object_value = 0;
     uc_mem_write(probe->uc, probe->errno_address, &object_value,
@@ -2884,7 +4339,7 @@ static uint32_t find_export(const ArmProbe *probe, const char *name) {
 
 static int run_guest(ArmProbe *probe, uint32_t entry,
                      const uint32_t *arguments, unsigned argument_count,
-                     uint32_t *return_value) {
+                     size_t instruction_limit, uint32_t *return_value) {
     uint32_t registers[4] = {0, 0, 0, 0};
     uint32_t stack_words = argument_count > 4u ? argument_count - 4u : 0u;
     uint32_t stack = (GUEST_STACK_TOP - 0x1000u - stack_words * 4u) & ~7u;
@@ -2908,7 +4363,8 @@ static int run_guest(ArmProbe *probe, uint32_t entry,
     probe->failed = 0;
     probe->failure[0] = 0;
     probe->current_entry = entry;
-    error = uc_emu_start(probe->uc, entry, UINT64_MAX, 0, 20000000u);
+    error = uc_emu_start(probe->uc, entry, UINT64_MAX, 0,
+                         instruction_limit);
     if (return_value)
         uc_reg_read(probe->uc, UC_ARM_REG_R0, return_value);
     if (probe->failed) {
@@ -2925,7 +4381,19 @@ static int run_guest(ArmProbe *probe, uint32_t entry,
         return 0;
     }
     if (!probe->returned) {
-        probe_log("ERROR: ARM call hit instruction limit without returning");
+        uint32_t pc = 0, lr = 0, r0 = 0, r1 = 0, r2 = 0, r3 = 0, sp = 0;
+        uc_reg_read(probe->uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(probe->uc, UC_ARM_REG_LR, &lr);
+        uc_reg_read(probe->uc, UC_ARM_REG_R0, &r0);
+        uc_reg_read(probe->uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(probe->uc, UC_ARM_REG_R2, &r2);
+        uc_reg_read(probe->uc, UC_ARM_REG_R3, &r3);
+        uc_reg_read(probe->uc, UC_ARM_REG_SP, &sp);
+        probe_log("ERROR: ARM call hit instruction limit=%llu without "
+                  "returning entry=0x%08x pc=0x%08x lr=0x%08x "
+                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x",
+                  (unsigned long long)instruction_limit, entry, pc, lr,
+                  r0, r1, r2, r3, sp);
         return 0;
     }
     return 1;
@@ -2956,7 +4424,8 @@ static int run_constructors(ArmProbe *probe) {
             probe_log("constructor %u/%u: guest 0x%08x (ELF+0x%08x)",
                       index + 1u, count, entry,
                       entry - GUEST_IMAGE_BASE);
-            if (!run_guest(probe, entry, NULL, 0, NULL)) {
+            if (!run_guest(probe, entry, NULL, 0,
+                           DEFAULT_GUEST_INSTRUCTION_LIMIT, NULL)) {
                 probe_log("RESULT: ARM_CONSTRUCTOR_FAILED index=%u", index + 1u);
                 return 0;
             }
@@ -2971,6 +4440,8 @@ static int run_constructors(ArmProbe *probe) {
 static void destroy_probe(ArmProbe *probe) {
     unsigned index;
     if (!probe) return;
+    for (index = 0; index < probe->zstream_count; ++index)
+        guest_zstream_release(&probe->zstreams[index]);
     for (index = 0; index < probe->file_count; ++index) {
         if (probe->files[index].host) fclose(probe->files[index].host);
         free(probe->files[index].payload);
@@ -3024,8 +4495,20 @@ static uint32_t resolve_native(ArmProbe *probe, const char *export_name,
 static int host_call(ArmProbe *probe, uint32_t address,
                      const uint32_t *arguments, unsigned count,
                      const char *label) {
+    int render_call = label && strcmp(label, "nativeRender") == 0;
+    size_t instruction_limit = label && strcmp(label, "nativeInit") == 0
+                                   ? NATIVE_INIT_INSTRUCTION_LIMIT
+                                   : render_call
+                                         ? NATIVE_RENDER_INSTRUCTION_LIMIT
+                                         : DEFAULT_GUEST_INSTRUCTION_LIMIT;
     if (!address) return 0;
-    if (!run_guest(probe, address, arguments, count, NULL)) {
+    if (instruction_limit != DEFAULT_GUEST_INSTRUCTION_LIMIT &&
+        (!render_call || probe->native_render_calls == 0))
+        probe_log("ARM call instruction budget: %s -> %llu",
+                  label, (unsigned long long)instruction_limit);
+    if (render_call) ++probe->native_render_calls;
+    if (!run_guest(probe, address, arguments, count, instruction_limit,
+                   NULL)) {
         probe_log("ERROR: ARM native call failed: %s", label ? label : "?");
         return 0;
     }
@@ -3267,7 +4750,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM native compatibility wrapper 0.9.4-arm-bootstrap1",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap3",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -3424,7 +4907,9 @@ int main(int argc, char **argv) {
              probe.executable_directory);
     g_log_stream = fopen(log_path, "w");
     g_active_probe = &probe;
-    probe_log("Geometry Dash ARM native compatibility wrapper 0.9.4-arm-bootstrap1");
+    SetUnhandledExceptionFilter(log_unhandled_exception);
+    probe_log("Geometry Dash ARM native compatibility wrapper "
+              "0.9.4-arm-bootstrap3");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -3477,7 +4962,8 @@ int main(int argc, char **argv) {
         goto finished;
     }
     probe_log("Calling authentic ARM JNI_OnLoad at guest 0x%08x", jni_on_load);
-    if (!run_guest(&probe, jni_on_load, jni_arguments, 2, &result)) {
+    if (!run_guest(&probe, jni_on_load, jni_arguments, 2,
+                   DEFAULT_GUEST_INSTRUCTION_LIMIT, &result)) {
         probe_log("RESULT: ARM_JNI_ONLOAD_FAILED");
         exit_code = 5;
         goto finished;

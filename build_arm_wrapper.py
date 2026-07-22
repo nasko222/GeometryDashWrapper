@@ -141,11 +141,19 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap1\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap3\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. Send gd-arm-wrapper.log after every test, "
-        "including successful boots. This is the first graphical ARM bootstrap "
-        "and is expected to expose missing JNI/import/OpenGL bridges.\n",
+        "including successful boots. This build retains the zlib, shader, and "
+        "nativeInit budget fixes; adds the ARM sscanf bridge required by the "
+        "Cocos bitmap-font loader; implements guest memchr/memrchr/wmemchr so "
+        "multi-line font files are parsed completely; implements ARM/Bionic "
+        "localtime, gmtime, reentrant time conversion, strftime, and strtok "
+        "bridges; marshals ARM client-side vertex and index arrays before "
+        "OpenGL draw calls; implements the Bionic ftime ABI; raises the ARM "
+        "nativeRender budget for libpng-heavy startup frames; records unhandled "
+        "host exceptions; and bounds OpenGL state-query writebacks to the exact "
+        "result size.\n",
         encoding="utf-8",
     )
     print(output / "GeometryDashArmWrapper.exe")
