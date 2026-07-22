@@ -141,19 +141,18 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap7\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap8\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. Send gd-arm-wrapper.log after every test, "
-        "including successful boots. Bootstrap7 fixes the Cocos scheduler's "
-        "clock by providing sub-second gettimeofday, clock_gettime, clock, and "
-        "ftime values from Windows' high-resolution performance counter. Live "
-        "render and input calls use the return-trampoline fast path without a "
-        "per-instruction Unicorn hook. The guest heap is 256 MiB and freed "
-        "blocks use size-indexed lookup, while active allocations use direct "
-        "address lookup. The build retains the working JNI, zlib, libpng, "
-        "OpenGL client-array, audio, input, storage, plist-cycle, and detailed "
-        "crash-diagnostic bridges. Measured render FPS is written to the log "
-        "every five seconds.\n",
+        "including successful boots. Bootstrap8 keeps the high-resolution "
+        "scheduler and runtime fast path, expands the allocation-record table "
+        "to 131,072 heap-backed entries, reuses closed file and zlib slots, "
+        "and adds a signature-checked Geometry Dash 1.4 particle-pool guard for "
+        "the shared PlayLayer gameplay crash. The guest heap remains 256 MiB. "
+        "The build retains the working JNI, zlib, libpng, OpenGL client-array, "
+        "audio, input, storage, plist-cycle, timing, and detailed crash-"
+        "diagnostic bridges. Measured render FPS is written to the log every "
+        "five seconds.\n",
         encoding="utf-8",
     )
     print(output / "GeometryDashArmWrapper.exe")

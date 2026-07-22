@@ -62,7 +62,7 @@
 
 #define MAX_IMPORTS 4096
 #define MAX_OBJECTS 256
-#define MAX_ALLOCS 32768
+#define MAX_ALLOCS 131072
 #define MAX_STRING 65536
 #define MAX_GUEST_REFS 4096
 #define MAX_GUEST_FILES 256
@@ -78,6 +78,8 @@
 #define DEFAULT_GUEST_INSTRUCTION_LIMIT 20000000u
 #define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
 #define NATIVE_RUNTIME_INSTRUCTION_LIMIT 0u
+#define CLAIM_PARTICLE_GUARD_OFFSET 0x001404eeu
+#define CLAIM_PARTICLE_NULL_RETURN_OFFSET 0x0014050au
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004u
 #define GUEST_ENV_OBJECT (GUEST_JNI_BASE + 0x1000u)
@@ -268,7 +270,7 @@ typedef struct {
     unsigned import_count;
     ArmImport objects[MAX_OBJECTS];
     unsigned object_count;
-    GuestAllocation allocations[MAX_ALLOCS];
+    GuestAllocation *allocations;
     unsigned allocation_count;
     uint32_t *free_allocation_next;
     uint32_t free_allocation_heads[GUEST_FREE_BIN_COUNT];
@@ -304,6 +306,7 @@ typedef struct {
     uint64_t ds_step_calls;
     uint64_t ds_step_iterations;
     uint64_t ds_step_cycles;
+    unsigned particle_claim_guards;
     uint32_t ds_seen_nodes[MAX_DS_SEEN_NODES];
     unsigned ds_seen_count;
     char ds_step_key[128];
@@ -1284,11 +1287,15 @@ static const char *guest_ref_string(ArmProbe *probe, uint32_t handle,
 }
 
 static GuestFile *guest_file(ArmProbe *probe, uint32_t handle) {
+    uint32_t offset;
     unsigned index;
-    for (index = 0; index < probe->file_count; ++index) {
-        if (probe->files[index].handle == handle) return &probe->files[index];
-    }
-    return NULL;
+    if (handle < GUEST_FILE_BASE) return NULL;
+    offset = handle - GUEST_FILE_BASE;
+    if (offset % 0x100u) return NULL;
+    index = offset / 0x100u;
+    if (index >= probe->file_count || probe->files[index].handle != handle)
+        return NULL;
+    return &probe->files[index];
 }
 
 static void path_slashes(char *path) {
@@ -1330,8 +1337,16 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
     FILE *host = NULL;
     unsigned char *payload = NULL;
     size_t payload_size = 0;
+    unsigned slot;
     int writable = mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
-    if (!path || !mode || probe->file_count >= MAX_GUEST_FILES) return 0;
+    if (!path || !mode) return 0;
+
+    for (slot = 0; slot < probe->file_count; ++slot)
+        if (!probe->files[slot].handle) break;
+    if (slot == probe->file_count && probe->file_count >= MAX_GUEST_FILES) {
+        probe_log("ARM file table exhausted: %u slots", MAX_GUEST_FILES);
+        return 0;
+    }
 
     if (!asset_only) {
         translate_guest_path(probe, path, translated, sizeof(translated));
@@ -1358,15 +1373,15 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
         probe_log("ARM file open failed: %s mode=%s", path, mode);
         return 0;
     }
-    file = &probe->files[probe->file_count];
+    file = &probe->files[slot];
     memset(file, 0, sizeof(*file));
-    file->handle = GUEST_FILE_BASE + probe->file_count * 0x100u;
+    file->handle = GUEST_FILE_BASE + slot * 0x100u;
     file->host = host;
     file->payload = payload;
     file->size = payload_size;
     file->writable = writable;
     if (host && strchr(mode, 'a')) fseek(host, 0, SEEK_END);
-    ++probe->file_count;
+    if (slot == probe->file_count) ++probe->file_count;
     if (host)
         probe_log("ARM file open: %s mode=%s source=host", path, mode);
     else
@@ -1466,10 +1481,16 @@ static GuestZStream *guest_zstream_prepare(ArmProbe *probe,
                                            uint32_t guest_address,
                                            GuestZStreamKind kind) {
     GuestZStream *stream = guest_zstream(probe, guest_address);
+    unsigned index;
     if (!guest_address) return NULL;
     if (!stream) {
-        if (probe->zstream_count >= MAX_GUEST_ZSTREAMS) return NULL;
-        stream = &probe->zstreams[probe->zstream_count++];
+        for (index = 0; index < probe->zstream_count; ++index)
+            if (!probe->zstreams[index].active) break;
+        if (index == probe->zstream_count) {
+            if (probe->zstream_count >= MAX_GUEST_ZSTREAMS) return NULL;
+            ++probe->zstream_count;
+        }
+        stream = &probe->zstreams[index];
         memset(stream, 0, sizeof(*stream));
         stream->guest_address = guest_address;
     } else {
@@ -4597,6 +4618,29 @@ static void ds_step_loop_hook(uc_engine *uc, uint64_t address, uint32_t size,
     }
 }
 
+static void claim_particle_guard_hook(uc_engine *uc, uint64_t address,
+                                      uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t destination_array = 0;
+    uint32_t source_array = 0;
+    uint32_t particle = 0;
+    uint32_t resume = (GUEST_IMAGE_BASE +
+                       CLAIM_PARTICLE_NULL_RETURN_OFFSET) | 1u;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R5, &destination_array);
+    if (destination_array) return;
+    uc_reg_read(uc, UC_ARM_REG_R4, &source_array);
+    uc_reg_read(uc, UC_ARM_REG_R6, &particle);
+    uc_reg_write(uc, UC_ARM_REG_PC, &resume);
+    ++probe->particle_claim_guards;
+    if (probe->particle_claim_guards <= 8u)
+        probe_log("ARM PlayLayer particle claim skipped: missing destination "
+                  "pool source=0x%08x particle=0x%08x records=%u/%u free=%u",
+                  source_array, particle, probe->allocation_count, MAX_ALLOCS,
+                  probe->free_allocation_count);
+}
+
 static void kuser_hook(uc_engine *uc, uint64_t address, uint32_t size,
                        void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -4695,13 +4739,16 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook png_error_trace;
     uc_hook ds_step_entry_trace;
     uc_hook ds_step_loop_trace;
+    uc_hook claim_particle_trace;
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
+    probe->allocations =
+        (GuestAllocation *)calloc(MAX_ALLOCS, sizeof(*probe->allocations));
     probe->free_allocation_next =
         (uint32_t *)calloc(MAX_ALLOCS, sizeof(*probe->free_allocation_next));
-    if (!probe->free_allocation_next) {
-        probe_log("ERROR: cannot allocate ARM guest free-list index");
+    if (!probe->allocations || !probe->free_allocation_next) {
+        probe_log("ERROR: cannot allocate ARM guest allocation metadata");
         return 0;
     }
     error = uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &probe->uc);
@@ -4807,6 +4854,29 @@ static int initialize_unicorn(ArmProbe *probe) {
                     invalid_memory_hook, probe, 1, 0) != UC_ERR_OK) {
         probe_log("ERROR: cannot install ARM guest hooks");
         return 0;
+    }
+    {
+        static const unsigned char claim_particle_signature[] = {
+            0x28, 0x1c, 0x31, 0x1c, 0x6a, 0xf0, 0x0d, 0xf8
+        };
+        unsigned char actual[sizeof(claim_particle_signature)];
+        uint32_t guard_address = GUEST_IMAGE_BASE +
+                                 CLAIM_PARTICLE_GUARD_OFFSET;
+        if (uc_mem_read(probe->uc, guard_address, actual, sizeof(actual)) ==
+                UC_ERR_OK &&
+            memcmp(actual, claim_particle_signature, sizeof(actual)) == 0) {
+            if (uc_hook_add(probe->uc, &claim_particle_trace, UC_HOOK_CODE,
+                            claim_particle_guard_hook, probe, guard_address,
+                            guard_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM PlayLayer particle guard");
+                return 0;
+            }
+            probe_log("ARM PlayLayer particle guard ready: guest 0x%08x",
+                      guard_address | 1u);
+        } else {
+            probe_log("ARM PlayLayer particle guard inactive: "
+                      "guest signature differs");
+        }
     }
     {
         static const unsigned char thumb_return[] = {
@@ -5024,6 +5094,7 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->objects[index].name);
     free(probe->image_data);
     free(probe->file_data);
+    free(probe->allocations);
     free(probe->free_allocation_next);
 }
 
@@ -5334,7 +5405,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap7",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap8",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5419,10 +5490,15 @@ static int run_arm_message_loop(ArmProbe *probe) {
                 DWORD elapsed = now - performance_started;
                 if (elapsed >= 5000u) {
                     probe_log("ARM render performance: %.1f FPS "
-                              "(%u frames / %lu ms)",
+                              "(%u frames / %lu ms) heap=%u MiB "
+                              "records=%u/%u free=%u",
                               (double)performance_frames * 1000.0 /
                                   (double)elapsed,
-                              performance_frames, (unsigned long)elapsed);
+                              performance_frames, (unsigned long)elapsed,
+                              (probe->heap_next - GUEST_HEAP_BASE) /
+                                  (1024u * 1024u),
+                              probe->allocation_count, MAX_ALLOCS,
+                              probe->free_allocation_count);
                     performance_started = now;
                     performance_frames = 0;
                 }
@@ -5515,7 +5591,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap7");
+              "0.9.4-arm-bootstrap8");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
