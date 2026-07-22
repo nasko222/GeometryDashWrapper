@@ -1,4 +1,4 @@
-# Building GD Wrapper 0.9.4-arm-bootstrap8
+# Building GD Wrapper 0.9.4-arm-bootstrap9
 
 The ARM backend is built as a 32-bit Windows executable and links Unicorn
 statically. The runtime folder therefore needs no Unicorn DLL. The reproducible

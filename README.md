@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-bootstrap8
+# GD Wrapper 0.9.4-arm-bootstrap9
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
@@ -8,15 +8,15 @@ keeps the familiar `GeometryDashWrapper` filename. This source release also
 adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
 Dash 1.0 through 1.4 APKs.
 
-Version `0.9.4-arm-bootstrap8` raises the guest allocation-record capacity from
-32,768 to 131,072 and moves the metadata table off the Windows stack. This
-addresses the exact record-table exhaustion that stopped Stereo Madness while
-only 139 MiB of the 256 MiB heap was occupied. Closed APK-file and completed
-zlib-stream slots are reused for longer sessions. A byte-signature-checked
-Geometry Dash 1.4 guard also makes `PlayLayer::claimParticle` take its existing
-null-return path when the destination particle pool is absent, instead of
-calling `CCArray::addObject` through a null pointer at the shared gameplay crash
-address from both bootstrap7 test logs.
+Version `0.9.4-arm-bootstrap9` retains bootstrap8's 131,072-entry heap-backed
+allocation table and reusable APK/zlib slots. Its byte-signature-checked
+Geometry Dash 1.4 particle guard now lends the already located particle when
+the destination pool is missing, instead of suppressing the portal and end-wall
+effect. A second exact-signature guard skips an unsupported BMFont character
+after the old Cocos assertion reports it, preventing the subsequent null
+dereference from aborting a level/editor scene transition. Each skipped Unicode
+code point is recorded in the log so the underlying font/string problem remains
+diagnosable.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -240,7 +240,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap8` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap9` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;

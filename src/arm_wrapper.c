@@ -79,7 +79,10 @@
 #define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
 #define NATIVE_RUNTIME_INSTRUCTION_LIMIT 0u
 #define CLAIM_PARTICLE_GUARD_OFFSET 0x001404eeu
+#define CLAIM_PARTICLE_BORROW_RESUME_OFFSET 0x001404feu
 #define CLAIM_PARTICLE_NULL_RETURN_OFFSET 0x0014050au
+#define LABEL_BMFONT_GUARD_OFFSET 0x001cbcc4u
+#define LABEL_BMFONT_SKIP_CHARACTER_OFFSET 0x001cbfdcu
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004u
 #define GUEST_ENV_OBJECT (GUEST_JNI_BASE + 0x1000u)
@@ -307,6 +310,7 @@ typedef struct {
     uint64_t ds_step_iterations;
     uint64_t ds_step_cycles;
     unsigned particle_claim_guards;
+    unsigned unsupported_font_characters;
     uint32_t ds_seen_nodes[MAX_DS_SEEN_NODES];
     unsigned ds_seen_count;
     char ds_step_key[128];
@@ -4624,21 +4628,46 @@ static void claim_particle_guard_hook(uc_engine *uc, uint64_t address,
     uint32_t destination_array = 0;
     uint32_t source_array = 0;
     uint32_t particle = 0;
-    uint32_t resume = (GUEST_IMAGE_BASE +
-                       CLAIM_PARTICLE_NULL_RETURN_OFFSET) | 1u;
+    uint32_t resume;
     (void)address;
     (void)size;
     uc_reg_read(uc, UC_ARM_REG_R5, &destination_array);
     if (destination_array) return;
     uc_reg_read(uc, UC_ARM_REG_R4, &source_array);
     uc_reg_read(uc, UC_ARM_REG_R6, &particle);
+    resume = (GUEST_IMAGE_BASE +
+              (particle ? CLAIM_PARTICLE_BORROW_RESUME_OFFSET
+                        : CLAIM_PARTICLE_NULL_RETURN_OFFSET)) | 1u;
     uc_reg_write(uc, UC_ARM_REG_PC, &resume);
     ++probe->particle_claim_guards;
     if (probe->particle_claim_guards <= 8u)
-        probe_log("ARM PlayLayer particle claim skipped: missing destination "
+        probe_log("ARM PlayLayer particle claim borrowed: missing destination "
                   "pool source=0x%08x particle=0x%08x records=%u/%u free=%u",
                   source_array, particle, probe->allocation_count, MAX_ALLOCS,
                   probe->free_allocation_count);
+}
+
+static void label_bmfont_guard_hook(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t font_definition = 0;
+    uint32_t character = 0;
+    uint32_t sp = 0;
+    uint32_t resume = (GUEST_IMAGE_BASE +
+                       LABEL_BMFONT_SKIP_CHARACTER_OFFSET) | 1u;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R4, &font_definition);
+    if (font_definition) return;
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+    if (sp)
+        uc_mem_read(uc, sp + 0x1ecu, &character, sizeof(character));
+    uc_reg_write(uc, UC_ARM_REG_PC, &resume);
+    ++probe->unsupported_font_characters;
+    if (probe->unsupported_font_characters <= 32u)
+        probe_log("ARM CCLabelBMFont skipped unsupported character: "
+                  "U+%04X (%u), count=%u",
+                  character, character, probe->unsupported_font_characters);
 }
 
 static void kuser_hook(uc_engine *uc, uint64_t address, uint32_t size,
@@ -4740,6 +4769,7 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook ds_step_entry_trace;
     uc_hook ds_step_loop_trace;
     uc_hook claim_particle_trace;
+    uc_hook label_bmfont_trace;
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
@@ -4875,6 +4905,40 @@ static int initialize_unicorn(ArmProbe *probe) {
                       guard_address | 1u);
         } else {
             probe_log("ARM PlayLayer particle guard inactive: "
+                      "guest signature differs");
+        }
+    }
+    {
+        static const unsigned char label_guard_signature[] = {
+            0x63, 0x68, 0x21, 0x1c, 0x08, 0x31, 0x16, 0x93
+        };
+        static const unsigned char label_skip_signature[] = {
+            0x0c, 0x9a, 0x01, 0x21, 0x8b, 0x44, 0x5a, 0x45
+        };
+        unsigned char actual_guard[sizeof(label_guard_signature)];
+        unsigned char actual_skip[sizeof(label_skip_signature)];
+        uint32_t guard_address = GUEST_IMAGE_BASE +
+                                 LABEL_BMFONT_GUARD_OFFSET;
+        uint32_t skip_address = GUEST_IMAGE_BASE +
+                                LABEL_BMFONT_SKIP_CHARACTER_OFFSET;
+        if (uc_mem_read(probe->uc, guard_address, actual_guard,
+                        sizeof(actual_guard)) == UC_ERR_OK &&
+            uc_mem_read(probe->uc, skip_address, actual_skip,
+                        sizeof(actual_skip)) == UC_ERR_OK &&
+            memcmp(actual_guard, label_guard_signature,
+                   sizeof(actual_guard)) == 0 &&
+            memcmp(actual_skip, label_skip_signature,
+                   sizeof(actual_skip)) == 0) {
+            if (uc_hook_add(probe->uc, &label_bmfont_trace, UC_HOOK_CODE,
+                            label_bmfont_guard_hook, probe, guard_address,
+                            guard_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM CCLabelBMFont guard");
+                return 0;
+            }
+            probe_log("ARM CCLabelBMFont compatibility guard ready: "
+                      "guest 0x%08x", guard_address | 1u);
+        } else {
+            probe_log("ARM CCLabelBMFont compatibility guard inactive: "
                       "guest signature differs");
         }
     }
@@ -5405,7 +5469,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap8",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap9",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5591,7 +5655,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap8");
+              "0.9.4-arm-bootstrap9");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
