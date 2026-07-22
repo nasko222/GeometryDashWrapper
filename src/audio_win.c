@@ -20,6 +20,7 @@
 #include "../third_party/stb/stb_vorbis.c"
 
 #define MAX_EFFECT_SLOTS 24
+#define MAX_EFFECT_ASSET_CACHE 128
 
 typedef struct {
     unsigned identifier;
@@ -28,6 +29,11 @@ typedef struct {
     float volume;
     char alias[32];
 } EffectSlot;
+
+typedef struct {
+    char name[MAX_PATH];
+    char path[MAX_PATH * 2];
+} EffectAssetCache;
 
 /* MinGW's endpointvolume.h only forward-declares this interface in C. */
 typedef struct OutputMeter OutputMeter;
@@ -51,6 +57,8 @@ static char g_save_directory[MAX_PATH * 2];
 static char g_apk_path[MAX_PATH * 2];
 static char g_music_path[MAX_PATH * 2];
 static EffectSlot g_effects[MAX_EFFECT_SLOTS];
+static EffectAssetCache g_effect_asset_cache[MAX_EFFECT_ASSET_CACHE];
+static unsigned g_effect_asset_cache_count;
 static unsigned g_next_effect_identifier = 1;
 static unsigned g_next_effect_slot;
 static float g_music_volume = 1.0f;
@@ -64,6 +72,7 @@ static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
 static volatile LONG g_output_peak_logged;
 static volatile LONG g_short_path_logged;
+static volatile LONG g_effect_cache_hit_logged;
 static SRWLOCK g_mci_lock = SRWLOCK_INIT;
 
 /* Keep the Core Audio GUIDs local so the wrapper does not need uuid.lib. */
@@ -265,6 +274,90 @@ static int file_is_regular(const char *path) {
     DWORD attributes = GetFileAttributesA(path);
     return attributes != INVALID_FILE_ATTRIBUTES &&
            !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int effect_cache_lookup(const char *name, char *destination,
+                               size_t capacity) {
+    unsigned index;
+    for (index = 0; index < g_effect_asset_cache_count; ++index) {
+        EffectAssetCache *entry = &g_effect_asset_cache[index];
+        if (_stricmp(entry->name, name) != 0) continue;
+        if (!file_is_regular(entry->path)) {
+            entry->name[0] = 0;
+            entry->path[0] = 0;
+            return 0;
+        }
+        snprintf(destination, capacity, "%s", entry->path);
+        if (InterlockedCompareExchange(&g_effect_cache_hit_logged, 1, 0) == 0)
+            runtime_log("Audio effect cache: reusing decoded files without "
+                        "reopening game.apk");
+        return 1;
+    }
+    return 0;
+}
+
+static void effect_cache_remember(const char *name, const char *path) {
+    unsigned index;
+    EffectAssetCache *entry = NULL;
+    if (!name || !name[0] || !path || !path[0]) return;
+    for (index = 0; index < g_effect_asset_cache_count; ++index) {
+        if (_stricmp(g_effect_asset_cache[index].name, name) == 0) {
+            entry = &g_effect_asset_cache[index];
+            break;
+        }
+    }
+    if (!entry && g_effect_asset_cache_count < MAX_EFFECT_ASSET_CACHE)
+        entry = &g_effect_asset_cache[g_effect_asset_cache_count++];
+    if (!entry) return;
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+}
+
+static int find_persistent_effect_cache(const char *name, char *destination,
+                                        size_t capacity) {
+    WIN32_FILE_ATTRIBUTE_DATA apk_attributes;
+    WIN32_FIND_DATAA candidate;
+    HANDLE search;
+    char stem[MAX_PATH];
+    char pattern[MAX_PATH * 2];
+    char *extension;
+    size_t stem_length;
+    if (!name || strchr(name, '*') || strchr(name, '?') ||
+        !GetFileAttributesExA(g_apk_path, GetFileExInfoStandard,
+                              &apk_attributes))
+        return 0;
+    snprintf(stem, sizeof(stem), "%s", name);
+    extension = strrchr(stem, '.');
+    if (!extension || (_stricmp(extension, ".ogg") != 0 &&
+                       _stricmp(extension, ".wav") != 0))
+        return 0;
+    *extension = 0;
+    stem_length = strlen(stem);
+    snprintf(pattern, sizeof(pattern), "%s\\%s-????????.wav",
+             g_audio_cache_directory, stem);
+    search = FindFirstFileA(pattern, &candidate);
+    if (search == INVALID_HANDLE_VALUE) return 0;
+    do {
+        const char *suffix = candidate.cFileName + stem_length;
+        if ((candidate.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            _strnicmp(candidate.cFileName, stem, stem_length) != 0 ||
+            strlen(suffix) != 13u || suffix[0] != '-' ||
+            _stricmp(suffix + 9, ".wav") != 0 ||
+            CompareFileTime(&candidate.ftLastWriteTime,
+                            &apk_attributes.ftLastWriteTime) < 0)
+            continue;
+        snprintf(destination, capacity, "%s\\%s",
+                 g_audio_cache_directory, candidate.cFileName);
+        FindClose(search);
+        if (file_is_regular(destination)) {
+            runtime_log("Audio cache: reused %s from an existing decoded "
+                        "APK effect", name);
+            return 1;
+        }
+        return 0;
+    } while (FindNextFileA(search, &candidate));
+    FindClose(search);
+    return 0;
 }
 
 static int write_cached_audio(const char *destination, const void *data,
@@ -571,14 +664,23 @@ static int audio_asset_path(const char *requested, int effect,
             return 1;
         }
     }
-    if (effect && materialize_apk_effect(name, destination, capacity)) {
-        return 1;
+    if (effect) {
+        if (effect_cache_lookup(name, destination, capacity)) return 1;
+        if (find_persistent_effect_cache(name, destination, capacity)) {
+            effect_cache_remember(name, destination);
+            return 1;
+        }
+        if (materialize_apk_effect(name, destination, capacity)) {
+            effect_cache_remember(name, destination);
+            return 1;
+        }
     }
     snprintf(destination, capacity, "%s\\%s", g_audio_cache_directory,
              converted);
     if (file_is_regular(destination)) return 1;
     if ((effect && materialize_embedded_effect(converted, destination)) ||
         (!effect && materialize_apk_audio(name, destination))) {
+        if (effect) effect_cache_remember(name, destination);
         return 1;
     }
     runtime_log("Audio asset is missing: %s", destination);
@@ -683,6 +785,9 @@ void audio_initialize(const char *executable_directory) {
     CreateDirectoryA(g_audio_cache_directory, NULL);
     InterlockedExchange(&g_effect_log_count, 0);
     InterlockedExchange(&g_short_path_logged, 0);
+    InterlockedExchange(&g_effect_cache_hit_logged, 0);
+    memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
+    g_effect_asset_cache_count = 0;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
@@ -694,6 +799,11 @@ void audio_initialize(const char *executable_directory) {
 
 void audio_set_apk_path(const char *apk_path) {
     if (apk_path && apk_path[0]) {
+        if (_stricmp(g_apk_path, apk_path) != 0) {
+            memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
+            g_effect_asset_cache_count = 0;
+            InterlockedExchange(&g_effect_cache_hit_logged, 0);
+        }
         snprintf(g_apk_path, sizeof(g_apk_path), "%s", apk_path);
     }
 }

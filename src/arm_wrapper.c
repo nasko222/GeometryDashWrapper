@@ -65,6 +65,8 @@
 #define MAX_OBJECTS 256
 #define MAX_ALLOCS 131072
 #define MAX_STRING 65536
+#define MAX_GUEST_CSTRING (64u * 1024u * 1024u)
+#define MAX_GUEST_FORMAT (16u * 1024u * 1024u)
 #define MAX_GUEST_REFS 4096
 #define MAX_GUEST_FILES 256
 #define MAX_GUEST_ZSTREAMS 64
@@ -73,6 +75,8 @@
 #define MAX_DS_SEEN_NODES 4096
 #define MAX_COMPAT_PARTICLE_HOLDS 512
 #define MAX_QSORT_BYTES (64u * 1024u * 1024u)
+#define MAX_CALLBACK_DEPTH 32
+#define MAX_PTHREAD_KEYS 64
 #define GUEST_FREE_BIN_COUNT 32
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
 #define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
@@ -239,6 +243,18 @@ typedef struct {
     uint32_t function;
 } RegisteredNative;
 
+typedef enum {
+    GUEST_CALLBACK_NONE = 0,
+    GUEST_CALLBACK_QSORT,
+    GUEST_CALLBACK_PTHREAD_ONCE
+} GuestCallbackKind;
+
+typedef struct {
+    GuestCallbackKind kind;
+    uint32_t return_address;
+    uint32_t once_control;
+} GuestCallbackFrame;
+
 typedef struct {
     HWND window;
     HDC device;
@@ -327,6 +343,10 @@ typedef struct {
     unsigned suspicious_label_inputs;
     unsigned unsupported_font_characters;
     unsigned readonly_writes;
+    unsigned host_readonly_writes;
+    uint32_t immutable_start;
+    uint32_t immutable_end;
+    int host_write_guard_enabled;
     unsigned qsort_calls;
     uint64_t qsort_comparisons;
     uint64_t qsort_swaps;
@@ -343,6 +363,20 @@ typedef struct {
     int qsort_building;
     int qsort_phase;
     int qsort_active;
+    GuestCallbackFrame callback_frames[MAX_CALLBACK_DEPTH];
+    unsigned callback_depth;
+    uint32_t pthread_values[MAX_PTHREAD_KEYS];
+    uint32_t pthread_destructors[MAX_PTHREAD_KEYS];
+    uint32_t pthread_next_key;
+    unsigned pthread_once_calls;
+    uint32_t level_trace_play_init;
+    uint32_t level_trace_play_create;
+    uint32_t level_trace_editor_init;
+    uint32_t level_trace_editor_create;
+    uint32_t level_trace_set_string;
+    uint32_t level_trace_encode;
+    uint32_t level_trace_save;
+    unsigned level_trace_calls;
     uint32_t compatibility_particle_holds[MAX_COMPAT_PARTICLE_HOLDS];
     unsigned compatibility_particle_hold_count;
     uint32_t ds_seen_nodes[MAX_DS_SEEN_NODES];
@@ -379,6 +413,38 @@ static void probe_log(const char *format, ...) {
     log_v(format, arguments);
     va_end(arguments);
 }
+
+static uc_err guarded_uc_mem_write(uc_engine *uc, uint64_t address,
+                                   const void *bytes, size_t size,
+                                   const char *function, int line) {
+    ArmProbe *probe = g_active_probe;
+    uint64_t end = size && address <= UINT64_MAX - (size - 1u)
+                       ? address + size - 1u : UINT64_MAX;
+    if (probe && probe->uc == uc && probe->host_write_guard_enabled && size &&
+        address <= probe->immutable_end && end >= probe->immutable_start) {
+        uint64_t value = 0;
+        uint32_t pc = 0, lr = 0;
+        size_t captured = size < sizeof(value) ? size : sizeof(value);
+        if (bytes && captured) memcpy(&value, bytes, captured);
+        uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        ++probe->host_readonly_writes;
+        if (probe->host_readonly_writes <= 64u)
+            probe_log("ARM blocked host write into immutable game image: "
+                      "count=%u bridge=%s:%d address=0x%08llx size=%llu "
+                      "value=0x%016llx pc=0x%08x lr=0x%08x",
+                      probe->host_readonly_writes,
+                      function ? function : "?", line,
+                      (unsigned long long)address,
+                      (unsigned long long)size,
+                      (unsigned long long)value, pc, lr);
+        return UC_ERR_WRITE_PROT;
+    }
+    return uc_mem_write(uc, address, bytes, size);
+}
+
+#define uc_mem_write(uc, address, bytes, size) \
+    guarded_uc_mem_write((uc), (address), (bytes), (size), __func__, __LINE__)
 
 static LONG WINAPI log_unhandled_exception(EXCEPTION_POINTERS *exception) {
     if (exception && exception->ExceptionRecord) {
@@ -1027,6 +1093,173 @@ static int guest_read_string(ArmProbe *probe, uint32_t address,
     return 1;
 }
 
+static int guest_cstring_nlength(ArmProbe *probe, uint32_t address,
+                                 uint32_t limit, uint32_t *length,
+                                 int *terminated) {
+    unsigned char block[4096];
+    uint32_t offset = 0;
+    if (length) *length = 0;
+    if (terminated) *terminated = 0;
+    if (!probe || !address) return 0;
+    while (offset < limit) {
+        uint32_t part = limit - offset;
+        unsigned char *zero;
+        if (part > sizeof(block)) part = sizeof(block);
+        if (offset > UINT32_MAX - address ||
+            uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
+            return 0;
+        zero = (unsigned char *)memchr(block, 0, part);
+        if (zero) {
+            if (length) *length = offset + (uint32_t)(zero - block);
+            if (terminated) *terminated = 1;
+            return 1;
+        }
+        offset += part;
+    }
+    if (length) *length = limit;
+    return 1;
+}
+
+static int guest_cstring_length(ArmProbe *probe, uint32_t address,
+                                uint32_t *length) {
+    int terminated = 0;
+    return guest_cstring_nlength(probe, address, MAX_GUEST_CSTRING,
+                                 length, &terminated) && terminated;
+}
+
+static char *guest_duplicate_cstring(ArmProbe *probe, uint32_t address,
+                                     uint32_t maximum,
+                                     uint32_t *length_out) {
+    uint32_t length = 0;
+    int terminated = 0;
+    char *copy;
+    if (!guest_cstring_nlength(probe, address, maximum, &length,
+                              &terminated) || !terminated ||
+        (size_t)length + 1u < length)
+        return NULL;
+    copy = (char *)malloc((size_t)length + 1u);
+    if (!copy || uc_mem_read(probe->uc, address, copy,
+                             (size_t)length + 1u) != UC_ERR_OK) {
+        free(copy);
+        return NULL;
+    }
+    if (length_out) *length_out = length;
+    return copy;
+}
+
+static int guest_character_set(ArmProbe *probe, uint32_t address,
+                               unsigned char table[256]) {
+    unsigned char block[256];
+    uint32_t offset = 0;
+    memset(table, 0, 256);
+    if (!address) return 0;
+    while (offset < 4096u) {
+        uint32_t index;
+        if (offset > UINT32_MAX - address ||
+            uc_mem_read(probe->uc, address + offset, block,
+                        sizeof(block)) != UC_ERR_OK)
+            return 0;
+        for (index = 0; index < sizeof(block); ++index) {
+            if (!block[index]) return 1;
+            table[block[index]] = 1;
+        }
+        offset += sizeof(block);
+    }
+    return 0;
+}
+
+static int guest_span_set(ArmProbe *probe, uint32_t address,
+                          const unsigned char table[256], int members,
+                          uint32_t maximum, uint32_t *span,
+                          unsigned char *stop_character) {
+    unsigned char block[4096];
+    uint32_t offset = 0;
+    if (span) *span = 0;
+    if (stop_character) *stop_character = 0;
+    if (!address) return 0;
+    while (offset < maximum) {
+        uint32_t part = maximum - offset;
+        uint32_t index;
+        if (part > sizeof(block)) part = sizeof(block);
+        if (offset > UINT32_MAX - address ||
+            uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
+            return 0;
+        for (index = 0; index < part; ++index) {
+            unsigned char value = block[index];
+            if (!value || ((table[value] != 0) != (members != 0))) {
+                if (span) *span = offset + index;
+                if (stop_character) *stop_character = value;
+                return 1;
+            }
+        }
+        offset += part;
+    }
+    if (span) *span = maximum;
+    return 1;
+}
+
+static int guest_compare_cstrings(ArmProbe *probe, uint32_t first_address,
+                                  uint32_t second_address, uint32_t limit,
+                                  int ignore_case, int *comparison) {
+    unsigned char first[4096];
+    unsigned char second[4096];
+    uint32_t offset = 0;
+    if (comparison) *comparison = 0;
+    if (!first_address || !second_address) return 0;
+    while (offset < limit) {
+        uint32_t part = limit - offset;
+        uint32_t index;
+        if (part > sizeof(first)) part = sizeof(first);
+        if (offset > UINT32_MAX - first_address ||
+            offset > UINT32_MAX - second_address ||
+            uc_mem_read(probe->uc, first_address + offset, first, part) !=
+                UC_ERR_OK ||
+            uc_mem_read(probe->uc, second_address + offset, second, part) !=
+                UC_ERR_OK)
+            return 0;
+        for (index = 0; index < part; ++index) {
+            unsigned first_value = first[index];
+            unsigned second_value = second[index];
+            if (ignore_case) {
+                first_value = (unsigned)tolower((int)first_value);
+                second_value = (unsigned)tolower((int)second_value);
+            }
+            if (first_value != second_value) {
+                if (comparison)
+                    *comparison = first_value < second_value ? -1 : 1;
+                return 1;
+            }
+            if (!first[index]) return 1;
+        }
+        offset += part;
+    }
+    return 1;
+}
+
+static uint32_t guest_find_character(ArmProbe *probe, uint32_t address,
+                                     unsigned char character, int reverse) {
+    unsigned char block[4096];
+    uint32_t offset = 0;
+    uint32_t found = 0;
+    while (offset < MAX_GUEST_CSTRING) {
+        uint32_t part = MAX_GUEST_CSTRING - offset;
+        uint32_t index;
+        if (part > sizeof(block)) part = sizeof(block);
+        if (offset > UINT32_MAX - address ||
+            uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
+            return 0;
+        for (index = 0; index < part; ++index) {
+            if (block[index] == character) {
+                found = address + offset + index;
+                if (!reverse) return found;
+            }
+            if (!block[index]) return found;
+        }
+        offset += part;
+    }
+    return found;
+}
+
 static int guest_write_string(ArmProbe *probe, uint32_t address,
                               const char *value, uint32_t capacity) {
     size_t length = strlen(value);
@@ -1460,6 +1693,23 @@ static size_t guest_file_read(ArmProbe *probe, GuestFile *file,
     file->bytes_read += actual;
     free(temporary);
     return actual;
+}
+
+static int guest_file_get_character(GuestFile *file) {
+    int value;
+    if (!file) return EOF;
+    if (file->host) {
+        value = fgetc(file->host);
+        file->eof = value == EOF && feof(file->host) != 0;
+    } else if (file->position < file->size) {
+        value = file->payload[file->position++];
+        file->eof = file->position >= file->size;
+    } else {
+        value = EOF;
+        file->eof = 1;
+    }
+    if (value != EOF) ++file->bytes_read;
+    return value;
 }
 
 static size_t guest_file_write(ArmProbe *probe, GuestFile *file,
@@ -1921,6 +2171,68 @@ static void format_append_repeat(GuestFormatOutput *output, char value,
     }
 }
 
+static void format_append_padded_text(GuestFormatOutput *output,
+                                      const char *text, size_t length,
+                                      int width, int left_aligned) {
+    size_t padding = width > 0 && (size_t)width > length
+                         ? (size_t)width - length : 0;
+    if (!left_aligned) format_append_repeat(output, ' ', padding);
+    format_append(output, text, length);
+    if (left_aligned) format_append_repeat(output, ' ', padding);
+}
+
+static int format_append_guest_string(ArmProbe *probe,
+                                      GuestFormatOutput *output,
+                                      uint32_t address, int width,
+                                      int precision, int left_aligned) {
+    static const char null_text[] = "(null)";
+    static const char invalid_text[] = "<invalid>";
+    unsigned char block[4096];
+    uint32_t limit = precision >= 0 && (uint32_t)precision < MAX_GUEST_CSTRING
+                         ? (uint32_t)precision : MAX_GUEST_CSTRING;
+    uint32_t length = 0;
+    uint32_t offset = 0;
+    int terminated = 0;
+    size_t padding;
+    if (!address) {
+        size_t length_value = sizeof(null_text) - 1u;
+        if (precision >= 0 && (size_t)precision < length_value)
+            length_value = (size_t)precision;
+        format_append_padded_text(output, null_text, length_value, width,
+                                  left_aligned);
+        return 1;
+    }
+    if (!guest_cstring_nlength(probe, address, limit, &length, &terminated) ||
+        (precision < 0 && !terminated)) {
+        format_append_padded_text(output, invalid_text,
+                                  sizeof(invalid_text) - 1u, width,
+                                  left_aligned);
+        return 0;
+    }
+    padding = width > 0 && (size_t)width > length
+                  ? (size_t)width - length : 0;
+    if (!left_aligned) format_append_repeat(output, ' ', padding);
+    if (!output->capacity) {
+        output->total += length;
+    } else {
+        while (offset < length) {
+            uint32_t part = length - offset;
+            if (part > sizeof(block)) part = sizeof(block);
+            if (offset > UINT32_MAX - address ||
+                uc_mem_read(probe->uc, address + offset, block, part) !=
+                    UC_ERR_OK) {
+                format_append(output, invalid_text,
+                              sizeof(invalid_text) - 1u);
+                return 0;
+            }
+            format_append(output, (const char *)block, part);
+            offset += part;
+        }
+    }
+    if (left_aligned) format_append_repeat(output, ' ', padding);
+    return 1;
+}
+
 static void cursor_setup(GuestArgCursor *cursor, ArmProbe *probe,
                          uint32_t r0, uint32_t r1, uint32_t r2,
                          uint32_t r3, uint32_t sp, unsigned word_position,
@@ -2032,11 +2344,9 @@ static int guest_vformat(ArmProbe *probe, char *destination, size_t capacity,
         switch (specifier) {
         case 's': {
             uint32_t address = cursor_word(arguments);
-            char string_value[MAX_STRING];
-            if (!address || !guest_read_string(probe, address, string_value,
-                                                sizeof(string_value)))
-                strcpy(string_value, address ? "<invalid>" : "(null)");
-            FORMAT_VALUE(string_value);
+            format_append_guest_string(probe, &output, address, width,
+                                       precision, strchr(flags, '-') != NULL);
+            token_length = 0;
             break;
         }
         case 'c': FORMAT_VALUE((int)cursor_word(arguments)); break;
@@ -2449,18 +2759,31 @@ static int guest_vscan(ArmProbe *probe, const char *input, const char *format,
 static uint32_t guest_format_to_memory(ArmProbe *probe, uint32_t destination,
                                        uint32_t capacity, uint32_t format_address,
                                        GuestArgCursor *arguments) {
-    char format[MAX_STRING];
+    char *format;
     char *buffer;
     int result;
-    size_t host_capacity = capacity ? (size_t)capacity : 1u;
-    if (!guest_read_string(probe, format_address, format, sizeof(format))) return 0;
-    if (host_capacity > MAX_STRING) host_capacity = MAX_STRING;
+    GuestArgCursor measure_arguments;
+    size_t host_capacity;
+    format = guest_duplicate_cstring(probe, format_address, MAX_STRING, NULL);
+    if (!format) return 0;
+    measure_arguments = *arguments;
+    result = guest_vformat(probe, NULL, 0, format, &measure_arguments);
+    host_capacity = capacity ? (size_t)capacity : 1u;
+    if (host_capacity > MAX_GUEST_FORMAT) host_capacity = MAX_GUEST_FORMAT;
+    if (host_capacity > (size_t)result + 1u)
+        host_capacity = (size_t)result + 1u;
+    if (!host_capacity) host_capacity = 1u;
     buffer = (char *)calloc(1, host_capacity);
-    if (!buffer) return 0;
+    if (!buffer) {
+        free(format);
+        return 0;
+    }
     result = guest_vformat(probe, buffer, host_capacity, format, arguments);
     if (destination && capacity)
         uc_mem_write(probe->uc, destination, buffer,
-                     strlen(buffer) + 1u <= capacity ? strlen(buffer) + 1u : capacity);
+                     strlen(buffer) + 1u <= host_capacity
+                         ? strlen(buffer) + 1u : host_capacity);
+    free(format);
     free(buffer);
     return (uint32_t)result;
 }
@@ -2999,20 +3322,6 @@ static int initialize_guest_jni(ArmProbe *probe) {
     table = GUEST_VM_TABLE;
     uc_mem_write(probe->uc, GUEST_VM_OBJECT, &table, 4);
     return 1;
-}
-
-static int ascii_casecmp(const char *first, const char *second,
-                         size_t maximum, int bounded) {
-    size_t index = 0;
-    for (;;) {
-        unsigned char a;
-        unsigned char b;
-        if (bounded && index >= maximum) return 0;
-        a = (unsigned char)tolower((unsigned char)first[index]);
-        b = (unsigned char)tolower((unsigned char)second[index]);
-        if (a != b || !a || !b) return (int)a - (int)b;
-        ++index;
-    }
 }
 
 static int guest_copy_memory(ArmProbe *probe, uint32_t destination,
@@ -3639,6 +3948,26 @@ shader_done:
     return call_gl_raw(function,arguments,count);
 }
 
+static int guest_callback_push(ArmProbe *probe, GuestCallbackKind kind,
+                               uint32_t return_address,
+                               uint32_t once_control) {
+    GuestCallbackFrame *frame;
+    if (probe->callback_depth >= MAX_CALLBACK_DEPTH) return 0;
+    frame = &probe->callback_frames[probe->callback_depth++];
+    frame->kind = kind;
+    frame->return_address = return_address;
+    frame->once_control = once_control;
+    return 1;
+}
+
+static int guest_callback_pop(ArmProbe *probe, GuestCallbackFrame *frame) {
+    if (!probe->callback_depth || !frame) return 0;
+    *frame = probe->callback_frames[--probe->callback_depth];
+    memset(&probe->callback_frames[probe->callback_depth], 0,
+           sizeof(probe->callback_frames[probe->callback_depth]));
+    return 1;
+}
+
 static void guest_qsort_fail(ArmProbe *probe, const char *reason) {
     probe->qsort_active = 0;
     probe->failed = 1;
@@ -3692,6 +4021,7 @@ static int guest_qsort_compare(ArmProbe *probe, uint32_t first_index,
     arguments[1] = guest_qsort_element(probe, second_index);
     if (!arguments[0] || !arguments[1] || !probe->qsort_comparator)
         return 0;
+    if (!guest_callback_push(probe, GUEST_CALLBACK_QSORT, 0, 0)) return 0;
     probe->qsort_phase = phase;
     uc_reg_write(probe->uc, UC_ARM_REG_R0, &arguments[0]);
     uc_reg_write(probe->uc, UC_ARM_REG_R1, &arguments[1]);
@@ -3806,12 +4136,39 @@ static int guest_qsort_start(ArmProbe *probe, uint32_t base,
 static void guest_callback_return_hook(uc_engine *uc, uint64_t address,
                                        uint32_t size, void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
+    GuestCallbackFrame frame;
     uint32_t comparison = 0;
     (void)uc;
     (void)address;
     (void)size;
-    if (!probe->qsort_active) {
+    if (!guest_callback_pop(probe, &frame)) {
         guest_qsort_fail(probe, "unexpected callback return");
+        return;
+    }
+    if (frame.kind == GUEST_CALLBACK_PTHREAD_ONCE) {
+        uint32_t complete = 2u;
+        if (!frame.once_control ||
+            uc_mem_write(probe->uc, frame.once_control, &complete,
+                         sizeof(complete)) != UC_ERR_OK) {
+            probe->failed = 1;
+            snprintf(probe->failure, sizeof(probe->failure),
+                     "pthread_once cannot complete control 0x%08x",
+                     frame.once_control);
+            uc_emu_stop(probe->uc);
+            return;
+        }
+        set_r0(probe->uc, 0);
+        uc_reg_write(probe->uc, UC_ARM_REG_LR, &frame.return_address);
+        uc_reg_write(probe->uc, UC_ARM_REG_PC, &frame.return_address);
+        if (probe->pthread_once_calls <= 16u)
+            probe_log("ARM pthread_once initializer returned: "
+                      "control=0x%08x resume=0x%08x depth=%u",
+                      frame.once_control, frame.return_address,
+                      probe->callback_depth);
+        return;
+    }
+    if (frame.kind != GUEST_CALLBACK_QSORT || !probe->qsort_active) {
+        guest_qsort_fail(probe, "mismatched callback return");
         return;
     }
     uc_reg_read(probe->uc, UC_ARM_REG_R0, &comparison);
@@ -3842,6 +4199,49 @@ static void guest_callback_return_hook(uc_engine *uc, uint64_t address,
     } else {
         guest_qsort_finish_sift(probe);
     }
+}
+
+static int guest_pthread_once_start(ArmProbe *probe, uint32_t control,
+                                    uint32_t function) {
+    uint32_t state = 0;
+    uint32_t return_address = 0;
+    uint32_t callback_return = GUEST_CALLBACK_RETURN | 1u;
+    ++probe->pthread_once_calls;
+    if (!control ||
+        uc_mem_read(probe->uc, control, &state, sizeof(state)) != UC_ERR_OK)
+        return -1;
+    if (probe->pthread_once_calls <= 16u)
+        probe_log("ARM pthread_once: call=%u control=0x%08x state=%u "
+                  "initializer=0x%08x depth=%u",
+                  probe->pthread_once_calls, control, state, function,
+                  probe->callback_depth);
+    if (state == 2u) return 0;
+    if (state == 1u) {
+        /* The ARM guest currently runs on one host thread. Seeing the active
+           state here means an initializer recursively reached the same once
+           object; the outer callback will publish state 2 when it returns. */
+        return 0;
+    }
+    if (state != 0u) return -1;
+    if (!function) {
+        state = 2u;
+        return uc_mem_write(probe->uc, control, &state, sizeof(state)) ==
+                       UC_ERR_OK
+                   ? 0 : -1;
+    }
+    uc_reg_read(probe->uc, UC_ARM_REG_LR, &return_address);
+    if (!guest_callback_push(probe, GUEST_CALLBACK_PTHREAD_ONCE,
+                             return_address, control))
+        return -1;
+    state = 1u;
+    if (uc_mem_write(probe->uc, control, &state, sizeof(state)) != UC_ERR_OK) {
+        GuestCallbackFrame ignored;
+        guest_callback_pop(probe, &ignored);
+        return -1;
+    }
+    uc_reg_write(probe->uc, UC_ARM_REG_LR, &callback_return);
+    uc_reg_write(probe->uc, UC_ARM_REG_PC, &function);
+    return 1;
 }
 
 static void dispatch_import(ArmProbe *probe, ArmImport *import,
@@ -4047,30 +4447,37 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         free(a);
         free(b);
     } else if (strcmp(name, "strlen") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first)))
-            result = (uint32_t)strlen(first);
+        guest_cstring_length(probe, r0, &result);
     } else if (strcmp(name, "strchr") == 0 || strcmp(name, "strrchr") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first))) {
-            char *found = strcmp(name, "strchr") == 0
-                              ? strchr(first, (int)r1) : strrchr(first, (int)r1);
-            result = found ? r0 + (uint32_t)(found - first) : 0;
-        }
+        result = guest_find_character(probe, r0, (unsigned char)r1,
+                                      strcmp(name, "strrchr") == 0);
     } else if (strcmp(name, "strstr") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first)) &&
-            guest_read_string(probe, r1, second, sizeof(second))) {
-            char *found = strstr(first, second);
-            result = found ? r0 + (uint32_t)(found - first) : 0;
+        uint32_t first_length = 0, second_length = 0;
+        char *first_value = guest_duplicate_cstring(
+            probe, r0, MAX_GUEST_CSTRING, &first_length);
+        char *second_value = guest_duplicate_cstring(
+            probe, r1, MAX_GUEST_CSTRING, &second_length);
+        if (first_value && second_value) {
+            char *found = strstr(first_value, second_value);
+            result = found ? r0 + (uint32_t)(found - first_value) : 0;
         }
+        free(first_value);
+        free(second_value);
     } else if (strcmp(name, "strspn") == 0 || strcmp(name, "strcspn") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first)) &&
-            guest_read_string(probe, r1, second, sizeof(second)))
-            result = (uint32_t)(strcmp(name, "strspn") == 0
-                                    ? strspn(first, second) : strcspn(first, second));
+        unsigned char table[256];
+        unsigned char stop = 0;
+        if (guest_character_set(probe, r1, table))
+            guest_span_set(probe, r0, table, strcmp(name, "strspn") == 0,
+                           MAX_GUEST_CSTRING, &result, &stop);
     } else if (strcmp(name, "strtok") == 0 ||
                strcmp(name, "strtok_r") == 0) {
         int reentrant = strcmp(name, "strtok_r") == 0;
         uint32_t current = r0;
         uint32_t next = 0;
+        unsigned char table[256];
+        unsigned char stop = 0;
+        uint32_t skipped = 0;
+        uint32_t token_length = 0;
         if (!current) {
             if (reentrant) {
                 if (!r2 || uc_mem_read(probe->uc, r2, &current,
@@ -4080,24 +4487,21 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
                 current = probe->strtok_next;
             }
         }
-        if (current &&
-            guest_read_string(probe, current, first, sizeof(first)) &&
-            guest_read_string(probe, r1, second, sizeof(second))) {
-            size_t skipped = strspn(first, second);
-            char *token = first + skipped;
-            if (*token) {
-                size_t length = strcspn(token, second);
-                const char zero = 0;
-                result = current + (uint32_t)skipped;
-                next = result + (uint32_t)length;
-                if (token[length]) {
-                    if (uc_mem_write(probe->uc, next, &zero, 1) == UC_ERR_OK)
-                        ++next;
-                    else
-                        result = next = 0;
-                }
+        if (current && guest_character_set(probe, r1, table) &&
+            guest_span_set(probe, current, table, 1, MAX_GUEST_CSTRING,
+                           &skipped, &stop) && stop) {
+            result = current + skipped;
+            if (guest_span_set(probe, result, table, 0,
+                               MAX_GUEST_CSTRING - skipped,
+                               &token_length, &stop)) {
+                const unsigned char zero = 0;
+                next = result + token_length;
+                if (stop &&
+                    uc_mem_write(probe->uc, next, &zero, 1) == UC_ERR_OK)
+                    ++next;
             }
         }
+        if (!next && current) next = current + skipped;
         if (reentrant) {
             if (r2) uc_mem_write(probe->uc, r2, &next, sizeof(next));
         } else {
@@ -4108,50 +4512,53 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
                strcmp(name, "strncmp") == 0 ||
                strcmp(name, "strncasecmp") == 0 ||
                strcmp(name, "strcoll") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first)) &&
-            guest_read_string(probe, r1, second, sizeof(second))) {
-            if (strcmp(name, "strcasecmp") == 0)
-                result = (uint32_t)ascii_casecmp(first, second, 0, 0);
-            else if (strcmp(name, "strncasecmp") == 0)
-                result = (uint32_t)ascii_casecmp(first, second, r2, 1);
-            else if (strcmp(name, "strncmp") == 0)
-                result = (uint32_t)strncmp(first, second, r2);
-            else
-                result = (uint32_t)strcmp(first, second);
-        }
+        int comparison = 0;
+        uint32_t limit = strcmp(name, "strncmp") == 0 ||
+                         strcmp(name, "strncasecmp") == 0
+                             ? r2 : MAX_GUEST_CSTRING;
+        int ignore_case = strcmp(name, "strcasecmp") == 0 ||
+                          strcmp(name, "strncasecmp") == 0;
+        if (!limit || guest_compare_cstrings(probe, r0, r1, limit,
+                                             ignore_case, &comparison))
+            result = (uint32_t)comparison;
     } else if (strcmp(name, "strcpy") == 0 ||
                strcmp(name, "strncpy") == 0 ||
                strcmp(name, "strcat") == 0) {
-        if (guest_read_string(probe, r1, second, sizeof(second))) {
-            if (strcmp(name, "strcat") == 0 &&
-                guest_read_string(probe, r0, first, sizeof(first))) {
-                size_t used = strlen(first);
-                size_t remaining = sizeof(first) - used;
-                if (remaining > 1) strncat(first, second, remaining - 1);
-                guest_write_string(probe, r0, first,
-                                   (uint32_t)(strlen(first) + 1));
-            } else if (strcmp(name, "strncpy") == 0) {
-                size_t length = strlen(second);
-                unsigned char *temporary;
-                if (length > r2) length = r2;
-                temporary = (unsigned char *)calloc(1, r2 ? r2 : 1);
-                if (temporary) {
-                    memcpy(temporary, second, length);
-                    uc_mem_write(probe->uc, r0, temporary, r2);
-                    free(temporary);
-                }
-            } else {
-                guest_write_string(probe, r0, second,
-                                   (uint32_t)(strlen(second) + 1));
+        uint32_t source_length = 0;
+        int terminated = 0;
+        if (strcmp(name, "strncpy") == 0) {
+            if (r2 && guest_cstring_nlength(probe, r1, r2, &source_length,
+                                            &terminated) &&
+                guest_copy_memory(probe, r0, r1,
+                                  terminated ? source_length + 1u
+                                             : source_length) &&
+                terminated && source_length + 1u < r2)
+                guest_zero_memory(probe, r0 + source_length + 1u,
+                                  r2 - source_length - 1u);
+        } else if (guest_cstring_length(probe, r1, &source_length)) {
+            uint32_t destination_address = r0;
+            if (strcmp(name, "strcat") == 0) {
+                uint32_t destination_length = 0;
+                if (!guest_cstring_length(probe, r0, &destination_length) ||
+                    destination_length > UINT32_MAX - r0)
+                    destination_address = 0;
+                else
+                    destination_address = r0 + destination_length;
             }
+            if (destination_address && source_length < MAX_GUEST_CSTRING)
+                guest_copy_memory(probe, destination_address, r1,
+                                  source_length + 1u);
         }
         result = r0;
     } else if (strcmp(name, "strdup") == 0) {
-        if (guest_read_string(probe, r0, first, sizeof(first))) {
-            result = guest_alloc(probe, (uint32_t)strlen(first) + 1u);
-            if (result)
-                guest_write_string(probe, result, first,
-                                   (uint32_t)strlen(first) + 1u);
+        uint32_t length = 0;
+        if (guest_cstring_length(probe, r0, &length) &&
+            length < MAX_GUEST_CSTRING) {
+            result = guest_alloc(probe, length + 1u);
+            if (result && !guest_copy_memory(probe, result, r0, length + 1u)) {
+                guest_free(probe, result);
+                result = 0;
+            }
         }
     } else if (strcmp(name, "atoi") == 0 || strcmp(name, "atol") == 0 ||
                strcmp(name, "strtol") == 0 || strcmp(name, "strtoul") == 0) {
@@ -4329,11 +4736,11 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
             format_address = r2;
             cursor_setup(&format_arguments, probe, r0, r1, r2, r3, sp, 0u, r3);
         } else if (strcmp(name, "sprintf") == 0) {
-            capacity = MAX_STRING;
+            capacity = MAX_GUEST_FORMAT;
             format_address = r1;
             cursor_setup(&format_arguments, probe, r0, r1, r2, r3, sp, 2u, 0);
         } else {
-            capacity = MAX_STRING;
+            capacity = MAX_GUEST_FORMAT;
             format_address = r1;
             cursor_setup(&format_arguments, probe, r0, r1, r2, r3, sp, 0u, r2);
         }
@@ -4413,12 +4820,7 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         GuestFile *file = guest_file(probe, r0);
         result = file && file->host ? (uint32_t)fflush(file->host) : 0;
     } else if (strcmp(name, "getc") == 0 || strcmp(name, "fgetc") == 0) {
-        unsigned char value = 0;
-        GuestFile *file = guest_file(probe, r0);
-        uint32_t temp = guest_alloc(probe, 1);
-        result = temp && guest_file_read(probe, file, temp, 1) == 1 &&
-                 uc_mem_read(probe->uc, temp, &value, 1) == UC_ERR_OK
-                     ? value : (uint32_t)-1;
+        result = (uint32_t)guest_file_get_character(guest_file(probe, r0));
     } else if (strcmp(name, "open") == 0) {
         const char *mode = (r1 & 3u) == 0 ? "rb" : (r1 & 3u) == 1 ? "wb" : "r+b";
         if (guest_read_string(probe, r0, first, sizeof(first)))
@@ -4499,13 +4901,29 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         result = 0;
     } else if (strcmp(name, "dlopen") == 0) {
         result = 1;
+    } else if (strcmp(name, "pthread_once") == 0) {
+        int once_result = guest_pthread_once_start(probe, r0, r1);
+        if (once_result > 0) return;
+        result = once_result < 0 ? 22u : 0u;
+    } else if (strcmp(name, "pthread_setspecific") == 0) {
+        if (r0 < MAX_PTHREAD_KEYS && r0 < probe->pthread_next_key) {
+            probe->pthread_values[r0] = r1;
+            result = 0;
+        } else {
+            result = 22u;
+        }
+    } else if (strcmp(name, "pthread_key_delete") == 0) {
+        if (r0 < MAX_PTHREAD_KEYS && r0 < probe->pthread_next_key) {
+            probe->pthread_values[r0] = 0;
+            probe->pthread_destructors[r0] = 0;
+            result = 0;
+        } else {
+            result = 22u;
+        }
     } else if (strcmp(name, "pthread_mutex_init") == 0 ||
                strcmp(name, "pthread_mutex_destroy") == 0 ||
                strcmp(name, "pthread_mutex_lock") == 0 ||
                strcmp(name, "pthread_mutex_unlock") == 0 ||
-               strcmp(name, "pthread_once") == 0 ||
-               strcmp(name, "pthread_setspecific") == 0 ||
-               strcmp(name, "pthread_key_delete") == 0 ||
                strcmp(name, "pthread_detach") == 0 ||
                strcmp(name, "pthread_join") == 0 ||
                strcmp(name, "pthread_cond_init") == 0 ||
@@ -4521,12 +4939,21 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
                strcmp(name, "sigaction") == 0 || strcmp(name, "raise") == 0) {
         result = 0;
     } else if (strcmp(name, "pthread_key_create") == 0) {
-        static uint32_t next_key = 1;
-        uc_mem_write(probe->uc, r0, &next_key, sizeof(next_key));
-        ++next_key;
-        result = 0;
+        uint32_t key;
+        if (!probe->pthread_next_key) probe->pthread_next_key = 1u;
+        key = probe->pthread_next_key;
+        if (!r0 || key >= MAX_PTHREAD_KEYS ||
+            uc_mem_write(probe->uc, r0, &key, sizeof(key)) != UC_ERR_OK) {
+            result = 11u;
+        } else {
+            probe->pthread_destructors[key] = r1;
+            probe->pthread_values[key] = 0;
+            ++probe->pthread_next_key;
+            result = 0;
+        }
     } else if (strcmp(name, "pthread_getspecific") == 0) {
-        result = 0;
+        result = r0 < MAX_PTHREAD_KEYS && r0 < probe->pthread_next_key
+                     ? probe->pthread_values[r0] : 0;
     } else if (strcmp(name, "srand48") == 0) {
         probe->lrand48_state =
             (((uint64_t)r0 << 16u) | UINT64_C(0x330e)) &
@@ -5182,6 +5609,117 @@ static void readonly_write_hook(uc_engine *uc, uc_mem_type type,
               (unsigned long long)original, pc, lr, r0, r1, r2, r3);
 }
 
+static void level_string_trace(ArmProbe *probe, const char *stage,
+                               uint32_t owner, uint32_t string_object,
+                               uint32_t caller) {
+    uint32_t data = 0;
+    uint32_t metadata[3] = {0, 0, 0};
+    unsigned char block[4096];
+    char sample[97];
+    uint32_t offset = 0;
+    uint32_t semicolons = 0;
+    uint32_t commas = 0;
+    uLong checksum = crc32(0L, Z_NULL, 0);
+    unsigned sample_length;
+    unsigned index;
+    ++probe->level_trace_calls;
+    if (probe->level_trace_calls > 128u) return;
+    if (!string_object ||
+        uc_mem_read(probe->uc, string_object, &data, sizeof(data)) !=
+            UC_ERR_OK ||
+        data < 12u ||
+        uc_mem_read(probe->uc, data - 12u, metadata, sizeof(metadata)) !=
+            UC_ERR_OK ||
+        metadata[0] > MAX_GUEST_CSTRING || metadata[1] < metadata[0] ||
+        metadata[1] > MAX_GUEST_CSTRING) {
+        probe_log("ARM level string trace: call=%u stage=%s owner=0x%08x "
+                  "object=0x%08x data=0x%08x invalid-layout "
+                  "length=%u capacity=%u refs=%d caller=0x%08x",
+                  probe->level_trace_calls, stage, owner, string_object, data,
+                  metadata[0], metadata[1], (int32_t)metadata[2], caller);
+        return;
+    }
+    while (offset < metadata[0]) {
+        uint32_t part = metadata[0] - offset;
+        if (part > sizeof(block)) part = sizeof(block);
+        if (offset > UINT32_MAX - data ||
+            uc_mem_read(probe->uc, data + offset, block, part) != UC_ERR_OK) {
+            probe_log("ARM level string trace: call=%u stage=%s "
+                      "data=0x%08x unreadable-at=%u length=%u",
+                      probe->level_trace_calls, stage, data, offset,
+                      metadata[0]);
+            return;
+        }
+        checksum = crc32(checksum, block, (uInt)part);
+        for (index = 0; index < part; ++index) {
+            semicolons += block[index] == ';';
+            commas += block[index] == ',';
+        }
+        offset += part;
+    }
+    sample_length = metadata[0] < sizeof(sample) - 1u
+                        ? (unsigned)metadata[0]
+                        : (unsigned)sizeof(sample) - 1u;
+    memset(sample, 0, sizeof(sample));
+    if (sample_length &&
+        uc_mem_read(probe->uc, data, sample, sample_length) != UC_ERR_OK)
+        sample_length = 0;
+    for (index = 0; index < sample_length; ++index) {
+        unsigned char value = (unsigned char)sample[index];
+        if (value < 0x20u || value > 0x7eu) sample[index] = '.';
+    }
+    sample[sample_length] = 0;
+    probe_log("ARM level string trace: call=%u stage=%s owner=0x%08x "
+              "object=0x%08x data=0x%08x length=%u capacity=%u refs=%d "
+              "crc=%08lx semicolons=%u commas=%u caller=0x%08x sample=%.96s",
+              probe->level_trace_calls, stage, owner, string_object, data,
+              metadata[0], metadata[1], (int32_t)metadata[2],
+              (unsigned long)checksum, semicolons, commas, caller, sample);
+}
+
+static void level_string_trace_hook(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t r0 = 0, r1 = 0, lr = 0;
+    uint32_t owner = 0;
+    uint32_t string_object = 0;
+    const char *stage = "unknown";
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    if ((uint32_t)address == probe->level_trace_play_init) {
+        stage = "play-init";
+        owner = r1;
+        string_object = r1 ? r1 + 0x134u : 0;
+    } else if ((uint32_t)address == probe->level_trace_play_create) {
+        stage = "play-create";
+        owner = r0;
+        string_object = r1;
+    } else if ((uint32_t)address == probe->level_trace_editor_init) {
+        stage = "editor-init";
+        owner = r1;
+        string_object = r1 ? r1 + 0x134u : 0;
+    } else if ((uint32_t)address == probe->level_trace_editor_create) {
+        stage = "editor-create";
+        owner = r0;
+        string_object = r1;
+    } else if ((uint32_t)address == probe->level_trace_set_string) {
+        stage = "set-level-string";
+        owner = r0;
+        string_object = r1;
+    } else if ((uint32_t)address == probe->level_trace_encode) {
+        stage = "encode-level";
+        owner = r0;
+        string_object = r0 ? r0 + 0x134u : 0;
+    } else if ((uint32_t)address == probe->level_trace_save) {
+        stage = "save-level";
+        owner = r1;
+        string_object = r1 ? r1 + 0x134u : 0;
+    }
+    level_string_trace(probe, stage, owner, string_object, lr);
+}
+
 static bool invalid_memory_hook(uc_engine *uc, uc_mem_type type,
                                 uint64_t address, int size, int64_t value,
                                 void *user_data) {
@@ -5225,6 +5763,7 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook unclaim_particle_trace;
     uc_hook label_bmfont_set_string_trace;
     uc_hook label_bmfont_trace;
+    uc_hook level_string_traces[7];
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
@@ -5320,6 +5859,43 @@ static int initialize_unicorn(ArmProbe *probe) {
                       ds_step_address | 1u);
         }
     }
+    {
+        struct LevelTraceExport {
+            const char *name;
+            uint32_t *address;
+        } traces[] = {
+            {"_ZN9PlayLayer4initEP11GJGameLevel",
+             &probe->level_trace_play_init},
+            {"_ZN9PlayLayer22createObjectsFromSetupESs",
+             &probe->level_trace_play_create},
+            {"_ZN16LevelEditorLayer4initEP11GJGameLevel",
+             &probe->level_trace_editor_init},
+            {"_ZN16LevelEditorLayer22createObjectsFromSetupESs",
+             &probe->level_trace_editor_create},
+            {"_ZN11GJGameLevel14setLevelStringESs",
+             &probe->level_trace_set_string},
+            {"_ZN11GJGameLevel15encodeWithCoderEP13DS_Dictionary",
+             &probe->level_trace_encode},
+            {"_ZN16GameLevelManager9saveLevelEP11GJGameLevel",
+             &probe->level_trace_save}
+        };
+        unsigned installed = 0;
+        for (index = 0; index < sizeof(traces) / sizeof(traces[0]); ++index) {
+            *traces[index].address = find_export(probe, traces[index].name) &
+                                     ~1u;
+            if (!*traces[index].address) continue;
+            if (uc_hook_add(probe->uc, &level_string_traces[index],
+                            UC_HOOK_CODE, level_string_trace_hook, probe,
+                            *traces[index].address,
+                            *traces[index].address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM level-string trace %s",
+                          traces[index].name);
+                return 0;
+            }
+            ++installed;
+        }
+        probe_log("ARM level-string diagnostics ready: hooks=%u", installed);
+    }
     probe->errno_address = GUEST_OBJECT_BASE + GUEST_OBJECT_SIZE - 0x1000u;
     object_value = 0;
     uc_mem_write(probe->uc, probe->errno_address, &object_value,
@@ -5362,6 +5938,8 @@ static int initialize_unicorn(ArmProbe *probe) {
             continue;
         start = GUEST_IMAGE_BASE + segment->p_vaddr;
         end = start + segment->p_memsz - 1u;
+        probe->immutable_start = start;
+        probe->immutable_end = end;
         if (uc_hook_add(probe->uc, &readonly_write_trace,
                         UC_HOOK_MEM_WRITE, readonly_write_hook, probe,
                         start, end) != UC_ERR_OK) {
@@ -5531,6 +6109,11 @@ static int initialize_unicorn(ArmProbe *probe) {
                       png_filter_address | 1u);
         }
     }
+    probe->host_write_guard_enabled = probe->immutable_start != 0u;
+    if (probe->host_write_guard_enabled)
+        probe_log("ARM host immutable-write guard armed: guest "
+                  "0x%08x-0x%08x", probe->immutable_start,
+                  probe->immutable_end);
     probe->heap_next = GUEST_HEAP_BASE;
     probe_log("Unicorn ARMv5/Thumb guest initialized");
     return 1;
@@ -6028,7 +6611,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap11",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap12",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -6214,7 +6797,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap11");
+              "0.9.4-arm-bootstrap12");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
