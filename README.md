@@ -1,10 +1,21 @@
-# Android x86 native compatibility wrapper 0.9.3-alpha3
+# GD Wrapper 0.9.4-arm-bootstrap1
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
 Android, and does not borrow logic from a Windows Geometry Dash executable.
-The visible title is version- and game-neutral; the package keeps the familiar
-`GeometryDashWrapper` filename.
+The visible title is version- and game-neutral; the established x86 package
+keeps the familiar `GeometryDashWrapper` filename. This source release also
+adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
+Dash 1.0 through 1.4 APKs.
+
+Version `0.9.4-arm-bootstrap1` promotes the successful ARM relocation,
+constructor, and `JNI_OnLoad` probe into a first graphical bootstrap. It creates
+a real Win32/OpenGL window, captures registered JNI natives, invokes the guest
+Cocos `nativeInit` and render callbacks, delivers lifecycle/input events, and
+routes guest JNI, assets, files, preferences, audio, and OpenGL calls into the
+existing Windows compatibility services. This is an experimental bring-up
+release: the code path is complete enough for APK testing, but graphical ARM
+startup has not yet been validated on all target releases.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -208,40 +219,66 @@ The loader discovers the x86 library inside the APK, and the wrapper branding
 is version-neutral. The user has confirmed 1.5, 1.6, original Meltdown,
 Meltdown 1.01, Geometry Dash 2.0/2.1, and Geometry Dash World running with the
 current core. Earlier wrapper tests also covered 1.7 through 1.9, but those
-versions should be rechecked before a stable release. Geometry Dash 1.4/1.41
-and 1.3 are not supported. Plain HTTP online actions and some custom songs have
+versions should be rechecked before a stable release. The x86 executable
+cannot run Geometry Dash 1.0 through 1.4/1.41 because those APKs are ARM-only;
+use the experimental ARM executable for them. Plain HTTP online actions and
+some custom songs have
 been confirmed on GD 2.11; CDN HTTPS downloads, other historical versions, and
 private servers need retesting with 0.9.3-alpha3. JNI
 methods, Cocos exports, audio assets, and OS APIs changed across releases, so
 this is not yet a claim that every historical or later APK works.
 
-## Experimental ARM-only bootstrap branch
+## Experimental ARM-only graphical branch
 
-`src/arm_probe.c` is a separate proof backend for the ARMv5/Thumb-1 libraries
-in Geometry Dash 1.0 through 1.4. It uses a statically linked Unicorn 2.1.4
-translator; it does not cast ARM addresses to x86 function pointers and it does
-not launch an Android emulator. The probe reads `lib/armeabi/libgame.so`
-directly from an APK, maps the guest address space, applies `R_ARM_*`
-relocations, supplies Android kuser atomics/TLS, executes every authentic ELF
-constructor, and calls the authentic `JNI_OnLoad`.
+`src/arm_wrapper.c` is the first graphical backend for the ARMv5/Thumb-1
+libraries used by Geometry Dash 1.0 through 1.4. It uses statically linked
+Unicorn 2.1.4 and executes the original Android ARM code; it does not cast ARM
+addresses to x86 function pointers, use an Android emulator, or substitute a
+Windows Geometry Dash executable.
 
-The native Linux oracle has completed that sequence for the exact supplied
-1.000, 1.010, 1.300, and 1.400 APKs, plus the ARM half of the dual-ABI 1.600
-APK. This proves that a native compatibility route is technically viable. It
-does **not** mean the ARM-only releases are playable yet: the guest JNI table,
-callback/thread re-entry, Cocos nativeInit/render calls, OpenGL, input, storage,
-and audio bridges still need to be connected to this backend.
+The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
+from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
+provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap1` retains
+those probe modes and adds:
 
-See `BUILDING-ARM.md` for the reproducible Win32 translator build. The ARM
-probe EXE is a console diagnostic and requires only an APK at runtime; it does
-not require a loose `.so`.
+- a Win32 OpenGL window and message/render loop;
+- a guest JavaVM/JNIEnv table with `RegisterNatives` capture;
+- lookup and invocation of Cocos `nativeInit`, `nativeRender`, pause/resume,
+  touch, key, and text-input callbacks;
+- JNI object, string, array, preference, save-file, language, identity, URL,
+  keyboard, and audio services;
+- APK-backed `AAsset` and stdio/POSIX file access with a Windows `save/` path;
+- ARM-to-Windows OpenGL ES dispatch for the rendering calls used by early
+  Cocos builds;
+- existing Windows MCI/Ogg audio and durable storage services.
+
+The default mode now attempts a graphical boot. `--probe` stops after
+constructors and `JNI_OnLoad`; `--relocate-only` stops after ELF relocation.
+The graphical backend is intentionally labeled a bootstrap because the first
+real APK run may identify additional imported functions, JNI methods, or GL
+edge cases. Send `gd-arm-wrapper.log` after each test.
+
+See `BUILDING-ARM.md` for the reproducible Win32 translator and wrapper build.
+The runtime test folder needs `GeometryDashArmWrapper.exe` and `game.apk`; no
+loose `.so` or translator DLL is required.
 
 ## Rebuilding
 
-The complete buildable source is included in `source/`. Install Zig, then run:
+The complete buildable source is included in `source/`. Install Zig, then run
+this for the established x86 wrapper:
 
 ```text
 python build_wrapper.py --zig C:\path\to\zig.exe --apk Geometry_Dash.apk --out dist
+```
+
+The ARM wrapper additionally needs the patched Win32 Unicorn static library:
+
+```text
+python build_arm_wrapper.py --zig C:\path\to\zig.exe ^
+  --unicorn-source C:\path\to\unicorn-2.1.4 ^
+  --unicorn-lib C:\path\to\libunicorn.a ^
+  --apk Geometry_Dash_1.000.apk --out dist-arm-wrapper
 ```
 
 The builder verifies that the primary APK contains a little-endian ELF32/i386
