@@ -141,14 +141,17 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap9\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap10\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. Send gd-arm-wrapper.log after every test, "
-        "including successful boots. Bootstrap9 keeps the high-resolution "
+        "including successful boots. Bootstrap10 keeps the high-resolution "
         "scheduler and runtime fast path, expands the allocation-record table "
         "to 131,072 heap-backed entries, reuses closed file and zlib slots, "
-        "and adds signature-checked Geometry Dash 1.4 compatibility guards "
-        "for missing particle destinations and unsupported BMFont characters. "
+        "and pairs signature-checked Geometry Dash 1.4 particle claim/unclaim "
+        "compatibility paths so particles leave and re-enter the free pool "
+        "without touching a missing destination array. It also repairs the "
+        "observed Attempt-label spill into adjacent RTTI text and retains the "
+        "unsupported-BMFont-character safety guard. "
         "The guest heap remains 256 MiB. "
         "The build retains the working JNI, zlib, libpng, OpenGL client-array, "
         "audio, input, storage, plist-cycle, timing, and detailed crash-"

@@ -70,6 +70,7 @@
 #define MAX_REGISTERED_NATIVES 512
 #define MAX_GL_VERTEX_ATTRIBS 32
 #define MAX_DS_SEEN_NODES 4096
+#define MAX_COMPAT_PARTICLE_HOLDS 512
 #define GUEST_FREE_BIN_COUNT 32
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
 #define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
@@ -79,8 +80,11 @@
 #define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
 #define NATIVE_RUNTIME_INSTRUCTION_LIMIT 0u
 #define CLAIM_PARTICLE_GUARD_OFFSET 0x001404eeu
-#define CLAIM_PARTICLE_BORROW_RESUME_OFFSET 0x001404feu
+#define CLAIM_PARTICLE_REMOVE_SOURCE_OFFSET 0x001404f6u
 #define CLAIM_PARTICLE_NULL_RETURN_OFFSET 0x0014050au
+#define UNCLAIM_PARTICLE_GUARD_OFFSET 0x001403e0u
+#define UNCLAIM_PARTICLE_DEACTIVATE_OFFSET 0x001403eau
+#define LABEL_BMFONT_SET_STRING_OFFSET 0x001cc314u
 #define LABEL_BMFONT_GUARD_OFFSET 0x001cbcc4u
 #define LABEL_BMFONT_SKIP_CHARACTER_OFFSET 0x001cbfdcu
 #define JNI_TABLE_SIZE 233
@@ -310,7 +314,12 @@ typedef struct {
     uint64_t ds_step_iterations;
     uint64_t ds_step_cycles;
     unsigned particle_claim_guards;
+    unsigned particle_unclaim_guards;
+    unsigned attempt_label_repairs;
+    unsigned suspicious_label_inputs;
     unsigned unsupported_font_characters;
+    uint32_t compatibility_particle_holds[MAX_COMPAT_PARTICLE_HOLDS];
+    unsigned compatibility_particle_hold_count;
     uint32_t ds_seen_nodes[MAX_DS_SEEN_NODES];
     unsigned ds_seen_count;
     char ds_step_key[128];
@@ -4622,6 +4631,55 @@ static void ds_step_loop_hook(uc_engine *uc, uint64_t address, uint32_t size,
     }
 }
 
+static int compatibility_particle_retain(ArmProbe *probe, uint32_t particle) {
+    uint32_t retain_count = 0;
+    unsigned index;
+    if (!particle ||
+        probe->compatibility_particle_hold_count >=
+            MAX_COMPAT_PARTICLE_HOLDS ||
+        uc_mem_read(probe->uc, particle + 0x0cu, &retain_count,
+                    sizeof(retain_count)) != UC_ERR_OK ||
+        !retain_count || retain_count == UINT32_MAX)
+        return 0;
+    for (index = 0; index < probe->compatibility_particle_hold_count;
+         ++index)
+        if (probe->compatibility_particle_holds[index] == particle)
+            return 0;
+    ++retain_count;
+    if (uc_mem_write(probe->uc, particle + 0x0cu, &retain_count,
+                     sizeof(retain_count)) != UC_ERR_OK)
+        return 0;
+    probe->compatibility_particle_holds[
+        probe->compatibility_particle_hold_count++] = particle;
+    return 1;
+}
+
+static int compatibility_particle_release(ArmProbe *probe,
+                                          uint32_t particle) {
+    uint32_t retain_count = 0;
+    unsigned index;
+    for (index = 0; index < probe->compatibility_particle_hold_count;
+         ++index) {
+        if (probe->compatibility_particle_holds[index] != particle) continue;
+        if (uc_mem_read(probe->uc, particle + 0x0cu, &retain_count,
+                        sizeof(retain_count)) != UC_ERR_OK ||
+            retain_count <= 1u)
+            return 0;
+        --retain_count;
+        if (uc_mem_write(probe->uc, particle + 0x0cu, &retain_count,
+                         sizeof(retain_count)) != UC_ERR_OK)
+            return 0;
+        --probe->compatibility_particle_hold_count;
+        probe->compatibility_particle_holds[index] =
+            probe->compatibility_particle_holds[
+                probe->compatibility_particle_hold_count];
+        probe->compatibility_particle_holds[
+            probe->compatibility_particle_hold_count] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void claim_particle_guard_hook(uc_engine *uc, uint64_t address,
                                       uint32_t size, void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -4636,15 +4694,98 @@ static void claim_particle_guard_hook(uc_engine *uc, uint64_t address,
     uc_reg_read(uc, UC_ARM_REG_R4, &source_array);
     uc_reg_read(uc, UC_ARM_REG_R6, &particle);
     resume = (GUEST_IMAGE_BASE +
-              (particle ? CLAIM_PARTICLE_BORROW_RESUME_OFFSET
-                        : CLAIM_PARTICLE_NULL_RETURN_OFFSET)) | 1u;
+              (particle && compatibility_particle_retain(probe, particle)
+                   ? CLAIM_PARTICLE_REMOVE_SOURCE_OFFSET
+                   : CLAIM_PARTICLE_NULL_RETURN_OFFSET)) | 1u;
     uc_reg_write(uc, UC_ARM_REG_PC, &resume);
     ++probe->particle_claim_guards;
     if (probe->particle_claim_guards <= 8u)
-        probe_log("ARM PlayLayer particle claim borrowed: missing destination "
-                  "pool source=0x%08x particle=0x%08x records=%u/%u free=%u",
-                  source_array, particle, probe->allocation_count, MAX_ALLOCS,
+        probe_log("ARM PlayLayer particle claim compatibility: missing "
+                  "destination pool, particle=%s source=0x%08x "
+                  "particle=0x%08x holds=%u records=%u/%u free=%u",
+                  resume == ((GUEST_IMAGE_BASE +
+                              CLAIM_PARTICLE_REMOVE_SOURCE_OFFSET) | 1u)
+                      ? "retained and removed from free pool"
+                      : "suppressed because ownership could not be retained",
+                  source_array, particle,
+                  probe->compatibility_particle_hold_count,
+                  probe->allocation_count, MAX_ALLOCS,
                   probe->free_allocation_count);
+}
+
+static void unclaim_particle_guard_hook(uc_engine *uc, uint64_t address,
+                                        uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t destination_array = 0;
+    uint32_t particle = 0;
+    int released;
+    uint32_t resume = (GUEST_IMAGE_BASE +
+                       UNCLAIM_PARTICLE_DEACTIVATE_OFFSET) | 1u;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R6, &destination_array);
+    if (destination_array) return;
+    uc_reg_read(uc, UC_ARM_REG_R4, &particle);
+    released = compatibility_particle_release(probe, particle);
+    uc_reg_write(uc, UC_ARM_REG_PC, &resume);
+    ++probe->particle_unclaim_guards;
+    if (probe->particle_unclaim_guards <= 8u)
+        probe_log("ARM PlayLayer particle unclaim compatibility: restored "
+                  "particle to source, released_hold=%u, skipped missing "
+                  "destination particle=0x%08x holds=%u count=%u",
+                  released != 0, particle,
+                  probe->compatibility_particle_hold_count,
+                  probe->particle_unclaim_guards);
+}
+
+static void label_bmfont_set_string_hook(uc_engine *uc, uint64_t address,
+                                         uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t string_address = 0;
+    uint32_t lr = 0;
+    char text[2048];
+    char *attempt;
+    char *type_name;
+    char *digits;
+    char *end;
+    size_t length;
+    const char zero = 0;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R1, &string_address);
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    if (!guest_read_string(probe, string_address, text, sizeof(text))) return;
+    length = strlen(text);
+    type_name = strstr(text, "N7cocos2d");
+    attempt = strstr(text, "Attempt ");
+    if (type_name && attempt && attempt < type_name) {
+        digits = attempt + strlen("Attempt ");
+        end = digits;
+        while (*end >= '0' && *end <= '9') ++end;
+        if (end > digits &&
+            uc_mem_write(probe->uc,
+                         string_address + (uint32_t)(end - text),
+                         &zero, sizeof(zero)) == UC_ERR_OK) {
+            uint32_t repaired = string_address + (uint32_t)(attempt - text);
+            uc_reg_write(uc, UC_ARM_REG_R1, &repaired);
+            ++probe->attempt_label_repairs;
+            if (probe->attempt_label_repairs <= 8u)
+                probe_log("ARM CCLabelBMFont repaired 1.4 Attempt label "
+                          "spillover: input=0x%08x repaired=0x%08x "
+                          "caller=0x%08x count=%u",
+                          string_address, repaired, lr,
+                          probe->attempt_label_repairs);
+            return;
+        }
+    }
+    if (length + 1u == sizeof(text) || type_name) {
+        ++probe->suspicious_label_inputs;
+        if (probe->suspicious_label_inputs <= 12u)
+            probe_log("ARM CCLabelBMFont suspicious input: address=0x%08x "
+                      "caller=0x%08x length>=%u type_name=%u sample=%.160s",
+                      string_address, lr, (unsigned)length,
+                      type_name != NULL, text);
+    }
 }
 
 static void label_bmfont_guard_hook(uc_engine *uc, uint64_t address,
@@ -4652,6 +4793,8 @@ static void label_bmfont_guard_hook(uc_engine *uc, uint64_t address,
     ArmProbe *probe = (ArmProbe *)user_data;
     uint32_t font_definition = 0;
     uint32_t character = 0;
+    uint32_t label = 0;
+    uint32_t utf16 = 0;
     uint32_t sp = 0;
     uint32_t resume = (GUEST_IMAGE_BASE +
                        LABEL_BMFONT_SKIP_CHARACTER_OFFSET) | 1u;
@@ -4659,6 +4802,9 @@ static void label_bmfont_guard_hook(uc_engine *uc, uint64_t address,
     (void)size;
     uc_reg_read(uc, UC_ARM_REG_R4, &font_definition);
     if (font_definition) return;
+    uc_reg_read(uc, UC_ARM_REG_R5, &label);
+    if (label)
+        uc_mem_read(uc, label + 0x14cu, &utf16, sizeof(utf16));
     uc_reg_read(uc, UC_ARM_REG_SP, &sp);
     if (sp)
         uc_mem_read(uc, sp + 0x1ecu, &character, sizeof(character));
@@ -4666,8 +4812,9 @@ static void label_bmfont_guard_hook(uc_engine *uc, uint64_t address,
     ++probe->unsupported_font_characters;
     if (probe->unsupported_font_characters <= 32u)
         probe_log("ARM CCLabelBMFont skipped unsupported character: "
-                  "U+%04X (%u), count=%u",
-                  character, character, probe->unsupported_font_characters);
+                  "U+%04X (%u), label=0x%08x utf16=0x%08x count=%u",
+                  character, character, label, utf16,
+                  probe->unsupported_font_characters);
 }
 
 static void kuser_hook(uc_engine *uc, uint64_t address, uint32_t size,
@@ -4769,6 +4916,8 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook ds_step_entry_trace;
     uc_hook ds_step_loop_trace;
     uc_hook claim_particle_trace;
+    uc_hook unclaim_particle_trace;
+    uc_hook label_bmfont_set_string_trace;
     uc_hook label_bmfont_trace;
     unsigned char *stubs;
     unsigned index;
@@ -4889,12 +5038,22 @@ static int initialize_unicorn(ArmProbe *probe) {
         static const unsigned char claim_particle_signature[] = {
             0x28, 0x1c, 0x31, 0x1c, 0x6a, 0xf0, 0x0d, 0xf8
         };
+        static const unsigned char claim_remove_source_signature[] = {
+            0x20, 0x1c, 0x01, 0x21, 0x69, 0xf0, 0x87, 0xff
+        };
         unsigned char actual[sizeof(claim_particle_signature)];
+        unsigned char actual_remove[sizeof(claim_remove_source_signature)];
         uint32_t guard_address = GUEST_IMAGE_BASE +
                                  CLAIM_PARTICLE_GUARD_OFFSET;
+        uint32_t remove_address = GUEST_IMAGE_BASE +
+                                  CLAIM_PARTICLE_REMOVE_SOURCE_OFFSET;
         if (uc_mem_read(probe->uc, guard_address, actual, sizeof(actual)) ==
                 UC_ERR_OK &&
-            memcmp(actual, claim_particle_signature, sizeof(actual)) == 0) {
+            uc_mem_read(probe->uc, remove_address, actual_remove,
+                        sizeof(actual_remove)) == UC_ERR_OK &&
+            memcmp(actual, claim_particle_signature, sizeof(actual)) == 0 &&
+            memcmp(actual_remove, claim_remove_source_signature,
+                   sizeof(actual_remove)) == 0) {
             if (uc_hook_add(probe->uc, &claim_particle_trace, UC_HOOK_CODE,
                             claim_particle_guard_hook, probe, guard_address,
                             guard_address) != UC_ERR_OK) {
@@ -4905,6 +5064,68 @@ static int initialize_unicorn(ArmProbe *probe) {
                       guard_address | 1u);
         } else {
             probe_log("ARM PlayLayer particle guard inactive: "
+                      "guest signature differs");
+        }
+    }
+    {
+        static const unsigned char unclaim_guard_signature[] = {
+            0x30, 0x1c, 0x21, 0x1c, 0x01, 0x22, 0x6a, 0xf0,
+            0x87, 0xf8
+        };
+        static const unsigned char unclaim_deactivate_signature[] = {
+            0x23, 0x68, 0x20, 0x1c, 0x00, 0x21, 0x5b, 0x6f
+        };
+        unsigned char actual_guard[sizeof(unclaim_guard_signature)];
+        unsigned char actual_deactivate[sizeof(unclaim_deactivate_signature)];
+        uint32_t guard_address = GUEST_IMAGE_BASE +
+                                 UNCLAIM_PARTICLE_GUARD_OFFSET;
+        uint32_t deactivate_address = GUEST_IMAGE_BASE +
+                                      UNCLAIM_PARTICLE_DEACTIVATE_OFFSET;
+        if (uc_mem_read(probe->uc, guard_address, actual_guard,
+                        sizeof(actual_guard)) == UC_ERR_OK &&
+            uc_mem_read(probe->uc, deactivate_address, actual_deactivate,
+                        sizeof(actual_deactivate)) == UC_ERR_OK &&
+            memcmp(actual_guard, unclaim_guard_signature,
+                   sizeof(actual_guard)) == 0 &&
+            memcmp(actual_deactivate, unclaim_deactivate_signature,
+                   sizeof(actual_deactivate)) == 0) {
+            if (uc_hook_add(probe->uc, &unclaim_particle_trace, UC_HOOK_CODE,
+                            unclaim_particle_guard_hook, probe, guard_address,
+                            guard_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM PlayLayer particle "
+                          "unclaim guard");
+                return 0;
+            }
+            probe_log("ARM PlayLayer particle unclaim guard ready: "
+                      "guest 0x%08x", guard_address | 1u);
+        } else {
+            probe_log("ARM PlayLayer particle unclaim guard inactive: "
+                      "guest signature differs");
+        }
+    }
+    {
+        static const unsigned char set_string_signature[] = {
+            0xf0, 0xb5, 0x5f, 0x46, 0x56, 0x46, 0x4d, 0x46,
+            0x44, 0x46, 0xf0, 0xb4
+        };
+        unsigned char actual[sizeof(set_string_signature)];
+        uint32_t set_string_address = GUEST_IMAGE_BASE +
+                                      LABEL_BMFONT_SET_STRING_OFFSET;
+        if (uc_mem_read(probe->uc, set_string_address, actual,
+                        sizeof(actual)) == UC_ERR_OK &&
+            memcmp(actual, set_string_signature, sizeof(actual)) == 0) {
+            if (uc_hook_add(probe->uc, &label_bmfont_set_string_trace,
+                            UC_HOOK_CODE, label_bmfont_set_string_hook, probe,
+                            set_string_address,
+                            set_string_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install ARM CCLabelBMFont string "
+                          "compatibility hook");
+                return 0;
+            }
+            probe_log("ARM CCLabelBMFont string compatibility ready: "
+                      "guest 0x%08x", set_string_address | 1u);
+        } else {
+            probe_log("ARM CCLabelBMFont string compatibility inactive: "
                       "guest signature differs");
         }
     }
@@ -5469,7 +5690,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap9",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap10",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5655,7 +5876,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap9");
+              "0.9.4-arm-bootstrap10");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
