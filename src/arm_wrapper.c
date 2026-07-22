@@ -16,6 +16,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <io.h>
+#include <limits.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdarg.h>
@@ -50,7 +52,7 @@
 #define GUEST_OBJECT_BASE 0x20000000u
 #define GUEST_OBJECT_SIZE 0x00400000u
 #define GUEST_HEAP_BASE 0x30000000u
-#define GUEST_HEAP_SIZE 0x10000000u
+#define GUEST_HEAP_SIZE 0x20000000u
 #define GUEST_JNI_BASE 0x60000000u
 #define GUEST_JNI_SIZE 0x01000000u
 #define GUEST_FILE_BASE 0x50000000u
@@ -63,7 +65,7 @@
 
 #define MAX_IMPORTS 4096
 #define MAX_OBJECTS 256
-#define MAX_ALLOCS 131072
+#define MAX_ALLOCS 1048576
 #define MAX_STRING 65536
 #define MAX_GUEST_CSTRING (64u * 1024u * 1024u)
 #define MAX_GUEST_FORMAT (16u * 1024u * 1024u)
@@ -147,7 +149,10 @@ typedef struct {
     size_t bytes_read;
     size_t bytes_written;
     int writable;
+    int transactional;
     int eof;
+    char *transaction_path;
+    char *final_path;
     char diagnostic_name[40];
 } GuestFile;
 
@@ -333,6 +338,7 @@ typedef struct {
     int runtime_fast_path_logged;
     unsigned png_filter_rows;
     unsigned allocation_failures;
+    unsigned allocation_record_reclaims;
     unsigned free_allocation_count;
     uint64_t ds_step_calls;
     uint64_t ds_step_iterations;
@@ -952,75 +958,197 @@ static int apply_relocations(ArmProbe *probe) {
     return 1;
 }
 
-static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
-    uint32_t address;
-    unsigned index, bin;
-    if (!size) size = 1;
-    if (size > UINT32_MAX - 15u) return 0;
-    size = align_up(size, 16u);
-    bin = 0;
-    {
-        uint32_t value = size;
-        while (value > 1u && bin + 1u < GUEST_FREE_BIN_COUNT) {
-            value >>= 1u;
-            ++bin;
-        }
+static unsigned guest_allocation_bin(uint32_t size) {
+    unsigned bin = 0;
+    while (size > 1u && bin + 1u < GUEST_FREE_BIN_COUNT) {
+        size >>= 1u;
+        ++bin;
     }
-    if (probe->free_allocation_count && probe->free_allocation_next) {
-        unsigned search_bin;
-        for (search_bin = bin; search_bin < GUEST_FREE_BIN_COUNT;
-             ++search_bin) {
-            uint32_t *link = &probe->free_allocation_heads[search_bin];
-            while (*link) {
-                GuestAllocation *allocation;
-                uint32_t block_size;
-                index = *link - 1u;
-                if (index >= probe->allocation_count) {
-                    *link = 0;
-                    break;
-                }
-                allocation = &probe->allocations[index];
-                block_size = allocation->size & GUEST_ALLOCATION_SIZE_MASK;
-                if ((allocation->size & GUEST_ALLOCATION_FREE) != 0u &&
-                    block_size >= size) {
-                    *link = probe->free_allocation_next[index];
-                    probe->free_allocation_next[index] = 0;
-                    allocation->size = block_size;
-                    --probe->free_allocation_count;
-                    return allocation->address;
-                }
-                link = &probe->free_allocation_next[index];
+    return bin;
+}
+
+static uint32_t guest_take_free_allocation(ArmProbe *probe, uint32_t size,
+                                           unsigned first_bin,
+                                           unsigned last_bin) {
+    unsigned search_bin;
+    if (!probe->free_allocation_count || !probe->free_allocation_next ||
+        first_bin >= GUEST_FREE_BIN_COUNT)
+        return 0;
+    if (last_bin >= GUEST_FREE_BIN_COUNT) last_bin = GUEST_FREE_BIN_COUNT - 1u;
+    for (search_bin = first_bin; search_bin <= last_bin; ++search_bin) {
+        uint32_t *link = &probe->free_allocation_heads[search_bin];
+        unsigned visited = 0;
+        while (*link && visited++ <= probe->allocation_count) {
+            GuestAllocation *allocation;
+            uint32_t block_size;
+            unsigned index = *link - 1u;
+            if (index >= probe->allocation_count) {
+                *link = 0;
+                break;
             }
-        }
-    } else if (probe->free_allocation_count) {
-        for (index = 0; index < probe->allocation_count; ++index) {
-            GuestAllocation *allocation = &probe->allocations[index];
+            allocation = &probe->allocations[index];
+            block_size = allocation->size & GUEST_ALLOCATION_SIZE_MASK;
             if ((allocation->size & GUEST_ALLOCATION_FREE) != 0u &&
-                (allocation->size & GUEST_ALLOCATION_SIZE_MASK) >= size) {
-                allocation->size &= GUEST_ALLOCATION_SIZE_MASK;
+                block_size >= size) {
+                *link = probe->free_allocation_next[index];
+                probe->free_allocation_next[index] = 0;
+                allocation->size = block_size;
                 --probe->free_allocation_count;
                 return allocation->address;
             }
+            link = &probe->free_allocation_next[index];
+        }
+        if (*link) {
+            probe_log("ARM allocator repaired a cyclic free bin: bin=%u",
+                      search_bin);
+            *link = 0;
         }
     }
-    if (size > GUEST_HEAP_SIZE || probe->allocation_count >= MAX_ALLOCS ||
-        probe->heap_next > GUEST_HEAP_BASE + GUEST_HEAP_SIZE - size) {
-        ++probe->allocation_failures;
-        if (probe->allocation_failures <= 8u)
-            probe_log("ARM guest allocation failed: size=%u heap_used=%u "
-                      "records=%u/%u",
-                      size, probe->heap_next - GUEST_HEAP_BASE,
-                      probe->allocation_count, MAX_ALLOCS);
+    return 0;
+}
+
+static void guest_rebuild_free_bins(ArmProbe *probe) {
+    unsigned index;
+    memset(probe->free_allocation_heads, 0,
+           sizeof(probe->free_allocation_heads));
+    probe->free_allocation_count = 0;
+    if (!probe->free_allocation_next) return;
+    memset(probe->free_allocation_next, 0,
+           (size_t)probe->allocation_count *
+               sizeof(*probe->free_allocation_next));
+    for (index = 0; index < probe->allocation_count; ++index) {
+        uint32_t size = probe->allocations[index].size;
+        if ((size & GUEST_ALLOCATION_FREE) != 0u) {
+            unsigned bin = guest_allocation_bin(
+                size & GUEST_ALLOCATION_SIZE_MASK);
+            probe->free_allocation_next[index] =
+                probe->free_allocation_heads[bin];
+            probe->free_allocation_heads[bin] = index + 1u;
+            ++probe->free_allocation_count;
+        }
+    }
+}
+
+/* Allocation records are kept in ascending guest-address order for fast
+   free/realloc lookup.  If the metadata table ever fills, discard the
+   smallest already-free block, close the record gap, rebuild the bin indices,
+   and reuse that record for the next bump allocation.  The discarded block
+   was not live guest memory; losing that small hole is preferable to turning
+   one level-load failure into a permanent std::bad_alloc state. */
+static int guest_reclaim_free_allocation_record(ArmProbe *probe) {
+    unsigned index;
+    unsigned candidate = UINT_MAX;
+    uint32_t candidate_size = UINT32_MAX;
+    if (!probe->free_allocation_count) return 0;
+    for (index = 0; index < probe->allocation_count; ++index) {
+        uint32_t tagged_size = probe->allocations[index].size;
+        uint32_t size = tagged_size & GUEST_ALLOCATION_SIZE_MASK;
+        if ((tagged_size & GUEST_ALLOCATION_FREE) != 0u &&
+            size < candidate_size) {
+            candidate = index;
+            candidate_size = size;
+        }
+    }
+    if (candidate == UINT_MAX) {
+        guest_rebuild_free_bins(probe);
         return 0;
     }
-    address = probe->heap_next;
-    probe->heap_next += size;
-    probe->allocations[probe->allocation_count].address = address;
-    probe->allocations[probe->allocation_count].size = size;
-    if (probe->free_allocation_next)
+    if (candidate + 1u < probe->allocation_count) {
+        memmove(&probe->allocations[candidate],
+                &probe->allocations[candidate + 1u],
+                (size_t)(probe->allocation_count - candidate - 1u) *
+                    sizeof(*probe->allocations));
+    }
+    --probe->allocation_count;
+    guest_rebuild_free_bins(probe);
+    ++probe->allocation_record_reclaims;
+    if (probe->allocation_record_reclaims <= 8u) {
+        probe_log("ARM allocator recycled free metadata record: "
+                  "discarded=%u records=%u/%u free=%u",
+                  candidate_size, probe->allocation_count, MAX_ALLOCS,
+                  probe->free_allocation_count);
+    }
+    return 1;
+}
+
+static void guest_allocation_free_statistics(const ArmProbe *probe,
+                                             uint64_t *total,
+                                             uint32_t *largest) {
+    unsigned index;
+    uint64_t free_total = 0;
+    uint32_t free_largest = 0;
+    for (index = 0; index < probe->allocation_count; ++index) {
+        uint32_t tagged_size = probe->allocations[index].size;
+        if ((tagged_size & GUEST_ALLOCATION_FREE) != 0u) {
+            uint32_t size = tagged_size & GUEST_ALLOCATION_SIZE_MASK;
+            free_total += size;
+            if (size > free_largest) free_largest = size;
+        }
+    }
+    if (total) *total = free_total;
+    if (largest) *largest = free_largest;
+}
+
+static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
+    uint32_t address;
+    unsigned bin;
+    int heap_has_room;
+    if (!size) size = 1;
+    if (size > UINT32_MAX - 15u) return 0;
+    size = align_up(size, 16u);
+    bin = guest_allocation_bin(size);
+
+    /* Prefer only the matching size class while unused heap remains.  The old
+       policy gave 100 KiB image buffers to tiny C++ allocations, which rapidly
+       fragmented the 256 MiB arena during level changes. */
+    address = guest_take_free_allocation(probe, size, bin, bin);
+    if (address) return address;
+
+    heap_has_room = size <= GUEST_HEAP_SIZE &&
+        probe->heap_next <= GUEST_HEAP_BASE + GUEST_HEAP_SIZE - size;
+    if (heap_has_room && probe->allocation_count < MAX_ALLOCS) {
+        address = probe->heap_next;
+        probe->heap_next += size;
+        probe->allocations[probe->allocation_count].address = address;
+        probe->allocations[probe->allocation_count].size = size;
         probe->free_allocation_next[probe->allocation_count] = 0;
-    ++probe->allocation_count;
-    return address;
+        ++probe->allocation_count;
+        return address;
+    }
+
+    /* When bumping is impossible, accepting a larger free block is still much
+       better than failing. */
+    if (bin + 1u < GUEST_FREE_BIN_COUNT) {
+        address = guest_take_free_allocation(
+            probe, size, bin + 1u, GUEST_FREE_BIN_COUNT - 1u);
+        if (address) return address;
+    }
+
+    if (heap_has_room && probe->allocation_count >= MAX_ALLOCS &&
+        guest_reclaim_free_allocation_record(probe)) {
+        address = probe->heap_next;
+        probe->heap_next += size;
+        probe->allocations[probe->allocation_count].address = address;
+        probe->allocations[probe->allocation_count].size = size;
+        probe->free_allocation_next[probe->allocation_count] = 0;
+        ++probe->allocation_count;
+        return address;
+    }
+
+    ++probe->allocation_failures;
+    if (probe->allocation_failures <= 8u) {
+        uint64_t free_bytes = 0;
+        uint32_t largest_free = 0;
+        guest_allocation_free_statistics(probe, &free_bytes, &largest_free);
+        probe_log("ARM guest allocation failed: size=%u heap_used=%u/%u "
+                  "records=%u/%u free_records=%u free_bytes=%llu "
+                  "largest_free=%u",
+                  size, probe->heap_next - GUEST_HEAP_BASE, GUEST_HEAP_SIZE,
+                  probe->allocation_count, MAX_ALLOCS,
+                  probe->free_allocation_count,
+                  (unsigned long long)free_bytes, largest_free);
+    }
+    return 0;
 }
 
 static int guest_allocation_index(const ArmProbe *probe, uint32_t address) {
@@ -1605,12 +1733,25 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
                                 const char *mode, int asset_only) {
     GuestFile *file;
     char translated[MAX_PATH * 4];
+    char transaction[MAX_PATH * 4 + 32];
+    const char *slash;
+    const char *backslash;
+    const char *name;
     FILE *host = NULL;
     unsigned char *payload = NULL;
     size_t payload_size = 0;
     unsigned slot;
     int writable = mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
+    int game_file;
+    int transactional = 0;
+    int ignored_corrupt_save = 0;
     if (!path || !mode) return 0;
+
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    name = slash && (!backslash || slash > backslash)
+               ? slash + 1u : backslash ? backslash + 1u : path;
+    game_file = storage_is_game_file_name(name);
 
     for (slot = 0; slot < probe->file_count; ++slot)
         if (!probe->files[slot].handle) break;
@@ -1621,9 +1762,28 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
 
     if (!asset_only) {
         translate_guest_path(probe, path, translated, sizeof(translated));
-        host = fopen(translated, mode);
+        if (writable && game_file && strchr(mode, 'w')) {
+            snprintf(transaction, sizeof(transaction), "%s.wrapper.tmp",
+                     translated);
+            host = fopen(transaction, mode);
+            transactional = host != NULL;
+        } else {
+            host = fopen(translated, mode);
+        }
+        if (host && !writable && game_file) {
+            long length = -1;
+            if (fseek(host, 0, SEEK_END) == 0) length = ftell(host);
+            fseek(host, 0, SEEK_SET);
+            if (length == 22) {
+                fclose(host);
+                host = NULL;
+                ignored_corrupt_save = 1;
+                probe_log("ARM save recovery: ignored incomplete 22-byte %s",
+                          name);
+            }
+        }
     }
-    if (!host && !writable && probe->input_path[0]) {
+    if (!host && !writable && !ignored_corrupt_save && probe->input_path[0]) {
         char member[MAX_PATH * 4];
         const char *source = path;
         while (*source == '/' || *source == '\\') ++source;
@@ -1651,20 +1811,29 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
     file->payload = payload;
     file->size = payload_size;
     file->writable = writable;
-    {
-        const char *slash = strrchr(path, '/');
-        const char *backslash = strrchr(path, '\\');
-        const char *name = slash && (!backslash || slash > backslash)
-                               ? slash + 1u
-                               : backslash ? backslash + 1u : path;
-        if (storage_is_game_file_name(name))
-            snprintf(file->diagnostic_name,
-                     sizeof(file->diagnostic_name), "%s", name);
+    file->transactional = transactional;
+    if (transactional) {
+        file->transaction_path = copy_string(transaction);
+        file->final_path = copy_string(translated);
+        if (!file->transaction_path || !file->final_path) {
+            fclose(host);
+            DeleteFileA(transaction);
+            free(file->transaction_path);
+            free(file->final_path);
+            memset(file, 0, sizeof(*file));
+            probe_log("ARM file open failed: cannot track save transaction %s",
+                      name);
+            return 0;
+        }
     }
+    if (game_file)
+        snprintf(file->diagnostic_name,
+                 sizeof(file->diagnostic_name), "%s", name);
     if (host && strchr(mode, 'a')) fseek(host, 0, SEEK_END);
     if (slot == probe->file_count) ++probe->file_count;
     if (host)
-        probe_log("ARM file open: %s mode=%s source=host", path, mode);
+        probe_log("ARM file open: %s mode=%s source=host%s", path, mode,
+                  transactional ? " transaction=atomic" : "");
     else
         probe_log("ARM file open: %s mode=%s source=APK bytes=%u",
                   path, mode, (unsigned)payload_size);
@@ -1748,7 +1917,6 @@ static long guest_file_tell(GuestFile *file) {
 
 static int guest_file_close(ArmProbe *probe, GuestFile *file) {
     int result = 0;
-    (void)probe;
     if (!file) return -1;
     if (file->diagnostic_name[0]) {
         long position = file->host ? ftell(file->host) : (long)file->position;
@@ -1765,10 +1933,48 @@ static int guest_file_close(ArmProbe *probe, GuestFile *file) {
                   (unsigned long long)file->bytes_read,
                   (unsigned long long)file->bytes_written, length);
     }
-    if (file->host) result = fclose(file->host);
+    if (file->host) {
+        if (file->transactional &&
+            (fflush(file->host) != 0 || _commit(_fileno(file->host)) != 0))
+            result = EOF;
+        if (fclose(file->host) != 0) result = EOF;
+        file->host = NULL;
+    }
+    if (file->transactional && file->transaction_path && file->final_path) {
+        if (result == 0 && probe && !probe->allocation_failures) {
+            if (MoveFileExA(file->transaction_path, file->final_path,
+                            MOVEFILE_REPLACE_EXISTING |
+                                MOVEFILE_WRITE_THROUGH)) {
+                probe_log("ARM save transaction committed: %s",
+                          file->diagnostic_name[0]
+                              ? file->diagnostic_name : file->final_path);
+            } else {
+                result = EOF;
+                probe_log("ARM save transaction failed: %s error=%lu",
+                          file->diagnostic_name[0]
+                              ? file->diagnostic_name : file->final_path,
+                          (unsigned long)GetLastError());
+                DeleteFileA(file->transaction_path);
+            }
+        } else {
+            DeleteFileA(file->transaction_path);
+            if (probe && probe->allocation_failures) {
+                probe_log("ARM save transaction quarantined after allocation "
+                          "failure: %s (previous save preserved)",
+                          file->diagnostic_name[0]
+                              ? file->diagnostic_name : file->final_path);
+                /* The guest completed its write; keeping the previous file is
+                   a host-side recovery policy, not a guest I/O error. */
+                if (result == 0) result = 0;
+            }
+        }
+    }
     free(file->payload);
-    file->host = NULL;
+    free(file->transaction_path);
+    free(file->final_path);
     file->payload = NULL;
+    file->transaction_path = NULL;
+    file->final_path = NULL;
     file->handle = 0;
     return result;
 }
@@ -4563,13 +4769,15 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
     } else if (strcmp(name, "atoi") == 0 || strcmp(name, "atol") == 0 ||
                strcmp(name, "strtol") == 0 || strcmp(name, "strtoul") == 0) {
         char *end = NULL;
+        int takes_end_pointer = strcmp(name, "strtol") == 0 ||
+                                strcmp(name, "strtoul") == 0;
         int base = (strcmp(name, "atoi") == 0 || strcmp(name, "atol") == 0)
                        ? 10 : (int)r2;
         if (guest_read_string(probe, r0, first, sizeof(first))) {
             if (strcmp(name, "strtoul") == 0)
                 result = (uint32_t)strtoul(first, &end, base);
             else result = (uint32_t)strtol(first, &end, base);
-            if (r1 && end) {
+            if (takes_end_pointer && r1 && end) {
                 uint32_t guest_end = r0 + (uint32_t)(end - first);
                 uc_mem_write(probe->uc, r1, &guest_end, sizeof(guest_end));
             }
@@ -6280,8 +6488,8 @@ static void destroy_probe(ArmProbe *probe) {
     for (index = 0; index < probe->zstream_count; ++index)
         guest_zstream_release(&probe->zstreams[index]);
     for (index = 0; index < probe->file_count; ++index) {
-        if (probe->files[index].host) fclose(probe->files[index].host);
-        free(probe->files[index].payload);
+        if (probe->files[index].handle)
+            guest_file_close(probe, &probe->files[index]);
     }
     for (index = 0; index < probe->ref_count; ++index) {
         free(probe->refs[index].class_name);
@@ -6611,7 +6819,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap12",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap13",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -6797,7 +7005,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap12");
+              "0.9.4-arm-bootstrap13");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;

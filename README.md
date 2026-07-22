@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-bootstrap12
+# GD Wrapper 0.9.4-arm-bootstrap13
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
@@ -8,21 +8,22 @@ keeps the familiar `GeometryDashWrapper` filename. This source release also
 adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
 Dash 1.0 through 1.4 APKs.
 
-Version `0.9.4-arm-bootstrap12` removes the 64 KiB ceiling from the ARM guest's
-core C-string operations and replaces the old whole-tail `strtok` copy with a
-linear chunk scanner. Long official/editor level strings can now pass through
-`strlen`, copying, formatting, comparison, and tokenization without being
-silently shortened, while parsing no longer performs quadratic repeated
-copies. Targeted C++ `GJGameLevel` traces record length, capacity, checksum, and
-object delimiters at load, editor, and save boundaries.
+Version `0.9.4-arm-bootstrap13` fixes the allocator exhaustion exposed by full,
+untruncated official levels. The guest heap is now 512 MiB, the allocation
+record capacity is 1,048,576, and freed blocks are reused by matching size class
+before larger buffers. If metadata ever fills, an already-free record can be
+recycled instead of leaving every later level in a permanent `std::bad_alloc`
+state. Allocation failures now report total and largest reusable free space.
 
-Bootstrap12 also executes authentic ARM `pthread_once` initializer callbacks,
-implements single-guest-thread pthread-specific storage, and blocks host bridge
-writes into the immutable ELF segment while naming the responsible bridge in
-the log. Effect playback remembers decoded WAV paths and reuses compatible
-checksum-named cache files before reopening `game.apk`. Bootstrap11's authentic
-ARM-comparator `qsort`, save byte totals, label diagnostics, and bootstrap10's
-paired particle ownership fix remain active.
+Game-save writes made through ARM stdio are transactional. A valid close
+atomically replaces the destination, while any write following allocator
+failure is discarded so an existing save cannot be replaced by the 22-byte
+incomplete files seen in bootstrap12. Those known incomplete files are treated
+as absent on the next launch. Bootstrap13 also fixes `atoi`/`atol`: unlike
+`strtol`, they do not receive an end-pointer, so the bridge no longer writes
+through an unrelated register into Cocos string data. Bootstrap12's long-string
+parser, guest pthread initialization, APK effect cache, comparator-backed
+`qsort`, level diagnostics, and particle ownership fix remain active.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -246,7 +247,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap12` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap13` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;
