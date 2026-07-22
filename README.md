@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-bootstrap10
+# GD Wrapper 0.9.4-arm-bootstrap11
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
@@ -8,15 +8,15 @@ keeps the familiar `GeometryDashWrapper` filename. This source release also
 adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
 Dash 1.0 through 1.4 APKs.
 
-Version `0.9.4-arm-bootstrap10` pairs Geometry Dash 1.4's particle claim and
-unclaim compatibility paths. When the old game has no destination pool, the
-claimed particle is still removed from the free pool; unclaim restores it and
-skips only the invalid destination removal. This prevents repeated reuse of one
-active particle, scrambled later attempts, and the null-array crash seen in
-bootstrap9. A narrowly signature-gated BMFont hook also repairs the observed
-`Attempt 1` spill into adjacent Cocos RTTI text and records suspicious label
-inputs. The unsupported-character guard remains as a final safety net with
-additional label diagnostics.
+Version `0.9.4-arm-bootstrap11` implements the previously missing Bionic
+`qsort` service by running the game's authentic ARM comparator callbacks from a
+deterministic guest heapsort. Geometry Dash 1.4 uses these sorts while building
+object and gameplay arrays; returning without sorting could leave later
+attempts unordered, truncate a level early, or make loaded data appear empty.
+The bootstrap10 particle ownership fix remains unchanged. Bootstrap11 also
+restores the exact immutable `Attempt 1` literal if it is damaged, watches the
+ELF's read-only image for the responsible guest write, and records byte counts
+when game save files close.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -240,7 +240,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap10` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap11` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;
