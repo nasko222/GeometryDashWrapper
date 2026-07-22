@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-bootstrap5
+# GD Wrapper 0.9.4-arm-bootstrap6
 
 This is a native Windows compatibility wrapper for the original x86 Android
 game code inside a supported APK. It is not BlueStacks/Nox, does not boot
@@ -8,14 +8,16 @@ keeps the familiar `GeometryDashWrapper` filename. This source release also
 adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
 Dash 1.0 through 1.4 APKs.
 
-Version `0.9.4-arm-bootstrap5` promotes the successful ARM relocation,
-constructor, and `JNI_OnLoad` probe into a first graphical bootstrap. It creates
-a real Win32/OpenGL window, captures registered JNI natives, invokes the guest
-Cocos `nativeInit` and render callbacks, delivers lifecycle/input events, and
-routes guest JNI, assets, files, preferences, audio, and OpenGL calls into the
-existing Windows compatibility services. This is an experimental bring-up
-release: the code path is complete enough for APK testing, but graphical ARM
-startup has not yet been validated on all target releases.
+Version `0.9.4-arm-bootstrap6` keeps the ARM path that reached the Geometry Dash
+1.4 menu and removes Unicorn's per-instruction counter from live render and
+input callbacks after `nativeInit`. Normal runtime calls now stop at the wrapper
+return trampoline without instrumenting every guest instruction. JNI class and
+method IDs are also reused, and guest handles use direct lookup, avoiding the
+repeated allocation, logging, and linear scans seen in the first working menu
+run. Constructor, `JNI_OnLoad`, APK-path, and initialization calls retain their
+bring-up instruction limits. The message loop avoids a redundant sleep when
+OpenGL vertical sync is active and reports measured render FPS every five
+seconds in `gd-arm-wrapper.log`.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -239,7 +241,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap5` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap6` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;

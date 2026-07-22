@@ -76,7 +76,7 @@
 #define GUEST_ALLOCATION_SIZE_MASK 0x7fffffffu
 #define DEFAULT_GUEST_INSTRUCTION_LIMIT 20000000u
 #define NATIVE_INIT_INSTRUCTION_LIMIT 250000000u
-#define NATIVE_RENDER_INSTRUCTION_LIMIT 1000000000u
+#define NATIVE_RUNTIME_INSTRUCTION_LIMIT 0u
 #define JNI_TABLE_SIZE 233
 #define JNI_VERSION_1_4 0x00010004u
 #define GUEST_ENV_OBJECT (GUEST_JNI_BASE + 0x1000u)
@@ -249,6 +249,7 @@ typedef struct {
     int keyboard_down;
     int native_paused;
     int window_active;
+    int vsync_enabled;
     int closing;
 } ArmHost;
 
@@ -293,6 +294,7 @@ typedef struct {
     GuestGlVertexAttrib gl_vertex_attribs[MAX_GL_VERTEX_ATTRIBS];
     unsigned gl_draw_logs;
     unsigned native_render_calls;
+    int runtime_fast_path_logged;
     unsigned png_filter_rows;
     unsigned allocation_failures;
     unsigned free_allocation_count;
@@ -1104,11 +1106,15 @@ typedef struct {
 } GuestArgCursor;
 
 static GuestRef *guest_ref(ArmProbe *probe, uint32_t handle) {
+    uint32_t offset;
     unsigned index;
-    for (index = 0; index < probe->ref_count; ++index) {
-        if (probe->refs[index].handle == handle) return &probe->refs[index];
-    }
-    return NULL;
+    if (handle < GUEST_REF_BASE) return NULL;
+    offset = handle - GUEST_REF_BASE;
+    if (offset % 0x20u) return NULL;
+    index = offset / 0x20u;
+    if (index >= probe->ref_count || probe->refs[index].handle != handle)
+        return NULL;
+    return &probe->refs[index];
 }
 
 static GuestRef *guest_new_ref(ArmProbe *probe, GuestRefKind kind) {
@@ -2268,9 +2274,18 @@ static uint32_t guest_format_to_memory(ArmProbe *probe, uint32_t destination,
 }
 
 static uint32_t guest_new_class(ArmProbe *probe, const char *name) {
-    GuestRef *reference = guest_new_ref(probe, GREF_CLASS);
+    const char *class_name = name ? name : "?";
+    GuestRef *reference;
+    unsigned index;
+    for (index = 0; index < probe->ref_count; ++index) {
+        reference = &probe->refs[index];
+        if (reference->kind == GREF_CLASS && reference->class_name &&
+            strcmp(reference->class_name, class_name) == 0)
+            return reference->handle;
+    }
+    reference = guest_new_ref(probe, GREF_CLASS);
     if (!reference) return 0;
-    reference->class_name = copy_string(name ? name : "?");
+    reference->class_name = copy_string(class_name);
     probe_log("JNI FindClass: %s", name ? name : "<null>");
     return reference->handle;
 }
@@ -2278,12 +2293,25 @@ static uint32_t guest_new_class(ArmProbe *probe, const char *name) {
 static uint32_t guest_new_method(ArmProbe *probe, uint32_t class_handle,
                                  const char *name, const char *signature) {
     GuestRef *class_reference = guest_ref(probe, class_handle);
-    GuestRef *method = guest_new_ref(probe, GREF_METHOD);
+    const char *class_name = class_reference && class_reference->class_name
+                                 ? class_reference->class_name : "?";
+    const char *method_name = name ? name : "?";
+    const char *method_signature = signature ? signature : "?";
+    GuestRef *method;
+    unsigned index;
+    for (index = 0; index < probe->ref_count; ++index) {
+        method = &probe->refs[index];
+        if (method->kind == GREF_METHOD && method->class_name && method->name &&
+            method->signature && strcmp(method->class_name, class_name) == 0 &&
+            strcmp(method->name, method_name) == 0 &&
+            strcmp(method->signature, method_signature) == 0)
+            return method->handle;
+    }
+    method = guest_new_ref(probe, GREF_METHOD);
     if (!method) return 0;
-    method->class_name = copy_string(class_reference && class_reference->class_name
-                                         ? class_reference->class_name : "?");
-    method->name = copy_string(name ? name : "?");
-    method->signature = copy_string(signature ? signature : "?");
+    method->class_name = copy_string(class_name);
+    method->name = copy_string(method_name);
+    method->signature = copy_string(method_signature);
     probe_log("JNI method: %s.%s %s", method->class_name, method->name,
               method->signature);
     return method->handle;
@@ -4778,14 +4806,23 @@ static int run_guest(ArmProbe *probe, uint32_t entry,
         have_stack = sp &&
             uc_mem_read(probe->uc, sp, stack_dump,
                         sizeof(stack_dump)) == UC_ERR_OK;
-        probe_log("ERROR: ARM call hit instruction limit=%llu without "
-                  "returning entry=0x%08x pc=0x%08x lr=0x%08x "
-                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x "
-                  "cpsr=0x%08x mode=%s",
-                  (unsigned long long)instruction_limit, entry, pc, lr,
-                  r0, r1, r2, r3, sp, cpsr,
-                  (cpsr & (1u << 5u)) ? "Thumb" : "ARM");
-        probe_log("ARM instruction-limit stack: "
+        if (instruction_limit) {
+            probe_log("ERROR: ARM call hit instruction limit=%llu without "
+                      "returning entry=0x%08x pc=0x%08x lr=0x%08x "
+                      "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x "
+                      "cpsr=0x%08x mode=%s",
+                      (unsigned long long)instruction_limit, entry, pc, lr,
+                      r0, r1, r2, r3, sp, cpsr,
+                      (cpsr & (1u << 5u)) ? "Thumb" : "ARM");
+        } else {
+            probe_log("ERROR: ARM call stopped without returning "
+                      "entry=0x%08x pc=0x%08x lr=0x%08x "
+                      "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x "
+                      "cpsr=0x%08x mode=%s",
+                      entry, pc, lr, r0, r1, r2, r3, sp, cpsr,
+                      (cpsr & (1u << 5u)) ? "Thumb" : "ARM");
+        }
+        probe_log("ARM stopped-call stack: "
                   "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,"
                   "%08x,%08x,%08x,%08x%s",
                   stack_dump[0], stack_dump[1], stack_dump[2],
@@ -4901,14 +4938,19 @@ static int host_call(ArmProbe *probe, uint32_t address,
     int call_ok;
     size_t instruction_limit = label && strcmp(label, "nativeInit") == 0
                                    ? NATIVE_INIT_INSTRUCTION_LIMIT
-                                   : render_call
-                                         ? NATIVE_RENDER_INSTRUCTION_LIMIT
+                                   : probe->host.native_ready
+                                         ? NATIVE_RUNTIME_INSTRUCTION_LIMIT
                                          : DEFAULT_GUEST_INSTRUCTION_LIMIT;
     if (!address) return 0;
-    if (instruction_limit != DEFAULT_GUEST_INSTRUCTION_LIMIT &&
-        (!render_call || probe->native_render_calls == 0))
+    if (!instruction_limit && !probe->runtime_fast_path_logged) {
+        probe_log("ARM runtime fast path: per-instruction counting disabled "
+                  "(first call: %s)", label ? label : "?");
+        probe->runtime_fast_path_logged = 1;
+    } else if (instruction_limit != DEFAULT_GUEST_INSTRUCTION_LIMIT &&
+               (!render_call || probe->native_render_calls == 0)) {
         probe_log("ARM call instruction budget: %s -> %llu",
                   label, (unsigned long long)instruction_limit);
+    }
     if (render_call) ++probe->native_render_calls;
     call_ok = run_guest(probe, address, arguments, count, instruction_limit,
                         NULL);
@@ -5164,7 +5206,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap5",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap6",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5199,7 +5241,9 @@ static int create_arm_opengl_window(ArmProbe *probe) {
         return 0;
     }
     swap_interval = (SwapIntervalFunction)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval) swap_interval(1);
+    if (swap_interval && swap_interval(1)) probe->host.vsync_enabled = 1;
+    probe_log("OpenGL vertical sync: %s",
+              probe->host.vsync_enabled ? "enabled" : "unavailable");
     probe_log("OpenGL vendor: %s", glGetString(GL_VENDOR));
     probe_log("OpenGL renderer: %s", glGetString(GL_RENDERER));
     probe_log("OpenGL version: %s", glGetString(GL_VERSION));
@@ -5227,6 +5271,8 @@ static void destroy_arm_opengl_window(ArmProbe *probe) {
 static int run_arm_message_loop(ArmProbe *probe) {
     MSG message;
     uint32_t arguments[2] = {GUEST_ENV_OBJECT, 0};
+    DWORD performance_started = GetTickCount();
+    unsigned performance_frames = 0;
     probe_log("RESULT: ARM_RENDER_LOOP_ENTERED");
     while (probe->host.window && IsWindow(probe->host.window)) {
         while (PeekMessageA(&message, NULL, 0, 0, PM_REMOVE)) {
@@ -5239,8 +5285,26 @@ static int run_arm_message_loop(ArmProbe *probe) {
             if (!host_call(probe, probe->host.render, arguments, 2,
                            "nativeRender")) return 0;
             SwapBuffers(probe->host.device);
-            Sleep(1);
-        } else Sleep(16);
+            ++performance_frames;
+            {
+                DWORD now = GetTickCount();
+                DWORD elapsed = now - performance_started;
+                if (elapsed >= 5000u) {
+                    probe_log("ARM render performance: %.1f FPS "
+                              "(%u frames / %lu ms)",
+                              (double)performance_frames * 1000.0 /
+                                  (double)elapsed,
+                              performance_frames, (unsigned long)elapsed);
+                    performance_started = now;
+                    performance_frames = 0;
+                }
+            }
+            if (!probe->host.vsync_enabled) Sleep(1);
+        } else {
+            performance_started = GetTickCount();
+            performance_frames = 0;
+            Sleep(16);
+        }
     }
     return 0;
 }
@@ -5323,7 +5387,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap5");
+              "0.9.4-arm-bootstrap6");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;

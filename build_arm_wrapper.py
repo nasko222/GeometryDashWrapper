@@ -141,7 +141,7 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap5\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap6\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. Send gd-arm-wrapper.log after every test, "
         "including successful boots. This build retains the zlib, shader, and "
