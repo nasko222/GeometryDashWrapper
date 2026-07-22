@@ -49,7 +49,7 @@
 #define GUEST_OBJECT_BASE 0x20000000u
 #define GUEST_OBJECT_SIZE 0x00400000u
 #define GUEST_HEAP_BASE 0x30000000u
-#define GUEST_HEAP_SIZE 0x08000000u
+#define GUEST_HEAP_SIZE 0x10000000u
 #define GUEST_JNI_BASE 0x60000000u
 #define GUEST_JNI_SIZE 0x01000000u
 #define GUEST_FILE_BASE 0x50000000u
@@ -70,6 +70,7 @@
 #define MAX_REGISTERED_NATIVES 512
 #define MAX_GL_VERTEX_ATTRIBS 32
 #define MAX_DS_SEEN_NODES 4096
+#define GUEST_FREE_BIN_COUNT 32
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
 #define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
 #define GUEST_ALLOCATION_FREE 0x80000000u
@@ -269,6 +270,8 @@ typedef struct {
     unsigned object_count;
     GuestAllocation allocations[MAX_ALLOCS];
     unsigned allocation_count;
+    uint32_t *free_allocation_next;
+    uint32_t free_allocation_heads[GUEST_FREE_BIN_COUNT];
     uint32_t heap_next;
     uint32_t errno_address;
     uint32_t current_entry;
@@ -844,11 +847,45 @@ static int apply_relocations(ArmProbe *probe) {
 
 static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
     uint32_t address;
-    unsigned index;
+    unsigned index, bin;
     if (!size) size = 1;
     if (size > UINT32_MAX - 15u) return 0;
     size = align_up(size, 16u);
-    if (probe->free_allocation_count) {
+    bin = 0;
+    {
+        uint32_t value = size;
+        while (value > 1u && bin + 1u < GUEST_FREE_BIN_COUNT) {
+            value >>= 1u;
+            ++bin;
+        }
+    }
+    if (probe->free_allocation_count && probe->free_allocation_next) {
+        unsigned search_bin;
+        for (search_bin = bin; search_bin < GUEST_FREE_BIN_COUNT;
+             ++search_bin) {
+            uint32_t *link = &probe->free_allocation_heads[search_bin];
+            while (*link) {
+                GuestAllocation *allocation;
+                uint32_t block_size;
+                index = *link - 1u;
+                if (index >= probe->allocation_count) {
+                    *link = 0;
+                    break;
+                }
+                allocation = &probe->allocations[index];
+                block_size = allocation->size & GUEST_ALLOCATION_SIZE_MASK;
+                if ((allocation->size & GUEST_ALLOCATION_FREE) != 0u &&
+                    block_size >= size) {
+                    *link = probe->free_allocation_next[index];
+                    probe->free_allocation_next[index] = 0;
+                    allocation->size = block_size;
+                    --probe->free_allocation_count;
+                    return allocation->address;
+                }
+                link = &probe->free_allocation_next[index];
+            }
+        }
+    } else if (probe->free_allocation_count) {
         for (index = 0; index < probe->allocation_count; ++index) {
             GuestAllocation *allocation = &probe->allocations[index];
             if ((allocation->size & GUEST_ALLOCATION_FREE) != 0u &&
@@ -873,31 +910,53 @@ static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
     probe->heap_next += size;
     probe->allocations[probe->allocation_count].address = address;
     probe->allocations[probe->allocation_count].size = size;
+    if (probe->free_allocation_next)
+        probe->free_allocation_next[probe->allocation_count] = 0;
     ++probe->allocation_count;
     return address;
 }
 
-static uint32_t guest_allocation_size(const ArmProbe *probe, uint32_t address) {
-    unsigned index;
-    for (index = 0; index < probe->allocation_count; ++index) {
-        if ((probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u &&
-            probe->allocations[index].address == address)
-            return probe->allocations[index].size;
+static int guest_allocation_index(const ArmProbe *probe, uint32_t address) {
+    unsigned low = 0, high = probe->allocation_count;
+    while (low < high) {
+        unsigned middle = low + (high - low) / 2u;
+        uint32_t candidate = probe->allocations[middle].address;
+        if (candidate < address) low = middle + 1u;
+        else high = middle;
     }
+    return low < probe->allocation_count &&
+           probe->allocations[low].address == address ? (int)low : -1;
+}
+
+static uint32_t guest_allocation_size(const ArmProbe *probe, uint32_t address) {
+    int index = guest_allocation_index(probe, address);
+    if (index >= 0 &&
+        (probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u)
+        return probe->allocations[index].size;
     return 0;
 }
 
 static void guest_free(ArmProbe *probe, uint32_t address) {
-    unsigned index;
+    int index;
+    uint32_t size;
+    unsigned bin = 0;
     if (!address) return;
-    for (index = 0; index < probe->allocation_count; ++index) {
-        if ((probe->allocations[index].size & GUEST_ALLOCATION_FREE) == 0u &&
-            probe->allocations[index].address == address) {
-            probe->allocations[index].size |= GUEST_ALLOCATION_FREE;
-            ++probe->free_allocation_count;
-            return;
-        }
+    index = guest_allocation_index(probe, address);
+    if (index < 0 ||
+        (probe->allocations[index].size & GUEST_ALLOCATION_FREE) != 0u)
+        return;
+    size = probe->allocations[index].size & GUEST_ALLOCATION_SIZE_MASK;
+    probe->allocations[index].size = size | GUEST_ALLOCATION_FREE;
+    while (size > 1u && bin + 1u < GUEST_FREE_BIN_COUNT) {
+        size >>= 1u;
+        ++bin;
     }
+    if (probe->free_allocation_next) {
+        probe->free_allocation_next[index] =
+            probe->free_allocation_heads[bin];
+        probe->free_allocation_heads[bin] = (uint32_t)index + 1u;
+    }
+    ++probe->free_allocation_count;
 }
 
 static int guest_zero_memory(ArmProbe *probe, uint32_t address,
@@ -1015,14 +1074,60 @@ static uint32_t guest_time_to_tm(ArmProbe *probe, uint32_t time_address,
     return destination;
 }
 
-static uint64_t host_unix_milliseconds(void) {
+static uint64_t host_system_unix_100ns(void) {
     FILETIME file_time;
     uint64_t ticks;
     const uint64_t epoch = UINT64_C(116444736000000000);
     GetSystemTimeAsFileTime(&file_time);
     ticks = (uint64_t)file_time.dwLowDateTime |
             ((uint64_t)file_time.dwHighDateTime << 32u);
-    return ticks >= epoch ? (ticks - epoch) / UINT64_C(10000) : 0;
+    return ticks >= epoch ? ticks - epoch : 0;
+}
+
+static LARGE_INTEGER g_time_frequency;
+static LARGE_INTEGER g_time_origin;
+static uint64_t g_time_origin_unix_microseconds;
+static int g_time_ready;
+static int g_time_uses_qpc;
+
+static void host_time_initialize(void) {
+    if (g_time_ready) return;
+    if (QueryPerformanceFrequency(&g_time_frequency) &&
+        QueryPerformanceCounter(&g_time_origin) &&
+        g_time_frequency.QuadPart > 0) {
+        g_time_uses_qpc = 1;
+    } else {
+        g_time_frequency.QuadPart = 1000;
+        g_time_origin.QuadPart = GetTickCount();
+    }
+    g_time_origin_unix_microseconds =
+        host_system_unix_100ns() / UINT64_C(10);
+    g_time_ready = 1;
+    probe_log("ARM high-resolution timer ready: %lld Hz",
+              (long long)g_time_frequency.QuadPart);
+}
+
+static uint64_t host_monotonic_units(uint64_t units_per_second) {
+    LARGE_INTEGER now;
+    uint64_t elapsed, frequency;
+    host_time_initialize();
+    if (!g_time_uses_qpc || !QueryPerformanceCounter(&now))
+        now.QuadPart = GetTickCount();
+    elapsed = now.QuadPart >= g_time_origin.QuadPart
+                  ? (uint64_t)(now.QuadPart - g_time_origin.QuadPart) : 0;
+    frequency = (uint64_t)g_time_frequency.QuadPart;
+    return (elapsed / frequency) * units_per_second +
+           ((elapsed % frequency) * units_per_second) / frequency;
+}
+
+static uint64_t host_unix_microseconds(void) {
+    host_time_initialize();
+    return g_time_origin_unix_microseconds +
+           host_monotonic_units(UINT64_C(1000000));
+}
+
+static uint64_t host_unix_milliseconds(void) {
+    return host_unix_microseconds() / UINT64_C(1000);
 }
 
 static int guest_ftime(ArmProbe *probe, uint32_t destination) {
@@ -4139,17 +4244,31 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
             (UINT64_C(0x5deece66d) * probe->lrand48_state + UINT64_C(0xb)) &
             UINT64_C(0x0000ffffffffffff);
         result = (uint32_t)(probe->lrand48_state >> 17u);
-    } else if (strcmp(name, "time") == 0 || strcmp(name, "clock") == 0 ||
+    } else if (strcmp(name, "time") == 0 ||
                strcmp(name, "arc4random") == 0) {
         result = (uint32_t)time(NULL);
         if (r0 && strcmp(name, "time") == 0)
             uc_mem_write(probe->uc, r0, &result, sizeof(result));
+    } else if (strcmp(name, "clock") == 0) {
+        result = (uint32_t)host_monotonic_units(UINT64_C(1000000));
     } else if (strcmp(name, "gettimeofday") == 0) {
-        uint32_t values[2] = {(uint32_t)time(NULL), 0};
+        uint64_t microseconds = host_unix_microseconds();
+        uint32_t values[2] = {
+            (uint32_t)(microseconds / UINT64_C(1000000)),
+            (uint32_t)(microseconds % UINT64_C(1000000))
+        };
+        static const uint32_t timezone[2] = {0, 0};
         if (r0) uc_mem_write(probe->uc, r0, values, sizeof(values));
+        if (r1) uc_mem_write(probe->uc, r1, timezone, sizeof(timezone));
         result = 0;
     } else if (strcmp(name, "clock_gettime") == 0) {
-        uint32_t values[2] = {(uint32_t)time(NULL), 0};
+        uint64_t nanoseconds = r0 == 0
+                                   ? host_unix_microseconds() * UINT64_C(1000)
+                                   : host_monotonic_units(UINT64_C(1000000000));
+        uint32_t values[2] = {
+            (uint32_t)(nanoseconds / UINT64_C(1000000000)),
+            (uint32_t)(nanoseconds % UINT64_C(1000000000))
+        };
         if (r1) uc_mem_write(probe->uc, r1, values, sizeof(values));
         result = 0;
     } else if (strcmp(name, "ftime") == 0) {
@@ -4579,6 +4698,12 @@ static int initialize_unicorn(ArmProbe *probe) {
     unsigned char *stubs;
     unsigned index;
     uint32_t object_value;
+    probe->free_allocation_next =
+        (uint32_t *)calloc(MAX_ALLOCS, sizeof(*probe->free_allocation_next));
+    if (!probe->free_allocation_next) {
+        probe_log("ERROR: cannot allocate ARM guest free-list index");
+        return 0;
+    }
     error = uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &probe->uc);
     if (error != UC_ERR_OK) {
         probe_log("ERROR: uc_open: %s", uc_strerror(error));
@@ -4899,6 +5024,7 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->objects[index].name);
     free(probe->image_data);
     free(probe->file_data);
+    free(probe->free_allocation_next);
 }
 
 static uint32_t find_registered_native(const ArmProbe *probe,
@@ -4942,10 +5068,12 @@ static int host_call(ArmProbe *probe, uint32_t address,
                                          ? NATIVE_RUNTIME_INSTRUCTION_LIMIT
                                          : DEFAULT_GUEST_INSTRUCTION_LIMIT;
     if (!address) return 0;
-    if (!instruction_limit && !probe->runtime_fast_path_logged) {
-        probe_log("ARM runtime fast path: per-instruction counting disabled "
-                  "(first call: %s)", label ? label : "?");
-        probe->runtime_fast_path_logged = 1;
+    if (!instruction_limit) {
+        if (!probe->runtime_fast_path_logged) {
+            probe_log("ARM runtime fast path: per-instruction counting "
+                      "disabled (first call: %s)", label ? label : "?");
+            probe->runtime_fast_path_logged = 1;
+        }
     } else if (instruction_limit != DEFAULT_GUEST_INSTRUCTION_LIMIT &&
                (!render_call || probe->native_render_calls == 0)) {
         probe_log("ARM call instruction budget: %s -> %llu",
@@ -5206,7 +5334,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap6",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap7",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -5387,7 +5515,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap6");
+              "0.9.4-arm-bootstrap7");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;

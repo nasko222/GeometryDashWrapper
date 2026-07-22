@@ -141,27 +141,19 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap6\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap7\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. Send gd-arm-wrapper.log after every test, "
-        "including successful boots. This build retains the zlib, shader, and "
-        "nativeInit budget fixes; adds the ARM sscanf bridge required by the "
-        "Cocos bitmap-font loader; implements guest memchr/memrchr/wmemchr so "
-        "multi-line font files are parsed completely; implements ARM/Bionic "
-        "localtime, gmtime, reentrant time conversion, strftime, and strtok "
-        "bridges; marshals ARM client-side vertex and index arrays before "
-        "OpenGL draw calls; implements the Bionic ftime ABI; raises the ARM "
-        "nativeRender budget for libpng-heavy startup frames; records unhandled "
-        "host exceptions; accelerates the guest libpng row-filter hot loop "
-        "through an ABI-checked host bridge; reuses freed ARM heap blocks "
-        "instead of exhausting a bump-only allocation table; captures Bionic "
-        "standard-stream writes; reports exact libpng errors and fatal ARM "
-        "callers; retains the proven one-billion-instruction ceiling on every "
-        "render call; instruments the exact DS_Dictionary plist walker that "
-        "held the loading scene, reports its per-frame work, and safely breaks "
-        "a repeated XML-node cycle; records ARM/Thumb state and stack words if "
-        "the ceiling is reached; and bounds OpenGL state-query writebacks to "
-        "the exact result size.\n",
+        "including successful boots. Bootstrap7 fixes the Cocos scheduler's "
+        "clock by providing sub-second gettimeofday, clock_gettime, clock, and "
+        "ftime values from Windows' high-resolution performance counter. Live "
+        "render and input calls use the return-trampoline fast path without a "
+        "per-instruction Unicorn hook. The guest heap is 256 MiB and freed "
+        "blocks use size-indexed lookup, while active allocations use direct "
+        "address lookup. The build retains the working JNI, zlib, libpng, "
+        "OpenGL client-array, audio, input, storage, plist-cycle, and detailed "
+        "crash-diagnostic bridges. Measured render FPS is written to the log "
+        "every five seconds.\n",
         encoding="utf-8",
     )
     print(output / "GeometryDashArmWrapper.exe")
