@@ -82,6 +82,7 @@
 #define GUEST_FREE_BIN_COUNT 32
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
 #define MAX_GL_CLIENT_ARRAY_BYTES (64u * 1024u * 1024u)
+#define HOST_IO_SCRATCH_BYTES (1024u * 1024u)
 #define GUEST_ALLOCATION_FREE 0x80000000u
 #define GUEST_ALLOCATION_SIZE_MASK 0x7fffffffu
 #define DEFAULT_GUEST_INSTRUCTION_LIMIT 20000000u
@@ -148,6 +149,7 @@ typedef struct {
     size_t position;
     size_t bytes_read;
     size_t bytes_written;
+    int owns_payload;
     int writable;
     int transactional;
     int eof;
@@ -296,6 +298,8 @@ typedef struct {
     uc_engine *uc;
     unsigned char *file_data;
     size_t file_size;
+    unsigned char *apk_data;
+    size_t apk_size;
     unsigned char *image_data;
     uint32_t image_size;
     const Elf32_Ehdr *header;
@@ -333,7 +337,14 @@ typedef struct {
     uint32_t gl_array_buffer_binding;
     uint32_t gl_element_array_buffer_binding;
     GuestGlVertexAttrib gl_vertex_attribs[MAX_GL_VERTEX_ATTRIBS];
+    unsigned char *gl_client_buffers[MAX_GL_VERTEX_ATTRIBS];
+    size_t gl_client_buffer_capacities[MAX_GL_VERTEX_ATTRIBS];
+    unsigned char *gl_index_buffer;
+    size_t gl_index_buffer_capacity;
+    unsigned char *io_buffer;
+    size_t io_buffer_capacity;
     unsigned gl_draw_logs;
+    unsigned apk_cache_open_logs;
     unsigned native_render_calls;
     int runtime_fast_path_logged;
     unsigned png_filter_rows;
@@ -375,6 +386,27 @@ typedef struct {
     uint32_t pthread_destructors[MAX_PTHREAD_KEYS];
     uint32_t pthread_next_key;
     unsigned pthread_once_calls;
+    uint64_t profile_render_microseconds;
+    uint64_t profile_render_max_microseconds;
+    uint64_t profile_last_render_microseconds;
+    uint64_t profile_swap_microseconds;
+    uint64_t profile_swap_max_microseconds;
+    uint64_t profile_gl_draw_calls;
+    uint64_t profile_gl_vertices;
+    uint64_t profile_gl_client_copies;
+    uint64_t profile_gl_client_bytes;
+    uint64_t profile_alloc_calls;
+    uint64_t profile_alloc_bytes;
+    uint64_t profile_free_calls;
+    uint64_t profile_file_opens;
+    uint64_t profile_apk_opens;
+    uint64_t profile_file_read_bytes;
+    uint64_t profile_zlib_calls;
+    uint64_t profile_frames_over_20ms;
+    uint64_t profile_frames_over_33ms;
+    uint64_t profile_frames_over_50ms;
+    unsigned profile_slow_native_logs;
+    unsigned profile_import_baseline[MAX_IMPORTS];
     uint32_t level_trace_play_init;
     uint32_t level_trace_play_create;
     uint32_t level_trace_editor_init;
@@ -475,6 +507,27 @@ static char *copy_string(const char *source) {
     char *result = (char *)malloc(size);
     if (result) memcpy(result, source, size);
     return result;
+}
+
+static int host_buffer_reserve(unsigned char **buffer, size_t *capacity,
+                               size_t required) {
+    size_t next;
+    unsigned char *grown;
+    if (!buffer || !capacity) return 0;
+    if (required <= *capacity) return 1;
+    next = *capacity ? *capacity : 4096u;
+    while (next < required) {
+        if (next > SIZE_MAX / 2u) {
+            next = required;
+            break;
+        }
+        next *= 2u;
+    }
+    grown = (unsigned char *)realloc(*buffer, next);
+    if (!grown) return 0;
+    *buffer = grown;
+    *capacity = next;
+    return 1;
 }
 
 static int range_valid(size_t offset, size_t length, size_t total) {
@@ -632,7 +685,8 @@ static int apk_extract_one(const unsigned char *apk, size_t apk_size,
 }
 
 static int load_arm_input(const char *path, unsigned char **data,
-                          size_t *size) {
+                          size_t *size, unsigned char **apk_data,
+                          size_t *apk_size) {
     static const char *const members[] = {
         "lib/armeabi/libcocos2dcpp.so",
         "lib/armeabi/libgame.so",
@@ -642,6 +696,8 @@ static int load_arm_input(const char *path, unsigned char **data,
     unsigned char *input = NULL;
     size_t input_size = 0;
     size_t index;
+    if (apk_data) *apk_data = NULL;
+    if (apk_size) *apk_size = 0;
     if (!load_file(path, &input, &input_size)) return 0;
     if (input_size >= 4 && memcmp(input, "\x7f" "ELF", 4) == 0) {
         *data = input;
@@ -650,7 +706,12 @@ static int load_arm_input(const char *path, unsigned char **data,
     }
     for (index = 0; index < sizeof(members) / sizeof(members[0]); ++index) {
         if (apk_extract_one(input, input_size, members[index], data, size)) {
-            free(input);
+            if (apk_data && apk_size) {
+                *apk_data = input;
+                *apk_size = input_size;
+            } else {
+                free(input);
+            }
             return 1;
         }
     }
@@ -667,6 +728,12 @@ int apk_extract_member(const char *apk_path, const char *member_name,
     if (!apk_path || !member_name || !output || !output_size) return 0;
     *output = NULL;
     *output_size = 0;
+    if (g_active_probe && g_active_probe->apk_data &&
+        _stricmp(apk_path, g_active_probe->input_path) == 0) {
+        return apk_extract_one(g_active_probe->apk_data,
+                               g_active_probe->apk_size,
+                               member_name, output, output_size);
+    }
     if (!load_file(apk_path, &apk, &apk_size)) return 0;
     result = apk_extract_one(apk, apk_size, member_name, output, output_size);
     free(apk);
@@ -1096,6 +1163,8 @@ static uint32_t guest_alloc(ArmProbe *probe, uint32_t size) {
     if (!size) size = 1;
     if (size > UINT32_MAX - 15u) return 0;
     size = align_up(size, 16u);
+    ++probe->profile_alloc_calls;
+    probe->profile_alloc_bytes += size;
     bin = guest_allocation_bin(size);
 
     /* Prefer only the matching size class while unused heap remains.  The old
@@ -1180,6 +1249,7 @@ static void guest_free(ArmProbe *probe, uint32_t address) {
     if (index < 0 ||
         (probe->allocations[index].size & GUEST_ALLOCATION_FREE) != 0u)
         return;
+    ++probe->profile_free_calls;
     size = probe->allocations[index].size & GUEST_ALLOCATION_SIZE_MASK;
     probe->allocations[index].size = size | GUEST_ALLOCATION_FREE;
     while (size > 1u && bin + 1u < GUEST_FREE_BIN_COUNT) {
@@ -1729,6 +1799,63 @@ static void translate_guest_path(ArmProbe *probe, const char *path,
     path_slashes(destination);
 }
 
+static int save_file_is_incomplete(FILE *stream, long length,
+                                   const char **reason) {
+    char prefix[4097];
+    char suffix[513];
+    size_t prefix_size;
+    size_t suffix_size = 0;
+    char *start;
+    int xml;
+    if (reason) *reason = "incomplete";
+    if (!stream || length < 0) return 0;
+    if (length == 0) {
+        if (reason) *reason = "empty";
+        return 1;
+    }
+    if (length == 22) {
+        if (reason) *reason = "known 22-byte incomplete";
+        return 1;
+    }
+    if (fseek(stream, 0, SEEK_SET) != 0) return 0;
+    prefix_size = (size_t)length;
+    if (prefix_size >= sizeof(prefix)) prefix_size = sizeof(prefix) - 1u;
+    prefix_size = fread(prefix, 1, prefix_size, stream);
+    prefix[prefix_size] = 0;
+    start = prefix;
+    if (prefix_size >= 3u &&
+        (unsigned char)start[0] == 0xefu &&
+        (unsigned char)start[1] == 0xbbu &&
+        (unsigned char)start[2] == 0xbfu)
+        start += 3;
+    while (*start && isspace((unsigned char)*start)) ++start;
+    xml = strncmp(start, "<?xml", 5u) == 0 ||
+          strncmp(start, "<plist", 6u) == 0;
+    if (!xml) {
+        fseek(stream, 0, SEEK_SET);
+        return 0;
+    }
+    if (!strstr(start, "<plist") || !strstr(start, "<dict")) {
+        if (reason) *reason = "XML header without plist data";
+        fseek(stream, 0, SEEK_SET);
+        return 1;
+    }
+    if (length > 0) {
+        long suffix_offset = length > (long)(sizeof(suffix) - 1u)
+                                 ? length - (long)(sizeof(suffix) - 1u) : 0;
+        if (fseek(stream, suffix_offset, SEEK_SET) == 0) {
+            suffix_size = fread(suffix, 1, sizeof(suffix) - 1u, stream);
+            suffix[suffix_size] = 0;
+        }
+    }
+    fseek(stream, 0, SEEK_SET);
+    if (!suffix_size || !strstr(suffix, "</plist>")) {
+        if (reason) *reason = "truncated XML plist";
+        return 1;
+    }
+    return 0;
+}
+
 static uint32_t guest_open_file(ArmProbe *probe, const char *path,
                                 const char *mode, int asset_only) {
     GuestFile *file;
@@ -1741,6 +1868,7 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
     unsigned char *payload = NULL;
     size_t payload_size = 0;
     unsigned slot;
+    int owns_payload = 0;
     int writable = mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
     int game_file;
     int transactional = 0;
@@ -1762,7 +1890,11 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
 
     if (!asset_only) {
         translate_guest_path(probe, path, translated, sizeof(translated));
-        if (writable && game_file && strchr(mode, 'w')) {
+        if (!writable && probe->apk_data &&
+            _stricmp(translated, probe->input_path) == 0) {
+            payload = probe->apk_data;
+            payload_size = probe->apk_size;
+        } else if (writable && game_file && strchr(mode, 'w')) {
             snprintf(transaction, sizeof(transaction), "%s.wrapper.tmp",
                      translated);
             host = fopen(transaction, mode);
@@ -1772,18 +1904,21 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
         }
         if (host && !writable && game_file) {
             long length = -1;
+            const char *recovery_reason = NULL;
             if (fseek(host, 0, SEEK_END) == 0) length = ftell(host);
             fseek(host, 0, SEEK_SET);
-            if (length == 22) {
+            if (save_file_is_incomplete(host, length, &recovery_reason)) {
                 fclose(host);
                 host = NULL;
                 ignored_corrupt_save = 1;
-                probe_log("ARM save recovery: ignored incomplete 22-byte %s",
-                          name);
+                probe_log("ARM save recovery: ignored %s %s (%ld bytes)",
+                          recovery_reason ? recovery_reason : "incomplete",
+                          name, length);
             }
         }
     }
-    if (!host && !writable && !ignored_corrupt_save && probe->input_path[0]) {
+    if (!host && !payload && !writable && !ignored_corrupt_save &&
+        probe->input_path[0]) {
         char member[MAX_PATH * 4];
         const char *source = path;
         while (*source == '/' || *source == '\\') ++source;
@@ -1799,6 +1934,7 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
             snprintf(with_assets, sizeof(with_assets), "assets/%s", member);
             apk_extract_member(probe->input_path, with_assets, &payload, &payload_size);
         }
+        owns_payload = payload != NULL;
     }
     if (!host && !payload) {
         probe_log("ARM file open failed: %s mode=%s", path, mode);
@@ -1810,6 +1946,7 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
     file->host = host;
     file->payload = payload;
     file->size = payload_size;
+    file->owns_payload = owns_payload;
     file->writable = writable;
     file->transactional = transactional;
     if (transactional) {
@@ -1831,7 +1968,13 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
                  sizeof(file->diagnostic_name), "%s", name);
     if (host && strchr(mode, 'a')) fseek(host, 0, SEEK_END);
     if (slot == probe->file_count) ++probe->file_count;
-    if (host)
+    ++probe->profile_file_opens;
+    if (payload == probe->apk_data) {
+        ++probe->profile_apk_opens;
+        if (probe->apk_cache_open_logs++ < 2u)
+            probe_log("ARM file open: %s mode=%s source=shared APK cache "
+                      "bytes=%u", path, mode, (unsigned)payload_size);
+    } else if (host)
         probe_log("ARM file open: %s mode=%s source=host%s", path, mode,
                   transactional ? " transaction=atomic" : "");
     else
@@ -1842,26 +1985,44 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
 
 static size_t guest_file_read(ArmProbe *probe, GuestFile *file,
                               uint32_t destination, size_t bytes) {
-    unsigned char *temporary;
-    size_t actual = 0;
+    size_t total = 0;
     if (!file || !destination || !bytes) return 0;
-    temporary = (unsigned char *)malloc(bytes);
-    if (!temporary) return 0;
-    if (file->host) {
-        actual = fread(temporary, 1, bytes, file->host);
-        file->eof = feof(file->host) != 0;
-    } else if (file->position < file->size) {
-        actual = file->size - file->position;
+    if (!file->host) {
+        size_t actual = file->position < file->size
+                            ? file->size - file->position : 0;
         if (actual > bytes) actual = bytes;
-        memcpy(temporary, file->payload + file->position, actual);
-        file->position += actual;
+        if (actual &&
+            uc_mem_write(probe->uc, destination,
+                         file->payload + file->position, actual) == UC_ERR_OK) {
+            file->position += actual;
+            total = actual;
+        }
         file->eof = file->position >= file->size;
+    } else {
+        size_t scratch_size = bytes < HOST_IO_SCRATCH_BYTES
+                                  ? bytes : HOST_IO_SCRATCH_BYTES;
+        if (!host_buffer_reserve(&probe->io_buffer,
+                                 &probe->io_buffer_capacity,
+                                 scratch_size))
+            return 0;
+        while (total < bytes) {
+            size_t part = bytes - total;
+            size_t actual;
+            if (part > scratch_size) part = scratch_size;
+            if ((uint64_t)destination + total > UINT32_MAX) break;
+            actual = fread(probe->io_buffer, 1, part, file->host);
+            if (actual &&
+                uc_mem_write(probe->uc, destination + (uint32_t)total,
+                             probe->io_buffer, actual) != UC_ERR_OK)
+                break;
+            total += actual;
+            if (actual < part) break;
+        }
+        file->eof = feof(file->host) != 0;
     }
-    if (actual && uc_mem_write(probe->uc, destination, temporary, actual) != UC_ERR_OK)
-        actual = 0;
-    file->bytes_read += actual;
-    free(temporary);
-    return actual;
+    file->bytes_read += total;
+    probe->profile_file_read_bytes += total;
+    return total;
 }
 
 static int guest_file_get_character(GuestFile *file) {
@@ -1883,16 +2044,28 @@ static int guest_file_get_character(GuestFile *file) {
 
 static size_t guest_file_write(ArmProbe *probe, GuestFile *file,
                                uint32_t source, size_t bytes) {
-    unsigned char *temporary;
-    size_t actual = 0;
+    size_t total = 0;
+    size_t scratch_size;
     if (!file || !file->host || !source || !bytes) return 0;
-    temporary = (unsigned char *)malloc(bytes);
-    if (!temporary) return 0;
-    if (uc_mem_read(probe->uc, source, temporary, bytes) == UC_ERR_OK)
-        actual = fwrite(temporary, 1, bytes, file->host);
-    file->bytes_written += actual;
-    free(temporary);
-    return actual;
+    scratch_size = bytes < HOST_IO_SCRATCH_BYTES
+                       ? bytes : HOST_IO_SCRATCH_BYTES;
+    if (!host_buffer_reserve(&probe->io_buffer,
+                             &probe->io_buffer_capacity, scratch_size))
+        return 0;
+    while (total < bytes) {
+        size_t part = bytes - total;
+        size_t actual;
+        if (part > scratch_size) part = scratch_size;
+        if ((uint64_t)source + total > UINT32_MAX ||
+            uc_mem_read(probe->uc, source + (uint32_t)total,
+                        probe->io_buffer, part) != UC_ERR_OK)
+            break;
+        actual = fwrite(probe->io_buffer, 1, part, file->host);
+        total += actual;
+        if (actual < part) break;
+    }
+    file->bytes_written += total;
+    return total;
 }
 
 static int guest_file_seek(GuestFile *file, long offset, int origin) {
@@ -1969,7 +2142,7 @@ static int guest_file_close(ArmProbe *probe, GuestFile *file) {
             }
         }
     }
-    free(file->payload);
+    if (file->owns_payload) free(file->payload);
     free(file->transaction_path);
     free(file->final_path);
     file->payload = NULL;
@@ -2106,6 +2279,7 @@ static int guest_zstream_process(ArmProbe *probe, uint32_t guest_address,
     uint32_t consumed = 0;
     uint32_t produced = 0;
     int result = Z_STREAM_ERROR;
+    ++probe->profile_zlib_calls;
     if (!stream || !stream->active || stream->kind != kind ||
         !guest_zstream_read_layout(probe, guest_address, &layout))
         return Z_STREAM_ERROR;
@@ -3818,9 +3992,16 @@ static int gl_prepare_client_arrays(ArmProbe *probe, uint32_t vertex_limit,
         if (!element_size || stride < element_size) goto failed;
         required = (uint64_t)(vertex_limit - 1u) * stride + element_size;
         if (required > MAX_GL_CLIENT_ARRAY_BYTES) goto failed;
-        copies[index] = guest_buffer_copy(
-            probe, attribute->guest_pointer, (size_t)required);
-        if (!copies[index]) goto failed;
+        if (!host_buffer_reserve(&probe->gl_client_buffers[index],
+                                 &probe->gl_client_buffer_capacities[index],
+                                 (size_t)required) ||
+            uc_mem_read(probe->uc, attribute->guest_pointer,
+                        probe->gl_client_buffers[index],
+                        (size_t)required) != UC_ERR_OK)
+            goto failed;
+        copies[index] = probe->gl_client_buffers[index];
+        ++probe->profile_gl_client_copies;
+        probe->profile_gl_client_bytes += required;
         pointer_arguments[0] = index;
         pointer_arguments[1] = attribute->size;
         pointer_arguments[2] = attribute->type;
@@ -3874,12 +4055,6 @@ static uint32_t gl_index_vertex_limit(const void *indices, uint32_t count,
         if (value > maximum) maximum = value;
     }
     return count && maximum != UINT32_MAX ? maximum + 1u : 0;
-}
-
-static void gl_free_client_arrays(void **copies) {
-    unsigned index;
-    for (index = 0; index < MAX_GL_VERTEX_ATTRIBS; ++index)
-        free(copies[index]);
 }
 
 static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
@@ -3954,10 +4129,11 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         unsigned prepared = 0;
         unsigned log_draw = probe->gl_draw_logs++;
         uint32_t draw_result = 0;
+        ++probe->profile_gl_draw_calls;
+        if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
         if (limit > UINT32_MAX ||
             !gl_prepare_client_arrays(probe, (uint32_t)limit,
                                       copies, &prepared)) {
-            gl_free_client_arrays(copies);
             return 0;
         }
         if (log_draw < 8u)
@@ -3965,7 +4141,6 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
                       "client_attribs=%u", first, draw_count, prepared);
         draw_result = call_gl_raw(function, arguments, 3);
         if (log_draw < 8u) probe_log("OpenGL draw returned: glDrawArrays");
-        gl_free_client_arrays(copies);
         return draw_result;
     }
     if (strcmp(name, "glDrawElements") == 0) {
@@ -3978,20 +4153,27 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         unsigned log_draw = probe->gl_draw_logs++;
         uint32_t draw_result = 0;
         if (draw_count < 0 || !index_size) return 0;
+        ++probe->profile_gl_draw_calls;
+        if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
         if (!probe->gl_element_array_buffer_binding && draw_count) {
             uint64_t bytes = (uint64_t)(uint32_t)draw_count * index_size;
             if (bytes > MAX_GL_CLIENT_ARRAY_BYTES ||
-                !(indices = guest_buffer_copy(
-                      probe, arguments[3], (size_t)bytes)))
+                !host_buffer_reserve(&probe->gl_index_buffer,
+                                     &probe->gl_index_buffer_capacity,
+                                     (size_t)bytes) ||
+                uc_mem_read(probe->uc, arguments[3],
+                            probe->gl_index_buffer,
+                            (size_t)bytes) != UC_ERR_OK)
                 return 0;
+            indices = probe->gl_index_buffer;
+            ++probe->profile_gl_client_copies;
+            probe->profile_gl_client_bytes += bytes;
             vertex_limit = gl_index_vertex_limit(
                 indices, (uint32_t)draw_count, arguments[2]);
             arguments[3] = (uint32_t)(uintptr_t)indices;
         }
         if (!gl_prepare_client_arrays(probe, vertex_limit,
                                       copies, &prepared)) {
-            free(indices);
-            gl_free_client_arrays(copies);
             return 0;
         }
         if (log_draw < 8u)
@@ -4000,8 +4182,6 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
                       draw_count, prepared, indices != NULL);
         draw_result = call_gl_raw(function, arguments, 4);
         if (log_draw < 8u) probe_log("OpenGL draw returned: glDrawElements");
-        free(indices);
-        gl_free_client_arrays(copies);
         return draw_result;
     }
     if (strcmp(name, "glGetString") == 0) {
@@ -6506,6 +6686,11 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->imports[index].name);
     for (index = 0; index < probe->object_count; ++index)
         free(probe->objects[index].name);
+    for (index = 0; index < MAX_GL_VERTEX_ATTRIBS; ++index)
+        free(probe->gl_client_buffers[index]);
+    free(probe->gl_index_buffer);
+    free(probe->io_buffer);
+    free(probe->apk_data);
     free(probe->image_data);
     free(probe->file_data);
     free(probe->allocations);
@@ -6543,6 +6728,13 @@ static int host_call(ArmProbe *probe, uint32_t address,
                      const uint32_t *arguments, unsigned count,
                      const char *label) {
     int render_call = label && strcmp(label, "nativeRender") == 0;
+    uint64_t started_microseconds;
+    uint64_t elapsed_microseconds;
+    uint64_t apk_opens_before = probe->profile_apk_opens;
+    uint64_t file_bytes_before = probe->profile_file_read_bytes;
+    uint64_t zlib_before = probe->profile_zlib_calls;
+    uint64_t allocs_before = probe->profile_alloc_calls;
+    uint64_t draws_before = probe->profile_gl_draw_calls;
     uint64_t ds_calls_before = probe->ds_step_calls;
     uint64_t ds_iterations_before = probe->ds_step_iterations;
     uint64_t ds_cycles_before = probe->ds_step_cycles;
@@ -6553,6 +6745,7 @@ static int host_call(ArmProbe *probe, uint32_t address,
                                          ? NATIVE_RUNTIME_INSTRUCTION_LIMIT
                                          : DEFAULT_GUEST_INSTRUCTION_LIMIT;
     if (!address) return 0;
+    started_microseconds = host_monotonic_units(UINT64_C(1000000));
     if (!instruction_limit) {
         if (!probe->runtime_fast_path_logged) {
             probe_log("ARM runtime fast path: per-instruction counting "
@@ -6567,6 +6760,32 @@ static int host_call(ArmProbe *probe, uint32_t address,
     if (render_call) ++probe->native_render_calls;
     call_ok = run_guest(probe, address, arguments, count, instruction_limit,
                         NULL);
+    elapsed_microseconds =
+        host_monotonic_units(UINT64_C(1000000)) - started_microseconds;
+    if (render_call) {
+        probe->profile_last_render_microseconds = elapsed_microseconds;
+        probe->profile_render_microseconds += elapsed_microseconds;
+        if (elapsed_microseconds > probe->profile_render_max_microseconds)
+            probe->profile_render_max_microseconds = elapsed_microseconds;
+    }
+    if (probe->host.native_ready && elapsed_microseconds >= UINT64_C(100000) &&
+        probe->profile_slow_native_logs < 32u &&
+        (!render_call || elapsed_microseconds >= UINT64_C(250000))) {
+        ++probe->profile_slow_native_logs;
+        probe_log("ARM slow native call: %s %.1f ms apk-opens=%llu "
+                  "file-read=%.2f MiB zlib=%llu allocs=%llu draws=%llu",
+                  label ? label : "?",
+                  (double)elapsed_microseconds / 1000.0,
+                  (unsigned long long)(probe->profile_apk_opens -
+                                            apk_opens_before),
+                  (double)(probe->profile_file_read_bytes -
+                               file_bytes_before) / (1024.0 * 1024.0),
+                  (unsigned long long)(probe->profile_zlib_calls - zlib_before),
+                  (unsigned long long)(probe->profile_alloc_calls -
+                                            allocs_before),
+                  (unsigned long long)(probe->profile_gl_draw_calls -
+                                            draws_before));
+    }
     if (render_call &&
         (probe->native_render_calls <= 24u ||
          probe->ds_step_cycles != ds_cycles_before))
@@ -6819,7 +7038,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap13",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap14",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -6881,11 +7100,117 @@ static void destroy_arm_opengl_window(ArmProbe *probe) {
     probe->host.window = NULL;
 }
 
+static void arm_frame_profile_reset(ArmProbe *probe) {
+    unsigned index;
+    if (!probe) return;
+    probe->profile_render_microseconds = 0;
+    probe->profile_render_max_microseconds = 0;
+    probe->profile_last_render_microseconds = 0;
+    probe->profile_swap_microseconds = 0;
+    probe->profile_swap_max_microseconds = 0;
+    probe->profile_gl_draw_calls = 0;
+    probe->profile_gl_vertices = 0;
+    probe->profile_gl_client_copies = 0;
+    probe->profile_gl_client_bytes = 0;
+    probe->profile_alloc_calls = 0;
+    probe->profile_alloc_bytes = 0;
+    probe->profile_free_calls = 0;
+    probe->profile_file_opens = 0;
+    probe->profile_apk_opens = 0;
+    probe->profile_file_read_bytes = 0;
+    probe->profile_zlib_calls = 0;
+    probe->profile_frames_over_20ms = 0;
+    probe->profile_frames_over_33ms = 0;
+    probe->profile_frames_over_50ms = 0;
+    for (index = 0; index < probe->import_count; ++index)
+        probe->profile_import_baseline[index] = probe->imports[index].calls;
+}
+
+static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
+                                  DWORD elapsed_milliseconds) {
+    enum { HOT_IMPORTS = 6 };
+    unsigned hot_indices[HOT_IMPORTS];
+    uint64_t hot_calls[HOT_IMPORTS] = {0};
+    uint64_t total_imports = 0;
+    char hot_text[768];
+    size_t hot_used = 0;
+    unsigned index;
+    double elapsed_seconds = (double)elapsed_milliseconds / 1000.0;
+    memset(hot_indices, 0xff, sizeof(hot_indices));
+    for (index = 0; index < probe->import_count; ++index) {
+        uint64_t delta = (unsigned)(probe->imports[index].calls -
+                                    probe->profile_import_baseline[index]);
+        unsigned place;
+        total_imports += delta;
+        if (!delta) continue;
+        for (place = 0; place < HOT_IMPORTS; ++place) {
+            if (delta > hot_calls[place]) {
+                unsigned move;
+                for (move = HOT_IMPORTS - 1u; move > place; --move) {
+                    hot_calls[move] = hot_calls[move - 1u];
+                    hot_indices[move] = hot_indices[move - 1u];
+                }
+                hot_calls[place] = delta;
+                hot_indices[place] = index;
+                break;
+            }
+        }
+    }
+    hot_text[0] = 0;
+    for (index = 0; index < HOT_IMPORTS && hot_calls[index]; ++index) {
+        int written = snprintf(hot_text + hot_used,
+                               sizeof(hot_text) - hot_used,
+                               "%s%s:%llu", index ? "," : "",
+                               probe->imports[hot_indices[index]].name,
+                               (unsigned long long)hot_calls[index]);
+        if (written < 0 || (size_t)written >= sizeof(hot_text) - hot_used) {
+            hot_text[sizeof(hot_text) - 1u] = 0;
+            break;
+        }
+        hot_used += (size_t)written;
+    }
+    if (!hot_text[0]) snprintf(hot_text, sizeof(hot_text), "none");
+    probe_log("ARM frame profile: render avg=%.2f max=%.2f ms "
+              "swap avg=%.2f max=%.2f ms slow>20/33/50=%llu/%llu/%llu "
+              "draws/frame=%.1f vertices/frame=%.0f",
+              frames ? (double)probe->profile_render_microseconds /
+                           (1000.0 * frames) : 0.0,
+              (double)probe->profile_render_max_microseconds / 1000.0,
+              frames ? (double)probe->profile_swap_microseconds /
+                           (1000.0 * frames) : 0.0,
+              (double)probe->profile_swap_max_microseconds / 1000.0,
+              (unsigned long long)probe->profile_frames_over_20ms,
+              (unsigned long long)probe->profile_frames_over_33ms,
+              (unsigned long long)probe->profile_frames_over_50ms,
+              frames ? (double)probe->profile_gl_draw_calls / frames : 0.0,
+              frames ? (double)probe->profile_gl_vertices / frames : 0.0);
+    probe_log("ARM bridge profile: imports/frame=%.0f client-copies/frame=%.1f "
+              "client-copy=%.2f MiB/s alloc/free=%llu/%llu "
+              "alloc-bytes=%.2f MiB apk-opens=%llu file-opens=%llu "
+              "file-read=%.2f MiB zlib=%llu hot=%s",
+              frames ? (double)total_imports / frames : 0.0,
+              frames ? (double)probe->profile_gl_client_copies / frames : 0.0,
+              elapsed_seconds > 0.0
+                  ? (double)probe->profile_gl_client_bytes /
+                        (1024.0 * 1024.0 * elapsed_seconds) : 0.0,
+              (unsigned long long)probe->profile_alloc_calls,
+              (unsigned long long)probe->profile_free_calls,
+              (double)probe->profile_alloc_bytes / (1024.0 * 1024.0),
+              (unsigned long long)probe->profile_apk_opens,
+              (unsigned long long)probe->profile_file_opens,
+              (double)probe->profile_file_read_bytes / (1024.0 * 1024.0),
+              (unsigned long long)probe->profile_zlib_calls,
+              hot_text);
+    arm_frame_profile_reset(probe);
+}
+
 static int run_arm_message_loop(ArmProbe *probe) {
     MSG message;
     uint32_t arguments[2] = {GUEST_ENV_OBJECT, 0};
     DWORD performance_started = GetTickCount();
     unsigned performance_frames = 0;
+    int performance_active = 0;
+    arm_frame_profile_reset(probe);
     probe_log("RESULT: ARM_RENDER_LOOP_ENTERED");
     while (probe->host.window && IsWindow(probe->host.window)) {
         while (PeekMessageA(&message, NULL, 0, 0, PM_REMOVE)) {
@@ -6895,9 +7220,32 @@ static int run_arm_message_loop(ArmProbe *probe) {
         }
         if (probe->host.render && probe->host.window_active &&
             !probe->host.native_paused) {
+            uint64_t swap_started;
+            uint64_t swap_elapsed;
+            uint64_t frame_elapsed;
+            if (!performance_active) {
+                performance_started = GetTickCount();
+                performance_frames = 0;
+                arm_frame_profile_reset(probe);
+                performance_active = 1;
+            }
             if (!host_call(probe, probe->host.render, arguments, 2,
                            "nativeRender")) return 0;
+            swap_started = host_monotonic_units(UINT64_C(1000000));
             SwapBuffers(probe->host.device);
+            swap_elapsed = host_monotonic_units(UINT64_C(1000000)) -
+                           swap_started;
+            probe->profile_swap_microseconds += swap_elapsed;
+            if (swap_elapsed > probe->profile_swap_max_microseconds)
+                probe->profile_swap_max_microseconds = swap_elapsed;
+            frame_elapsed = probe->profile_last_render_microseconds +
+                            swap_elapsed;
+            if (frame_elapsed > UINT64_C(20000))
+                ++probe->profile_frames_over_20ms;
+            if (frame_elapsed > UINT64_C(33333))
+                ++probe->profile_frames_over_33ms;
+            if (frame_elapsed > UINT64_C(50000))
+                ++probe->profile_frames_over_50ms;
             ++performance_frames;
             {
                 DWORD now = GetTickCount();
@@ -6913,14 +7261,19 @@ static int run_arm_message_loop(ArmProbe *probe) {
                                   (1024u * 1024u),
                               probe->allocation_count, MAX_ALLOCS,
                               probe->free_allocation_count);
+                    arm_frame_profile_log(probe, performance_frames, elapsed);
                     performance_started = now;
                     performance_frames = 0;
                 }
             }
             if (!probe->host.vsync_enabled) Sleep(1);
         } else {
-            performance_started = GetTickCount();
-            performance_frames = 0;
+            if (performance_active) {
+                performance_started = GetTickCount();
+                performance_frames = 0;
+                arm_frame_profile_reset(probe);
+                performance_active = 0;
+            }
             Sleep(16);
         }
     }
@@ -7005,7 +7358,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap13");
+              "0.9.4-arm-bootstrap14");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -7037,8 +7390,22 @@ int main(int argc, char **argv) {
     audio_set_apk_path(absolute_apk);
 
     probe_log("Input: %s", input_path);
-    if (!load_arm_input(input_path, &probe.file_data, &probe.file_size) ||
-        !validate_elf(&probe) || !build_image(&probe) ||
+    if (!load_arm_input(input_path, &probe.file_data, &probe.file_size,
+                        &probe.apk_data, &probe.apk_size)) {
+        probe_log("RESULT: ARM_LOAD_FAILED");
+        exit_code = 2;
+        goto finished;
+    }
+    if (mode == 2 && !probe.apk_data &&
+        !load_file(absolute_apk, &probe.apk_data, &probe.apk_size)) {
+        probe_log("RESULT: ARM_APK_CACHE_FAILED");
+        exit_code = 2;
+        goto finished;
+    }
+    if (probe.apk_data)
+        probe_log("ARM shared APK cache ready: %.2f MiB",
+                  (double)probe.apk_size / (1024.0 * 1024.0));
+    if (!validate_elf(&probe) || !build_image(&probe) ||
         !apply_relocations(&probe) || !initialize_unicorn(&probe)) {
         probe_log("RESULT: ARM_LOAD_FAILED");
         exit_code = 2;
