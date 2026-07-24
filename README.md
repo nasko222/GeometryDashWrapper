@@ -1,38 +1,33 @@
-# GD Wrapper 0.9.4-arm-bootstrap14
+# GD Wrapper 0.9.4-arm-bootstrap15
 
-This is a native Windows compatibility wrapper for the original x86 Android
-game code inside a supported APK. It is not BlueStacks/Nox, does not boot
-Android, and does not borrow logic from a Windows Geometry Dash executable.
-The visible title is version- and game-neutral; the established x86 package
-keeps the familiar `GeometryDashWrapper` filename. This source release also
-adds the separate `GeometryDashArmWrapper` executable for ARM-only Geometry
-Dash 1.0 through 1.4 APKs.
+This is a native Windows compatibility wrapper for the original Android game
+code inside a supported APK. It does not boot Android and does not use a Windows
+Geometry Dash executable. The established x86 wrapper remains available for
+x86 APKs; `GeometryDashArmWrapper.exe` runs the ARM-only Geometry Dash 1.0
+through 1.4 libraries through a native Win32 compatibility layer.
 
-Version `0.9.4-arm-bootstrap14` keeps bootstrap13's stable allocator and targets
-the remaining load-time and dense-level performance costs. The wrapper retains
-one immutable in-memory copy of `game.apk`, gives every guest open an independent
-seek position over that shared copy, and stops flushing hundreds of identical
-APK-open log lines. Host file I/O and OpenGL client arrays now reuse bounded
-buffers instead of allocating and freeing temporary memory for every operation
-or draw. A low-overhead five-second profile reports ARM render time, buffer-swap
-time, slow frames, draw/vertex/client-copy volume, allocation and APK traffic,
-zlib work, and the hottest imported functions.
+`0.9.4-arm-bootstrap15` is the first release focused mainly on removing wrapper
+overhead rather than fixing corruption. Bootstrap14 already proved stable in
+long editor/play sessions and kept one 23.56 MiB APK image in memory. Bootstrap15
+keeps those fixes and adds host-backed guest RAM, direct zlib input/output,
+direct OpenGL client arrays, cached decompressed APK members, batched register
+access, fast import classification, and guest-side zero-return stubs for the
+single-threaded pthread mutex/condition operations that previously caused
+hundreds of thousands of unnecessary ARM-to-host callbacks.
 
-The guest heap remains 512 MiB, the allocation record capacity remains
-1,048,576, and freed blocks are reused by matching size class before larger
-buffers. If metadata ever fills, an already-free record can be recycled instead
-of leaving every later level in a permanent `std::bad_alloc` state.
+The expensive DS_Dictionary and level-string tracing hooks are now disabled in
+normal runs. Start with `--deep-diagnostics` only when investigating a parser,
+level, or save corruption regression; that mode intentionally sacrifices
+performance. Five-second profiles now report direct-memory use, direct versus
+copied OpenGL arrays, APK-member-cache hits/misses, zlib work, and remaining hot
+imports.
 
-Game-save writes made through ARM stdio are transactional. A valid close
-atomically replaces the destination, while any write following allocator
-failure is discarded so an existing save cannot be replaced by the 22-byte
-incomplete files seen in bootstrap12. Those known incomplete files, empty
-saves, XML-header-only saves, and truncated XML plists are treated as absent on
-the next launch without deleting them. Bootstrap13 also fixes `atoi`/`atol`: unlike
-`strtol`, they do not receive an end-pointer, so the bridge no longer writes
-through an unrelated register into Cocos string data. Bootstrap12's long-string
-parser, guest pthread initialization, APK effect cache, comparator-backed
-`qsort`, level diagnostics, and particle ownership fix remain active.
+Audio effects now keep decoded WAV/MCI voices open after preload and recycle
+them for later plays. This targets the roughly 250 ms crash/death-sound delay
+caused by reopening an MCI decoder for every effect. Save transactions, the
+512 MiB guest heap, allocation metadata recycling, particle ownership guards,
+long-string parsing, qsort callbacks, APK-backed assets, and bootstrap14's
+corruption protections remain active.
 
 Version 0.9.3-alpha3 fixes numbered saves such as `CCGameManager2.dat` and
 `CCLocalLevels2.dat`: they are routed into `save/`, and root-level copies from
@@ -256,7 +251,7 @@ Windows Geometry Dash executable.
 The earlier `0.9.4-arm-probe1` milestone already loaded the ARM library directly
 from an APK, mapped its guest address space, applied `R_ARM_*` relocations,
 provided Android kuser atomics/TLS, ran every authentic ELF constructor, and
-received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap14` retains
+received JNI 1.4 from the authentic `JNI_OnLoad`. `0.9.4-arm-bootstrap15` retains
 those probe modes and adds:
 
 - a Win32 OpenGL window and message/render loop;
@@ -276,9 +271,13 @@ The graphical backend is intentionally labeled a bootstrap because the first
 real APK run may identify additional imported functions, JNI methods, or GL
 edge cases. Send `gd-arm-wrapper.log` after each test.
 
-See `BUILDING-ARM.md` for the reproducible Win32 translator and wrapper build.
-The runtime test folder needs `GeometryDashArmWrapper.exe` and `game.apk`; no
-loose `.so` or translator DLL is required.
+On Windows, double-click `BUILD_WINDOWS.cmd`. It downloads verified portable
+copies of Zig, CMake, and Ninja into `.build-tools/`, builds the included patched
+Unicorn source, and creates `dist-arm-wrapper-bootstrap15/`. Nothing is installed
+system-wide and no Linux/WSL setup is required. See `BUILDING-ARM.md` for details
+and the manual reproducible route. The runtime folder needs only
+`GeometryDashArmWrapper.exe` and `game.apk`; no loose `.so` or Unicorn DLL is
+required.
 
 ## Rebuilding
 
@@ -289,14 +288,17 @@ this for the established x86 wrapper:
 python build_wrapper.py --zig C:\path\to\zig.exe --apk Geometry_Dash.apk --out dist
 ```
 
-The ARM wrapper additionally needs the patched Win32 Unicorn static library:
+For the ARM wrapper on Windows, use the included one-click builder:
 
 ```text
-python build_arm_wrapper.py --zig C:\path\to\zig.exe ^
-  --unicorn-source C:\path\to\unicorn-2.1.4 ^
-  --unicorn-lib C:\path\to\libunicorn.a ^
-  --apk Geometry_Dash_1.000.apk --out dist-arm-wrapper
+BUILD_WINDOWS.cmd C:\path\to\Geometry_Dash_1.000.apk
 ```
+
+You may also place the APK in the source folder as `game.apk` and simply
+double-click `BUILD_WINDOWS.cmd`. The first build downloads portable tools into
+the source folder; later builds reuse them. Use `BUILD_WINDOWS.cmd -Clean` for a
+full rebuild. The lower-level `build_arm_wrapper.py` route remains available for
+existing Linux/WSL or custom toolchains.
 
 The builder verifies that the primary APK contains a little-endian ELF32/i386
 game library. Runtime effect decoding needs no external codec. `--effects-apk`

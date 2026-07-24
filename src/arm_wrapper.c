@@ -5,7 +5,9 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host.
+ * complete nativeInit/nativeRender lifecycle host. Bootstrap15 maps guest RAM
+ * onto host-owned backing memory so bridge operations can avoid expensive
+ * per-call Unicorn memory copies while preserving the ARM execution model.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -71,6 +73,8 @@
 #define MAX_GUEST_FORMAT (16u * 1024u * 1024u)
 #define MAX_GUEST_REFS 4096
 #define MAX_GUEST_FILES 256
+#define MAX_APK_MEMBER_CACHE 512
+#define MAX_APK_MEMBER_CACHE_BYTES (256u * 1024u * 1024u)
 #define MAX_GUEST_ZSTREAMS 64
 #define MAX_REGISTERED_NATIVES 512
 #define MAX_GL_VERTEX_ATTRIBS 32
@@ -109,11 +113,41 @@
 #define GUEST_VM_TRAPS   (GUEST_JNI_BASE + 0x20000u)
 #define GUEST_REF_BASE   (GUEST_JNI_BASE + 0x400000u)
 
+typedef enum {
+    IMPORT_SLOW = 0,
+    IMPORT_MALLOC,
+    IMPORT_CALLOC,
+    IMPORT_REALLOC,
+    IMPORT_FREE,
+    IMPORT_MEMCPY,
+    IMPORT_MEMMOVE,
+    IMPORT_MEMSET,
+    IMPORT_MEMCMP,
+    IMPORT_STRLEN,
+    IMPORT_STRCMP,
+    IMPORT_STRNCMP,
+    IMPORT_PTHREAD_NOOP,
+    IMPORT_LRAND48,
+    IMPORT_FREAD,
+    IMPORT_OPENGL
+} ArmImportKind;
+
 typedef struct {
     char *name;
     uint32_t address;
     unsigned calls;
+    ArmImportKind kind;
 } ArmImport;
+
+typedef struct {
+    uint32_t base;
+    uint32_t size;
+    unsigned char *host;
+    int direct_write;
+    int owned;
+} GuestMemoryRegion;
+
+#define MAX_GUEST_MEMORY_REGIONS 9
 
 typedef struct {
     uint32_t address;
@@ -157,6 +191,13 @@ typedef struct {
     char *final_path;
     char diagnostic_name[40];
 } GuestFile;
+
+typedef struct {
+    char *name;
+    unsigned char *payload;
+    size_t size;
+    uint64_t hits;
+} ApkMemberCacheEntry;
 
 typedef enum {
     GUEST_ZSTREAM_NONE = 0,
@@ -296,11 +337,17 @@ typedef struct {
 
 typedef struct {
     uc_engine *uc;
+    GuestMemoryRegion memory_regions[MAX_GUEST_MEMORY_REGIONS];
+    unsigned memory_region_count;
+    uint64_t direct_memory_reads;
+    uint64_t direct_memory_writes;
+    int deep_diagnostics;
     unsigned char *file_data;
     size_t file_size;
     unsigned char *apk_data;
     size_t apk_size;
     unsigned char *image_data;
+    int image_data_virtual;
     uint32_t image_size;
     const Elf32_Ehdr *header;
     const Elf32_Phdr *program_headers;
@@ -321,6 +368,11 @@ typedef struct {
     unsigned ref_count;
     GuestFile files[MAX_GUEST_FILES];
     unsigned file_count;
+    ApkMemberCacheEntry apk_member_cache[MAX_APK_MEMBER_CACHE];
+    unsigned apk_member_cache_count;
+    size_t apk_member_cache_bytes;
+    uint64_t apk_member_cache_hits;
+    uint64_t apk_member_cache_misses;
     GuestZStream zstreams[MAX_GUEST_ZSTREAMS];
     unsigned zstream_count;
     RegisteredNative natives[MAX_REGISTERED_NATIVES];
@@ -345,6 +397,7 @@ typedef struct {
     size_t io_buffer_capacity;
     unsigned gl_draw_logs;
     unsigned apk_cache_open_logs;
+    unsigned zlib_stream_logs;
     unsigned native_render_calls;
     int runtime_fast_path_logged;
     unsigned png_filter_rows;
@@ -394,6 +447,7 @@ typedef struct {
     uint64_t profile_gl_draw_calls;
     uint64_t profile_gl_vertices;
     uint64_t profile_gl_client_copies;
+    uint64_t profile_gl_direct_arrays;
     uint64_t profile_gl_client_bytes;
     uint64_t profile_alloc_calls;
     uint64_t profile_alloc_bytes;
@@ -407,6 +461,10 @@ typedef struct {
     uint64_t profile_frames_over_50ms;
     unsigned profile_slow_native_logs;
     unsigned profile_import_baseline[MAX_IMPORTS];
+    uint64_t profile_direct_read_baseline;
+    uint64_t profile_direct_write_baseline;
+    uint64_t profile_apk_cache_hit_baseline;
+    uint64_t profile_apk_cache_miss_baseline;
     uint32_t level_trace_play_init;
     uint32_t level_trace_play_create;
     uint32_t level_trace_editor_init;
@@ -452,6 +510,82 @@ static void probe_log(const char *format, ...) {
     va_end(arguments);
 }
 
+static GuestMemoryRegion *guest_memory_region(ArmProbe *probe,
+                                                uint64_t address,
+                                                size_t size) {
+    uint64_t end;
+    unsigned index;
+    if (!probe || !size || address > UINT32_MAX ||
+        size - 1u > UINT32_MAX - address)
+        return NULL;
+    end = address + size;
+    for (index = 0; index < probe->memory_region_count; ++index) {
+        GuestMemoryRegion *region = &probe->memory_regions[index];
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        if (address >= region->base && end <= region_end)
+            return region;
+    }
+    return NULL;
+}
+
+static int register_guest_memory_region(ArmProbe *probe, uint32_t base,
+                                        uint32_t size, unsigned char *host,
+                                        int direct_write, int owned) {
+    GuestMemoryRegion *region;
+    if (!probe || !host || !size ||
+        probe->memory_region_count >= MAX_GUEST_MEMORY_REGIONS)
+        return 0;
+    region = &probe->memory_regions[probe->memory_region_count++];
+    region->base = base;
+    region->size = size;
+    region->host = host;
+    region->direct_write = direct_write;
+    region->owned = owned;
+    return 1;
+}
+
+static int map_guest_memory(ArmProbe *probe, uint32_t base, uint32_t size,
+                            uint32_t permissions, unsigned char *existing,
+                            int direct_write) {
+    unsigned char *backing = existing;
+    int owned = 0;
+    uc_err error;
+    if (!backing) {
+        backing = (unsigned char *)VirtualAlloc(
+            NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        owned = backing != NULL;
+    }
+    if (backing) {
+        error = uc_mem_map_ptr(probe->uc, base, size, permissions, backing);
+        if (error == UC_ERR_OK) {
+            if (!register_guest_memory_region(probe, base, size, backing,
+                                              direct_write, owned)) {
+                probe_log("ERROR: direct guest memory region table full");
+                return 0;
+            }
+            return 1;
+        }
+        if (owned) VirtualFree(backing, 0, MEM_RELEASE);
+        probe_log("ARM direct memory map fallback: guest 0x%08x size=%.2f MiB (%s)",
+                  base, (double)size / (1024.0 * 1024.0), uc_strerror(error));
+    }
+    return uc_mem_map(probe->uc, base, size, permissions) == UC_ERR_OK;
+}
+
+static uc_err direct_uc_mem_read(uc_engine *uc, uint64_t address,
+                                 void *bytes, size_t size) {
+    ArmProbe *probe = g_active_probe;
+    GuestMemoryRegion *region = probe && probe->uc == uc
+                                    ? guest_memory_region(probe, address, size)
+                                    : NULL;
+    if (region) {
+        memcpy(bytes, region->host + (size_t)(address - region->base), size);
+        ++probe->direct_memory_reads;
+        return UC_ERR_OK;
+    }
+    return uc_mem_read(uc, address, bytes, size);
+}
+
 static uc_err guarded_uc_mem_write(uc_engine *uc, uint64_t address,
                                    const void *bytes, size_t size,
                                    const char *function, int line) {
@@ -478,9 +612,19 @@ static uc_err guarded_uc_mem_write(uc_engine *uc, uint64_t address,
                       (unsigned long long)value, pc, lr);
         return UC_ERR_WRITE_PROT;
     }
+    if (probe && probe->uc == uc && size) {
+        GuestMemoryRegion *region = guest_memory_region(probe, address, size);
+        if (region && region->direct_write) {
+            memcpy(region->host + (size_t)(address - region->base), bytes, size);
+            ++probe->direct_memory_writes;
+            return UC_ERR_OK;
+        }
+    }
     return uc_mem_write(uc, address, bytes, size);
 }
 
+#define uc_mem_read(uc, address, bytes, size) \
+    direct_uc_mem_read((uc), (address), (bytes), (size))
 #define uc_mem_write(uc, address, bytes, size) \
     guarded_uc_mem_write((uc), (address), (bytes), (size), __func__, __LINE__)
 
@@ -740,6 +884,56 @@ int apk_extract_member(const char *apk_path, const char *member_name,
     return result;
 }
 
+static int apk_extract_member_cached(ArmProbe *probe,
+                                     const char *member_name,
+                                     unsigned char **output,
+                                     size_t *output_size,
+                                     int *owned) {
+    unsigned index;
+    unsigned char *payload = NULL;
+    size_t payload_size = 0;
+    if (output) *output = NULL;
+    if (output_size) *output_size = 0;
+    if (owned) *owned = 0;
+    if (!probe || !member_name || !output || !output_size ||
+        !probe->apk_data)
+        return 0;
+    for (index = 0; index < probe->apk_member_cache_count; ++index) {
+        ApkMemberCacheEntry *entry = &probe->apk_member_cache[index];
+        if (strcmp(entry->name, member_name) == 0) {
+            ++entry->hits;
+            ++probe->apk_member_cache_hits;
+            *output = entry->payload;
+            *output_size = entry->size;
+            return 1;
+        }
+    }
+    ++probe->apk_member_cache_misses;
+    if (!apk_extract_one(probe->apk_data, probe->apk_size, member_name,
+                         &payload, &payload_size))
+        return 0;
+    if (probe->apk_member_cache_count < MAX_APK_MEMBER_CACHE &&
+        payload_size <= MAX_APK_MEMBER_CACHE_BYTES -
+                            probe->apk_member_cache_bytes) {
+        ApkMemberCacheEntry *entry =
+            &probe->apk_member_cache[probe->apk_member_cache_count++];
+        entry->name = copy_string(member_name);
+        if (entry->name) {
+            entry->payload = payload;
+            entry->size = payload_size;
+            probe->apk_member_cache_bytes += payload_size;
+            *output = payload;
+            *output_size = payload_size;
+            return 1;
+        }
+        --probe->apk_member_cache_count;
+    }
+    *output = payload;
+    *output_size = payload_size;
+    if (owned) *owned = 1;
+    return 1;
+}
+
 static const Elf32_Shdr *section_at(const ArmProbe *probe, uint32_t index) {
     if (index >= probe->header->e_shnum) return NULL;
     return &probe->section_headers[index];
@@ -797,7 +991,11 @@ static int build_image(ArmProbe *probe) {
         if ((uint32_t)end > maximum) maximum = (uint32_t)end;
     }
     probe->image_size = align_up(maximum, 0x1000u);
-    probe->image_data = (unsigned char *)calloc(1, probe->image_size);
+    probe->image_data = (unsigned char *)VirtualAlloc(
+        NULL, probe->image_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    probe->image_data_virtual = probe->image_data != NULL;
+    if (!probe->image_data)
+        probe->image_data = (unsigned char *)calloc(1, probe->image_size);
     if (!probe->image_data) return 0;
     for (index = 0; index < probe->header->e_phnum; ++index) {
         const Elf32_Phdr *segment = &probe->program_headers[index];
@@ -812,6 +1010,41 @@ static int build_image(ArmProbe *probe) {
     return 1;
 }
 
+static ArmImportKind classify_import(const char *name) {
+    if (!name) return IMPORT_SLOW;
+    if (strcmp(name, "malloc") == 0) return IMPORT_MALLOC;
+    if (strcmp(name, "calloc") == 0) return IMPORT_CALLOC;
+    if (strcmp(name, "realloc") == 0) return IMPORT_REALLOC;
+    if (strcmp(name, "free") == 0) return IMPORT_FREE;
+    if (strcmp(name, "memcpy") == 0 || strcmp(name, "__aeabi_memcpy") == 0 ||
+        strcmp(name, "__aeabi_memcpy4") == 0 ||
+        strcmp(name, "__aeabi_memcpy8") == 0)
+        return IMPORT_MEMCPY;
+    if (strcmp(name, "memmove") == 0 || strcmp(name, "__aeabi_memmove") == 0 ||
+        strcmp(name, "__aeabi_memmove4") == 0 ||
+        strcmp(name, "__aeabi_memmove8") == 0)
+        return IMPORT_MEMMOVE;
+    /* ARM EABI memset uses (destination, length, value), unlike libc memset's
+       (destination, value, length), so keep __aeabi_memset* on its dedicated
+       slow-dispatch branch below. */
+    if (strcmp(name, "memset") == 0) return IMPORT_MEMSET;
+    if (strcmp(name, "memcmp") == 0) return IMPORT_MEMCMP;
+    if (strcmp(name, "strlen") == 0) return IMPORT_STRLEN;
+    if (strcmp(name, "strcmp") == 0) return IMPORT_STRCMP;
+    if (strcmp(name, "strncmp") == 0) return IMPORT_STRNCMP;
+    if (strcmp(name, "pthread_mutex_lock") == 0 ||
+        strcmp(name, "pthread_mutex_unlock") == 0 ||
+        strcmp(name, "pthread_mutex_init") == 0 ||
+        strcmp(name, "pthread_mutex_destroy") == 0 ||
+        strcmp(name, "pthread_cond_signal") == 0 ||
+        strcmp(name, "pthread_cond_broadcast") == 0)
+        return IMPORT_PTHREAD_NOOP;
+    if (strcmp(name, "lrand48") == 0) return IMPORT_LRAND48;
+    if (strcmp(name, "fread") == 0) return IMPORT_FREAD;
+    if (name[0] == 'g' && name[1] == 'l') return IMPORT_OPENGL;
+    return IMPORT_SLOW;
+}
+
 static uint32_t ensure_import(ArmProbe *probe, const char *name) {
     unsigned index;
     for (index = 0; index < probe->import_count; ++index) {
@@ -822,6 +1055,7 @@ static uint32_t ensure_import(ArmProbe *probe, const char *name) {
     index = probe->import_count++;
     probe->imports[index].name = copy_string(name);
     probe->imports[index].address = GUEST_IMPORT_BASE + index * 4u + 1u;
+    probe->imports[index].kind = classify_import(name);
     return probe->imports[index].address;
 }
 
@@ -1280,14 +1514,38 @@ static int guest_zero_memory(ArmProbe *probe, uint32_t address,
 
 static int guest_read_string(ArmProbe *probe, uint32_t address,
                              char *buffer, size_t capacity) {
-    size_t index;
-    if (!address || !buffer || capacity < 1) return 0;
-    for (index = 0; index + 1 < capacity; ++index) {
-        if (uc_mem_read(probe->uc, address + index, buffer + index, 1) !=
-            UC_ERR_OK) return 0;
-        if (!buffer[index]) return 1;
+    size_t offset = 0;
+    if (!probe || !address || !buffer || capacity < 1u) return 0;
+    while (offset + 1u < capacity) {
+        uint64_t current64 = (uint64_t)address + offset;
+        uint32_t current;
+        size_t wanted = capacity - 1u - offset;
+        GuestMemoryRegion *region;
+        const unsigned char *source;
+        const unsigned char *zero;
+        if (current64 > UINT32_MAX) return 0;
+        current = (uint32_t)current64;
+        region = guest_memory_region(probe, current, 1u);
+        if (region) {
+            size_t available = (size_t)region->size -
+                               (size_t)(current - region->base);
+            size_t part = wanted < available ? wanted : available;
+            source = region->host + (size_t)(current - region->base);
+            zero = (const unsigned char *)memchr(source, 0, part);
+            if (zero) part = (size_t)(zero - source) + 1u;
+            memcpy(buffer + offset, source, part);
+            ++probe->direct_memory_reads;
+            offset += part;
+            if (zero) return 1;
+        } else {
+            unsigned char byte = 0;
+            if (uc_mem_read(probe->uc, current, &byte, 1u) != UC_ERR_OK)
+                return 0;
+            buffer[offset++] = (char)byte;
+            if (!byte) return 1;
+        }
     }
-    buffer[capacity - 1] = 0;
+    buffer[capacity - 1u] = 0;
     return 1;
 }
 
@@ -1301,14 +1559,25 @@ static int guest_cstring_nlength(ArmProbe *probe, uint32_t address,
     if (!probe || !address) return 0;
     while (offset < limit) {
         uint32_t part = limit - offset;
+        GuestMemoryRegion *region;
+        const unsigned char *bytes;
         unsigned char *zero;
         if (part > sizeof(block)) part = sizeof(block);
-        if (offset > UINT32_MAX - address ||
-            uc_mem_read(probe->uc, address + offset, block, part) != UC_ERR_OK)
-            return 0;
-        zero = (unsigned char *)memchr(block, 0, part);
+        if (offset > UINT32_MAX - address) return 0;
+        region = guest_memory_region(probe, address + offset, part);
+        if (region) {
+            bytes = region->host +
+                    (size_t)(address + offset - region->base);
+            ++probe->direct_memory_reads;
+        } else {
+            if (uc_mem_read(probe->uc, address + offset, block, part) !=
+                UC_ERR_OK)
+                return 0;
+            bytes = block;
+        }
+        zero = (unsigned char *)memchr(bytes, 0, part);
         if (zero) {
-            if (length) *length = offset + (uint32_t)(zero - block);
+            if (length) *length = offset + (uint32_t)(zero - bytes);
             if (terminated) *terminated = 1;
             return 1;
         }
@@ -1407,17 +1676,33 @@ static int guest_compare_cstrings(ArmProbe *probe, uint32_t first_address,
     while (offset < limit) {
         uint32_t part = limit - offset;
         uint32_t index;
+        const unsigned char *first_bytes = first;
+        const unsigned char *second_bytes = second;
+        GuestMemoryRegion *first_region;
+        GuestMemoryRegion *second_region;
         if (part > sizeof(first)) part = sizeof(first);
         if (offset > UINT32_MAX - first_address ||
-            offset > UINT32_MAX - second_address ||
-            uc_mem_read(probe->uc, first_address + offset, first, part) !=
-                UC_ERR_OK ||
-            uc_mem_read(probe->uc, second_address + offset, second, part) !=
-                UC_ERR_OK)
+            offset > UINT32_MAX - second_address)
             return 0;
+        first_region = guest_memory_region(probe, first_address + offset, part);
+        second_region = guest_memory_region(probe, second_address + offset, part);
+        if (first_region)
+            first_bytes = first_region->host +
+                          (size_t)(first_address + offset - first_region->base);
+        else if (uc_mem_read(probe->uc, first_address + offset, first, part) !=
+                     UC_ERR_OK)
+            return 0;
+        if (second_region)
+            second_bytes = second_region->host +
+                           (size_t)(second_address + offset - second_region->base);
+        else if (uc_mem_read(probe->uc, second_address + offset, second, part) !=
+                     UC_ERR_OK)
+            return 0;
+        probe->direct_memory_reads += (first_region != NULL) +
+                                      (second_region != NULL);
         for (index = 0; index < part; ++index) {
-            unsigned first_value = first[index];
-            unsigned second_value = second[index];
+            unsigned first_value = first_bytes[index];
+            unsigned second_value = second_bytes[index];
             if (ignore_case) {
                 first_value = (unsigned)tolower((int)first_value);
                 second_value = (unsigned)tolower((int)second_value);
@@ -1427,7 +1712,7 @@ static int guest_compare_cstrings(ArmProbe *probe, uint32_t first_address,
                     *comparison = first_value < second_value ? -1 : 1;
                 return 1;
             }
-            if (!first[index]) return 1;
+            if (!first_bytes[index]) return 1;
         }
         offset += part;
     }
@@ -1635,10 +1920,11 @@ static void set_r0(uc_engine *uc, uint32_t value) {
 }
 
 static void set_r0_r1_u64(uc_engine *uc, uint64_t value) {
+    static const int registers[2] = {UC_ARM_REG_R0, UC_ARM_REG_R1};
     uint32_t low = (uint32_t)value;
     uint32_t high = (uint32_t)(value >> 32);
-    uc_reg_write(uc, UC_ARM_REG_R0, &low);
-    uc_reg_write(uc, UC_ARM_REG_R1, &high);
+    void *values[2] = {&low, &high};
+    uc_reg_write_batch(uc, registers, values, 2);
 }
 
 static uint64_t join_u64(uint32_t low, uint32_t high) {
@@ -1928,13 +2214,14 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
             for (index = 0; member[index]; ++index)
                 if (member[index] == '\\') member[index] = '/';
         }
-        if (!apk_extract_member(probe->input_path, member, &payload, &payload_size) &&
+        if (!apk_extract_member_cached(probe, member, &payload,
+                                       &payload_size, &owns_payload) &&
             !path_has_prefix(member, "assets/")) {
             char with_assets[MAX_PATH * 4];
             snprintf(with_assets, sizeof(with_assets), "assets/%s", member);
-            apk_extract_member(probe->input_path, with_assets, &payload, &payload_size);
+            apk_extract_member_cached(probe, with_assets, &payload,
+                                      &payload_size, &owns_payload);
         }
-        owns_payload = payload != NULL;
     }
     if (!host && !payload) {
         probe_log("ARM file open failed: %s mode=%s", path, mode);
@@ -1978,7 +2265,7 @@ static uint32_t guest_open_file(ArmProbe *probe, const char *path,
         probe_log("ARM file open: %s mode=%s source=host%s", path, mode,
                   transactional ? " transaction=atomic" : "");
     else
-        probe_log("ARM file open: %s mode=%s source=APK bytes=%u",
+        probe_log("ARM file open: %s mode=%s source=APK member cache bytes=%u",
                   path, mode, (unsigned)payload_size);
     return file->handle;
 }
@@ -2234,9 +2521,14 @@ static int guest_inflate_init(ArmProbe *probe, uint32_t guest_address,
         guest_zstream_release(stream);
         return Z_STREAM_ERROR;
     }
-    if (result == Z_OK)
-        probe_log("ARM zlib inflate stream ready: guest=0x%08x window=%d",
-                  guest_address, use_window_bits ? window_bits : MAX_WBITS);
+    if (result == Z_OK) {
+        unsigned log_index = probe->zlib_stream_logs++;
+        if (log_index < 16u)
+            probe_log("ARM zlib inflate stream ready: guest=0x%08x window=%d",
+                      guest_address, use_window_bits ? window_bits : MAX_WBITS);
+        else if (log_index == 16u)
+            probe_log("ARM zlib stream-ready logs suppressed; profiling remains active");
+    }
     return result;
 }
 
@@ -2262,9 +2554,14 @@ static int guest_deflate_init(ArmProbe *probe, uint32_t guest_address,
         guest_zstream_release(stream);
         return Z_STREAM_ERROR;
     }
-    if (result == Z_OK)
-        probe_log("ARM zlib deflate stream ready: guest=0x%08x",
-                  guest_address);
+    if (result == Z_OK) {
+        unsigned log_index = probe->zlib_stream_logs++;
+        if (log_index < 16u)
+            probe_log("ARM zlib deflate stream ready: guest=0x%08x",
+                      guest_address);
+        else if (log_index == 16u)
+            probe_log("ARM zlib stream-ready logs suppressed; profiling remains active");
+    }
     return result;
 }
 
@@ -2272,8 +2569,12 @@ static int guest_zstream_process(ArmProbe *probe, uint32_t guest_address,
                                  GuestZStreamKind kind, int flush) {
     GuestZStream *stream = guest_zstream(probe, guest_address);
     GuestZStreamLayout layout;
+    GuestMemoryRegion *input_region = NULL;
+    GuestMemoryRegion *output_region = NULL;
     unsigned char *input = NULL;
     unsigned char *output = NULL;
+    int owns_input = 0;
+    int owns_output = 0;
     uint32_t input_size;
     uint32_t output_size;
     uint32_t consumed = 0;
@@ -2289,13 +2590,32 @@ static int guest_zstream_process(ArmProbe *probe, uint32_t guest_address,
         output_size > MAX_GUEST_ZLIB_BUFFER)
         return Z_MEM_ERROR;
     if (input_size) {
-        if (!layout.next_in || !(input = (unsigned char *)malloc(input_size)) ||
-            uc_mem_read(probe->uc, layout.next_in, input, input_size) != UC_ERR_OK)
-            goto finished;
+        if (!layout.next_in) goto finished;
+        input_region = guest_memory_region(probe, layout.next_in, input_size);
+        if (input_region) {
+            input = input_region->host +
+                    (size_t)(layout.next_in - input_region->base);
+            ++probe->direct_memory_reads;
+        } else {
+            input = (unsigned char *)malloc(input_size);
+            owns_input = input != NULL;
+            if (!input || uc_mem_read(probe->uc, layout.next_in,
+                                      input, input_size) != UC_ERR_OK)
+                goto finished;
+        }
     }
     if (output_size) {
-        if (!layout.next_out || !(output = (unsigned char *)malloc(output_size)))
-            goto finished;
+        if (!layout.next_out) goto finished;
+        output_region = guest_memory_region(probe, layout.next_out, output_size);
+        if (output_region && output_region->direct_write) {
+            output = output_region->host +
+                     (size_t)(layout.next_out - output_region->base);
+            ++probe->direct_memory_writes;
+        } else {
+            output = (unsigned char *)malloc(output_size);
+            owns_output = output != NULL;
+            if (!output) goto finished;
+        }
     }
     stream->host.next_in = input;
     stream->host.avail_in = input_size;
@@ -2306,7 +2626,7 @@ static int guest_zstream_process(ArmProbe *probe, uint32_t guest_address,
                  : deflate(&stream->host, flush);
     consumed = input_size - stream->host.avail_in;
     produced = output_size - stream->host.avail_out;
-    if (produced &&
+    if (owns_output && produced &&
         uc_mem_write(probe->uc, layout.next_out, output, produced) != UC_ERR_OK) {
         result = Z_STREAM_ERROR;
         goto finished;
@@ -2323,8 +2643,8 @@ finished:
     stream->host.avail_in = 0;
     stream->host.next_out = Z_NULL;
     stream->host.avail_out = 0;
-    free(input);
-    free(output);
+    if (owns_input) free(input);
+    if (owns_output) free(output);
     return result;
 }
 
@@ -2364,7 +2684,9 @@ static int guest_zstream_end(ArmProbe *probe, uint32_t guest_address,
 static int guest_inflate_sync(ArmProbe *probe, uint32_t guest_address) {
     GuestZStream *stream = guest_zstream(probe, guest_address);
     GuestZStreamLayout layout;
+    GuestMemoryRegion *input_region = NULL;
     unsigned char *input = NULL;
+    int owns_input = 0;
     uint32_t input_size;
     uint32_t consumed = 0;
     int result = Z_STREAM_ERROR;
@@ -2375,10 +2697,19 @@ static int guest_inflate_sync(ArmProbe *probe, uint32_t guest_address) {
     input_size = layout.avail_in;
     if (input_size > MAX_GUEST_ZLIB_BUFFER) return Z_MEM_ERROR;
     if (input_size) {
-        input = (unsigned char *)malloc(input_size);
-        if (!input || !layout.next_in ||
-            uc_mem_read(probe->uc, layout.next_in, input, input_size) != UC_ERR_OK)
-            goto finished;
+        if (!layout.next_in) goto finished;
+        input_region = guest_memory_region(probe, layout.next_in, input_size);
+        if (input_region) {
+            input = input_region->host +
+                    (size_t)(layout.next_in - input_region->base);
+            ++probe->direct_memory_reads;
+        } else {
+            input = (unsigned char *)malloc(input_size);
+            owns_input = input != NULL;
+            if (!input || uc_mem_read(probe->uc, layout.next_in,
+                                      input, input_size) != UC_ERR_OK)
+                goto finished;
+        }
     }
     stream->host.next_in = input;
     stream->host.avail_in = input_size;
@@ -2392,7 +2723,7 @@ static int guest_inflate_sync(ArmProbe *probe, uint32_t guest_address) {
 finished:
     stream->host.next_in = Z_NULL;
     stream->host.avail_in = 0;
-    free(input);
+    if (owns_input) free(input);
     return result;
 }
 
@@ -2422,7 +2753,9 @@ static int guest_deflate_params(ArmProbe *probe, uint32_t guest_address,
                                 int level, int strategy) {
     GuestZStream *stream = guest_zstream(probe, guest_address);
     GuestZStreamLayout layout;
+    GuestMemoryRegion *output_region = NULL;
     unsigned char *output = NULL;
+    int owns_output = 0;
     uint32_t output_size;
     uint32_t produced = 0;
     int result = Z_STREAM_ERROR;
@@ -2433,14 +2766,23 @@ static int guest_deflate_params(ArmProbe *probe, uint32_t guest_address,
     output_size = layout.avail_out;
     if (output_size > MAX_GUEST_ZLIB_BUFFER) return Z_MEM_ERROR;
     if (output_size) {
-        if (!layout.next_out || !(output = (unsigned char *)malloc(output_size)))
-            goto finished;
+        if (!layout.next_out) goto finished;
+        output_region = guest_memory_region(probe, layout.next_out, output_size);
+        if (output_region && output_region->direct_write) {
+            output = output_region->host +
+                     (size_t)(layout.next_out - output_region->base);
+            ++probe->direct_memory_writes;
+        } else {
+            output = (unsigned char *)malloc(output_size);
+            owns_output = output != NULL;
+            if (!output) goto finished;
+        }
     }
     stream->host.next_out = output;
     stream->host.avail_out = output_size;
     result = deflateParams(&stream->host, level, strategy);
     produced = output_size - stream->host.avail_out;
-    if (produced &&
+    if (owns_output && produced &&
         uc_mem_write(probe->uc, layout.next_out, output, produced) != UC_ERR_OK) {
         result = Z_STREAM_ERROR;
         goto finished;
@@ -2453,7 +2795,7 @@ static int guest_deflate_params(ArmProbe *probe, uint32_t guest_address,
 finished:
     stream->host.next_out = Z_NULL;
     stream->host.avail_out = 0;
-    free(output);
+    if (owns_output) free(output);
     return result;
 }
 
@@ -3706,9 +4048,28 @@ static int initialize_guest_jni(ArmProbe *probe) {
 
 static int guest_copy_memory(ArmProbe *probe, uint32_t destination,
                              uint32_t source, uint32_t size) {
+    GuestMemoryRegion *source_region;
+    GuestMemoryRegion *destination_region;
+    unsigned char *source_pointer;
+    unsigned char *destination_pointer;
     unsigned char *temporary;
     if (!size) return 1;
     if (size > 64u * 1024u * 1024u) return 0;
+    source_region = guest_memory_region(probe, source, size);
+    destination_region = guest_memory_region(probe, destination, size);
+    source_pointer = source_region
+                         ? source_region->host + (size_t)(source - source_region->base)
+                         : NULL;
+    destination_pointer = destination_region && destination_region->direct_write
+                              ? destination_region->host +
+                                    (size_t)(destination - destination_region->base)
+                              : NULL;
+    if (source_pointer && destination_pointer) {
+        memmove(destination_pointer, source_pointer, size);
+        ++probe->direct_memory_reads;
+        ++probe->direct_memory_writes;
+        return 1;
+    }
     temporary = (unsigned char *)malloc(size);
     if (!temporary) return 0;
     if (uc_mem_read(probe->uc, source, temporary, size) != UC_ERR_OK ||
@@ -3717,6 +4078,47 @@ static int guest_copy_memory(ArmProbe *probe, uint32_t destination,
         return 0;
     }
     free(temporary);
+    return 1;
+}
+
+static int guest_compare_memory(ArmProbe *probe, uint32_t first_address,
+                                uint32_t second_address, uint32_t size,
+                                int *comparison) {
+    GuestMemoryRegion *first_region;
+    GuestMemoryRegion *second_region;
+    unsigned char *first_pointer;
+    unsigned char *second_pointer;
+    unsigned char *first_copy;
+    unsigned char *second_copy;
+    if (comparison) *comparison = 0;
+    if (!size) return 1;
+    first_region = guest_memory_region(probe, first_address, size);
+    second_region = guest_memory_region(probe, second_address, size);
+    first_pointer = first_region
+                        ? first_region->host +
+                              (size_t)(first_address - first_region->base)
+                        : NULL;
+    second_pointer = second_region
+                         ? second_region->host +
+                               (size_t)(second_address - second_region->base)
+                         : NULL;
+    if (first_pointer && second_pointer) {
+        if (comparison) *comparison = memcmp(first_pointer, second_pointer, size);
+        probe->direct_memory_reads += 2u;
+        return 1;
+    }
+    first_copy = (unsigned char *)malloc(size);
+    second_copy = (unsigned char *)malloc(size);
+    if (!first_copy || !second_copy ||
+        uc_mem_read(probe->uc, first_address, first_copy, size) != UC_ERR_OK ||
+        uc_mem_read(probe->uc, second_address, second_copy, size) != UC_ERR_OK) {
+        free(first_copy);
+        free(second_copy);
+        return 0;
+    }
+    if (comparison) *comparison = memcmp(first_copy, second_copy, size);
+    free(first_copy);
+    free(second_copy);
     return 1;
 }
 
@@ -3992,16 +4394,27 @@ static int gl_prepare_client_arrays(ArmProbe *probe, uint32_t vertex_limit,
         if (!element_size || stride < element_size) goto failed;
         required = (uint64_t)(vertex_limit - 1u) * stride + element_size;
         if (required > MAX_GL_CLIENT_ARRAY_BYTES) goto failed;
-        if (!host_buffer_reserve(&probe->gl_client_buffers[index],
-                                 &probe->gl_client_buffer_capacities[index],
-                                 (size_t)required) ||
-            uc_mem_read(probe->uc, attribute->guest_pointer,
-                        probe->gl_client_buffers[index],
-                        (size_t)required) != UC_ERR_OK)
-            goto failed;
-        copies[index] = probe->gl_client_buffers[index];
-        ++probe->profile_gl_client_copies;
-        probe->profile_gl_client_bytes += required;
+        {
+            GuestMemoryRegion *region = guest_memory_region(
+                probe, attribute->guest_pointer, (size_t)required);
+            if (region) {
+                copies[index] = region->host +
+                    (size_t)(attribute->guest_pointer - region->base);
+                ++probe->profile_gl_direct_arrays;
+                ++probe->direct_memory_reads;
+            } else {
+                if (!host_buffer_reserve(&probe->gl_client_buffers[index],
+                                         &probe->gl_client_buffer_capacities[index],
+                                         (size_t)required) ||
+                    uc_mem_read(probe->uc, attribute->guest_pointer,
+                                probe->gl_client_buffers[index],
+                                (size_t)required) != UC_ERR_OK)
+                    goto failed;
+                copies[index] = probe->gl_client_buffers[index];
+                ++probe->profile_gl_client_copies;
+                probe->profile_gl_client_bytes += required;
+            }
+        }
         pointer_arguments[0] = index;
         pointer_arguments[1] = attribute->size;
         pointer_arguments[2] = attribute->type;
@@ -4157,17 +4570,26 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
         if (!probe->gl_element_array_buffer_binding && draw_count) {
             uint64_t bytes = (uint64_t)(uint32_t)draw_count * index_size;
-            if (bytes > MAX_GL_CLIENT_ARRAY_BYTES ||
-                !host_buffer_reserve(&probe->gl_index_buffer,
-                                     &probe->gl_index_buffer_capacity,
-                                     (size_t)bytes) ||
-                uc_mem_read(probe->uc, arguments[3],
-                            probe->gl_index_buffer,
-                            (size_t)bytes) != UC_ERR_OK)
-                return 0;
-            indices = probe->gl_index_buffer;
-            ++probe->profile_gl_client_copies;
-            probe->profile_gl_client_bytes += bytes;
+            GuestMemoryRegion *region;
+            if (bytes > MAX_GL_CLIENT_ARRAY_BYTES) return 0;
+            region = guest_memory_region(probe, arguments[3], (size_t)bytes);
+            if (region) {
+                indices = region->host +
+                    (size_t)(arguments[3] - region->base);
+                ++probe->profile_gl_direct_arrays;
+                ++probe->direct_memory_reads;
+            } else {
+                if (!host_buffer_reserve(&probe->gl_index_buffer,
+                                         &probe->gl_index_buffer_capacity,
+                                         (size_t)bytes) ||
+                    uc_mem_read(probe->uc, arguments[3],
+                                probe->gl_index_buffer,
+                                (size_t)bytes) != UC_ERR_OK)
+                    return 0;
+                indices = probe->gl_index_buffer;
+                ++probe->profile_gl_client_copies;
+                probe->profile_gl_client_bytes += bytes;
+            }
             vertex_limit = gl_index_vertex_limit(
                 indices, (uint32_t)draw_count, arguments[2]);
             arguments[3] = (uint32_t)(uintptr_t)indices;
@@ -4640,6 +5062,116 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
     if (import->calls++ == 0)
         probe_log("  import: %s", name);
 
+    switch (import->kind) {
+    case IMPORT_MALLOC:
+        result = guest_alloc(probe, r0);
+        goto import_done;
+    case IMPORT_CALLOC: {
+        uint64_t size = (uint64_t)r0 * r1;
+        if (size <= UINT32_MAX) {
+            uint32_t bytes = size ? (uint32_t)size : 1u;
+            result = guest_alloc(probe, bytes);
+            if (result && !guest_zero_memory(probe, result, bytes)) {
+                guest_free(probe, result);
+                result = 0;
+            }
+        }
+        goto import_done;
+    }
+    case IMPORT_REALLOC: {
+        uint32_t old_size = guest_allocation_size(probe, r0);
+        if (!r0) result = guest_alloc(probe, r1);
+        else if (!r1) { guest_free(probe, r0); result = 0; }
+        else if (old_size >= r1) result = r0;
+        else {
+            result = guest_alloc(probe, r1);
+            if (result && old_size &&
+                guest_copy_memory(probe, result, r0, old_size))
+                guest_free(probe, r0);
+            else if (result && old_size) {
+                guest_free(probe, result);
+                result = 0;
+            }
+        }
+        goto import_done;
+    }
+    case IMPORT_FREE:
+        guest_free(probe, r0);
+        result = 0;
+        goto import_done;
+    case IMPORT_MEMCPY:
+    case IMPORT_MEMMOVE:
+        result = guest_copy_memory(probe, r0, r1, r2) ? r0 : 0;
+        goto import_done;
+    case IMPORT_MEMSET: {
+        GuestMemoryRegion *region = guest_memory_region(probe, r0, r2);
+        if (region && region->direct_write) {
+            memset(region->host + (size_t)(r0 - region->base),
+                   (unsigned char)r1, r2);
+            ++probe->direct_memory_writes;
+        } else {
+            unsigned char block[4096];
+            uint32_t offset = 0;
+            memset(block, (unsigned char)r1, sizeof(block));
+            while (offset < r2) {
+                uint32_t part = r2 - offset;
+                if (part > sizeof(block)) part = sizeof(block);
+                if (uc_mem_write(probe->uc, r0 + offset, block, part) != UC_ERR_OK)
+                    break;
+                offset += part;
+            }
+        }
+        result = r0;
+        goto import_done;
+    }
+    case IMPORT_MEMCMP: {
+        int comparison = 0;
+        if (guest_compare_memory(probe, r0, r1, r2, &comparison))
+            result = (uint32_t)comparison;
+        goto import_done;
+    }
+    case IMPORT_STRLEN:
+        guest_cstring_length(probe, r0, &result);
+        goto import_done;
+    case IMPORT_STRCMP:
+    case IMPORT_STRNCMP: {
+        int comparison = 0;
+        uint32_t limit = import->kind == IMPORT_STRNCMP
+                             ? r2 : MAX_GUEST_CSTRING;
+        if (!limit || guest_compare_cstrings(probe, r0, r1, limit, 0,
+                                             &comparison))
+            result = (uint32_t)comparison;
+        goto import_done;
+    }
+    case IMPORT_PTHREAD_NOOP:
+        result = 0;
+        goto import_done;
+    case IMPORT_LRAND48:
+        if (!probe->lrand48_state)
+            probe->lrand48_state = UINT64_C(0x1234abcd330e);
+        probe->lrand48_state =
+            (UINT64_C(0x5deece66d) * probe->lrand48_state + UINT64_C(0xb)) &
+            UINT64_C(0x0000ffffffffffff);
+        result = (uint32_t)(probe->lrand48_state >> 17u);
+        goto import_done;
+    case IMPORT_FREAD: {
+        GuestFile *file = guest_file(probe, r3);
+        uint64_t requested = (uint64_t)r1 * r2;
+        size_t actual = requested <= SIZE_MAX
+                            ? guest_file_read(probe, file, r0,
+                                              (size_t)requested)
+                            : 0;
+        result = r1 ? (uint32_t)(actual / r1) : 0;
+        goto import_done;
+    }
+    case IMPORT_OPENGL:
+        result = dispatch_gl(probe, name, r0, r1, r2, r3, sp);
+        goto import_done;
+    case IMPORT_SLOW:
+    default:
+        break;
+    }
+
     if (strcmp(name, "__aeabi_memcpy") == 0 ||
         strcmp(name, "__aeabi_memcpy4") == 0 ||
         strcmp(name, "__aeabi_memcpy8") == 0 ||
@@ -4825,13 +5357,9 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
     } else if (strcmp(name, "wmemchr") == 0) {
         result = guest_find_wide_character(probe, r0, r1, r2);
     } else if (strcmp(name, "memcmp") == 0) {
-        unsigned char *a = (unsigned char *)malloc(r2 ? r2 : 1);
-        unsigned char *b = (unsigned char *)malloc(r2 ? r2 : 1);
-        if (a && b && uc_mem_read(probe->uc, r0, a, r2) == UC_ERR_OK &&
-            uc_mem_read(probe->uc, r1, b, r2) == UC_ERR_OK)
-            result = (uint32_t)memcmp(a, b, r2);
-        free(a);
-        free(b);
+        int comparison = 0;
+        if (guest_compare_memory(probe, r0, r1, r2, &comparison))
+            result = (uint32_t)comparison;
     } else if (strcmp(name, "strlen") == 0) {
         guest_cstring_length(probe, r0, &result);
     } else if (strcmp(name, "strchr") == 0 || strcmp(name, "strrchr") == 0) {
@@ -5002,41 +5530,80 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         result = float_bits(value);
     } else if (strcmp(name, "crc32") == 0) {
         unsigned char *payload = NULL;
+        int owns_payload = 0;
         if (!r1) {
             result = (uint32_t)crc32((uLong)r0, Z_NULL, 0);
         } else if (!r2) {
             result = r0;
-        } else if (r2 <= MAX_GUEST_ZLIB_BUFFER &&
-                   (payload = (unsigned char *)malloc(r2)) != NULL &&
-                   uc_mem_read(probe->uc, r1, payload, r2) == UC_ERR_OK) {
-            result = (uint32_t)crc32((uLong)r0, payload, (uInt)r2);
+        } else if (r2 <= MAX_GUEST_ZLIB_BUFFER) {
+            GuestMemoryRegion *region = guest_memory_region(probe, r1, r2);
+            if (region) {
+                payload = region->host + (size_t)(r1 - region->base);
+                ++probe->direct_memory_reads;
+            } else {
+                payload = (unsigned char *)malloc(r2);
+                owns_payload = payload != NULL;
+                if (!payload || uc_mem_read(probe->uc, r1, payload, r2) != UC_ERR_OK)
+                    payload = NULL;
+            }
+            if (payload)
+                result = (uint32_t)crc32((uLong)r0, payload, (uInt)r2);
         }
-        free(payload);
+        if (owns_payload) free(payload);
     } else if (strcmp(name, "uncompress") == 0) {
         uint32_t capacity = 0;
+        GuestMemoryRegion *source_region = NULL;
+        GuestMemoryRegion *destination_region = NULL;
         unsigned char *source = NULL;
         unsigned char *destination = NULL;
+        int owns_source = 0;
+        int owns_destination = 0;
         uLongf destination_size;
         int zresult = Z_STREAM_ERROR;
         if (r1 && uc_mem_read(probe->uc, r1, &capacity, sizeof(capacity)) ==
                       UC_ERR_OK &&
             capacity <= MAX_GUEST_ZLIB_BUFFER &&
-            r3 <= MAX_GUEST_ZLIB_BUFFER &&
-            (!r3 || (r2 && (source = (unsigned char *)malloc(r3)) != NULL &&
-                            uc_mem_read(probe->uc, r2, source, r3) == UC_ERR_OK)) &&
-            (!capacity || (r0 &&
-                            (destination = (unsigned char *)malloc(capacity)) != NULL))) {
+            r3 <= MAX_GUEST_ZLIB_BUFFER) {
+            if (r3) {
+                if (!r2) goto uncompress_finished;
+                source_region = guest_memory_region(probe, r2, r3);
+                if (source_region) {
+                    source = source_region->host +
+                             (size_t)(r2 - source_region->base);
+                    ++probe->direct_memory_reads;
+                } else {
+                    source = (unsigned char *)malloc(r3);
+                    owns_source = source != NULL;
+                    if (!source || uc_mem_read(probe->uc, r2, source, r3) !=
+                                       UC_ERR_OK)
+                        goto uncompress_finished;
+                }
+            }
+            if (capacity) {
+                if (!r0) goto uncompress_finished;
+                destination_region = guest_memory_region(probe, r0, capacity);
+                if (destination_region && destination_region->direct_write) {
+                    destination = destination_region->host +
+                                  (size_t)(r0 - destination_region->base);
+                    ++probe->direct_memory_writes;
+                } else {
+                    destination = (unsigned char *)malloc(capacity);
+                    owns_destination = destination != NULL;
+                    if (!destination) goto uncompress_finished;
+                }
+            }
             destination_size = capacity;
             zresult = uncompress(destination, &destination_size, source, r3);
-            if (zresult == Z_OK && destination_size &&
+            if (zresult == Z_OK && owns_destination && destination_size &&
                 uc_mem_write(probe->uc, r0, destination,
                              destination_size) != UC_ERR_OK)
                 zresult = Z_STREAM_ERROR;
             capacity = (uint32_t)destination_size;
             uc_mem_write(probe->uc, r1, &capacity, sizeof(capacity));
         }
-        free(source);
-        free(destination);
+uncompress_finished:
+        if (owns_source) free(source);
+        if (owns_destination) free(destination);
         result = (uint32_t)zresult;
     } else if (strcmp(name, "inflateInit_") == 0) {
         result = (uint32_t)guest_inflate_init(probe, r0, 0, MAX_WBITS);
@@ -5490,6 +6057,7 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
            first-use line above makes every missing semantic visible. */
         result = 0;
     }
+import_done:
     set_r0(probe->uc, result);
 }
 
@@ -5507,12 +6075,48 @@ static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
     if (address < GUEST_IMPORT_BASE || address >= GUEST_IMPORT_BASE +
         probe->import_count * 4u) return;
     index = (unsigned)((address - GUEST_IMPORT_BASE) / 4u);
-    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
-    uc_reg_read(uc, UC_ARM_REG_R1, &r1);
-    uc_reg_read(uc, UC_ARM_REG_R2, &r2);
-    uc_reg_read(uc, UC_ARM_REG_R3, &r3);
-    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+    {
+        static const int registers[5] = {
+            UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2,
+            UC_ARM_REG_R3, UC_ARM_REG_SP
+        };
+        void *values[5] = {&r0, &r1, &r2, &r3, &sp};
+        if (uc_reg_read_batch(uc, registers, values, 5) != UC_ERR_OK) {
+            probe->failed = 1;
+            snprintf(probe->failure, sizeof(probe->failure),
+                     "cannot read ARM import registers");
+            uc_emu_stop(uc);
+            return;
+        }
+    }
     dispatch_import(probe, &probe->imports[index], r0, r1, r2, r3, sp);
+}
+
+static int install_import_hooks(ArmProbe *probe) {
+    uc_hook hook;
+    unsigned index = 0;
+    unsigned hook_spans = 0;
+    while (index < probe->import_count) {
+        unsigned first;
+        unsigned last;
+        while (index < probe->import_count &&
+               probe->imports[index].kind == IMPORT_PTHREAD_NOOP)
+            ++index;
+        if (index >= probe->import_count) break;
+        first = index;
+        while (index < probe->import_count &&
+               probe->imports[index].kind != IMPORT_PTHREAD_NOOP)
+            ++index;
+        last = index - 1u;
+        if (uc_hook_add(probe->uc, &hook, UC_HOOK_CODE,
+                        import_hook, probe,
+                        GUEST_IMPORT_BASE + first * 4u,
+                        GUEST_IMPORT_BASE + last * 4u + 3u) != UC_ERR_OK)
+            return 0;
+        ++hook_spans;
+    }
+    probe_log("ARM fast pthread stubs ready: hook-spans=%u", hook_spans);
+    return 1;
 }
 
 static unsigned char png_paeth_predictor(unsigned char left,
@@ -6135,7 +6739,6 @@ static bool invalid_memory_hook(uc_engine *uc, uc_mem_type type,
 
 static int initialize_unicorn(ArmProbe *probe) {
     uc_err error;
-    uc_hook import_trace;
     uc_hook return_trace;
     uc_hook callback_return_trace;
     uc_hook invalid_trace;
@@ -6168,36 +6771,51 @@ static int initialize_unicorn(ArmProbe *probe) {
         probe_log("ERROR: uc_open: %s", uc_strerror(error));
         return 0;
     }
-    if (uc_mem_map(probe->uc, GUEST_IMAGE_BASE, probe->image_size,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_RETURN_BASE, 0x1000u, UC_PROT_ALL) !=
-            UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_IMPORT_BASE, GUEST_IMPORT_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_OBJECT_BASE, GUEST_OBJECT_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_HEAP_BASE, GUEST_HEAP_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_JNI_BASE, GUEST_JNI_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_FILE_BASE, GUEST_FILE_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_STACK_BASE, GUEST_STACK_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK ||
-        uc_mem_map(probe->uc, GUEST_KUSER_BASE, GUEST_KUSER_SIZE,
-                   UC_PROT_ALL) != UC_ERR_OK) {
+    if (!map_guest_memory(probe, GUEST_IMAGE_BASE, probe->image_size,
+                          UC_PROT_ALL, probe->image_data, 0) ||
+        !map_guest_memory(probe, GUEST_RETURN_BASE, 0x1000u,
+                          UC_PROT_ALL, NULL, 0) ||
+        !map_guest_memory(probe, GUEST_IMPORT_BASE, GUEST_IMPORT_SIZE,
+                          UC_PROT_ALL, NULL, 0) ||
+        !map_guest_memory(probe, GUEST_OBJECT_BASE, GUEST_OBJECT_SIZE,
+                          UC_PROT_ALL, NULL, 1) ||
+        !map_guest_memory(probe, GUEST_HEAP_BASE, GUEST_HEAP_SIZE,
+                          UC_PROT_ALL, NULL, 1) ||
+        !map_guest_memory(probe, GUEST_JNI_BASE, GUEST_JNI_SIZE,
+                          UC_PROT_ALL, NULL, 1) ||
+        !map_guest_memory(probe, GUEST_FILE_BASE, GUEST_FILE_SIZE,
+                          UC_PROT_ALL, NULL, 1) ||
+        !map_guest_memory(probe, GUEST_STACK_BASE, GUEST_STACK_SIZE,
+                          UC_PROT_ALL, NULL, 1) ||
+        !map_guest_memory(probe, GUEST_KUSER_BASE, GUEST_KUSER_SIZE,
+                          UC_PROT_ALL, NULL, 0)) {
         probe_log("ERROR: cannot map ARM guest address space");
         return 0;
     }
-    if (uc_mem_write(probe->uc, GUEST_IMAGE_BASE, probe->image_data,
-                     probe->image_size) != UC_ERR_OK) return 0;
+    if (!guest_memory_region(probe, GUEST_IMAGE_BASE, probe->image_size) &&
+        uc_mem_write(probe->uc, GUEST_IMAGE_BASE, probe->image_data,
+                     probe->image_size) != UC_ERR_OK)
+        return 0;
+    probe_log("ARM direct guest memory ready: regions=%u heap=%.0f MiB",
+              probe->memory_region_count,
+              (double)GUEST_HEAP_SIZE / (1024.0 * 1024.0));
     stubs = (unsigned char *)calloc(1, probe->import_count * 4u);
     if (!stubs) return 0;
     for (index = 0; index < probe->import_count; ++index) {
-        stubs[index * 4u] = 0x70;     /* bx lr */
-        stubs[index * 4u + 1u] = 0x47;
-        stubs[index * 4u + 2u] = 0xc0; /* nop */
-        stubs[index * 4u + 3u] = 0x46;
+        if (probe->imports[index].kind == IMPORT_PTHREAD_NOOP) {
+            /* movs r0, #0; bx lr. These guest-side stubs deliberately have no
+               Unicorn code hook, removing hundreds of thousands of pointless
+               ARM-to-host transitions in the single-threaded renderer. */
+            stubs[index * 4u] = 0x00;
+            stubs[index * 4u + 1u] = 0x20;
+            stubs[index * 4u + 2u] = 0x70;
+            stubs[index * 4u + 3u] = 0x47;
+        } else {
+            stubs[index * 4u] = 0x70;     /* bx lr */
+            stubs[index * 4u + 1u] = 0x47;
+            stubs[index * 4u + 2u] = 0xc0; /* nop */
+            stubs[index * 4u + 3u] = 0x46;
+        }
     }
     error = uc_mem_write(probe->uc, GUEST_IMPORT_BASE, stubs,
                          probe->import_count * 4u);
@@ -6228,7 +6846,7 @@ static int initialize_unicorn(ArmProbe *probe) {
             return 0;
         }
     }
-    {
+    if (probe->deep_diagnostics) {
         uint32_t ds_step_address =
             find_export(probe,
                         "_ZN13DS_Dictionary22stepIntoSubDictWithKeyEPKc") &
@@ -6247,7 +6865,7 @@ static int initialize_unicorn(ArmProbe *probe) {
                       ds_step_address | 1u);
         }
     }
-    {
+    if (probe->deep_diagnostics) {
         struct LevelTraceExport {
             const char *name;
             uint32_t *address;
@@ -6283,6 +6901,8 @@ static int initialize_unicorn(ArmProbe *probe) {
             ++installed;
         }
         probe_log("ARM level-string diagnostics ready: hooks=%u", installed);
+    } else {
+        probe_log("ARM deep parser diagnostics disabled (use --deep-diagnostics)");
     }
     probe->errno_address = GUEST_OBJECT_BASE + GUEST_OBJECT_SIZE - 0x1000u;
     object_value = 0;
@@ -6292,10 +6912,7 @@ static int initialize_unicorn(ArmProbe *probe) {
         probe_log("ERROR: cannot initialize guest JNI tables");
         return 0;
     }
-    if (uc_hook_add(probe->uc, &import_trace, UC_HOOK_CODE,
-                    import_hook, probe, GUEST_IMPORT_BASE,
-                    GUEST_IMPORT_BASE + probe->import_count * 4u - 1u) !=
-            UC_ERR_OK ||
+    if (!install_import_hooks(probe) ||
         uc_hook_add(probe->uc, &return_trace, UC_HOOK_CODE,
                     import_hook, probe, GUEST_RETURN_BASE,
                     GUEST_RETURN_BASE) != UC_ERR_OK ||
@@ -6646,9 +7263,11 @@ static int run_constructors(ArmProbe *probe) {
                             &entry, sizeof(entry)) != UC_ERR_OK)
                 return 0;
             if (!entry || entry == UINT32_MAX) continue;
-            probe_log("constructor %u/%u: guest 0x%08x (ELF+0x%08x)",
-                      index + 1u, count, entry,
-                      entry - GUEST_IMAGE_BASE);
+            if (index < 8u || ((index + 1u) % 32u) == 0u ||
+                index + 1u == count)
+                probe_log("constructor %u/%u: guest 0x%08x (ELF+0x%08x)",
+                          index + 1u, count, entry,
+                          entry - GUEST_IMAGE_BASE);
             if (!run_guest(probe, entry, NULL, 0,
                            DEFAULT_GUEST_INSTRUCTION_LIMIT, NULL)) {
                 probe_log("RESULT: ARM_CONSTRUCTOR_FAILED index=%u", index + 1u);
@@ -6682,6 +7301,11 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->natives[index].signature);
     }
     if (probe->uc) uc_close(probe->uc);
+    for (index = 0; index < probe->memory_region_count; ++index) {
+        GuestMemoryRegion *region = &probe->memory_regions[index];
+        if (region->owned && region->host)
+            VirtualFree(region->host, 0, MEM_RELEASE);
+    }
     for (index = 0; index < probe->import_count; ++index)
         free(probe->imports[index].name);
     for (index = 0; index < probe->object_count; ++index)
@@ -6690,8 +7314,15 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->gl_client_buffers[index]);
     free(probe->gl_index_buffer);
     free(probe->io_buffer);
+    for (index = 0; index < probe->apk_member_cache_count; ++index) {
+        free(probe->apk_member_cache[index].name);
+        free(probe->apk_member_cache[index].payload);
+    }
     free(probe->apk_data);
-    free(probe->image_data);
+    if (probe->image_data_virtual && probe->image_data)
+        VirtualFree(probe->image_data, 0, MEM_RELEASE);
+    else
+        free(probe->image_data);
     free(probe->file_data);
     free(probe->allocations);
     free(probe->free_allocation_next);
@@ -7038,7 +7669,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap14",
+        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap15",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -7111,6 +7742,7 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
     probe->profile_gl_draw_calls = 0;
     probe->profile_gl_vertices = 0;
     probe->profile_gl_client_copies = 0;
+    probe->profile_gl_direct_arrays = 0;
     probe->profile_gl_client_bytes = 0;
     probe->profile_alloc_calls = 0;
     probe->profile_alloc_bytes = 0;
@@ -7122,6 +7754,10 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
     probe->profile_frames_over_20ms = 0;
     probe->profile_frames_over_33ms = 0;
     probe->profile_frames_over_50ms = 0;
+    probe->profile_direct_read_baseline = probe->direct_memory_reads;
+    probe->profile_direct_write_baseline = probe->direct_memory_writes;
+    probe->profile_apk_cache_hit_baseline = probe->apk_member_cache_hits;
+    probe->profile_apk_cache_miss_baseline = probe->apk_member_cache_misses;
     for (index = 0; index < probe->import_count; ++index)
         probe->profile_import_baseline[index] = probe->imports[index].calls;
 }
@@ -7185,14 +7821,21 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               frames ? (double)probe->profile_gl_draw_calls / frames : 0.0,
               frames ? (double)probe->profile_gl_vertices / frames : 0.0);
     probe_log("ARM bridge profile: imports/frame=%.0f client-copies/frame=%.1f "
-              "client-copy=%.2f MiB/s alloc/free=%llu/%llu "
-              "alloc-bytes=%.2f MiB apk-opens=%llu file-opens=%llu "
-              "file-read=%.2f MiB zlib=%llu hot=%s",
+              "direct-arrays/frame=%.1f client-copy=%.2f MiB/s "
+              "direct-r/w=%llu/%llu "
+              "alloc/free=%llu/%llu alloc-bytes=%.2f MiB "
+              "apk-opens=%llu file-opens=%llu file-read=%.2f MiB "
+              "zlib=%llu apk-cache-h/m=%llu/%llu hot=%s",
               frames ? (double)total_imports / frames : 0.0,
               frames ? (double)probe->profile_gl_client_copies / frames : 0.0,
+              frames ? (double)probe->profile_gl_direct_arrays / frames : 0.0,
               elapsed_seconds > 0.0
                   ? (double)probe->profile_gl_client_bytes /
                         (1024.0 * 1024.0 * elapsed_seconds) : 0.0,
+              (unsigned long long)(probe->direct_memory_reads -
+                                   probe->profile_direct_read_baseline),
+              (unsigned long long)(probe->direct_memory_writes -
+                                   probe->profile_direct_write_baseline),
               (unsigned long long)probe->profile_alloc_calls,
               (unsigned long long)probe->profile_free_calls,
               (double)probe->profile_alloc_bytes / (1024.0 * 1024.0),
@@ -7200,6 +7843,10 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               (unsigned long long)probe->profile_file_opens,
               (double)probe->profile_file_read_bytes / (1024.0 * 1024.0),
               (unsigned long long)probe->profile_zlib_calls,
+              (unsigned long long)(probe->apk_member_cache_hits -
+                                   probe->profile_apk_cache_hit_baseline),
+              (unsigned long long)(probe->apk_member_cache_misses -
+                                   probe->profile_apk_cache_miss_baseline),
               hot_text);
     arm_frame_profile_reset(probe);
 }
@@ -7358,7 +8005,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap14");
+              "0.9.4-arm-bootstrap15");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -7370,6 +8017,8 @@ int main(int argc, char **argv) {
             probe.host.native_width = atoi(argv[index] + 8);
         else if (strncmp(argv[index], "--height=", 9) == 0)
             probe.host.native_height = atoi(argv[index] + 9);
+        else if (strcmp(argv[index], "--deep-diagnostics") == 0)
+            probe.deep_diagnostics = 1;
         else if (argv[index][0] != '-') apk_path = argv[index];
     }
     if (probe.host.native_width < 320) probe.host.native_width = 320;

@@ -1,22 +1,64 @@
-# Building GD Wrapper 0.9.4-arm-bootstrap14
+# Building GD Wrapper 0.9.4-arm-bootstrap15
 
-The ARM backend is built as a 32-bit Windows executable and links Unicorn
-statically. The runtime folder therefore needs no Unicorn DLL. The reproducible
-host setup is Linux or WSL with Python 3, CMake 3.27 or newer, a POSIX shell,
-`patch`, and Zig.
+## Windows: no Linux, WSL, admin rights, or installer
 
-## 1. Build the Win32 ARM translator
+Use the full-source archive. Keep `game.apk` in the source folder, or drag an
+APK onto `BUILD_WINDOWS.cmd` / pass its path on the command line:
 
-Extract `third_party/unicorn-2.1.4.tar.gz` to a working directory, then apply
-the included patch from the extracted Unicorn root:
+```text
+BUILD_WINDOWS.cmd C:\Games\GeometryDash-1.4.apk
+```
+
+The script downloads verified portable copies of Zig 0.14.1, CMake 3.31.10,
+and Ninja 1.13.2 into `.build-tools/`. It then builds the included patched
+Unicorn 2.1.4 source as an ARM-only static Win32 library and compiles the
+32-bit wrapper. Nothing is installed in Program Files, the registry, PATH, WSL,
+or a Linux VM.
+
+The result is written to:
+
+```text
+dist-arm-wrapper-bootstrap15\
+```
+
+It contains `GeometryDashArmWrapper.exe`, launchers, build information, and
+`game.apk` when one was supplied. The downloaded tools and build cache can be
+deleted at any time; later builds will simply download/rebuild them again.
+
+Useful commands:
+
+```text
+BUILD_WINDOWS.cmd
+BUILD_WINDOWS.cmd C:\path\to\game.apk
+BUILD_WINDOWS.cmd -Clean
+```
+
+The first command uses `game.apk` from the source folder. `-Clean` removes the
+compiled caches before rebuilding. Internet access is needed only when the
+portable tools are not already cached.
+
+## Test modes
+
+- `RUN_ARM_NATIVE_BOOT.cmd` starts the graphical wrapper.
+- `RUN_ARM_PROBE.cmd` stops after constructors and `JNI_OnLoad`.
+- `RUN_ARM_RELOCATION_ONLY.cmd` stops after mapping and relocation.
+- Add `--deep-diagnostics` manually only for corruption/parser investigation;
+  it enables intentionally expensive instruction-level hooks.
+
+Preserve the entire `gd-arm-wrapper.log` after testing menu startup, repeated
+deaths, Clutterfunk, Xstep, Cycles, and editor load/save.
+
+## Manual Linux/WSL route
+
+The older reproducible route remains supported for developers who already have
+Python 3, CMake 3.27+, a POSIX shell, `patch`, and Zig.
+
+Extract `third_party/unicorn-2.1.4.tar.gz`, apply
+`patches/unicorn-2.1.4-win32-zig.patch`, export the helper scripts in `tools/`,
+and configure an ARM-only static build:
 
 ```sh
 patch -p1 < /absolute/path/to/source/patches/unicorn-2.1.4-win32-zig.patch
-```
-
-Make the helper scripts executable and export their absolute paths:
-
-```sh
 export ZIG=/absolute/path/to/zig
 export GD_ARM_ZIGCC=/absolute/path/to/source/tools/zigcc-win32.sh
 export GD_ARM_ZIGAR=/absolute/path/to/source/tools/zigar.sh
@@ -24,11 +66,7 @@ export GD_ARM_ZIGRANLIB=/absolute/path/to/source/tools/zigranlib.sh
 export GD_ARM_BUILD_CACHE=/absolute/path/to/build-cache
 export PATH=/absolute/path/to/source/tools:$PATH
 chmod +x /absolute/path/to/source/tools/*.sh
-```
 
-Configure and build only the ARM architecture:
-
-```sh
 cmake -S /path/to/unicorn-2.1.4 -B /path/to/unicorn-win32 \
   -G "Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE=/absolute/path/to/source/tools/unicorn-win32-zig.cmake \
@@ -39,13 +77,7 @@ cmake -S /path/to/unicorn-2.1.4 -B /path/to/unicorn-win32 \
   -DUNICORN_INSTALL=OFF \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build /path/to/unicorn-win32 --parallel
-```
 
-The expected library is typically `/path/to/unicorn-win32/libunicorn.a`.
-
-## 2. Build the graphical ARM wrapper
-
-```sh
 python3 build_arm_wrapper.py \
   --zig "$ZIG" \
   --unicorn-source /path/to/unicorn-2.1.4 \
@@ -54,43 +86,5 @@ python3 build_arm_wrapper.py \
   --out dist-arm-wrapper
 ```
 
-`--apk` is optional. When supplied, the builder verifies that the APK contains
-a little-endian ELF32/ARM shared library and copies it to the output as
-`game.apk`.
-
-The output contains:
-
-- `GeometryDashArmWrapper.exe`
-- `RUN_ARM_NATIVE_BOOT.cmd`
-- `RUN_ARM_PROBE.cmd`
-- `RUN_ARM_RELOCATION_ONLY.cmd`
-- `README-ARM-TEST.txt`
-- `game.apk` when `--apk` was supplied
-
-## 3. Test modes
-
-Run `RUN_ARM_NATIVE_BOOT.cmd` for the graphical path. It executes the authentic
-constructors and `JNI_OnLoad`, creates the Windows OpenGL context, invokes the
-registered/exported Cocos `nativeInit`, then drives `nativeRender` from the
-Windows message loop.
-
-Run `RUN_ARM_PROBE.cmd` to repeat the successful non-graphical native milestone.
-Its expected final line is `RESULT: ARM_NATIVE_PROBE_OK`.
-
-Run `RUN_ARM_RELOCATION_ONLY.cmd` to stop after mapping and relocation.
-
-The graphical branch writes `gd-arm-wrapper.log`. Preserve and send the entire
-file after a test, including when a window opens or the game reaches a menu.
-Because this is the first graphical bootstrap release, an unimplemented import,
-JNI method, or OpenGL call found by a real APK is useful diagnostic output, not
-proof that the ARM route failed.
-
-## Legacy probe executable
-
-`build_arm_probe.py` and `src/arm_probe.c` remain available to reproduce the
-small standalone `0.9.4-arm-probe1` executable. New development should use
-`build_arm_wrapper.py` and `src/arm_wrapper.c`.
-
-Unicorn 2.1.4 is distributed under its own GPL-2.0 license. Its unmodified
-upstream source tarball, license, and the exact wrapper patch are included so
-the static binary can be rebuilt.
+Unicorn 2.1.4 is distributed under its own GPL-2.0 license. Its upstream source,
+license, and exact wrapper patch are included in the full-source archive.

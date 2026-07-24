@@ -1,0 +1,4 @@
+/.build-tools
+/build-cache-windows
+/third_party/unicorn-2.1.4
+*.apk

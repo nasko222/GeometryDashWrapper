@@ -19,7 +19,7 @@
 #define STB_VORBIS_HEADER_ONLY
 #include "../third_party/stb/stb_vorbis.c"
 
-#define MAX_EFFECT_SLOTS 24
+#define MAX_EFFECT_SLOTS 48
 #define MAX_EFFECT_ASSET_CACHE 128
 
 typedef struct {
@@ -28,6 +28,7 @@ typedef struct {
     int paused;
     float volume;
     char alias[32];
+    char path[MAX_PATH * 2];
 } EffectSlot;
 
 typedef struct {
@@ -758,10 +759,63 @@ static void close_effect_slot(EffectSlot *slot) {
     slot->paused = 0;
     slot->identifier = 0;
     slot->volume = 1.0f;
+    slot->path[0] = 0;
+}
+
+static void park_effect_slot(EffectSlot *slot) {
+    char command[80];
+    if (!slot || !slot->open) return;
+    snprintf(command, sizeof(command), "stop %s", slot->alias);
+    mci_command(command, NULL, 0, 0);
+    snprintf(command, sizeof(command), "seek %s to start", slot->alias);
+    mci_command(command, NULL, 0, 0);
+    slot->paused = 0;
+    slot->identifier = 0;
+    slot->volume = 1.0f;
+}
+
+static int effect_slot_playing(EffectSlot *slot) {
+    char command[80];
+    char mode[32] = {0};
+    if (!slot || !slot->open || !slot->identifier) return 0;
+    snprintf(command, sizeof(command), "status %s mode", slot->alias);
+    if (!mci_command(command, mode, sizeof(mode), 0)) return 0;
+    return _stricmp(mode, "playing") == 0 ||
+           _stricmp(mode, "paused") == 0;
+}
+
+static EffectSlot *reusable_effect_slot(const char *path) {
+    unsigned index;
+    for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
+        EffectSlot *slot = &g_effects[index];
+        if (!slot->open || _stricmp(slot->path, path) != 0) continue;
+        if (!slot->identifier || !effect_slot_playing(slot)) {
+            slot->identifier = 0;
+            slot->paused = 0;
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static EffectSlot *open_effect_slot(const char *path, int report_error) {
+    EffectSlot *slot = reusable_effect_slot(path);
+    if (slot) return slot;
+    slot = &g_effects[g_next_effect_slot++ % MAX_EFFECT_SLOTS];
+    close_effect_slot(slot);
+    if (!mci_open_path(path, "waveaudio", slot->alias, report_error))
+        return NULL;
+    slot->open = 1;
+    slot->identifier = 0;
+    slot->paused = 0;
+    slot->volume = 1.0f;
+    snprintf(slot->path, sizeof(slot->path), "%s", path);
+    return slot;
 }
 
 static EffectSlot *find_effect(unsigned identifier) {
     unsigned index;
+    if (!identifier) return NULL;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open &&
             g_effects[index].identifier == identifier) {
@@ -788,6 +842,7 @@ void audio_initialize(const char *executable_directory) {
     InterlockedExchange(&g_effect_cache_hit_logged, 0);
     memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
     g_effect_asset_cache_count = 0;
+    memset(g_effects, 0, sizeof(g_effects));
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
                  "gd18_fx_%u", index);
@@ -800,6 +855,9 @@ void audio_initialize(const char *executable_directory) {
 void audio_set_apk_path(const char *apk_path) {
     if (apk_path && apk_path[0]) {
         if (_stricmp(g_apk_path, apk_path) != 0) {
+            unsigned index;
+            for (index = 0; index < MAX_EFFECT_SLOTS; ++index)
+                close_effect_slot(&g_effects[index]);
             memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
             g_effect_asset_cache_count = 0;
             InterlockedExchange(&g_effect_cache_hit_logged, 0);
@@ -822,6 +880,11 @@ void audio_shutdown(void) {
     InterlockedExchange(&g_output_peak_bits, 0);
     InterlockedExchange(&g_output_peak_logged, 0);
     audio_stop_all_effects();
+    {
+        unsigned index;
+        for (index = 0; index < MAX_EFFECT_SLOTS; ++index)
+            close_effect_slot(&g_effects[index]);
+    }
     close_music();
 }
 
@@ -956,7 +1019,14 @@ float audio_get_output_peak(void) {
 
 void audio_preload_effect(const char *path) {
     char resolved[MAX_PATH * 2];
-    (void)audio_asset_path(path, 1, resolved, sizeof(resolved));
+    EffectSlot *slot;
+    if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return;
+    slot = open_effect_slot(resolved, 0);
+    if (slot) {
+        set_alias_volume(slot->alias, g_effects_volume);
+        runtime_log("Audio effect decoder preloaded: %s",
+                    file_name_part(path));
+    }
 }
 
 unsigned audio_play_effect(const char *path, int loop) {
@@ -965,19 +1035,20 @@ unsigned audio_play_effect(const char *path, int loop) {
     EffectSlot *slot;
     unsigned identifier;
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return 0;
-    slot = &g_effects[g_next_effect_slot++ % MAX_EFFECT_SLOTS];
-    close_effect_slot(slot);
+    slot = open_effect_slot(resolved, 1);
+    if (!slot) return 0;
     identifier = g_next_effect_identifier++;
     if (!identifier) identifier = g_next_effect_identifier++;
-    if (!mci_open_path(resolved, "waveaudio", slot->alias, 1)) return 0;
-    slot->open = 1;
     slot->identifier = identifier;
+    slot->paused = 0;
     slot->volume = 1.0f;
     set_alias_volume(slot->alias, g_effects_volume * slot->volume);
+    snprintf(command, sizeof(command), "seek %s to start", slot->alias);
+    mci_command(command, NULL, 0, 0);
     snprintf(command, sizeof(command), "play %s from 0%s", slot->alias,
              loop ? " repeat" : "");
     if (!mci_command(command, NULL, 0, 1)) {
-        close_effect_slot(slot);
+        park_effect_slot(slot);
         return 0;
     }
     if (InterlockedIncrement(&g_effect_log_count) <= 64) {
@@ -1022,33 +1093,41 @@ void audio_resume_effect(unsigned identifier) {
 }
 
 void audio_stop_effect(unsigned identifier) {
-    close_effect_slot(find_effect(identifier));
+    park_effect_slot(find_effect(identifier));
 }
 
 void audio_pause_all_effects(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        if (g_effects[index].open) audio_pause_effect(g_effects[index].identifier);
+        if (g_effects[index].open && g_effects[index].identifier)
+            audio_pause_effect(g_effects[index].identifier);
     }
 }
 
 void audio_resume_all_effects(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        if (g_effects[index].open) audio_resume_effect(g_effects[index].identifier);
+        if (g_effects[index].open && g_effects[index].identifier)
+            audio_resume_effect(g_effects[index].identifier);
     }
 }
 
 void audio_stop_all_effects(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        close_effect_slot(&g_effects[index]);
+        if (g_effects[index].open) park_effect_slot(&g_effects[index]);
     }
 }
 
 void audio_unload_effect(const char *path) {
-    (void)path;
-    /* Each play owns a short-lived MCI alias; there is no persistent decoder. */
+    char resolved[MAX_PATH * 2];
+    unsigned index;
+    if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return;
+    for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
+        if (g_effects[index].open &&
+            _stricmp(g_effects[index].path, resolved) == 0)
+            close_effect_slot(&g_effects[index]);
+    }
 }
 
 float audio_get_effects_volume(void) { return g_effects_volume; }
