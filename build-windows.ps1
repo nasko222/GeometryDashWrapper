@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-overkilltest3"
+$Output = Join-Path $Root "dist-arm-wrapper-performancetest2"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -253,8 +253,15 @@ if ($Apk) {
     if (Test-Path $BundledApk) { $SelectedApk = $BundledApk }
 }
 if ($SelectedApk) {
-    Copy-Item -LiteralPath $SelectedApk -Destination (Join-Path $Output "game.apk") -Force
+    $OutputApk = Join-Path $Output "game.apk"
+    $UnpackedAssets = Join-Path $Output "apk-unpacked"
+    Copy-Item -LiteralPath $SelectedApk -Destination $OutputApk -Force
     Write-Host "Copied APK: $SelectedApk"
+    if (Test-Path $UnpackedAssets) { Remove-Item -LiteralPath $UnpackedAssets -Recurse -Force }
+    New-Item -ItemType Directory -Path $UnpackedAssets -Force | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($OutputApk, $UnpackedAssets)
+    Write-Host "Pre-extracted complete APK: $UnpackedAssets"
 } else {
     Write-Warning "No APK was supplied. Place game.apk beside the built EXE before running it."
 }
@@ -262,117 +269,67 @@ if ($SelectedApk) {
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_NATIVE_BOOT.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo OVERKILL visual mode: audio and cosmetics removed; textures become 1x1 white.
-echo Hotkeys: F3 nativeRender, F4 ARM draws, F5 particles, F6 host draws, F7 scene, F8 GL, F9 textures, F10 state, F11 ARM profiler.
-GeometryDashArmWrapper.exe --apk=game.apk --overkill
+GeometryDashArmWrapper.exe --apk=game.apk --unpacked-assets=apk-unpacked --pretranslate-all
 if errorlevel 1 pause
 '@
-Write-AsciiFile -Path (Join-Path $Output "RUN_CONTROL_PERFORMANCETEST1.cmd") -Content @'
+Write-AsciiFile -Path (Join-Path $Output "RUN_NO_PRETRANSLATE_BASELINE.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Control run: all normal performancetest1 subsystems enabled.
-GeometryDashArmWrapper.exe --apk=game.apk
+GeometryDashArmWrapper.exe --apk=game.apk --unpacked-assets=apk-unpacked
 if errorlevel 1 pause
 '@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_BARE_MINIMUM.cmd") -Content @'
+Write-AsciiFile -Path (Join-Path $Output "RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Bare minimum: audio, particles, ARM draw methods, textures and host OpenGL removed.
-echo Game update/collision and scene traversal still execute. Window will be blank.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --headless-gl --no-vsync --uncapped
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_ZERO_RENDER.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo Zero-render baseline: nativeRender is never called. Window will be blank.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --skip-native-render --no-vsync --uncapped
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_NO_ARM_DRAWS.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo ARM sprite, batch, atlas, layer, label and shape draw methods removed.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --no-vsync --uncapped
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_NO_TEXTURES.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo Audio, cosmetics and all texture uploads removed.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-textures
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_NO_DRAWS.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo ARM still builds the scene, but every host draw call is discarded.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-textures --skip-draws --no-vsync --uncapped
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_LOGIC_ONLY.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo CCNode scene traversal is removed. The window may be blank.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --skip-scene-visit --headless-gl --no-vsync --uncapped
-if errorlevel 1 pause
-'@
-Write-AsciiFile -Path (Join-Path $Output "RUN_OVERKILL_HEADLESS_GL.cmd") -Content @'
-@echo off
-cd /d "%~dp0"
-echo Every OpenGL call uses the fake headless backend. The window will be blank.
-GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --headless-gl --no-vsync --uncapped
+echo WARNING: experimental comparison run with particle compatibility hooks disabled.
+GeometryDashArmWrapper.exe --apk=game.apk --no-particle-guards
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_IMPORT_TIME.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Diagnostic callback timing adds overhead. Test one heavy section, then close.
-GeometryDashArmWrapper.exe --apk=game.apk --overkill --profile-import-time
+echo Diagnostic run: callback timing adds overhead. Test one heavy level section, then close the game.
+GeometryDashArmWrapper.exe --apk=game.apk --profile-import-time
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_ARM_BLOCKS.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Diagnostic ARM block profiling is slow. Test one heavy section, then close.
-GeometryDashArmWrapper.exe --apk=game.apk --overkill --profile-arm-blocks
+echo Diagnostic run: ARM block profiling is slow. Test one heavy section, then close the game.
+GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_PROBE.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-GeometryDashArmWrapper.exe --probe --apk=game.apk --no-audio
+GeometryDashArmWrapper.exe --probe --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_RELOCATION_ONLY.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-GeometryDashArmWrapper.exe --relocate-only --apk=game.apk --no-audio
+GeometryDashArmWrapper.exe --relocate-only --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest2
 
-RUN_ARM_NATIVE_BOOT.cmd starts the visual overkill mode: audio is never initialized,
-particle/trail/cosmetic ARM functions are hot-patched out, and original PNG
-assets are replaced before decoding by a 70-byte 1x1 white image. Enter a heavy level, then use:
+Run RUN_ARM_NATIVE_BOOT.cmd. Keep your existing save folder beside the EXE.
+PerformanceTest1 keeps bootstrap15 integrity protections and enables Unicorn's
+flat virtual TLB with a 256 MiB translation cache. It also caches OpenGL entry
+points, uploads directly from host-backed guest RAM, suppresses redundant buffer
+binds, narrows ARM register reads, and fast-dispatches common math/division calls.
+Send the complete gd-arm-wrapper.log after testing Clutterfunk, Xstep, Cycles,
+editor load/save and repeated deaths.
 
-  F3  toggle nativeRender itself (zero-render baseline)
-  F4  toggle ARM sprite/label/shape draw methods
-  F5  toggle particles/cosmetics
-  F6  toggle actual OpenGL draw calls
-  F7  toggle CCNode scene traversal (strongest logic-only test)
-  F8  toggle the entire host OpenGL backend
-  F9  toggle future texture uploads
-  F10 print the current state to gd-arm-wrapper.log
-  F11 profile hottest ARM blocks for five seconds
-
-The other RUN_OVERKILL_*.cmd launchers start directly in stronger blank-screen
-modes. Compare their ARM frame profile and ARM overkill-test profile lines.
+RUN_PROFILE_IMPORT_TIME.cmd times imported callbacks. RUN_PROFILE_ARM_BLOCKS.cmd
+identifies the hottest guest ARM blocks for later native replacement. Both add
+diagnostic overhead and should be used for only one heavy level section.
+Use --deep-diagnostics only when investigating parser or level corruption.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest2
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion

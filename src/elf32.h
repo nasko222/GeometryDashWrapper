@@ -67,6 +67,9 @@ typedef struct {
 #define ET_DYN 3
 #define EM_386 3
 #define PT_LOAD 1
+#define PF_X 0x1u
+#define PF_W 0x2u
+#define PF_R 0x4u
 #define SHT_SYMTAB 2
 #define SHT_STRTAB 3
 #define SHT_RELA 4
