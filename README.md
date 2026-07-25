@@ -1,6 +1,6 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
+# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3
 
-`overkilltest2` is a destructive diagnostic branch based on `performancetest1`.
+`overkilltest3` is a targeted ARM hot-path diagnostic branch based on `overkilltest2`.
 It is not intended to look correct. Its purpose is to remove complete subsystems
 one layer at a time and reveal where the remaining ARM slowdown actually lives.
 
@@ -19,7 +19,7 @@ The portable builder downloads Zig, CMake and Ninja into `.build-tools` and
 creates:
 
 ```text
-dist-arm-wrapper-overkilltest2\
+dist-arm-wrapper-overkilltest3\
 ```
 
 No Visual Studio, WSL, Linux, MSYS2 or administrator rights are required.
@@ -58,3 +58,7 @@ normal-speed execution, and writes `ARM hot block profile` with nearest function
 names to `gd-arm-wrapper.log`.
 
 See `OVERKILLTEST2-NOTES.md` for the interpretation table and stronger launchers.
+
+## Automatic slow-path profiling
+
+Run `RUN_AUTO_PROFILE_ORIGINAL.cmd`. It preserves original assets and automatically captures ARM hot blocks when ten clean consecutive render calls exceed 22 ms.

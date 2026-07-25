@@ -60,6 +60,13 @@ def write_launchers(output: Path) -> None:
             "GeometryDashArmWrapper.exe --apk=game.apk\r\n"
             "if errorlevel 1 pause\r\n"
         ),
+        "RUN_AUTO_PROFILE_ORIGINAL.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Original audio/textures/cosmetics; automatic ARM profiler starts only on sustained clean lag.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --auto-profile-slow\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
         "RUN_OVERKILL_BARE_MINIMUM.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
@@ -214,9 +221,9 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
-        "RUN_ARM_NATIVE_BOOT.cmd. OverkillTest2 keeps performancetest1's integrity protections but adds destructive "
+        "RUN_ARM_NATIVE_BOOT.cmd. OverkillTest3 keeps performancetest1's integrity protections but adds destructive "
         "diagnostic modes. Audio can be removed before initialization; particle, trail "
         "and cosmetic guest functions are hot-patched to return; original PNG assets "
         "can be replaced by a 70-byte 1x1 image; ARM sprite/label/shape draw methods, "

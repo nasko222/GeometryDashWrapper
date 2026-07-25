@@ -1,4 +1,4 @@
-# Building Geometry Dash ARM Wrapper overkilltest2
+# Building Geometry Dash ARM Wrapper overkilltest3
 
 ## Windows one-click build
 
@@ -21,7 +21,7 @@ wrapper. Nothing is installed system-wide.
 Output:
 
 ```text
-dist-arm-wrapper-overkilltest2\
+dist-arm-wrapper-overkilltest3\
 ```
 
 The bundled `game.apk` is copied automatically. To use another APK:

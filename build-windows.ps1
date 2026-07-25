@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-overkilltest2"
+$Output = Join-Path $Root "dist-arm-wrapper-overkilltest3"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -351,7 +351,7 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk --no-audio
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
+Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3
 
 RUN_ARM_NATIVE_BOOT.cmd starts the visual overkill mode: audio is never initialized,
 particle/trail/cosmetic ARM functions are hot-patched out, and original PNG
@@ -372,7 +372,7 @@ modes. Compare their ARM frame profile and ARM overkill-test profile lines.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
+Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion

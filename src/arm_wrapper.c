@@ -412,6 +412,10 @@ typedef struct {
     int uncapped;
     int profile_import_timing;
     int profile_arm_blocks;
+    int auto_profile_slow;
+    unsigned auto_profile_slow_streak;
+    unsigned auto_profile_samples;
+    DWORD auto_profile_cooldown_until;
     DWORD block_profile_deadline;
     LARGE_INTEGER profile_import_frequency;
     ArmBlockProfileEntry *block_profile_entries;
@@ -525,6 +529,9 @@ typedef struct {
     uint64_t profile_render_microseconds;
     uint64_t profile_render_max_microseconds;
     uint64_t profile_last_render_microseconds;
+    uint64_t profile_last_render_apk_opens;
+    uint64_t profile_last_render_file_read_bytes;
+    uint64_t profile_last_render_zlib_calls;
     uint64_t profile_swap_microseconds;
     uint64_t profile_swap_max_microseconds;
     uint64_t profile_gl_draw_calls;
@@ -8497,6 +8504,9 @@ static int arm_block_profiler_set(ArmProbe *probe, int enabled,
     arm_block_profile_report(probe, "completed 5-second sample");
     probe->profile_arm_blocks = 0;
     probe->block_profile_deadline = 0;
+    probe->auto_profile_slow_streak = 0;
+    if (probe->auto_profile_slow)
+        probe->auto_profile_cooldown_until = GetTickCount() + 10000u;
     probe_log("ARM block profiler DISABLED; normal-speed translation restored");
     return 1;
 }
@@ -8747,6 +8757,12 @@ static int host_call(ArmProbe *probe, uint32_t address,
         host_monotonic_units(UINT64_C(1000000)) - started_microseconds;
     if (render_call) {
         probe->profile_last_render_microseconds = elapsed_microseconds;
+        probe->profile_last_render_apk_opens =
+            probe->profile_apk_opens - apk_opens_before;
+        probe->profile_last_render_file_read_bytes =
+            probe->profile_file_read_bytes - file_bytes_before;
+        probe->profile_last_render_zlib_calls =
+            probe->profile_zlib_calls - zlib_before;
         probe->profile_render_microseconds += elapsed_microseconds;
         if (elapsed_microseconds > probe->profile_render_max_microseconds)
             probe->profile_render_max_microseconds = elapsed_microseconds;
@@ -9078,7 +9094,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-overkilltest2",
+        "Geometry Dash ARM wrapper 0.9.4-arm-overkilltest3",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -9358,6 +9374,9 @@ static int run_arm_message_loop(ArmProbe *probe) {
             }
             if (probe->skip_native_render) {
                 probe->profile_last_render_microseconds = 0;
+                probe->profile_last_render_apk_opens = 0;
+                probe->profile_last_render_file_read_bytes = 0;
+                probe->profile_last_render_zlib_calls = 0;
                 ++probe->overkill_native_render_skips;
             } else if (!host_call(probe, probe->host.render, arguments, 2,
                                   "nativeRender")) {
@@ -9382,6 +9401,30 @@ static int run_arm_message_loop(ArmProbe *probe) {
             {
                 DWORD now = GetTickCount();
                 DWORD elapsed = now - performance_started;
+                if (probe->auto_profile_slow && !probe->profile_arm_blocks &&
+                    probe->auto_profile_samples < 3u &&
+                    (LONG)(now - probe->auto_profile_cooldown_until) >= 0 &&
+                    probe->native_render_calls > 180u &&
+                    probe->profile_last_render_microseconds >= UINT64_C(22000) &&
+                    probe->profile_last_render_microseconds < UINT64_C(100000) &&
+                    probe->profile_last_render_apk_opens == 0 &&
+                    probe->profile_last_render_file_read_bytes == 0 &&
+                    probe->profile_last_render_zlib_calls == 0) {
+                    if (++probe->auto_profile_slow_streak >= 10u) {
+                        ++probe->auto_profile_samples;
+                        probe_log("ARM automatic slow-path trigger: sample=%u "
+                                  "render=%.2f ms after 10 clean slow frames",
+                                  probe->auto_profile_samples,
+                                  (double)probe->profile_last_render_microseconds /
+                                      1000.0);
+                        if (!arm_block_profiler_set(probe, 1, 1))
+                            probe_log("WARNING: automatic ARM profiler could "
+                                      "not start");
+                        probe->auto_profile_slow_streak = 0;
+                    }
+                } else if (!probe->profile_arm_blocks) {
+                    probe->auto_profile_slow_streak = 0;
+                }
                 if (elapsed >= 5000u) {
                     probe_log("ARM render performance: %.1f FPS "
                               "(%u frames / %lu ms) heap=%u MiB "
@@ -9484,6 +9527,7 @@ int main(int argc, char **argv) {
     probe.host.native_height = 720;
     probe.host.window_active = 1;
     probe.frame_interval = 1.0 / 60.0;
+    probe.auto_profile_slow = 1;
     if (!executable_directory(probe.executable_directory,
                               sizeof(probe.executable_directory)))
         snprintf(probe.executable_directory,
@@ -9494,7 +9538,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-overkilltest2");
+              "0.9.4-arm-overkilltest3");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -9541,6 +9585,10 @@ int main(int argc, char **argv) {
             probe.profile_import_timing = 1;
         else if (strcmp(argv[index], "--profile-arm-blocks") == 0)
             probe.profile_arm_blocks = 1;
+        else if (strcmp(argv[index], "--no-auto-profile-slow") == 0)
+            probe.auto_profile_slow = 0;
+        else if (strcmp(argv[index], "--auto-profile-slow") == 0)
+            probe.auto_profile_slow = 1;
         else if (argv[index][0] != '-') apk_path = argv[index];
     }
     if (probe.profile_import_timing) {
@@ -9578,6 +9626,9 @@ int main(int argc, char **argv) {
               "F5 particles, F6 host draws, F7 scene visit, "
               "F8 headless GL, F9 future textures, F10 state, "
               "F11 5-second ARM hot-block profile");
+    probe_log("ARM automatic slow-path profiler: %s (10 consecutive clean "
+              "renders >=22 ms, up to 3 samples)",
+              probe.auto_profile_slow ? "ARMED" : "disabled");
     probe_log("Input: %s", input_path);
     if (!load_arm_input(input_path, &probe.file_data, &probe.file_size,
                         &probe.apk_data, &probe.apk_size)) {
