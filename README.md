@@ -1,6 +1,6 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest1
+# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
 
-`overkilltest1` is a destructive diagnostic branch based on `performancetest1`.
+`overkilltest2` is a destructive diagnostic branch based on `performancetest1`.
 It is not intended to look correct. Its purpose is to remove complete subsystems
 one layer at a time and reveal where the remaining ARM slowdown actually lives.
 
@@ -19,7 +19,7 @@ The portable builder downloads Zig, CMake and Ninja into `.build-tools` and
 creates:
 
 ```text
-dist-arm-wrapper-overkilltest1\
+dist-arm-wrapper-overkilltest2\
 ```
 
 No Visual Studio, WSL, Linux, MSYS2 or administrator rights are required.
@@ -44,10 +44,17 @@ F7  CCNode scene traversal
 F8  the complete host OpenGL backend
 F9  all future texture uploads
 F10 write the current state to the log
+F11 capture a five-second ARM hot-block profile
+
+Function-key auto-repeat is ignored, so one press changes each diagnostic state exactly once.
 ```
 
 Leave each test enabled for at least one complete five-second profile window,
-then toggle it back before testing the next layer. Send the complete
-`gd-arm-wrapper.log`.
+then toggle it back before testing the next layer.
 
-See `OVERKILLTEST1-NOTES.md` for the interpretation table and stronger launchers.
+After reproducing the slow section with normal rendering, press **F11 once**.
+It automatically profiles translated ARM basic blocks for five seconds, restores
+normal-speed execution, and writes `ARM hot block profile` with nearest function
+names to `gd-arm-wrapper.log`.
+
+See `OVERKILLTEST2-NOTES.md` for the interpretation table and stronger launchers.

@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-overkilltest1"
+$Output = Join-Path $Root "dist-arm-wrapper-overkilltest2"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -263,7 +263,7 @@ Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_NATIVE_BOOT.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
 echo OVERKILL visual mode: audio and cosmetics removed; textures become 1x1 white.
-echo Hotkeys: F3 nativeRender, F4 ARM draws, F5 particles, F6 host draws, F7 scene, F8 GL, F9 textures, F10 state.
+echo Hotkeys: F3 nativeRender, F4 ARM draws, F5 particles, F6 host draws, F7 scene, F8 GL, F9 textures, F10 state, F11 ARM profiler.
 GeometryDashArmWrapper.exe --apk=game.apk --overkill
 if errorlevel 1 pause
 '@
@@ -351,7 +351,7 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk --no-audio
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest1
+Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
 
 RUN_ARM_NATIVE_BOOT.cmd starts the visual overkill mode: audio is never initialized,
 particle/trail/cosmetic ARM functions are hot-patched out, and original PNG
@@ -365,13 +365,14 @@ assets are replaced before decoding by a 70-byte 1x1 white image. Enter a heavy 
   F8  toggle the entire host OpenGL backend
   F9  toggle future texture uploads
   F10 print the current state to gd-arm-wrapper.log
+  F11 profile hottest ARM blocks for five seconds
 
 The other RUN_OVERKILL_*.cmd launchers start directly in stronger blank-screen
 modes. Compare their ARM frame profile and ARM overkill-test profile lines.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest1
+Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion

@@ -1,10 +1,10 @@
-# OverkillTest1 diagnostic notes
+# OverkillTest2 diagnostic notes
 
 ## Goal
 
 PerformanceTest1 proved that indexed APK extraction and direct OpenGL uploads
 work, but the heavy Clutterfunk section can still take roughly 35 ms per
-`nativeRender` while steady file reads and zlib work are zero. OverkillTest1
+`nativeRender` while steady file reads and zlib work are zero. OverkillTest2
 removes entire layers so the next optimization can target measured code rather
 than another guess.
 
@@ -114,11 +114,18 @@ F3-F8 hotkeys are better for testing the exact same position inside a level.
 A Windows runtime FPS result cannot be claimed until this build is run on the
 actual wrapper and game APK.
 
-## Startup hotfix 1
+## OverkillTest2 corrections
 
-The original OverkillTest1 package passed 32-bit guest addresses directly to
-Unicorn's variadic `uc_ctl_remove_cache` control. Unicorn consumes those two
-arguments as `uint64_t`; on the 32-bit Windows host the adjacent 32-bit values
-were combined and the patch stage returned `UC_ERR_ARG` before constructors.
-The hotfix casts both cache bounds to `uint64_t` and treats optional diagnostic
-patch failures as non-fatal.
+The previous OverkillTest1 runtime toggles were partially invalid. Once the
+immutable-image host guard was armed, F4, F5 restore and F7 attempted deliberate
+code writes through the same guard used to detect corruption, producing
+`UC_ERR_WRITE_PROT`. OverkillTest2 temporarily bypasses that guard only for the
+four-byte verified diagnostic patch, then immediately restores it and invalidates
+the affected translated block.
+
+OverkillTest2 also ignores repeated `WM_KEYDOWN` messages for F3-F11. In the
+previous log, a single held F3 press removed and restored `nativeRender`
+immediately, while F9 toggled several times.
+
+The timed F11 hot-block profiler lets the next optimization target measured
+ARM/Cocos functions rather than another subsystem guess.

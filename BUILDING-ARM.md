@@ -1,4 +1,4 @@
-# Building Geometry Dash ARM Wrapper overkilltest1
+# Building Geometry Dash ARM Wrapper overkilltest2
 
 ## Windows one-click build
 
@@ -21,7 +21,7 @@ wrapper. Nothing is installed system-wide.
 Output:
 
 ```text
-dist-arm-wrapper-overkilltest1\
+dist-arm-wrapper-overkilltest2\
 ```
 
 The bundled `game.apk` is copied automatically. To use another APK:
@@ -30,5 +30,5 @@ The bundled `game.apk` is copied automatically. To use another APK:
 powershell -ExecutionPolicy Bypass -File .\build-windows.ps1 -Apk "D:\path\game.apk"
 ```
 
-Use `RUN_ARM_NATIVE_BOOT.cmd` first. See `OVERKILLTEST1-NOTES.md` before using
+Use `RUN_ARM_NATIVE_BOOT.cmd` first. See `OVERKILLTEST2-NOTES.md` before using
 the blank-screen diagnostic launchers.

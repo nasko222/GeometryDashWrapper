@@ -5,7 +5,7 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host. OverkillTest1 deliberately
+ * complete nativeInit/nativeRender lifecycle host. OverkillTest2 deliberately
  * removes optional subsystems and can hot-patch cosmetic/render functions so the
  * remaining ARM game logic can be measured without audio, particles or real GL.
  */
@@ -412,8 +412,10 @@ typedef struct {
     int uncapped;
     int profile_import_timing;
     int profile_arm_blocks;
+    DWORD block_profile_deadline;
     LARGE_INTEGER profile_import_frequency;
     ArmBlockProfileEntry *block_profile_entries;
+    uc_hook arm_block_trace;
     uint64_t profile_block_dropped;
     unsigned char *file_data;
     size_t file_size;
@@ -586,6 +588,8 @@ typedef struct {
 } ArmProbe;
 
 static uint32_t find_export(const ArmProbe *probe, const char *name);
+static int arm_block_profiler_set(ArmProbe *probe, int enabled,
+                                  int timed_sample);
 
 static ArmProbe *g_active_probe;
 static FILE *g_log_stream;
@@ -4909,7 +4913,7 @@ static uint32_t dispatch_gl_headless(ArmProbe *probe, const char *name,
         return 0;
     }
     if (strcmp(name, "glGetString") == 0) {
-        const char *text = "OverkillTest1 headless OpenGL ES 2.0";
+        const char *text = "OverkillTest2 headless OpenGL ES 2.0";
         uint32_t address = guest_alloc(probe, (uint32_t)strlen(text) + 1u);
         if (address) guest_write_string(probe, address, text,
                                         (uint32_t)strlen(text) + 1u);
@@ -6897,48 +6901,97 @@ static int overkill_apply_patch(ArmProbe *probe, GuestNoopPatch *patch,
     static const unsigned char thumb_void_return[4] = {0x70,0x47,0xc0,0x46};
     static const unsigned char thumb_zero_return[4] = {0x00,0x20,0x70,0x47};
     const unsigned char *bytes;
+    uc_err error;
     if (!patch || !patch->ready || patch->active == enabled) return 1;
     bytes = enabled ? (patch->return_zero ? thumb_zero_return : thumb_void_return)
                     : patch->original;
-    if (uc_mem_write(probe->uc, patch->address, bytes, 4u) != UC_ERR_OK ||
-        uc_ctl_remove_cache(probe->uc, patch->address,
-                            patch->address + 4u) != UC_ERR_OK)
+    {
+        int guard_was_enabled = probe->host_write_guard_enabled;
+        /* These are deliberate diagnostic code patches. The immutable-image
+           host guard is meant to catch accidental corruption, but in
+           OverkillTest2 it also blocked every runtime F4/F5/F7 toggle. */
+        probe->host_write_guard_enabled = 0;
+        error = uc_mem_write(probe->uc, patch->address, bytes, 4u);
+        probe->host_write_guard_enabled = guard_was_enabled;
+    }
+    if (error != UC_ERR_OK) {
+        probe_log("ERROR: OVERKILL patch write failed: %s address=0x%08x "
+                  "symbol=%s", uc_strerror(error), patch->address,
+                  patch->name ? patch->name : "?");
         return 0;
+    }
+    /* uc_ctl_remove_cache is variadic and consumes uint64_t arguments.
+       Explicit casts are mandatory for the 32-bit Windows host build; passing
+       uint32_t here makes va_arg combine adjacent stack arguments and causes
+       UC_ERR_ARG before the game can start. */
+    error = uc_ctl_remove_cache(probe->uc, (uint64_t)patch->address,
+                                (uint64_t)patch->address + 4u);
+    if (error != UC_ERR_OK) {
+        probe_log("ERROR: OVERKILL patch cache invalidation failed: %s "
+                  "address=0x%08x symbol=%s", uc_strerror(error),
+                  patch->address, patch->name ? patch->name : "?");
+        return 0;
+    }
     patch->active = enabled;
     return 1;
 }
 
 static int overkill_set_particles(ArmProbe *probe, int disabled) {
     unsigned index;
-    for (index = 0; index < probe->overkill_particle_patch_count; ++index)
-        if (!overkill_apply_patch(probe,
-                                  &probe->overkill_particle_patches[index],
-                                  disabled)) return 0;
+    unsigned applied = 0;
+    unsigned failed = 0;
+    for (index = 0; index < probe->overkill_particle_patch_count; ++index) {
+        if (overkill_apply_patch(probe,
+                                 &probe->overkill_particle_patches[index],
+                                 disabled))
+            ++applied;
+        else
+            ++failed;
+    }
     probe->disable_particles = disabled;
     ++probe->overkill_particle_toggles;
-    probe_log("OVERKILL particles/cosmetics: %s (%u guest functions)",
-              disabled ? "REMOVED" : "restored",
-              probe->overkill_particle_patch_count);
+    probe_log("OVERKILL particles/cosmetics: %s (applied=%u failed=%u)",
+              disabled ? "REMOVED" : "restored", applied, failed);
+    if (failed)
+        probe_log("WARNING: OVERKILL continued with %u unavailable cosmetic "
+                  "patches", failed);
     return 1;
 }
 
 static int overkill_set_node_draws(ArmProbe *probe, int disabled) {
     unsigned index;
-    for (index = 0; index < probe->overkill_node_draw_patch_count; ++index)
-        if (!overkill_apply_patch(probe,
-                                  &probe->overkill_node_draw_patches[index],
-                                  disabled)) return 0;
+    unsigned applied = 0;
+    unsigned failed = 0;
+    for (index = 0; index < probe->overkill_node_draw_patch_count; ++index) {
+        if (overkill_apply_patch(probe,
+                                 &probe->overkill_node_draw_patches[index],
+                                 disabled))
+            ++applied;
+        else
+            ++failed;
+    }
     probe->disable_node_draws = disabled;
     ++probe->overkill_node_draw_toggles;
-    probe_log("OVERKILL ARM node draw functions: %s (%u patches)",
-              disabled ? "REMOVED" : "restored",
-              probe->overkill_node_draw_patch_count);
+    probe_log("OVERKILL ARM node draw functions: %s (applied=%u failed=%u)",
+              disabled ? "REMOVED" : "restored", applied, failed);
+    if (failed)
+        probe_log("WARNING: OVERKILL continued with %u unavailable draw "
+                  "patches", failed);
     return 1;
 }
 
 static int overkill_set_scene_visit(ArmProbe *probe, int disabled) {
+    if (!probe->overkill_scene_visit_patch.ready) {
+        probe_log("WARNING: OVERKILL scene traversal patch unavailable; "
+                  "continuing");
+        return 1;
+    }
     if (!overkill_apply_patch(probe, &probe->overkill_scene_visit_patch,
-                              disabled)) return 0;
+                              disabled)) {
+        probe_log("WARNING: OVERKILL scene traversal toggle failed; "
+                  "continuing");
+        return 1;
+    }
     probe->skip_scene_visit = disabled;
     ++probe->overkill_scene_toggles;
     probe_log("OVERKILL scene traversal: %s",
@@ -7809,7 +7862,6 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook unclaim_particle_trace;
     uc_hook label_bmfont_set_string_trace;
     uc_hook label_bmfont_trace;
-    uc_hook arm_block_trace;
     uc_hook level_string_traces[7];
     unsigned char *stubs;
     unsigned index;
@@ -7925,17 +7977,11 @@ static int initialize_unicorn(ArmProbe *probe) {
         }
     }
     if (probe->profile_arm_blocks) {
-        probe->block_profile_entries = (ArmBlockProfileEntry *)calloc(
-            MAX_BLOCK_PROFILE_ENTRIES, sizeof(*probe->block_profile_entries));
-        if (!probe->block_profile_entries ||
-            uc_hook_add(probe->uc, &arm_block_trace, UC_HOOK_BLOCK,
-                        arm_block_profile_hook, probe, GUEST_IMAGE_BASE,
-                        GUEST_IMAGE_BASE + probe->image_size - 1u) !=
-                UC_ERR_OK) {
-            probe_log("ERROR: cannot enable ARM block profiler");
+        /* Preserve the command-line startup profiler while sharing the same
+           runtime implementation used by F11. */
+        probe->profile_arm_blocks = 0;
+        if (!arm_block_profiler_set(probe, 1, 0))
             return 0;
-        }
-        probe_log("ARM block profiler enabled: diagnostic overhead expected");
     }
     if (probe->deep_diagnostics) {
         uint32_t ds_step_address =
@@ -8272,6 +8318,187 @@ static uint32_t find_export(const ArmProbe *probe, const char *name) {
         }
     }
     return 0;
+}
+
+
+static const char *find_nearest_export(const ArmProbe *probe,
+                                       uint32_t guest_address,
+                                       uint32_t *symbol_address) {
+    uint32_t image_offset;
+    uint32_t best_value = 0;
+    const char *best_name = NULL;
+    uint16_t section_index;
+    if (symbol_address) *symbol_address = 0;
+    if (!probe || guest_address < GUEST_IMAGE_BASE) return NULL;
+    image_offset = guest_address - GUEST_IMAGE_BASE;
+    for (section_index = 0; section_index < probe->header->e_shnum;
+         ++section_index) {
+        const Elf32_Shdr *symbols_section =
+            &probe->section_headers[section_index];
+        const Elf32_Shdr *strings_section;
+        const Elf32_Sym *symbols;
+        const char *strings;
+        uint32_t count;
+        uint32_t index;
+        if (symbols_section->sh_type != SHT_DYNSYM ||
+            symbols_section->sh_entsize != sizeof(Elf32_Sym))
+            continue;
+        strings_section = section_at(probe, symbols_section->sh_link);
+        if (!strings_section) continue;
+        symbols = (const Elf32_Sym *)(probe->file_data +
+                                      symbols_section->sh_offset);
+        strings = (const char *)(probe->file_data +
+                                  strings_section->sh_offset);
+        count = symbols_section->sh_size / sizeof(Elf32_Sym);
+        for (index = 0; index < count; ++index) {
+            const Elf32_Sym *symbol = &symbols[index];
+            if (symbol->st_shndx == SHN_UNDEF || !symbol->st_value ||
+                symbol->st_value > image_offset ||
+                symbol->st_name >= strings_section->sh_size)
+                continue;
+            if (!best_name || symbol->st_value > best_value) {
+                const char *name = strings + symbol->st_name;
+                if (!*name) continue;
+                best_name = name;
+                best_value = symbol->st_value;
+            }
+        }
+    }
+    if (best_name && symbol_address)
+        *symbol_address = GUEST_IMAGE_BASE + best_value;
+    return best_name;
+}
+
+static void arm_block_profile_clear(ArmProbe *probe) {
+    if (!probe || !probe->block_profile_entries) return;
+    memset(probe->block_profile_entries, 0,
+           MAX_BLOCK_PROFILE_ENTRIES * sizeof(*probe->block_profile_entries));
+    probe->profile_block_dropped = 0;
+}
+
+static void arm_block_profile_report(ArmProbe *probe, const char *reason) {
+    enum { TOP_BLOCKS = 16 };
+    unsigned top_indices[TOP_BLOCKS];
+    uint64_t top_scores[TOP_BLOCKS] = {0};
+    char block_text[3072];
+    size_t block_used = 0;
+    unsigned index;
+    unsigned place;
+    if (!probe || !probe->block_profile_entries) return;
+    memset(top_indices, 0xff, sizeof(top_indices));
+    for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index) {
+        ArmBlockProfileEntry *entry = &probe->block_profile_entries[index];
+        uint64_t score = entry->calls * (entry->size ? entry->size : 2u);
+        if (!score) continue;
+        for (place = 0; place < TOP_BLOCKS; ++place) {
+            if (score > top_scores[place]) {
+                unsigned move;
+                for (move = TOP_BLOCKS - 1u; move > place; --move) {
+                    top_scores[move] = top_scores[move - 1u];
+                    top_indices[move] = top_indices[move - 1u];
+                }
+                top_scores[place] = score;
+                top_indices[place] = index;
+                break;
+            }
+        }
+    }
+    block_text[0] = 0;
+    for (place = 0; place < TOP_BLOCKS && top_scores[place]; ++place) {
+        ArmBlockProfileEntry *entry =
+            &probe->block_profile_entries[top_indices[place]];
+        uint32_t symbol_address = 0;
+        const char *symbol =
+            find_nearest_export(probe, entry->address, &symbol_address);
+        int written;
+        if (symbol) {
+            written = snprintf(
+                block_text + block_used, sizeof(block_text) - block_used,
+                "%s0x%08x:%llux%u=%s+0x%x",
+                place ? "," : "", entry->address,
+                (unsigned long long)entry->calls, entry->size, symbol,
+                entry->address - symbol_address);
+        } else {
+            written = snprintf(
+                block_text + block_used, sizeof(block_text) - block_used,
+                "%s0x%08x(+0x%06x):%llux%u",
+                place ? "," : "", entry->address,
+                entry->address - GUEST_IMAGE_BASE,
+                (unsigned long long)entry->calls, entry->size);
+        }
+        if (written < 0 || (size_t)written >=
+                             sizeof(block_text) - block_used)
+            break;
+        block_used += (size_t)written;
+    }
+    probe_log("ARM hot block profile (%s): %s dropped=%llu",
+              reason ? reason : "sample",
+              block_text[0] ? block_text : "none",
+              (unsigned long long)probe->profile_block_dropped);
+}
+
+static int arm_block_profiler_set(ArmProbe *probe, int enabled,
+                                  int timed_sample) {
+    uc_err error;
+    if (!probe || !probe->uc) return 0;
+    if (enabled) {
+        if (probe->profile_arm_blocks) return 1;
+        if (!probe->block_profile_entries) {
+            probe->block_profile_entries = (ArmBlockProfileEntry *)calloc(
+                MAX_BLOCK_PROFILE_ENTRIES,
+                sizeof(*probe->block_profile_entries));
+            if (!probe->block_profile_entries) {
+                probe_log("ERROR: cannot allocate ARM block profiler table");
+                return 0;
+            }
+        }
+        arm_block_profile_clear(probe);
+        error = uc_hook_add(probe->uc, &probe->arm_block_trace, UC_HOOK_BLOCK,
+                            arm_block_profile_hook, probe, GUEST_IMAGE_BASE,
+                            GUEST_IMAGE_BASE + probe->image_size - 1u);
+        if (error != UC_ERR_OK) {
+            probe_log("ERROR: cannot enable ARM block profiler: %s",
+                      uc_strerror(error));
+            probe->arm_block_trace = 0;
+            return 0;
+        }
+        error = uc_ctl_remove_cache(
+            probe->uc, (uint64_t)GUEST_IMAGE_BASE,
+            (uint64_t)GUEST_IMAGE_BASE + probe->image_size);
+        if (error != UC_ERR_OK) {
+            uc_hook_del(probe->uc, probe->arm_block_trace);
+            probe->arm_block_trace = 0;
+            probe_log("ERROR: cannot activate ARM block profiler cache: %s",
+                      uc_strerror(error));
+            return 0;
+        }
+        probe->profile_arm_blocks = 1;
+        probe->block_profile_deadline =
+            timed_sample ? GetTickCount() + 5000u : 0u;
+        probe_log("ARM block profiler ENABLED%s: translated blocks will run "
+                  "slower during this diagnostic sample",
+                  timed_sample ? " for 5 seconds" : "");
+        return 1;
+    }
+    if (!probe->profile_arm_blocks) return 1;
+    if (probe->arm_block_trace) {
+        error = uc_hook_del(probe->uc, probe->arm_block_trace);
+        if (error != UC_ERR_OK)
+            probe_log("WARNING: cannot remove ARM block profiler hook: %s",
+                      uc_strerror(error));
+        probe->arm_block_trace = 0;
+    }
+    error = uc_ctl_remove_cache(
+        probe->uc, (uint64_t)GUEST_IMAGE_BASE,
+        (uint64_t)GUEST_IMAGE_BASE + probe->image_size);
+    if (error != UC_ERR_OK)
+        probe_log("WARNING: cannot restore normal ARM translation cache: %s",
+                  uc_strerror(error));
+    arm_block_profile_report(probe, "completed 5-second sample");
+    probe->profile_arm_blocks = 0;
+    probe->block_profile_deadline = 0;
+    probe_log("ARM block profiler DISABLED; normal-speed translation restored");
+    return 1;
 }
 
 static int run_guest(ArmProbe *probe, uint32_t entry,
@@ -8737,6 +8964,12 @@ static LRESULT CALLBACK arm_window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_KEYDOWN:
+        /* Windows auto-repeat generated multiple toggles for a single held
+           function key in OverkillTest1 (for example F3 was removed and then
+           restored immediately). Bit 30 is set when the key was already down. */
+        if (wparam >= VK_F3 && wparam <= VK_F11 &&
+            (lparam & ((LPARAM)1 << 30)) != 0)
+            return 0;
         if (wparam == VK_F3) {
             probe->skip_native_render = !probe->skip_native_render;
             probe_log("OVERKILL nativeRender: %s",
@@ -8782,6 +9015,10 @@ static LRESULT CALLBACK arm_window_procedure(HWND window, UINT message,
         }
         if (wparam == VK_F10) {
             overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F11) {
+            arm_block_profiler_set(probe, !probe->profile_arm_blocks, 1);
             return 0;
         }
         if (wparam == VK_ESCAPE && probe->host.native_ready &&
@@ -8841,7 +9078,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-overkilltest1",
+        "Geometry Dash ARM wrapper 0.9.4-arm-overkilltest2",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -9061,52 +9298,10 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
         probe_log("ARM timed import profile: %s",
                   timing_text[0] ? timing_text : "no callbacks");
     }
-    if (probe->profile_arm_blocks && probe->block_profile_entries) {
-        enum { TOP_BLOCKS = 12 };
-        unsigned top_indices[TOP_BLOCKS];
-        uint64_t top_scores[TOP_BLOCKS] = {0};
-        char block_text[1536];
-        size_t block_used = 0;
-        unsigned place;
-        memset(top_indices, 0xff, sizeof(top_indices));
-        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index) {
-            ArmBlockProfileEntry *entry =
-                &probe->block_profile_entries[index];
-            uint64_t score = entry->calls * (entry->size ? entry->size : 2u);
-            if (!score) continue;
-            for (place = 0; place < TOP_BLOCKS; ++place) {
-                if (score > top_scores[place]) {
-                    unsigned move;
-                    for (move = TOP_BLOCKS - 1u; move > place; --move) {
-                        top_scores[move] = top_scores[move - 1u];
-                        top_indices[move] = top_indices[move - 1u];
-                    }
-                    top_scores[place] = score;
-                    top_indices[place] = index;
-                    break;
-                }
-            }
-        }
-        block_text[0] = 0;
-        for (place = 0; place < TOP_BLOCKS && top_scores[place]; ++place) {
-            ArmBlockProfileEntry *entry =
-                &probe->block_profile_entries[top_indices[place]];
-            int written = snprintf(
-                block_text + block_used, sizeof(block_text) - block_used,
-                "%s0x%08x(+0x%06x):%llux%u", place ? "," : "",
-                entry->address, entry->address - GUEST_IMAGE_BASE,
-                (unsigned long long)entry->calls, entry->size);
-            if (written < 0 || (size_t)written >=
-                                 sizeof(block_text) - block_used)
-                break;
-            block_used += (size_t)written;
-        }
-        probe_log("ARM hot block profile: %s dropped=%llu",
-                  block_text[0] ? block_text : "none",
-                  (unsigned long long)probe->profile_block_dropped);
-        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index)
-            probe->block_profile_entries[index].calls = 0;
-        probe->profile_block_dropped = 0;
+    if (probe->profile_arm_blocks && probe->block_profile_entries &&
+        !probe->block_profile_deadline) {
+        arm_block_profile_report(probe, "current profile window");
+        arm_block_profile_clear(probe);
     }
     probe_log("ARM overkill-test profile: gl-proc-cache=%llu/%llu "
               "redundant-binds=%llu direct-uploads=%llu "
@@ -9202,6 +9397,10 @@ static int run_arm_message_loop(ArmProbe *probe) {
                     performance_started = now;
                     performance_frames = 0;
                 }
+                if (probe->profile_arm_blocks &&
+                    probe->block_profile_deadline &&
+                    (LONG)(now - probe->block_profile_deadline) >= 0)
+                    arm_block_profiler_set(probe, 0, 0);
             }
             if (!probe->host.vsync_enabled && !probe->uncapped) Sleep(1);
         } else {
@@ -9295,7 +9494,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-overkilltest1");
+              "0.9.4-arm-overkilltest2");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -9377,7 +9576,8 @@ int main(int argc, char **argv) {
     overkill_log_state(&probe);
     probe_log("OVERKILL hotkeys: F3 nativeRender, F4 ARM node draws, "
               "F5 particles, F6 host draws, F7 scene visit, "
-              "F8 headless GL, F9 future textures, F10 state");
+              "F8 headless GL, F9 future textures, F10 state, "
+              "F11 5-second ARM hot-block profile");
     probe_log("Input: %s", input_path);
     if (!load_arm_input(input_path, &probe.file_data, &probe.file_size,
                         &probe.apk_data, &probe.apk_size)) {

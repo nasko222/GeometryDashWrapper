@@ -1,4 +1,4 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest1
+# Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest2
 
 Destructive subsystem-isolation build based on PerformanceTest1.
 
@@ -12,17 +12,22 @@ Destructive subsystem-isolation build based on PerformanceTest1.
   shape draw methods.
 - `--skip-draws`, `--skip-scene-visit` and `--skip-native-render` diagnostics.
 - F3-F10 live subsystem toggles.
+- F11 automatic five-second ARM basic-block profiler with nearest ELF symbol
+  mapping.
 - Dedicated bare-minimum, logic-only, zero-render and control launchers.
 - Expanded overkill profile counters and active-state flags.
 
-## Startup hotfix 1
+## Corrected diagnostics
 
-- Fixed 32-bit Windows variadic argument corruption in
-  `uc_ctl_remove_cache`; overkill guest patches now pass explicit 64-bit
-  cache bounds.
-- Added per-symbol patch errors for future diagnosis.
-- Made particle, draw and scene diagnostic patches fail-safe: an unavailable
-  optional patch is skipped instead of aborting ARM startup.
+- Runtime F4/F5/F7 code patches now temporarily bypass the immutable-image host
+  corruption guard for their verified four-byte target, then restore the guard
+  and invalidate only the patched translation range.
+- This fixes the observed `UC_ERR_WRITE_PROT` failures where F4 reported
+  `applied=0 failed=7` and F7 never disabled `CCNode::visit`.
+- Added automatic cache regeneration when the F11 block profiler is enabled or
+  removed.
+- Function-key auto-repeat is ignored, preventing one held key from toggling a
+  diagnostic off and immediately back on.
 
 ## Retained
 
