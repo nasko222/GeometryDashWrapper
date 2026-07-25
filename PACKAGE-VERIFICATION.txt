@@ -1,0 +1,32 @@
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest5
+Package verification
+
+Base used:
+  GeometryDashArmWrapper-0.9.4-arm-dynarmictest4-full-source.zip
+  Base archive bytes: 33899073
+
+Preservation checks:
+  game.apk: present
+  game.apk bytes: 24704408
+  game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
+  src files: 19
+  third_party files: 1065
+  tools files: 11
+  patches files: 1
+  BUILD_DYNARMIC_X64.cmd: present
+  build-dynarmic-x64.ps1: present
+  dynarmic-x64/CMakeLists.txt: present
+
+Test5 changes are limited to:
+  - src/dynarmic_probe.cpp diagnostics/input logging
+  - Dynarmic x64 build/version/output naming
+  - current README, notes, changelog, and source-content documentation
+  - replacement of superseded Test4 documentation with Test5 documentation
+
+Validation performed:
+  - C++20 syntax check passed against a minimal Dynarmic A32 API compatibility stub.
+  - git diff whitespace/error check passed.
+  - ZIP integrity and required-file checks are performed after packaging.
+
+A complete Windows/Dynarmic executable was not built in the packaging environment.
+Run BUILD_DYNARMIC_X64.cmd on 64-bit Windows to compile the test build.

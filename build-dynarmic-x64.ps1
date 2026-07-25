@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest4"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest5"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -427,8 +427,8 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$Test4Notes = Join-Path $Root "DYNARMICTEST4-NOTES.md"
-if (Test-Path $Test4Notes) { Copy-Item -Force $Test4Notes (Join-Path $Output "DYNARMICTEST4-NOTES.md") }
+$Test5Notes = Join-Path $Root "DYNARMICTEST5-NOTES.md"
+if (Test-Path $Test5Notes) { Copy-Item -Force $Test5Notes (Join-Path $Output "DYNARMICTEST5-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $Launcher = @'
@@ -456,6 +456,6 @@ exit /b %RESULT%
 [IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE_ONLY.cmd"), $ProbeLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 Test4 interactive build ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 Test5 diagnostic build ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Run RUN_DYNARMIC_INTERACTIVE.cmd"

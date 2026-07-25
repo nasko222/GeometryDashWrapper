@@ -57,6 +57,16 @@ using u64 = std::uint64_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
 
+class ScopeExit {
+public:
+    explicit ScopeExit(std::function<void()> callback) : callback_(std::move(callback)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() { if (callback_) callback_(); }
+private:
+    std::function<void()> callback_;
+};
+
 namespace {
 
 constexpr u32 kGameBase = 0x10000000u;
@@ -824,7 +834,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest4Window";
+        const char* class_name = "GeometryDashDynarmicTest5Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -836,7 +846,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test4",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test5",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1142,6 +1152,9 @@ public:
 
     bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
         if (!function) return true;
+        std::ostringstream details;
+        details << std::fixed << std::setprecision(2) << "x=" << x << " y=" << y;
+        LogHostDispatch(label, function, details.str());
         return RunFunction(function, {kEnvObject, 0u, 0u, FloatToWord(x), FloatToWord(y)},
                            nullptr, label, 0u, std::chrono::milliseconds(10000));
     }
@@ -1163,12 +1176,16 @@ public:
             !env_.WriteBytes(ys->data_address, &y, sizeof(y))) {
             return Fail("could not update touch-move JNI arrays");
         }
+        std::ostringstream details;
+        details << std::fixed << std::setprecision(2) << "x=" << x << " y=" << y;
+        LogHostDispatch("nativeTouchesMove", function, details.str());
         return RunFunction(function, {kEnvObject, 0u, touch_ids_, touch_xs_, touch_ys_},
                            nullptr, "nativeTouchesMove", 0u, std::chrono::milliseconds(10000));
     }
 
     bool SendKey(u32 function, u32 key_code) {
         if (!function) return true;
+        LogHostDispatch("nativeKeyDown", function, "key=" + std::to_string(key_code));
         return RunFunction(function, {kEnvObject, 0u, key_code}, nullptr,
                            "nativeKeyDown", 0u, std::chrono::milliseconds(10000));
     }
@@ -1177,18 +1194,22 @@ public:
         if (!function || text.empty()) return true;
         const u32 text_ref = NewStringRef(text);
         if (!text_ref) return Fail("could not allocate text JNI string");
+        LogHostDispatch("nativeInsertText", function,
+                        "bytes=" + std::to_string(text.size()) + " text=\"" + SanitizeLogText(text) + "\"");
         return RunFunction(function, {kEnvObject, 0u, text_ref}, nullptr,
                            "nativeInsertText", 0u, std::chrono::milliseconds(10000));
     }
 
     bool SendDeleteBackward(u32 function) {
         if (!function) return true;
+        LogHostDispatch("nativeDeleteBackward", function, {});
         return RunFunction(function, {kEnvObject, 0u}, nullptr,
                            "nativeDeleteBackward", 0u, std::chrono::milliseconds(10000));
     }
 
     bool SendLifecycle(u32 function, const std::string& label) {
         if (!function) return true;
+        LogHostDispatch(label, function, "lifecycle");
         return RunFunction(function, {kEnvObject, 0u}, nullptr,
                            label, 0u, std::chrono::milliseconds(30000));
     }
@@ -1209,6 +1230,11 @@ public:
                      std::chrono::milliseconds wall_budget = std::chrono::milliseconds::zero()) {
         if (call_depth_ >= 16) return Fail("guest call recursion limit reached in " + label);
         ++call_depth_;
+        active_calls_.push_back(label);
+        ScopeExit call_scope([this] {
+            if (!active_calls_.empty()) active_calls_.pop_back();
+            if (call_depth_) --call_depth_;
+        });
         cpu_.Regs().fill(0);
         cpu_.ExtRegs().fill(0);
         const u32 stack_top = kStackBase + kStackSize - static_cast<u32>(call_depth_) * 0x00080000u;
@@ -1235,7 +1261,6 @@ public:
             if (wall_budget.count() > 0 && before_run - started >= wall_budget) {
                 const std::string diagnostic = BuildExecutionDiagnostic(
                     label + " exceeded wall-clock guard", estimated_ticks, before_run - started);
-                --call_depth_;
                 return Fail(diagnostic);
             }
 
@@ -1250,21 +1275,18 @@ public:
                 error << label << " invalid guest memory at 0x" << std::hex << env_.fault_address
                       << " PC=0x" << cpu_.Regs()[15] << " (" << DescribeAddress(cpu_.Regs()[15]) << ')'
                       << " LR=0x" << cpu_.Regs()[14] << " (" << DescribeAddress(cpu_.Regs()[14]) << ')';
-                --call_depth_;
                 return Fail(error.str());
             }
             if (env_.interpreter_fallback) {
                 std::ostringstream error;
                 error << label << " interpreter fallback at 0x" << std::hex << env_.fallback_pc
                       << " (" << DescribeAddress(env_.fallback_pc) << ") count=" << std::dec << env_.fallback_count;
-                --call_depth_;
                 return Fail(error.str());
             }
             if (env_.exception_seen) {
                 std::ostringstream error;
                 error << label << " exception at 0x" << std::hex << env_.exception_pc
                       << " (" << DescribeAddress(env_.exception_pc) << ')';
-                --call_depth_;
                 return Fail(error.str());
             }
             if (env_.svc_pending) {
@@ -1274,7 +1296,6 @@ public:
                     break;
                 }
                 if (!HandleSvc(env_.pending_svc, label)) {
-                    --call_depth_;
                     return false;
                 }
                 if (!unlimited_ticks) budget = budget > 1024 ? budget - 1024 : 0;
@@ -1288,7 +1309,6 @@ public:
                       << " LR=0x" << cpu_.Regs()[14] << " (" << DescribeAddress(cpu_.Regs()[14]) << ')'
                       << " SP=0x" << cpu_.Regs()[13]
                       << " CPSR=0x" << cpu_.Cpsr() << " halt=0x" << static_cast<u64>(halt_reason);
-                --call_depth_;
                 return Fail(error.str());
             }
 
@@ -1304,11 +1324,9 @@ public:
             const auto elapsed = std::chrono::steady_clock::now() - started;
             const std::string diagnostic = BuildExecutionDiagnostic(
                 label + " exceeded guest tick budget", estimated_ticks, elapsed);
-            --call_depth_;
             return Fail(diagnostic);
         }
         if (result) *result = cpu_.Regs()[0];
-        --call_depth_;
         return true;
     }
 
@@ -1419,6 +1437,101 @@ private:
             output << '}';
         }
         return output.str();
+    }
+    static std::string SanitizeLogText(const std::string& text) {
+        std::ostringstream output;
+        const std::size_t limit = std::min<std::size_t>(text.size(), 96u);
+        for (std::size_t index = 0; index < limit; ++index) {
+            const unsigned char value = static_cast<unsigned char>(text[index]);
+            if (value == '\\' || value == '"') output << '\\' << static_cast<char>(value);
+            else if (value >= 0x20u && value < 0x7Fu) output << static_cast<char>(value);
+            else output << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                        << static_cast<unsigned>(value) << std::dec;
+        }
+        if (text.size() > limit) output << "...";
+        return output.str();
+    }
+    void LogHostDispatch(const std::string& label, u32 function, const std::string& details) {
+        ++host_event_sequence_;
+        std::ostringstream event;
+        event << "host#" << host_event_sequence_ << ':' << label;
+        if (!details.empty()) event << ' ' << details;
+        RememberEvent(event.str());
+        log_ << "Dynarmic host dispatch #" << host_event_sequence_
+             << ": " << label << " guest=0x" << std::hex << function
+             << " (" << DescribeAddress(function) << ')' << std::dec;
+        if (!details.empty()) log_ << ' ' << details;
+        log_ << '\n';
+        log_.flush();
+    }
+    void DumpFatalGuestState(const std::string& import_name) {
+        const u32 pc = cpu_.Regs()[15];
+        const u32 lr = cpu_.Regs()[14];
+        const u32 sp = cpu_.Regs()[13];
+        log_ << "===== DYNARMIC TEST5 GUEST FATAL DIAGNOSTIC =====\n";
+        log_ << "Fatal import: " << import_name << '\n';
+        log_ << "Active guest call depth: " << active_calls_.size() << '\n';
+        if (!active_calls_.empty()) {
+            log_ << "Active guest calls:";
+            for (const std::string& call : active_calls_) log_ << " -> " << call;
+            log_ << '\n';
+        }
+        log_ << "PC=0x" << std::hex << pc << " (" << DescribeAddress(pc) << ") "
+             << "LR=0x" << lr << " (" << DescribeAddress(lr) << ") "
+             << "SP=0x" << sp << " CPSR=0x" << cpu_.Cpsr() << std::dec << '\n';
+        for (unsigned base = 0; base < 13; base += 4) {
+            log_ << "Registers:";
+            for (unsigned index = base; index < std::min<unsigned>(base + 4, 13); ++index) {
+                log_ << " R" << index << "=0x" << std::hex << std::setw(8)
+                     << std::setfill('0') << cpu_.Regs()[index] << std::dec;
+            }
+            log_ << '\n';
+        }
+        if (!last_assert_title_.empty() || !last_assert_text_.empty()) {
+            log_ << "Last guest message box #" << last_assert_sequence_ << ": "
+                 << last_assert_title_ << " | " << last_assert_text_ << '\n';
+        } else {
+            log_ << "Last guest message box: none recorded\n";
+        }
+        if (!recent_events_.empty()) {
+            log_ << "Recent guest/JNI/host events:\n";
+            for (const std::string& event : recent_events_) log_ << "  " << event << '\n';
+        }
+
+        constexpr u32 words_before = 8u;
+        constexpr u32 words_after = 32u;
+        const u32 bytes_before = words_before * 4u;
+        const u32 dump_base = sp >= bytes_before ? sp - bytes_before : sp;
+        std::array<u32, words_before + words_after> words{};
+        if (sp && env_.ReadBytes(dump_base, words.data(), sizeof(words))) {
+            log_ << "Guest stack window: " << sizeof(words) << " bytes from 0x"
+                 << std::hex << dump_base << " through 0x" << (dump_base + sizeof(words))
+                 << std::dec << '\n';
+            for (std::size_t index = 0; index < words.size(); ++index) {
+                const u32 address = dump_base + static_cast<u32>(index * 4u);
+                const s64 relative = static_cast<s64>(address) - static_cast<s64>(sp);
+                const u32 value = words[index];
+                log_ << "  [SP" << (relative < 0 ? "-" : "+") << "0x"
+                     << std::hex << static_cast<u64>(relative < 0 ? -relative : relative)
+                     << "] 0x" << std::setw(8) << std::setfill('0') << value;
+                if ((value >= runtime_.image_min && value < runtime_.image_max) ||
+                    (value >= kImportBase && value < kImportBase + kImportRegionSize) ||
+                    value == kReturnStub) {
+                    log_ << "  (" << DescribeAddress(value) << ')';
+                }
+                log_ << std::dec << '\n';
+            }
+        } else {
+            log_ << "Guest stack window: unreadable at SP=0x" << std::hex << sp << std::dec << '\n';
+        }
+        log_ << "===== END DYNARMIC TEST5 GUEST FATAL DIAGNOSTIC =====\n";
+        log_.flush();
+    }
+    bool FatalImport(const std::string& import_name) {
+        last_error_ = "guest called fatal import " + import_name;
+        DumpFatalGuestState(import_name);
+        std::cerr << "DYNARMIC EXECUTION ERROR: " << last_error_ << '\n';
+        return false;
     }
     void InitializeControlTraps() {
         WriteArmSvcStub(env_, kReturnStub, kSvcReturn);
@@ -1772,7 +1885,11 @@ private:
         } else if (name == "showMessageBox") {
             const std::string title = RefString(arguments.Word());
             const std::string text = RefString(arguments.Word());
-            log_ << "JNI message box: " << title << " | " << text << '\n';
+            last_assert_title_ = title;
+            last_assert_text_ = text;
+            last_assert_sequence_ = ++message_box_count_;
+            RememberEvent("message-box:" + title + " | " + text);
+            log_ << "JNI message box #" << last_assert_sequence_ << ": " << title << " | " << text << '\n';
         } else {
             // The remaining Android activity calls are safe no-ops for the first-frame milestone.
         }
@@ -2817,7 +2934,7 @@ private:
         else if (name == "gzopen" || name == "gzread" || name == "gzclose") result = 0;
         else if (name == "__cxa_atexit") result = 0;
         else if (name == "__errno") result = errno_address_;
-        else if (name == "__stack_chk_fail" || name == "abort" || name == "exit" || name == "longjmp" || name == "siglongjmp") return Fail("guest called fatal import " + name);
+        else if (name == "__stack_chk_fail" || name == "abort" || name == "exit" || name == "longjmp" || name == "siglongjmp") return FatalImport(name);
         else if (name == "setjmp" || name == "sigsetjmp") result = 0;
         else if (name == "pthread_once") {
             const u32 state = env_.MemoryRead32(r0);
@@ -2953,6 +3070,12 @@ private:
     u64 permissive_stub_calls_=0;
     std::set<std::string> permissive_names_;
     std::deque<std::string> recent_events_;
+    std::vector<std::string> active_calls_;
+    u64 host_event_sequence_=0;
+    u64 message_box_count_=0;
+    u64 last_assert_sequence_=0;
+    std::string last_assert_title_;
+    std::string last_assert_text_;
     std::string last_error_;
     std::vector<GuestRef> refs_;
     std::set<u32> unimplemented_jni_slots_;
@@ -3035,11 +3158,11 @@ int main(int argc,char** argv) {
     std::ofstream log_file(log_path,std::ios::trunc);
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest4");
-        emit("Milestone: interactive Dynarmic x64 window, input, lifecycle, and persistent render loop");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest5");
+        emit("Milestone: interactive Dynarmic x64 fatal-call diagnostics and symbolized guest crash context");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest4 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest5 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -3096,7 +3219,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP4_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP5_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -3174,7 +3297,7 @@ int main(int argc,char** argv) {
                     <<" FPS avg-frame="<<std::setprecision(2)<<avg_ms<<" ms total-frames="<<frame_count;
                 emit(line.str());
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test4 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test5 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -3191,11 +3314,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP4_OK");
+        emit("RESULT: DYNARMIC_BRINGUP5_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP4_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP5_FAILED");
         return 1;
     }
 }

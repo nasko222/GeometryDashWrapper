@@ -1,27 +1,27 @@
-# Geometry Dash ARM Wrapper — Dynarmic x64 Test4
+# Geometry Dash ARM Wrapper — Dynarmic x64 Test5
 
-Current version: **0.9.4-arm-dynarmictest4**
+Current version: **0.9.4-arm-dynarmictest5**
 
-Test4 turns the proven Dynarmic x64 first-frame build into a persistent interactive wrapper. The host executable is 64-bit Windows; the authentic game library remains a 32-bit ARMv5TE guest.
+Test5 keeps the persistent interactive Dynarmic wrapper from Test4 and adds guest-fatal diagnostics for the menu and level-loading aborts. The host executable is 64-bit Windows; the authentic game library remains a 32-bit ARMv5TE guest.
 
 ## Build
 
-The full source package already includes `game.apk` and the complete wrapper/vendor source tree. Run:
+The full source package includes `game.apk` and the complete source/vendor tree. Run:
 
 ```cmd
 BUILD_DYNARMIC_X64.cmd
 ```
 
-The builder reuses `.build-tools` and `build-cache-windows` when they already exist and creates:
+The builder reuses `.build-tools` and `build-cache-windows` when available and creates:
 
 ```text
-dist-arm-wrapper-dynarmictest4
+dist-arm-wrapper-dynarmictest5
 ```
 
 Launch:
 
 ```text
-dist-arm-wrapper-dynarmictest4\RUN_DYNARMIC_INTERACTIVE.cmd
+dist-arm-wrapper-dynarmictest5\RUN_DYNARMIC_INTERACTIVE.cmd
 ```
 
 ## Controls
@@ -33,8 +33,21 @@ dist-arm-wrapper-dynarmictest4\RUN_DYNARMIC_INTERACTIVE.cmd
 - Text and Backspace: forwarded to the game
 - Window deactivate/reactivate: Android pause/resume
 
+## Test5 crash logging
+
+When the ARM guest calls `abort`, `exit`, a stack-protector failure, or a long-jump fatal path, the log now records:
+
+- the active native callback and nested guest-call chain
+- symbolized PC and LR with `libgame.so` ELF offsets
+- SP, CPSR, and registers R0-R12
+- a 160-byte guest-stack window with candidate code addresses symbolized
+- the most recent host input, JNI calls, runtime imports, and guest message box
+- exactly one final fatal error line in the log
+
+Input callbacks are also logged with coordinates, key codes, text, and guest entry addresses.
+
 ## Source-tree policy
 
-This package keeps all functional source and build dependencies from the working wrapper tree, including the existing Unicorn wrapper source, vendor source, patches, build scripts, toolchain helpers, and `game.apk`. Only obsolete milestone notes/changelogs were removed. No cleanup script is included.
+This package preserves all functional source and dependencies from the corrected Test4 full-source package, including `game.apk`, the existing Unicorn wrapper source, vendor source, patches, build scripts, and toolchain helpers. Only the superseded Test4 notes/changelog are replaced by current Test5 documentation. No destructive cleanup script is included.
 
-See `DYNARMICTEST4-NOTES.md` for runtime details and `SOURCE-CONTENTS.md` for the preservation checks used when packaging.
+See `DYNARMICTEST5-NOTES.md` for the diagnostic format and `SOURCE-CONTENTS.md` for packaging checks.
