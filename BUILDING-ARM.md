@@ -12,8 +12,9 @@ BUILD_WINDOWS.cmd C:\Games\GeometryDash-1.4.apk
 The script downloads verified portable copies of Zig 0.14.1, CMake 3.31.10,
 and Ninja 1.13.2 into `.build-tools/`. It then builds the included patched
 Unicorn 2.1.4 source as an ARM-only static Win32 library and compiles the
-32-bit wrapper. Nothing is installed in Program Files, the registry, PATH, WSL,
-or a Linux VM.
+32-bit wrapper. The Windows route uses bundled Win32 QEMU configuration headers,
+so it does not require Bash, MSYS2, Git Bash, WSL, or a Linux VM. Nothing is
+installed in Program Files, the registry, or the system PATH.
 
 The result is written to:
 
@@ -88,3 +89,5 @@ python3 build_arm_wrapper.py \
 
 Unicorn 2.1.4 is distributed under its own GPL-2.0 license. Its upstream source,
 license, and exact wrapper patch are included in the full-source archive.
+
+Builder6 does not create Unicorn's legacy `unicorn.o` symbolic link on Windows. No Developer Mode or administrator privileges are required; the wrapper links directly against `libunicorn.a`.

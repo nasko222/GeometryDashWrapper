@@ -22,6 +22,7 @@ $CMakeVersion = "3.31.10"
 $NinjaVersion = "1.13.2"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
+$BuilderRevision = "bootstrap15-windows-builder6"
 
 function Invoke-External {
     param(
@@ -147,14 +148,38 @@ Write-Host "  Zig:   $ZigExe"
 Write-Host "  CMake: $CMakeExe"
 Write-Host "  Ninja: $NinjaExe"
 
+# CMake writes the compiler path into generated .cmake source. Raw Windows
+# backslashes there are parsed as escapes (for example, \G is invalid), so the
+# Zig and archive-tool paths must use CMake-style forward slashes.
+# The C compiler is invoked directly as `zig.exe cc`; a batch wrapper would
+# corrupt arguments containing `=` on some Windows cmd.exe configurations.
 $env:ZIG = $ZigExe
-$env:GD_ARM_ZIGCC = Join-Path $Root "tools\zigcc-win32.cmd"
-$env:GD_ARM_ZIGAR = Join-Path $Root "tools\zigar-win32.cmd"
-$env:GD_ARM_ZIGRANLIB = Join-Path $Root "tools\zigranlib-win32.cmd"
+$env:GD_ARM_QEMU_ZIG = $ZigExe
+$env:GD_ARM_ZIGAR = (Join-Path $Root "tools\zigar-win32.cmd").Replace('\', '/')
+$env:GD_ARM_ZIGRANLIB = (Join-Path $Root "tools\zigranlib-win32.cmd").Replace('\', '/')
 $env:GD_ARM_BUILD_CACHE = Join-Path $BuildRoot "zig-unicorn"
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $BuildRoot "zig-global"
 $env:ZIG_LOCAL_CACHE_DIR = Join-Path $BuildRoot "zig-local"
 $env:PATH = "$NinjaDirectory;$env:PATH"
+
+# The compiler command changed across builder revisions. Discard the old
+# Unicorn CMake tree once so generated compiler rules cannot remain stale.
+$BuilderStamp = Join-Path $UnicornBuild ".gd-builder-revision"
+$ExistingBuilderRevision = ""
+if (Test-Path $BuilderStamp) {
+    $ExistingBuilderRevision = (Get-Content -LiteralPath $BuilderStamp -Raw).Trim()
+}
+if ((Test-Path $UnicornBuild) -and ($ExistingBuilderRevision -ne $BuilderRevision)) {
+    if ($ExistingBuilderRevision -eq "bootstrap15-windows-builder5") {
+        # Builder6 only removes a privileged Windows symlink post-build step.
+        # Keep the already compiled Unicorn objects; CMake will regenerate the
+        # final archive rule and normally rebuild only libunicorn.a.
+        Write-Host "Updating Unicorn final-link rule for $BuilderRevision (preserving object cache)"
+    } else {
+        Write-Host "Refreshing Unicorn CMake cache for $BuilderRevision"
+        Remove-Item -Recurse -Force $UnicornBuild
+    }
+}
 
 $Toolchain = Join-Path $Root "tools\unicorn-win32-zig.cmake"
 $ConfigureArguments = @(
@@ -168,9 +193,11 @@ $ConfigureArguments = @(
     "-DUNICORN_LEGACY_STATIC_ARCHIVE=ON",
     "-DUNICORN_BUILD_TESTS=OFF",
     "-DUNICORN_INSTALL=OFF",
+    "-DUNICORN_USE_PREGENERATED_WIN32_CONFIG=ON",
     "-DCMAKE_BUILD_TYPE=Release"
 )
 Invoke-External -FilePath $CMakeExe -Arguments $ConfigureArguments
+Write-AsciiFile -Path $BuilderStamp -Content $BuilderRevision
 Invoke-External -FilePath $CMakeExe -Arguments @("--build", $UnicornBuild, "--parallel")
 
 $UnicornLibraries = @(Get-ChildItem -LiteralPath $UnicornBuild -Filter "libunicorn.a" -File -Recurse)

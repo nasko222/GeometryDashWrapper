@@ -25,3 +25,47 @@ stable corruption/save behavior.
 - Added `BUILD_WINDOWS.cmd` / `build-windows.ps1`, which download verified
   portable tools and build everything on ordinary 64-bit Windows without WSL,
   Linux, admin rights, or system-wide installation.
+
+## Windows builder hotfix 1
+
+- Normalize CMake compiler, archiver and ranlib wrapper paths to forward slashes.
+- Automatically discard the invalid CMake cache produced by the original builder.
+- Fixes `Invalid character escape '\G'` on drives such as `D:\GDOldVersionsProject`.
+
+## Windows builder hotfix 2
+
+- Invoke `zig.exe cc -target x86-windows-gnu` directly through CMake's supported
+  compiler-command list instead of reconstructing compiler arguments in a batch
+  file.
+- Fixes Zig receiving the invalid bare option `-std` when Ninja supplied
+  `-std=gnu11`.
+- Automatically refreshes the Unicorn CMake tree from older builder revisions.
+
+## Windows builder hotfix 3
+
+- Preserve `zig cc -target x86-windows-gnu` when Unicorn invokes QEMU's legacy
+  shell configure stage, instead of passing bare `zig.exe`.
+- Generate and verify `arm-softmmu/config-target.h` before Ninja compilation.
+- Treat QEMU configure/header-generation failures as fatal CMake errors rather
+  than continuing into misleading missing-header compiler failures.
+- Automatically refreshes the Unicorn CMake tree from builder3 and older.
+
+## Windows builder hotfix 4
+
+- Remove the QEMU POSIX-shell configure stage from the ordinary Windows build.
+- Use dedicated pre-generated Win32/Zig host and ARM target configuration
+  headers bundled with the patched Unicorn source.
+- Skip the invalid bare `zig.exe -dumpmachine` probe; the builder already fixes
+  the host target explicitly as 32-bit `x86-windows-gnu`.
+- Avoid inheriting Unicorn's MSVC-only 128-bit atomic setting on the 32-bit Zig
+  target.
+- Automatically refreshes the Unicorn CMake tree from builder4 and older.
+
+## Windows builder hotfix 5
+
+- Skip Unicorn's legacy `unicorn.o` symbolic-link alias on Windows; the wrapper
+  already links directly against `libunicorn.a`.
+- Fixes `A required privilege is not held by the client` on the final 70/70
+  archive step without requiring Developer Mode or administrator rights.
+- Preserve builder5's already compiled Unicorn object cache, so an upgraded
+  failed build normally reruns only the final archive rule.

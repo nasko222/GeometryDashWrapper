@@ -1,65 +1,252 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 056f4cf..699bdbd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -110,6 +110,7 @@
-     qemu/include
-     include
-     qemu/tcg
-+    qemu/tcg/i386
- )
+@@ -88,6 +88,7 @@ option(UNICORN_BUILD_TESTS "Build unicorn tests" ${PROJECT_IS_TOP_LEVEL})
+ option(UNICORN_INSTALL "Enable unicorn installation" ${PROJECT_IS_TOP_LEVEL})
+ set(UNICORN_ARCH "x86;arm;aarch64;riscv;mips;sparc;m68k;ppc;s390x;tricore" CACHE STRING "Enabled unicorn architectures")
+ option(UNICORN_TRACER "Trace unicorn execution" OFF)
++option(UNICORN_USE_PREGENERATED_WIN32_CONFIG "Use bundled Windows QEMU config headers instead of a POSIX shell configure step" OFF)
  
- # QEMU logging facility
-@@ -1208,13 +1209,13 @@
- )
- 
- # A workaround to avoid circle dependency between unicorn and *-softmmu
--if(MSVC)
-+if(WIN32)
-     set(UNICORN_COMMON_SRCS
-         ${UNICORN_COMMON_SRCS}
-         qemu/util/oslib-win32.c
-         qemu/util/qemu-thread-win32.c
+ foreach(ARCH_LOOP ${UNICORN_ARCH})
+     string(TOUPPER "${ARCH_LOOP}" ARCH_LOOP)
+@@ -98,6 +99,10 @@ if(MSVC)
+     include_directories(
+         ${CMAKE_CURRENT_SOURCE_DIR}/msvc
      )
--    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
-         if(MSVC_VERSION LESS 1600 AND MSVC_IDE)
-             add_custom_command(OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/build/setjmp-wrapper-win32.dir/setjmp-wrapper-win32.obj"
-                 COMMAND ml64 /c /nologo /Fo"${CMAKE_CURRENT_SOURCE_DIR}/build/setjmp-wrapper-win32.dir/setjmp-wrapper-win32.obj" /W3 /errorReport:prompt /Ta"${CMAKE_CURRENT_SOURCE_DIR}/qemu/util/setjmp-wrapper-win32.asm"
-@@ -1244,7 +1245,7 @@
-                       C_VISIBILITY_PRESET
-                       hidden)
++elseif(UNICORN_USE_PREGENERATED_WIN32_CONFIG)
++    include_directories(
++        ${CMAKE_CURRENT_SOURCE_DIR}/win32-zig
++    )
+ else()
+     include_directories(
+         ${CMAKE_BINARY_DIR}
+@@ -167,21 +172,28 @@ if(MSVC)
+     endif()
+ else()
+     if(MINGW)
+-        execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine
+-            OUTPUT_VARIABLE UC_COMPILER_VERSION)
+-
+-        if(UC_COMPILER_VERSION MATCHES "^i686.*")
++        if(UNICORN_USE_PREGENERATED_WIN32_CONFIG)
++            # The bootstrap15 Windows builder uses Zig's explicit x86-windows-gnu
++            # target. Avoid CMake's bare `zig.exe -dumpmachine` probe, which drops
++            # the required `cc -target ...` compiler arguments.
+             set(UNICORN_TARGET_ARCH "i386")
+-            set(UNICORN_CFLAGS -m32 -static-libgcc) # Workaround for github action bugs
+-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m32")
+-            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m32")
+-        elseif(UC_COMPILER_VERSION MATCHES "^x86_64.*")
+-            set(UNICORN_TARGET_ARCH "i386")
+-            set(UNICORN_CFLAGS -m64 -mcx16)
+-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m64")
+-            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m64")
+-        elseif(UC_COMPILER_VERSION MATCHES "^aarch64.*")
+-            set(UNICORN_TARGET_ARCH "aarch64")
++        else()
++            execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine
++                OUTPUT_VARIABLE UC_COMPILER_VERSION)
++
++            if(UC_COMPILER_VERSION MATCHES "^i686.*")
++                set(UNICORN_TARGET_ARCH "i386")
++                set(UNICORN_CFLAGS -m32 -static-libgcc) # Workaround for github action bugs
++                set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m32")
++                set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m32")
++            elseif(UC_COMPILER_VERSION MATCHES "^x86_64.*")
++                set(UNICORN_TARGET_ARCH "i386")
++                set(UNICORN_CFLAGS -m64 -mcx16)
++                set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m64")
++                set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m64")
++            elseif(UC_COMPILER_VERSION MATCHES "^aarch64.*")
++                set(UNICORN_TARGET_ARCH "aarch64")
++            endif()
+         endif()
+     elseif(ANDROID_ABI)
+         string(FIND "${ANDROID_ABI}" "arm64" UC_RET)
+@@ -199,9 +211,20 @@ else()
+             endif()
+         endif()
+     else()
+-        execute_process(COMMAND ${CMAKE_C_COMPILER} -dM -E -
+-            INPUT_FILE /dev/null
+-            OUTPUT_VARIABLE UC_COMPILER_MACRO)
++        if(DEFINED ENV{GD_ARM_QEMU_ZIG} AND NOT "$ENV{GD_ARM_QEMU_ZIG}" STREQUAL "")
++            execute_process(COMMAND "$ENV{GD_ARM_QEMU_ZIG}" cc -target x86-windows-gnu -dM -E -
++                INPUT_FILE /dev/null
++                OUTPUT_VARIABLE UC_COMPILER_MACRO
++                RESULT_VARIABLE UC_COMPILER_MACRO_RESULT)
++        else()
++            execute_process(COMMAND ${CMAKE_C_COMPILER} -dM -E -
++                INPUT_FILE /dev/null
++                OUTPUT_VARIABLE UC_COMPILER_MACRO
++                RESULT_VARIABLE UC_COMPILER_MACRO_RESULT)
++        endif()
++        if(NOT UC_COMPILER_MACRO_RESULT EQUAL 0)
++            message(FATAL_ERROR "Compiler macro probe failed with exit code ${UC_COMPILER_MACRO_RESULT}")
++        endif()
  
--if(NOT MSVC AND NOT ANDROID_ABI)
-+if(NOT WIN32 AND NOT ANDROID_ABI)
-     target_link_libraries(unicorn-common PRIVATE pthread)
- endif()
+         while(TRUE)
+             string(FIND "${UC_COMPILER_MACRO}" "__x86_64__" UC_RET)
+@@ -368,6 +391,11 @@ else()
+     endif()
+     set(TARGET_LIST "${TARGET_LIST} ")
  
-@@ -1367,7 +1368,8 @@
- endif()
- 
- if(MINGW)
--    set(UNICORN_LINK_LIBRARIES ${UNICORN_LINK_LIBRARIES} pthread)
-+    # The wrapper builds Unicorn with Zig's MinGW CRT, which has native Win32
-+    # threading but intentionally does not ship winpthreads.
- endif()
- 
- if(ATOMIC_LINKAGE_FIX)
-@@ -1425,7 +1427,7 @@
-     set(SAMPLES_LIB
-         unicorn
++    if(UNICORN_USE_PREGENERATED_WIN32_CONFIG)
++        # Unicorn already ships the configuration headers used by its Windows
++        # build. Reuse them for Zig/MinGW so a POSIX shell is not required.
++        message(STATUS "Using bundled Windows QEMU configuration headers")
++    else()
+     # GEN config-host.mak & target directories
+     # MESSAGE(STATUS "sh ${CMAKE_CURRENT_SOURCE_DIR}/qemu/configure
+     #     --cc=${CMAKE_C_COMPILER}
+@@ -380,11 +408,19 @@ else()
+         ${EXTRA_CFLAGS}
+         ${TARGET_LIST}
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
++        RESULT_VARIABLE QEMU_CONFIGURE_RESULT
      )
--elseif(NOT ANDROID_ABI)
-+elseif(NOT ANDROID_ABI AND NOT WIN32)
-     set(SAMPLES_LIB
-         unicorn
-         pthread
---- a/qemu/include/qemu/thread.h
-+++ b/qemu/include/qemu/thread.h
-@@ -7,7 +7,7 @@
- struct uc_struct;
- typedef struct QemuThread QemuThread;
++    if(NOT QEMU_CONFIGURE_RESULT EQUAL 0)
++        message(FATAL_ERROR "QEMU configure failed with exit code ${QEMU_CONFIGURE_RESULT}")
++    endif()
+     execute_process(COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/qemu/scripts/create_config
+         INPUT_FILE ${CMAKE_BINARY_DIR}/config-host.mak
+         OUTPUT_FILE ${CMAKE_BINARY_DIR}/config-host.h
++        RESULT_VARIABLE QEMU_HOST_CONFIG_RESULT
+     )
++    if(NOT QEMU_HOST_CONFIG_RESULT EQUAL 0)
++        message(FATAL_ERROR "QEMU host config header generation failed with exit code ${QEMU_HOST_CONFIG_RESULT}")
++    endif()
+     if(UNICORN_HAS_X86)
+         execute_process(COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/qemu/scripts/create_config
+             INPUT_FILE ${CMAKE_BINARY_DIR}/x86_64-softmmu/config-target.mak
+@@ -395,7 +431,12 @@ else()
+         execute_process(COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/qemu/scripts/create_config
+             INPUT_FILE ${CMAKE_BINARY_DIR}/arm-softmmu/config-target.mak
+             OUTPUT_FILE ${CMAKE_BINARY_DIR}/arm-softmmu/config-target.h
++            RESULT_VARIABLE QEMU_ARM_CONFIG_RESULT
+         )
++        if(NOT QEMU_ARM_CONFIG_RESULT EQUAL 0 OR
++           NOT EXISTS ${CMAKE_BINARY_DIR}/arm-softmmu/config-target.h)
++            message(FATAL_ERROR "QEMU ARM target config header generation failed")
++        endif()
+     endif()
+     if(UNICORN_HAS_AARCH64)
+         execute_process(COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/qemu/scripts/create_config
+@@ -469,6 +510,7 @@ else()
+             OUTPUT_FILE ${CMAKE_BINARY_DIR}/tricore-softmmu/config-target.h
+         )
+     endif()
++    endif()
+     add_compile_options(
+         ${UNICORN_CFLAGS}
+         -I${CMAKE_CURRENT_SOURCE_DIR}/qemu/tcg/${UNICORN_TARGET_ARCH}
+@@ -598,6 +640,13 @@ if(MSVC)
+         /I${CMAKE_CURRENT_SOURCE_DIR}/msvc/arm-softmmu
+         /I${CMAKE_CURRENT_SOURCE_DIR}/qemu/target/arm
+     )
++elseif(UNICORN_USE_PREGENERATED_WIN32_CONFIG)
++    target_compile_options(arm-softmmu PRIVATE
++        -DNEED_CPU_H
++        -include arm.h
++        -I${CMAKE_CURRENT_SOURCE_DIR}/win32-zig/arm-softmmu
++        -I${CMAKE_CURRENT_SOURCE_DIR}/qemu/target/arm
++    )
+ else()
+     target_compile_options(arm-softmmu PRIVATE
+         -DNEED_CPU_H
+diff --git a/cmake/bundle_static.cmake b/cmake/bundle_static.cmake
+index 0123fe6..1e5878f 100644
+--- a/cmake/bundle_static.cmake
++++ b/cmake/bundle_static.cmake
+@@ -51,7 +51,12 @@ function(bundle_static_library tgt_name bundled_tgt_name library_name)
+     OUTPUT_NAME "${library_name}"
+     SYMLINK_NAME "${library_name}.o"
+   )
+-  add_custom_command(TARGET ${bundled_tgt_name} POST_BUILD
+-    COMMAND ${CMAKE_COMMAND} -E create_symlink "$<TARGET_FILE_NAME:${bundled_tgt_name}>" "$<TARGET_FILE_DIR:${bundled_tgt_name}>/$<TARGET_PROPERTY:${bundled_tgt_name},SYMLINK_NAME>"
+-  )
++  # The legacy .o alias is only needed by old Unix consumers. Creating it as
++  # a symbolic link on Windows requires Developer Mode or administrator
++  # privileges, while the wrapper links directly against libunicorn.a.
++  if (NOT WIN32)
++    add_custom_command(TARGET ${bundled_tgt_name} POST_BUILD
++      COMMAND ${CMAKE_COMMAND} -E create_symlink "$<TARGET_FILE_NAME:${bundled_tgt_name}>" "$<TARGET_FILE_DIR:${bundled_tgt_name}>/$<TARGET_PROPERTY:${bundled_tgt_name},SYMLINK_NAME>"
++    )
++  endif()
+ endfunction()
+diff --git a/qemu/configure b/qemu/configure
+index cfd344f..4c4069c 100644
+--- a/qemu/configure
++++ b/qemu/configure
+@@ -56,6 +56,24 @@ error_exit() {
+     exit 1
+ }
  
--#if defined(_WIN32) && !defined(__MINGW32__)
-+#if defined(_WIN32)
- #include "qemu/thread-win32.h"
- #else
- #include "qemu/thread-posix.h"
++run_compiler() {
++    # The Windows portable builder drives CMake with `zig cc` as a compiler
++    # command list. Unicorn's CMake layer historically passes only the first
++    # list item (zig.exe) to this configure script, losing `cc -target ...`.
++    # Use the explicit Zig path supplied by the builder and preserve argv.
++    local compiler="$1"
++    shift
++    if test -n "${GD_ARM_QEMU_ZIG-}"; then
++        if test "$compiler" = "$cxx"; then
++            "$GD_ARM_QEMU_ZIG" c++ -target x86-windows-gnu "$@"
++        else
++            "$GD_ARM_QEMU_ZIG" cc -target x86-windows-gnu "$@"
++        fi
++    else
++        $compiler "$@"
++    fi
++}
++
+ do_compiler() {
+     # Run the compiler, capturing its output to the log. First argument
+     # is compiler binary to execute.
+@@ -67,7 +85,7 @@ funcs: ${FUNCNAME[*]}
+ lines: ${BASH_LINENO[*]}"
+     '; fi
+     echo $compiler "$@" >> config.log
+-    $compiler "$@" >> config.log 2>&1 || return $?
++    run_compiler "$compiler" "$@" >> config.log 2>&1 || return $?
+     # Test passed. If this is an --enable-werror build, rerun
+     # the test with -Werror and bail out if it fails. This
+     # makes warning-generating-errors in configure test code
+@@ -82,7 +100,7 @@ lines: ${BASH_LINENO[*]}"
+         ;;
+     esac
+     echo $compiler -Werror "$@" >> config.log
+-    $compiler -Werror "$@" >> config.log 2>&1 && return $?
++    run_compiler "$compiler" -Werror "$@" >> config.log 2>&1 && return $?
+     error_exit "configure test passed without -Werror but failed with -Werror." \
+         "This is probably a bug in the configure script. The failing command" \
+         "will be at the bottom of config.log." \
+diff --git a/b/win32-zig/arm-softmmu/config-target.h b/win32-zig/arm-softmmu/config-target.h
+new file mode 100644
+index 0000000..f72b555
+--- /dev/null
++++ b/win32-zig/arm-softmmu/config-target.h
+@@ -0,0 +1,7 @@
++/* Pre-generated for bootstrap15: ARM softmmu target. */
++#ifndef GD_UNICORN_WIN32_ZIG_ARM_CONFIG_TARGET_H
++#define GD_UNICORN_WIN32_ZIG_ARM_CONFIG_TARGET_H
++#define TARGET_ARM 1
++#define TARGET_NAME "arm"
++#define CONFIG_SOFTMMU 1
++#endif
+diff --git a/b/win32-zig/config-host.h b/win32-zig/config-host.h
+new file mode 100644
+index 0000000..e45194f
+--- /dev/null
++++ b/win32-zig/config-host.h
+@@ -0,0 +1,9 @@
++/* Pre-generated for bootstrap15: Zig x86-windows-gnu host. */
++#ifndef GD_UNICORN_WIN32_ZIG_CONFIG_HOST_H
++#define GD_UNICORN_WIN32_ZIG_CONFIG_HOST_H
++#define HOST_I386 1
++#define CONFIG_WIN32 1
++#define CONFIG_TCG 1
++#define CONFIG_CPUID_H 1
++/* 32-bit x86 does not provide lock-free 128-bit compare/exchange. */
++#endif
