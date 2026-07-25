@@ -64,10 +64,12 @@ key.
 
 The modified C sources pass strict syntax checks against the bundled Unicorn
 and zlib headers, and all Python build scripts compile. The Windows builder and
-hashes were reviewed, including the correct 64-bit CMake archive hash. This
-Linux runtime did not contain a Windows cross-linker and blocked fetching one,
-so no bootstrap15 EXE is claimed as tested here. Build and runtime validation
-must be done on Windows with `BUILD_WINDOWS.cmd`.
+hashes were reviewed, including the correct 64-bit CMake archive hash. Builder
+revision 5 reached all 70 Unicorn compilation/archive steps on a real Windows
+machine using the bundled Win32 host and ARM target headers, with no `sh`, QEMU
+configure, or `-dumpmachine` probe. Builder6 removes the final privileged
+legacy `unicorn.o` symlink while keeping the real `libunicorn.a` archive. The
+wrapper EXE and runtime behavior still require validation on Windows.
 
 ## Recommended test sequence
 

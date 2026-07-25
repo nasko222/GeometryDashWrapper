@@ -1,3 +1,0 @@
-PerformanceTest4 -> PerformanceTest5 source update
-
-Copy everything inside this folder into the root of your existing PerformanceTest4 source tree and replace files. Then run BUILD_WINDOWS.cmd.

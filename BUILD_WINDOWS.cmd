@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Geometry Dash ARM Wrapper overkilltest3 Windows build
+echo Geometry Dash ARM Wrapper performancetest1 Windows build
 echo.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0build-windows.ps1" %*
 set "RESULT=%ERRORLEVEL%"

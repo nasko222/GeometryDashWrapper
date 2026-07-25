@@ -1,3 +1,9 @@
+# Dynarmic x64 branch
+
+The current experimental milestone is **0.9.4-arm-dynarmictest1**. Build it with `BUILD_DYNARMIC_X64.cmd`, not the older `BUILD_WINDOWS.cmd`. Git for Windows is used only for a non-interactive checkout of the public GitLab Dynarmic mirror at pinned commit `a41c380246d3`; no GitHub sign-in is required. Zig/CMake/Ninja remain portable. This first x64 milestone is a backend/ELF bring-up probe, not yet a playable game; see `DYNARMICTEST1-NOTES.md`.
+
+---
+
 # GD Wrapper 0.9.4-arm-performancetest5
 
 PerformanceTest5 returns to the normal game and adds a dedicated one-second
@@ -32,3 +38,9 @@ scene while suppressing most gameplay simulation, making the comparison useful.
 
 The normal launcher is unchanged. PerformanceTest4 object/render HUD launchers
 and the PerformanceTest3 massive profiler remain available.
+
+### Zig/libc++ compatibility
+
+The Dynarmic x64 builder automatically handles the vendored fmt 10.1
+`<__std_stream>` incompatibility in Zig 0.14.1. No libc++ or fmt installation is
+required.
