@@ -1,36 +1,24 @@
-# GD Wrapper 0.9.4-arm-performancetest3
+# GD Wrapper 0.9.4-arm-performancetest4
 
-Experimental performance branch built from stable bootstrap15.
+PerformanceTest4 returns to the stable ARM wrapper and adds a live one-second
+correlation HUD.
 
-The normal launcher preserves bootstrap15's memory-integrity, save-transaction, immutable-image, label, allocator, and particle protections. This branch targets the remaining CPU bottleneck with Unicorn translation-cache tuning, faster import dispatch, cached OpenGL entry points, direct guest-memory uploads, and redundant state suppression.
-
-## Build on Windows
+Build on Windows with:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+.\BUILD_WINDOWS.cmd
 ```
 
-The portable builder downloads Zig, CMake and Ninja into `.build-tools` and writes:
+Run the full object counter:
 
 ```text
-dist-arm-wrapper-performancetest3\
+dist-arm-wrapper-performancetest4\RUN_LIVE_OBJECT_HUD.cmd
 ```
 
-No Visual Studio, WSL, MSYS2, administrator rights, or Developer Mode is required.
+The game window title and `gd-arm-wrapper.log` update every second with FPS,
+frame time, Cocos nodes visited, sprite/batch/particle/other draw methods, host
+OpenGL draws, submitted vertices, and ARM-to-host import transitions. The full
+object hooks add overhead, so repeat the same section with
+`RUN_RENDER_HUD_LOW_OVERHEAD.cmd` for a bridge-only baseline.
 
-## Run
-
-Use `RUN_ARM_NATIVE_BOOT.cmd` for the normal integrity-protected benchmark.
-
-Use `RUN_PROFILE_IMPORT_TIME.cmd` for one short diagnostic run. It intentionally adds timing overhead and reports which imports consume actual milliseconds.
-
-Use `RUN_PROFILE_ARM_BLOCKS.cmd` for one short heavy gameplay section. It identifies the hottest guest ARM blocks for targeted native replacement.
-
-Use `RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd` only as an A/B comparison after the normal build is verified stable.
-
-See `PERFORMANCETEST1-NOTES.md` for the exact test procedure.
-
-
-## PerformanceTest3 massive profiler
-
-PerformanceTest2 proved pretranslation is not the steady-state fix. Run `RUN_MASSIVE_PROFILER.cmd`, reach the exact laggy section, and press F11 once. The wrapper captures ten seconds of guest block execution and host import timing, then restores normal translation speed automatically.
+The normal stable launcher remains `RUN_ARM_NATIVE_BOOT.cmd`.

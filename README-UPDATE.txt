@@ -1,3 +1,5 @@
-PerformanceTest2 -> PerformanceTest3 source update.
-Copy these contents into the root of the complete PerformanceTest2 source tree and overwrite files.
-Run BUILD_WINDOWS.cmd. Then run RUN_MASSIVE_PROFILER.cmd, reach the exact laggy section, and press F11 once.
+PerformanceTest3 -> PerformanceTest4 source update
+
+Copy the CONTENTS of this folder into the complete PerformanceTest3 source directory and replace files.
+Then run BUILD_WINDOWS.cmd. Unicorn should remain cached; only the wrapper executable needs recompiling.
+Use RUN_LIVE_OBJECT_HUD.cmd for the full Cocos-object counter and RUN_RENDER_HUD_LOW_OVERHEAD.cmd for the bridge-only baseline.

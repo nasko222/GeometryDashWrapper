@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-performancetest3"
+$Output = Join-Path $Root "dist-arm-wrapper-performancetest4"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -274,6 +274,20 @@ echo The ten-second capture intentionally runs slower and stops automatically.
 GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler
 if errorlevel 1 pause
 '@
+Write-AsciiFile -Path (Join-Path $Output "RUN_LIVE_OBJECT_HUD.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo Live one-second HUD: FPS, frame time, Cocos nodes/draws, GL draws, vertices and imports.
+GeometryDashArmWrapper.exe --apk=game.apk --object-hud
+if errorlevel 1 pause
+'@
+Write-AsciiFile -Path (Join-Path $Output "RUN_RENDER_HUD_LOW_OVERHEAD.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo Low-overhead HUD: FPS, frame time, GL draws, vertices and imports.
+GeometryDashArmWrapper.exe --apk=game.apk --render-hud
+if errorlevel 1 pause
+'@
 Write-AsciiFile -Path (Join-Path $Output "RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
@@ -307,25 +321,24 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4
 
-RUN_ARM_NATIVE_BOOT.cmd is the normal stable test path.
+RUN_ARM_NATIVE_BOOT.cmd is the normal stable path.
 
-For the massive profiler:
-1. Run RUN_MASSIVE_PROFILER.cmd.
-2. Reach the exact heavy Clutterfunk, Xstep or Cycles section.
-3. Press F11 once.
-4. Keep playing for ten seconds. Profiling intentionally makes this interval slower.
-5. The profiler stops automatically and restores normal translation speed.
-6. Close the game and send gd-arm-wrapper.log.
+Live correlation test:
+1. Run RUN_LIVE_OBJECT_HUD.cmd.
+2. The game window title and gd-arm-wrapper.log update every second.
+3. Compare nodes/frame, Cocos draw methods/frame, GL draws/frame, vertices/frame,
+   imports/frame, frame milliseconds and FPS in the exact same level section.
+4. This full mode installs exact Cocos hooks and adds diagnostic overhead.
+5. Run RUN_RENDER_HUD_LOW_OVERHEAD.cmd for the same section; it omits Cocos
+   hooks and reports only the bridge counters, providing the overhead baseline.
 
-The report separates import callback body time from the remaining guest/TCG time,
-prints frame p50/p90/p95/p99, lists the 16 most expensive imports by measured
-wall time, and maps the 32 hottest ARM blocks to nearest ELF symbols.
+RUN_MASSIVE_PROFILER.cmd remains available for F11 hot-block captures.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion

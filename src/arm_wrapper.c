@@ -5,7 +5,7 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host. PerformanceTest3 maps guest RAM
+ * complete nativeInit/nativeRender lifecycle host. PerformanceTest4 maps guest RAM
  * onto host-owned backing memory so bridge operations can avoid expensive
  * per-call Unicorn memory copies while preserving the ARM execution model.
  */
@@ -393,7 +393,32 @@ typedef struct {
     int profile_import_timing;
     int profile_arm_blocks;
     int massive_profiler;
+    int object_hud;
+    int object_hud_full;
     DWORD block_profile_deadline;
+    uc_hook object_hud_hooks[8];
+    unsigned object_hud_hook_count;
+    uint64_t hud_frame_nodes;
+    uint64_t hud_frame_sprites;
+    uint64_t hud_frame_batches;
+    uint64_t hud_frame_particles;
+    uint64_t hud_frame_other_draws;
+    uint64_t hud_frame_gl_draws;
+    uint64_t hud_frame_vertices;
+    uint64_t hud_frame_imports;
+    uint64_t hud_interval_nodes;
+    uint64_t hud_interval_sprites;
+    uint64_t hud_interval_batches;
+    uint64_t hud_interval_particles;
+    uint64_t hud_interval_other_draws;
+    uint64_t hud_interval_gl_draws;
+    uint64_t hud_interval_vertices;
+    uint64_t hud_interval_imports;
+    uint64_t hud_interval_frame_microseconds;
+    uint64_t hud_max_nodes;
+    uint64_t hud_max_drawn;
+    unsigned hud_interval_frames;
+    DWORD hud_interval_started;
     uc_hook arm_block_trace;
     int pretranslate_all;
     char unpacked_assets[MAX_PATH * 2];
@@ -4889,6 +4914,10 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         unsigned log_draw = probe->gl_draw_logs++;
         uint32_t draw_result = 0;
         ++probe->profile_gl_draw_calls;
+        if (probe->object_hud) {
+            ++probe->hud_frame_gl_draws;
+            if (draw_count > 0) probe->hud_frame_vertices += (uint32_t)draw_count;
+        }
         if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
         if (limit > UINT32_MAX ||
             !gl_prepare_client_arrays(probe, (uint32_t)limit,
@@ -4913,6 +4942,10 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         uint32_t draw_result = 0;
         if (draw_count < 0 || !index_size) return 0;
         ++probe->profile_gl_draw_calls;
+        if (probe->object_hud) {
+            ++probe->hud_frame_gl_draws;
+            if (draw_count > 0) probe->hud_frame_vertices += (uint32_t)draw_count;
+        }
         if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
         if (!probe->gl_element_array_buffer_binding && draw_count) {
             uint64_t bytes = (uint64_t)(uint32_t)draw_count * index_size;
@@ -6538,6 +6571,89 @@ static int read_import_registers(uc_engine *uc, const ArmImport *import,
         uc_reg_read_batch(uc, registers, values, (int)count) == UC_ERR_OK;
 }
 
+static void object_hud_node_hook(uc_engine *uc, uint64_t address,
+                                 uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    (void)uc; (void)address; (void)size;
+    ++probe->hud_frame_nodes;
+}
+
+static void object_hud_sprite_hook(uc_engine *uc, uint64_t address,
+                                   uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    (void)uc; (void)address; (void)size;
+    ++probe->hud_frame_sprites;
+}
+
+static void object_hud_batch_hook(uc_engine *uc, uint64_t address,
+                                  uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    (void)uc; (void)address; (void)size;
+    ++probe->hud_frame_batches;
+}
+
+static void object_hud_particle_hook(uc_engine *uc, uint64_t address,
+                                     uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    (void)uc; (void)address; (void)size;
+    ++probe->hud_frame_particles;
+}
+
+static void object_hud_other_draw_hook(uc_engine *uc, uint64_t address,
+                                       uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    (void)uc; (void)address; (void)size;
+    ++probe->hud_frame_other_draws;
+}
+
+static int object_hud_add_hook(ArmProbe *probe, const char *symbol,
+                               void *callback) {
+    uint32_t address;
+    uc_err error;
+    uc_hook *hook;
+    if (!probe || !symbol || !callback ||
+        probe->object_hud_hook_count >= 8u) return 0;
+    address = find_export(probe, symbol) & ~1u;
+    if (!address) {
+        probe_log("WARNING: ARM object HUD symbol missing: %s", symbol);
+        return 1;
+    }
+    hook = &probe->object_hud_hooks[probe->object_hud_hook_count];
+    error = uc_hook_add(probe->uc, hook, UC_HOOK_CODE, callback, probe,
+                        address, address);
+    if (error != UC_ERR_OK) {
+        probe_log("WARNING: ARM object HUD hook failed: %s (%s)",
+                  symbol, uc_strerror(error));
+        return 1;
+    }
+    ++probe->object_hud_hook_count;
+    return 1;
+}
+
+static int install_object_hud_hooks(ArmProbe *probe) {
+    if (!probe || !probe->object_hud_full) return 1;
+    if (!object_hud_add_hook(probe, "_ZN7cocos2d6CCNode5visitEv",
+                             (void *)object_hud_node_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d8CCSprite4drawEv",
+                             (void *)object_hud_sprite_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d17CCSpriteBatchNode4drawEv",
+                             (void *)object_hud_batch_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d20CCParticleSystemQuad4drawEv",
+                             (void *)object_hud_particle_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d19CCParticleBatchNode4drawEv",
+                             (void *)object_hud_particle_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d11CCAtlasNode4drawEv",
+                             (void *)object_hud_other_draw_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d12CCLayerColor4drawEv",
+                             (void *)object_hud_other_draw_hook) ||
+        !object_hud_add_hook(probe, "_ZN7cocos2d15CCProgressTimer4drawEv",
+                             (void *)object_hud_other_draw_hook))
+        return 0;
+    probe_log("ARM object HUD hooks ready: nodes + sprite/batch/particle/other draws (%u hooks)",
+              probe->object_hud_hook_count);
+    return 1;
+}
+
 static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
                         void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -6552,6 +6668,7 @@ static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
     if (address < GUEST_IMPORT_BASE || address >= GUEST_IMPORT_BASE +
         probe->import_count * 4u) return;
     index = (unsigned)((address - GUEST_IMPORT_BASE) / 4u);
+    if (probe->object_hud) ++probe->hud_frame_imports;
     {
         LARGE_INTEGER timing_start = {0};
         LARGE_INTEGER timing_end = {0};
@@ -8598,7 +8715,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest3",
+        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest4",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -8890,6 +9007,84 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
     arm_frame_profile_reset(probe);
 }
 
+static void object_hud_finish_frame(ArmProbe *probe,
+                                    uint64_t frame_microseconds) {
+    DWORD now;
+    DWORD elapsed;
+    uint64_t drawn;
+    if (!probe || !probe->object_hud) return;
+    ++probe->hud_interval_frames;
+    probe->hud_interval_frame_microseconds += frame_microseconds;
+    probe->hud_interval_nodes += probe->hud_frame_nodes;
+    probe->hud_interval_sprites += probe->hud_frame_sprites;
+    probe->hud_interval_batches += probe->hud_frame_batches;
+    probe->hud_interval_particles += probe->hud_frame_particles;
+    probe->hud_interval_other_draws += probe->hud_frame_other_draws;
+    probe->hud_interval_gl_draws += probe->hud_frame_gl_draws;
+    probe->hud_interval_vertices += probe->hud_frame_vertices;
+    probe->hud_interval_imports += probe->hud_frame_imports;
+    drawn = probe->hud_frame_sprites + probe->hud_frame_batches +
+            probe->hud_frame_particles + probe->hud_frame_other_draws;
+    if (probe->hud_frame_nodes > probe->hud_max_nodes)
+        probe->hud_max_nodes = probe->hud_frame_nodes;
+    if (drawn > probe->hud_max_drawn) probe->hud_max_drawn = drawn;
+    probe->hud_frame_nodes = 0;
+    probe->hud_frame_sprites = 0;
+    probe->hud_frame_batches = 0;
+    probe->hud_frame_particles = 0;
+    probe->hud_frame_other_draws = 0;
+    probe->hud_frame_gl_draws = 0;
+    probe->hud_frame_vertices = 0;
+    probe->hud_frame_imports = 0;
+    now = GetTickCount();
+    if (!probe->hud_interval_started) probe->hud_interval_started = now;
+    elapsed = now - probe->hud_interval_started;
+    if (elapsed >= 1000u && probe->hud_interval_frames) {
+        double frames = (double)probe->hud_interval_frames;
+        double fps = frames * 1000.0 / (double)elapsed;
+        double frame_ms = (double)probe->hud_interval_frame_microseconds /
+                          (1000.0 * frames);
+        double nodes = (double)probe->hud_interval_nodes / frames;
+        double sprites = (double)probe->hud_interval_sprites / frames;
+        double batches = (double)probe->hud_interval_batches / frames;
+        double particles = (double)probe->hud_interval_particles / frames;
+        double other = (double)probe->hud_interval_other_draws / frames;
+        double cocos_drawn = sprites + batches + particles + other;
+        double gl_draws = (double)probe->hud_interval_gl_draws / frames;
+        double vertices = (double)probe->hud_interval_vertices / frames;
+        double imports = (double)probe->hud_interval_imports / frames;
+        char title[512];
+        snprintf(title, sizeof(title),
+                 "GD ARM PT4 | %.1f FPS %.1fms | nodes %.0f | cocos-draw %.0f "
+                 "(S%.0f B%.0f P%.0f O%.0f) | GL %.1f verts %.0f | imports %.0f",
+                 fps, frame_ms, nodes, cocos_drawn, sprites, batches,
+                 particles, other, gl_draws, vertices, imports);
+        if (probe->host.window) SetWindowTextA(probe->host.window, title);
+        probe_log("ARM LIVE OBJECT HUD: fps=%.1f frame=%.2fms nodes/frame=%.1f "
+                  "nodes-max=%llu cocos-draw/frame=%.1f draw-max=%llu "
+                  "sprites=%.1f batches=%.1f particles=%.1f other=%.1f "
+                  "gl-draws=%.1f vertices=%.0f imports=%.0f",
+                  fps, frame_ms, nodes,
+                  (unsigned long long)probe->hud_max_nodes, cocos_drawn,
+                  (unsigned long long)probe->hud_max_drawn,
+                  sprites, batches, particles, other, gl_draws, vertices,
+                  imports);
+        probe->hud_interval_nodes = 0;
+        probe->hud_interval_sprites = 0;
+        probe->hud_interval_batches = 0;
+        probe->hud_interval_particles = 0;
+        probe->hud_interval_other_draws = 0;
+        probe->hud_interval_gl_draws = 0;
+        probe->hud_interval_vertices = 0;
+        probe->hud_interval_imports = 0;
+        probe->hud_interval_frame_microseconds = 0;
+        probe->hud_max_nodes = 0;
+        probe->hud_max_drawn = 0;
+        probe->hud_interval_frames = 0;
+        probe->hud_interval_started = now;
+    }
+}
+
 static int run_arm_message_loop(ArmProbe *probe) {
     MSG message;
     uint32_t arguments[2] = {GUEST_ENV_OBJECT, 0};
@@ -8935,6 +9130,7 @@ static int run_arm_message_loop(ArmProbe *probe) {
                 ++probe->profile_frames_over_33ms;
             if (frame_elapsed > UINT64_C(50000))
                 ++probe->profile_frames_over_50ms;
+            object_hud_finish_frame(probe, frame_elapsed);
             ++performance_frames;
             {
                 DWORD now = GetTickCount();
@@ -9050,7 +9246,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-performancetest3");
+              "0.9.4-arm-performancetest4");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -9073,6 +9269,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[index], "--massive-profiler") == 0) {
             probe.massive_profiler = 1;
             probe.profile_import_timing = 1;
+        }
+        else if (strcmp(argv[index], "--render-hud") == 0)
+            probe.object_hud = 1;
+        else if (strcmp(argv[index], "--object-hud") == 0) {
+            probe.object_hud = 1;
+            probe.object_hud_full = 1;
         }
         else if (strcmp(argv[index], "--pretranslate-all") == 0)
             probe.pretranslate_all = 1;
@@ -9128,6 +9330,14 @@ int main(int argc, char **argv) {
         exit_code = 2;
         goto finished;
     }
+    if (!install_object_hud_hooks(&probe)) {
+        probe_log("RESULT: ARM_OBJECT_HUD_FAILED");
+        exit_code = 2;
+        goto finished;
+    }
+    if (probe.object_hud)
+        probe_log("ARM live HUD enabled: title bar and log update every second (%s counters)",
+                  probe.object_hud_full ? "Cocos object + render" : "low-overhead render");
     pretranslate_guest_image(&probe);
     if (probe.profile_arm_blocks) {
         probe.profile_arm_blocks = 0;

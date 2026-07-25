@@ -58,6 +58,20 @@ def write_launchers(output: Path) -> None:
             "GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler\r\n"
             "if errorlevel 1 pause\r\n"
         ),
+        "RUN_LIVE_OBJECT_HUD.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Live one-second HUD: FPS, frame time, Cocos nodes/draws, GL draws, vertices, imports.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --object-hud\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
+        "RUN_RENDER_HUD_LOW_OVERHEAD.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Low-overhead HUD: FPS, frame time, GL draws, vertices and imports; Cocos object counts are disabled.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --render-hud\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
         "RUN_PROFILE_IMPORT_TIME.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
@@ -160,14 +174,14 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
-        "RUN_ARM_NATIVE_BOOT.cmd. PerformanceTest3 keeps bootstrap15's corruption "
-        "and save protections while testing Unicorn's flat virtual TLB, a 256 MiB "
-        "translation cache, cached OpenGL function pointers, direct VBO uploads, "
-        "redundant bind suppression, narrower register reads, and fast math/import "
-        "dispatch. The import-time and ARM-block profiling launchers add overhead "
-        "but reveal expensive bridge callbacks and hot guest code addresses. "
+        "RUN_ARM_NATIVE_BOOT.cmd. PerformanceTest4 keeps bootstrap15's corruption "
+        "and save protections while adding a live one-second object/render HUD. "
+        "RUN_LIVE_OBJECT_HUD.cmd counts Cocos node visits and draw methods plus "
+        "OpenGL draws, vertices and import transitions. RUN_RENDER_HUD_LOW_OVERHEAD.cmd "
+        "shows only bridge-side counters to measure hook overhead. Massive-profiler "
+        "launchers remain available to reveal expensive bridge callbacks and hot guest code addresses. "
         "Deep parser hooks are disabled by "
         "default; use --deep-diagnostics only for corruption investigation. "
         "Send the complete gd-arm-wrapper.log after menu load, Clutterfunk, "
