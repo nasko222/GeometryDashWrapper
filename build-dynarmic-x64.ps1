@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest3-fix1"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest4"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,8 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmictest1-x64-builder5-fmt-libcpp"
+$BuilderRevision = "dynarmic-x64-builder5-fmt-libcpp"
+$CompatibleBuilderRevisions = @($BuilderRevision, "dynarmictest1-x64-builder5-fmt-libcpp")
 
 function Invoke-External {
     param([string]$FilePath, [string[]]$Arguments)
@@ -360,7 +361,7 @@ $env:PATH = "$NinjaDirectory;$env:PATH"
 $Stamp = Join-Path $BuildDir ".gd-builder-revision"
 if (Test-Path $BuildDir) {
     $Old = if (Test-Path $Stamp) { (Get-Content -LiteralPath $Stamp -Raw).Trim() } else { "" }
-    if ($Old -ne $BuilderRevision) {
+    if ($Old -notin $CompatibleBuilderRevisions) {
         Remove-Item -Recurse -Force $BuildDir
     }
 }
@@ -414,6 +415,7 @@ Invoke-External -FilePath $CMakeExe -Arguments @("--build", $BuildDir, "--parall
 $ProbeMatches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashDynarmicProbe.exe" -File -Recurse)
 if ($ProbeMatches.Count -lt 1) { throw "Build completed but GeometryDashDynarmicProbe.exe was not found" }
 $ProbeExe = $ProbeMatches[0].FullName
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Output
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Copy-Item -Force $ProbeExe (Join-Path $Output "GeometryDashDynarmicProbe.exe")
 
@@ -425,25 +427,23 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$Test3Notes = Join-Path $Root "DYNARMICTEST3-NOTES.md"
-if (Test-Path $Test3Notes) { Copy-Item -Force $Test3Notes (Join-Path $Output "DYNARMICTEST3-NOTES.md") }
-$Test3Fix1Notes = Join-Path $Root "DYNARMICTEST3-FIX1.md"
-if (Test-Path $Test3Fix1Notes) { Copy-Item -Force $Test3Fix1Notes (Join-Path $Output "DYNARMICTEST3-FIX1.md") }
+$Test4Notes = Join-Path $Root "DYNARMICTEST4-NOTES.md"
+if (Test-Path $Test4Notes) { Copy-Item -Force $Test4Notes (Join-Path $Output "DYNARMICTEST4-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $Launcher = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-GeometryDashDynarmicProbe.exe game.apk --frames=180 --log=gd-dynarmic-first-frame.log
+GeometryDashDynarmicProbe.exe game.apk --log=gd-dynarmic-interactive.log
 set "RESULT=%ERRORLEVEL%"
 echo.
-if not "%RESULT%"=="0" echo Dynarmic first-frame bring-up failed. See gd-dynarmic-first-frame.log.
-if "%RESULT%"=="0" echo Dynarmic x64 milestone 3 fix 1 first-frame test passed. See gd-dynarmic-first-frame.log.
+if not "%RESULT%"=="0" echo Dynarmic interactive wrapper failed. See gd-dynarmic-interactive.log.
+if "%RESULT%"=="0" echo Dynarmic interactive wrapper closed cleanly. See gd-dynarmic-interactive.log.
 pause
 exit /b %RESULT%
 '@
-[IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_FIRST_FRAME.cmd"), $Launcher, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_INTERACTIVE.cmd"), $Launcher, [Text.Encoding]::ASCII)
 $ProbeLauncher = @'
 @echo off
 setlocal
@@ -456,6 +456,6 @@ exit /b %RESULT%
 [IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE_ONLY.cmd"), $ProbeLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 milestone 3 fix 1 first-frame build ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 Test4 interactive build ready:" -ForegroundColor Green
 Write-Host "  $Output"
-Write-Host "Run RUN_DYNARMIC_FIRST_FRAME.cmd"
+Write-Host "Run RUN_DYNARMIC_INTERACTIVE.cmd"

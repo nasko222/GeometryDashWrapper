@@ -451,6 +451,12 @@ struct ElfRuntime {
     u32 native_set_paths = 0;
     u32 native_init = 0;
     u32 native_render = 0;
+    u32 native_touch_begin = 0;
+    u32 native_touch_end = 0;
+    u32 native_touch_move = 0;
+    u32 native_key_down = 0;
+    u32 native_insert_text = 0;
+    u32 native_delete_backward = 0;
     u32 native_pause = 0;
     u32 native_resume = 0;
     std::vector<u32> constructors;
@@ -611,6 +617,12 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                      name == "Java_org_cocos2dx_lib_Cocos2dxHelper_nativeSetApkPath") runtime.native_set_paths = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInit") runtime.native_init = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeRender") runtime.native_render = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeTouchesBegin") runtime.native_touch_begin = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeTouchesEnd") runtime.native_touch_end = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeTouchesMove") runtime.native_touch_move = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeKeyDown") runtime.native_key_down = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInsertText") runtime.native_insert_text = address;
+            else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeDeleteBackward") runtime.native_delete_backward = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause") runtime.native_pause = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
         }
@@ -672,7 +684,12 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
         for (std::size_t i = 0; i < count; ++i) runtime.constructors.push_back(env.MemoryRead32(kGameBase + section.addr + static_cast<u32>(i * 4u)));
         break;
     }
-    if (runtime.jni_onload == 0 || runtime.native_set_paths == 0 || runtime.native_init == 0 || runtime.native_render == 0) throw std::runtime_error("required JNI exports were not found in libgame.so");
+    if (runtime.jni_onload == 0 || runtime.native_set_paths == 0 || runtime.native_init == 0 ||
+        runtime.native_render == 0 || runtime.native_touch_begin == 0 ||
+        runtime.native_touch_end == 0 || runtime.native_touch_move == 0 ||
+        runtime.native_key_down == 0) {
+        throw std::runtime_error("required JNI/render/input exports were not found in libgame.so");
+    }
     if (runtime.constructors.empty()) throw std::runtime_error("ARM ELF has no .init_array");
     return runtime;
 }
@@ -762,6 +779,24 @@ struct GuestFile {
     std::string path;
 };
 
+enum class HostEventType {
+    TouchBegin,
+    TouchMove,
+    TouchEnd,
+    KeyDown,
+    TextInput,
+    DeleteBackward,
+    Pause,
+    Resume
+};
+
+struct HostEvent {
+    HostEventType type = HostEventType::TouchMove;
+    float x = 0.0f;
+    float y = 0.0f;
+    u32 value = 0;
+};
+
 #ifdef _WIN32
 #ifndef GL_ARRAY_BUFFER
 #define GL_ARRAY_BUFFER 0x8892
@@ -784,8 +819,12 @@ public:
 
     bool Create(int width, int height, std::ostream& log) {
         log_ = &log;
+        native_width_ = width;
+        native_height_ = height;
+        closed_ = false;
+        active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest3Window";
+        const char* class_name = "GeometryDashDynarmicTest4Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -797,7 +836,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test3",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test4",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -837,6 +876,7 @@ public:
         if (window_) { DestroyWindow(window_); window_ = nullptr; }
         if (opengl_) { FreeLibrary(opengl_); opengl_ = nullptr; }
         functions_.clear();
+        events_.clear();
     }
 
     void* Resolve(const std::string& name) {
@@ -855,16 +895,55 @@ public:
     bool PumpMessages() {
         MSG message;
         while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE)) {
-            if (message.message == WM_QUIT) return false;
+            if (message.message == WM_QUIT) { closed_ = true; break; }
             TranslateMessage(&message);
             DispatchMessageA(&message);
         }
         return !closed_;
     }
+
+    std::vector<HostEvent> TakeEvents() {
+        std::vector<HostEvent> result;
+        result.reserve(events_.size());
+        while (!events_.empty()) {
+            result.push_back(std::move(events_.front()));
+            events_.pop_front();
+        }
+        return result;
+    }
+
     void Swap() { if (device_) SwapBuffers(device_); }
     bool Ready() const { return context_ != nullptr; }
+    bool Active() const { return active_ && !closed_; }
+    void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
 
 private:
+    void Queue(HostEvent event) {
+        if (event.type == HostEventType::TouchMove && !events_.empty() &&
+            events_.back().type == HostEventType::TouchMove) {
+            events_.back() = event;
+            return;
+        }
+        events_.push_back(std::move(event));
+    }
+
+    void ClientPoint(LPARAM lparam, float& x, float& y) {
+        const int raw_x = static_cast<int>(static_cast<short>(static_cast<unsigned long>(lparam) & 0xFFFFu));
+        const int raw_y = static_cast<int>(static_cast<short>((static_cast<unsigned long>(lparam) >> 16) & 0xFFFFu));
+        RECT area{};
+        if (!window_ || !GetClientRect(window_, &area) || area.right <= area.left || area.bottom <= area.top) {
+            x = static_cast<float>(raw_x);
+            y = static_cast<float>(raw_y);
+            return;
+        }
+        const float client_width = static_cast<float>(area.right - area.left);
+        const float client_height = static_cast<float>(area.bottom - area.top);
+        x = std::clamp(static_cast<float>(raw_x) * static_cast<float>(native_width_) / client_width,
+                       0.0f, static_cast<float>(native_width_));
+        y = std::clamp(static_cast<float>(raw_y) * static_cast<float>(native_height_) / client_height,
+                       0.0f, static_cast<float>(native_height_));
+    }
+
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         WinGlHost* self = reinterpret_cast<WinGlHost*>(GetWindowLongPtrA(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -872,15 +951,94 @@ private:
             self = static_cast<WinGlHost*>(create->lpCreateParams);
             SetWindowLongPtrA(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
-        if (message == WM_CLOSE) {
-            if (self) self->closed_ = true;
-            DestroyWindow(window);
+        if (!self) return DefWindowProcA(window, message, wparam, lparam);
+
+        float x = 0.0f, y = 0.0f;
+        switch (message) {
+        case WM_CLOSE:
+            if (self->mouse_down_) {
+                self->mouse_down_ = false;
+                self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
+            }
+            self->closed_ = true;
             return 0;
-        }
-        if (message == WM_DESTROY) {
-            if (self) self->closed_ = true;
+        case WM_DESTROY:
+            self->closed_ = true;
             PostQuitMessage(0);
             return 0;
+        case WM_ACTIVATEAPP: {
+            const bool becoming_active = wparam != 0;
+            if (self->active_ != becoming_active) {
+                self->active_ = becoming_active;
+                self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
+            }
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_LBUTTONDOWN:
+            self->ClientPoint(lparam, x, y);
+            self->last_x_ = x; self->last_y_ = y;
+            self->mouse_down_ = true;
+            SetFocus(window);
+            SetCapture(window);
+            self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
+            return 0;
+        case WM_MOUSEMOVE:
+            if (self->mouse_down_) {
+                self->ClientPoint(lparam, x, y);
+                self->last_x_ = x; self->last_y_ = y;
+                self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (self->mouse_down_) {
+                self->ClientPoint(lparam, x, y);
+                self->last_x_ = x; self->last_y_ = y;
+                self->mouse_down_ = false;
+                ReleaseCapture();
+                self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (self->mouse_down_) {
+                self->mouse_down_ = false;
+                self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
+            }
+            return 0;
+        case WM_KEYDOWN:
+            if (wparam == VK_ESCAPE) {
+                self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
+                return 0;
+            }
+            if ((wparam == VK_SPACE || wparam == VK_UP) && !self->keyboard_down_) {
+                self->keyboard_down_ = true;
+                self->Queue(HostEvent{HostEventType::TouchBegin,
+                                      static_cast<float>(self->native_width_) * 0.5f,
+                                      static_cast<float>(self->native_height_) * 0.5f, 0});
+                return 0;
+            }
+            break;
+        case WM_KEYUP:
+            if ((wparam == VK_SPACE || wparam == VK_UP) && self->keyboard_down_) {
+                self->keyboard_down_ = false;
+                self->Queue(HostEvent{HostEventType::TouchEnd,
+                                      static_cast<float>(self->native_width_) * 0.5f,
+                                      static_cast<float>(self->native_height_) * 0.5f, 0});
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+            if (wparam == '\b') self->Queue(HostEvent{HostEventType::DeleteBackward});
+            else if (wparam == '\r') self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>('\n')});
+            else if (wparam >= 0x20u) self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>(wparam)});
+            return 0;
+        case WM_UNICHAR:
+            if (wparam == UNICODE_NOCHAR) return TRUE;
+            if (wparam <= 0x10FFFFu) self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>(wparam)});
+            return 0;
+        default:
+            break;
         }
         return DefWindowProcA(window, message, wparam, lparam);
     }
@@ -897,6 +1055,14 @@ private:
     HGLRC context_ = nullptr;
     HMODULE opengl_ = nullptr;
     bool closed_ = false;
+    bool active_ = true;
+    bool mouse_down_ = false;
+    bool keyboard_down_ = false;
+    int native_width_ = 1280;
+    int native_height_ = 720;
+    float last_x_ = 0.0f;
+    float last_y_ = 0.0f;
+    std::deque<HostEvent> events_;
     std::unordered_map<std::string, void*> functions_;
 };
 #else
@@ -906,8 +1072,11 @@ public:
     void Destroy() {}
     void* Resolve(const char*) { return nullptr; }
     bool PumpMessages() { return false; }
+    std::vector<HostEvent> TakeEvents() { return {}; }
     void Swap() {}
     bool Ready() const { return false; }
+    bool Active() const { return false; }
+    void SetTitle(const std::string&) {}
 };
 #endif
 
@@ -967,6 +1136,62 @@ public:
     u64 PermissiveStubCalls() const { return permissive_stub_calls_; }
     const std::set<std::string>& PermissiveNames() const { return permissive_names_; }
     const std::string& LastError() const { return last_error_; }
+    std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
+    bool WindowActive() const { return gl_.Active(); }
+    void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+
+    bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
+        if (!function) return true;
+        return RunFunction(function, {kEnvObject, 0u, 0u, FloatToWord(x), FloatToWord(y)},
+                           nullptr, label, 0u, std::chrono::milliseconds(10000));
+    }
+
+    bool SendTouchMove(u32 function, float x, float y) {
+        if (!function) return true;
+        if (!touch_ids_) {
+            touch_ids_ = NewArrayRef(RefKind::IntArray, 1u, 4u);
+            touch_xs_ = NewArrayRef(RefKind::FloatArray, 1u, 4u);
+            touch_ys_ = NewArrayRef(RefKind::FloatArray, 1u, 4u);
+        }
+        GuestRef* ids = FindRef(touch_ids_);
+        GuestRef* xs = FindRef(touch_xs_);
+        GuestRef* ys = FindRef(touch_ys_);
+        if (!ids || !xs || !ys) return Fail("could not allocate touch-move JNI arrays");
+        const s32 identifier = 0;
+        if (!env_.WriteBytes(ids->data_address, &identifier, sizeof(identifier)) ||
+            !env_.WriteBytes(xs->data_address, &x, sizeof(x)) ||
+            !env_.WriteBytes(ys->data_address, &y, sizeof(y))) {
+            return Fail("could not update touch-move JNI arrays");
+        }
+        return RunFunction(function, {kEnvObject, 0u, touch_ids_, touch_xs_, touch_ys_},
+                           nullptr, "nativeTouchesMove", 0u, std::chrono::milliseconds(10000));
+    }
+
+    bool SendKey(u32 function, u32 key_code) {
+        if (!function) return true;
+        return RunFunction(function, {kEnvObject, 0u, key_code}, nullptr,
+                           "nativeKeyDown", 0u, std::chrono::milliseconds(10000));
+    }
+
+    bool SendText(u32 function, const std::string& text) {
+        if (!function || text.empty()) return true;
+        const u32 text_ref = NewStringRef(text);
+        if (!text_ref) return Fail("could not allocate text JNI string");
+        return RunFunction(function, {kEnvObject, 0u, text_ref}, nullptr,
+                           "nativeInsertText", 0u, std::chrono::milliseconds(10000));
+    }
+
+    bool SendDeleteBackward(u32 function) {
+        if (!function) return true;
+        return RunFunction(function, {kEnvObject, 0u}, nullptr,
+                           "nativeDeleteBackward", 0u, std::chrono::milliseconds(10000));
+    }
+
+    bool SendLifecycle(u32 function, const std::string& label) {
+        if (!function) return true;
+        return RunFunction(function, {kEnvObject, 0u}, nullptr,
+                           label, 0u, std::chrono::milliseconds(30000));
+    }
 
     u32 NewStringRef(const std::string& value) {
         GuestRef ref;
@@ -2749,7 +2974,31 @@ private:
     float background_volume_=1.0f;
     float effects_volume_=1.0f;
     u32 next_effect_id_=1;
+    u32 touch_ids_=0;
+    u32 touch_xs_=0;
+    u32 touch_ys_=0;
 };
+
+static std::string Utf8FromCodepoint(u32 codepoint) {
+    std::string result;
+    if (codepoint <= 0x7Fu) {
+        result.push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7FFu) {
+        result.push_back(static_cast<char>(0xC0u | (codepoint >> 6)));
+        result.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+    } else if (codepoint <= 0xFFFFu) {
+        if (codepoint >= 0xD800u && codepoint <= 0xDFFFu) return {};
+        result.push_back(static_cast<char>(0xE0u | (codepoint >> 12)));
+        result.push_back(static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu)));
+        result.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+    } else if (codepoint <= 0x10FFFFu) {
+        result.push_back(static_cast<char>(0xF0u | (codepoint >> 18)));
+        result.push_back(static_cast<char>(0x80u | ((codepoint >> 12) & 0x3Fu)));
+        result.push_back(static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu)));
+        result.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+    }
+    return result;
+}
 
 static void RunThumbSmoke() {
     ProbeEnvironment env;
@@ -2777,7 +3026,7 @@ extern "C" void runtime_log(const char* format, ...) {
 }
 
 int main(int argc,char** argv) {
-    std::string log_path = "gd-dynarmic-probe.log";
+    std::string log_path = "gd-dynarmic-interactive.log";
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
         if (argument.rfind("--log=", 0) == 0 && argument.size() > 6u)
@@ -2786,21 +3035,21 @@ int main(int argc,char** argv) {
     std::ofstream log_file(log_path,std::ios::trunc);
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest3-fix1");
-        emit("Milestone: x64 Dynarmic nativeInit wall guard and execution diagnostics");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest4");
+        emit("Milestone: interactive Dynarmic x64 window, input, lifecycle, and persistent render loop");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest3 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest4 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
         std::string apk_path="game.apk";
         bool probe_only=false;
-        int width=1280,height=720,frames=180;
+        int width=1280,height=720,max_frames=0;
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
             if(argument=="--probe-only") probe_only=true;
-            else if(argument.rfind("--frames=",0)==0) frames=std::max(1,std::stoi(std::string(argument.substr(9))));
+            else if(argument.rfind("--frames=",0)==0) max_frames=std::max(1,std::stoi(std::string(argument.substr(9))));
             else if(argument.rfind("--width=",0)==0) width=std::max(320,std::stoi(std::string(argument.substr(8))));
             else if(argument.rfind("--height=",0)==0) height=std::max(240,std::stoi(std::string(argument.substr(9))));
             else if(!argument.empty()&&argument[0]!='-') apk_path=std::string(argument);
@@ -2820,7 +3069,15 @@ int main(int argc,char** argv) {
         emit("Authentic ARM constructors: "+std::to_string(runtime.constructors.size()));
         emit("Dynarmic relocation targets: function-imports="+std::to_string(runtime.imports.size())+" objects="+std::to_string(runtime.objects.size()));
         {
-            std::ostringstream line; line<<"Exports: JNI_OnLoad=0x"<<std::hex<<runtime.jni_onload<<" nativeSetPaths=0x"<<runtime.native_set_paths<<" nativeInit=0x"<<runtime.native_init<<" nativeRender=0x"<<runtime.native_render<<std::dec; emit(line.str());
+            std::ostringstream line;
+            line<<"Exports: JNI_OnLoad=0x"<<std::hex<<runtime.jni_onload
+                <<" nativeSetPaths=0x"<<runtime.native_set_paths
+                <<" nativeInit=0x"<<runtime.native_init
+                <<" nativeRender=0x"<<runtime.native_render
+                <<" touches=0x"<<runtime.native_touch_begin<<"/0x"<<runtime.native_touch_move<<"/0x"<<runtime.native_touch_end
+                <<" key=0x"<<runtime.native_key_down
+                <<" pause/resume=0x"<<runtime.native_pause<<"/0x"<<runtime.native_resume<<std::dec;
+            emit(line.str());
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
         GuestExecutor executor(env,runtime,log_file);
@@ -2839,7 +3096,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP3_FIX1_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP4_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -2850,24 +3107,95 @@ int main(int argc,char** argv) {
         if(!executor.RunFunction(runtime.native_init,{kEnvObject,0u,static_cast<u32>(width),static_cast<u32>(height)},&result,"nativeInit",0u,std::chrono::milliseconds(120000))) throw std::runtime_error(executor.LastError());
         const double init_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-init_start).count();
         emit("RESULT: DYNARMIC_NATIVE_INIT_RETURNED time_ms="+std::to_string(init_ms));
+        emit("RESULT: DYNARMIC_INPUT_BRIDGE_READY");
         emit("RESULT: DYNARMIC_RENDER_LOOP_ENTERED");
+
         bool first_frame=false;
-        for(int frame=0;frame<frames&&executor.PumpMessages();++frame){
+        bool native_paused=false;
+        std::uint64_t frame_count=0;
+        std::uint64_t interval_frames=0;
+        auto interval_start=std::chrono::steady_clock::now();
+        double interval_render_ms=0.0;
+        bool running=true;
+        while(running){
+            const bool window_open=executor.PumpMessages();
+            for(const HostEvent& event:executor.TakeHostEvents()){
+                bool ok=true;
+                switch(event.type){
+                case HostEventType::TouchBegin:
+                    if(!native_paused) ok=executor.SendTouchPoint(runtime.native_touch_begin,event.x,event.y,"nativeTouchesBegin");
+                    break;
+                case HostEventType::TouchMove:
+                    if(!native_paused) ok=executor.SendTouchMove(runtime.native_touch_move,event.x,event.y);
+                    break;
+                case HostEventType::TouchEnd:
+                    if(!native_paused) ok=executor.SendTouchPoint(runtime.native_touch_end,event.x,event.y,"nativeTouchesEnd");
+                    break;
+                case HostEventType::KeyDown:
+                    if(!native_paused) ok=executor.SendKey(runtime.native_key_down,event.value);
+                    break;
+                case HostEventType::TextInput:
+                    if(!native_paused) ok=executor.SendText(runtime.native_insert_text,Utf8FromCodepoint(event.value));
+                    break;
+                case HostEventType::DeleteBackward:
+                    if(!native_paused) ok=executor.SendDeleteBackward(runtime.native_delete_backward);
+                    break;
+                case HostEventType::Pause:
+                    if(!native_paused){ok=executor.SendLifecycle(runtime.native_pause,"nativeOnPause");if(ok)native_paused=true;}
+                    break;
+                case HostEventType::Resume:
+                    if(native_paused){ok=executor.SendLifecycle(runtime.native_resume,"nativeOnResume");if(ok)native_paused=false;}
+                    break;
+                }
+                if(!ok) throw std::runtime_error(executor.LastError());
+            }
+            if(!window_open){running=false;break;}
+            if(native_paused||!executor.WindowActive()){
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
             const auto start=std::chrono::steady_clock::now();
-            if(!executor.RunFunction(runtime.native_render,{kEnvObject,0u},&result,"nativeRender frame "+std::to_string(frame+1),0u,std::chrono::milliseconds(30000))) throw std::runtime_error(executor.LastError());
+            if(!executor.RunFunction(runtime.native_render,{kEnvObject,0u},&result,"nativeRender frame "+std::to_string(frame_count+1u),0u,std::chrono::milliseconds(30000))) throw std::runtime_error(executor.LastError());
             executor.SwapBuffersHost();
             const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            ++frame_count;
+            ++interval_frames;
+            interval_render_ms+=elapsed;
             if(!first_frame){first_frame=true;emit("RESULT: DYNARMIC_FIRST_FRAME_OK frame_ms="+std::to_string(elapsed));}
-            if((frame+1)%60==0) emit("Dynarmic render progress: frame="+std::to_string(frame+1)+" last_ms="+std::to_string(elapsed));
+
+            const auto now=std::chrono::steady_clock::now();
+            const double interval_ms=std::chrono::duration<double,std::milli>(now-interval_start).count();
+            if(interval_ms>=5000.0){
+                const double fps=static_cast<double>(interval_frames)*1000.0/interval_ms;
+                const double avg_ms=interval_frames?interval_render_ms/static_cast<double>(interval_frames):0.0;
+                std::ostringstream line;
+                line<<std::fixed<<std::setprecision(1)<<"Dynarmic interactive performance: "<<fps
+                    <<" FPS avg-frame="<<std::setprecision(2)<<avg_ms<<" ms total-frames="<<frame_count;
+                emit(line.str());
+                std::ostringstream title;
+                title<<"Geometry Dash ARM - Dynarmic x64 Test4 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                executor.SetWindowTitle(title.str());
+                interval_start=now;
+                interval_frames=0;
+                interval_render_ms=0.0;
+            }
+            if(max_frames>0&&frame_count>=static_cast<std::uint64_t>(max_frames)) running=false;
+        }
+
+        if(!native_paused&&runtime.native_pause){
+            if(!executor.SendLifecycle(runtime.native_pause,"nativeOnPause shutdown")) throw std::runtime_error(executor.LastError());
+            native_paused=true;
         }
         if(!first_frame) throw std::runtime_error("render loop ended before the first frame");
+        emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP3_FIX1_OK");
+        emit("RESULT: DYNARMIC_BRINGUP4_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP3_FIX1_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP4_FAILED");
         return 1;
     }
 }
