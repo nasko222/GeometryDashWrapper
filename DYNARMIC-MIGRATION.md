@@ -34,3 +34,7 @@
 - audio
 - remaining compatibility guards
 - release-quality diagnostics and fallback behavior
+
+## Milestone 2
+
+DynarmicTest2 applies relocations, installs import/object traps, executes 238 constructors and calls JNI_OnLoad.

@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest1"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest2-fix1"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -416,13 +416,13 @@ GeometryDashDynarmicProbe.exe game.apk
 set "RESULT=%ERRORLEVEL%"
 echo.
 if not "%RESULT%"=="0" echo Dynarmic bring-up probe failed. See gd-dynarmic-probe.log.
-if "%RESULT%"=="0" echo Dynarmic x64 milestone 1 passed. See gd-dynarmic-probe.log.
+if "%RESULT%"=="0" echo Dynarmic x64 milestone 2 fix 1 passed. See gd-dynarmic-probe.log.
 pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE.cmd"), $Launcher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 probe ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 milestone 2 fix 1 probe ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Run RUN_DYNARMIC_PROBE.cmd"

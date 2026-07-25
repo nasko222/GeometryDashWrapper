@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashDynarmicProbe LANGUAGES C CXX)
+project(GeometryDashDynarmicBringup2Fix1 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
