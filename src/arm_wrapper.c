@@ -5,9 +5,9 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host. PerformanceTest1 maps guest RAM
- * onto host-owned backing memory so bridge operations can avoid expensive
- * per-call Unicorn memory copies while preserving the ARM execution model.
+ * complete nativeInit/nativeRender lifecycle host. OverkillTest1 deliberately
+ * removes optional subsystems and can hot-patch cosmetic/render functions so the
+ * remaining ARM game logic can be measured without audio, particles or real GL.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -85,6 +85,7 @@
 #define MAX_COMPAT_PARTICLE_HOLDS 512
 #define MAX_QSORT_BYTES (64u * 1024u * 1024u)
 #define MAX_CALLBACK_DEPTH 32
+#define MAX_OVERKILL_PATCHES 32
 #define MAX_PTHREAD_KEYS 64
 #define GUEST_FREE_BIN_COUNT 32
 #define MAX_GUEST_ZLIB_BUFFER (64u * 1024u * 1024u)
@@ -176,6 +177,15 @@ typedef struct {
     int direct_write;
     int owned;
 } GuestMemoryRegion;
+
+typedef struct {
+    const char *name;
+    uint32_t address;
+    unsigned char original[4];
+    int return_zero;
+    int ready;
+    int active;
+} GuestNoopPatch;
 
 typedef struct {
     uint32_t address;
@@ -389,6 +399,17 @@ typedef struct {
     uint64_t direct_memory_writes;
     int deep_diagnostics;
     int disable_particle_guards;
+    int disable_audio;
+    int disable_particles;
+    int disable_node_draws;
+    int skip_draw_calls;
+    int skip_scene_visit;
+    int skip_native_render;
+    int headless_gl;
+    int skip_texture_uploads;
+    int solid_textures;
+    int disable_vsync;
+    int uncapped;
     int profile_import_timing;
     int profile_arm_blocks;
     LARGE_INTEGER profile_import_frequency;
@@ -513,6 +534,21 @@ typedef struct {
     uint64_t profile_gl_proc_cache_misses;
     uint64_t profile_gl_redundant_binds;
     uint64_t profile_gl_direct_uploads;
+    uint64_t overkill_audio_skips;
+    uint64_t overkill_particle_toggles;
+    uint64_t overkill_node_draw_toggles;
+    uint64_t overkill_scene_toggles;
+    uint64_t overkill_native_render_skips;
+    uint64_t overkill_skipped_draws;
+    uint64_t overkill_headless_gl_calls;
+    uint64_t overkill_texture_skips;
+    uint32_t overkill_fake_audio_id;
+    uint32_t overkill_next_gl_id;
+    GuestNoopPatch overkill_particle_patches[MAX_OVERKILL_PATCHES];
+    unsigned overkill_particle_patch_count;
+    GuestNoopPatch overkill_node_draw_patches[MAX_OVERKILL_PATCHES];
+    unsigned overkill_node_draw_patch_count;
+    GuestNoopPatch overkill_scene_visit_patch;
     uint64_t profile_alloc_calls;
     uint64_t profile_alloc_bytes;
     uint64_t profile_free_calls;
@@ -3904,8 +3940,13 @@ static uint32_t jni_dispatch_boolean(ArmProbe *probe, GuestRef *method,
             (int)cursor_word(arguments));
     if (strcmp(name, "shouldResumeSound") == 0 ||
         strcmp(name, "isNetworkAvailable") == 0) return 1;
-    if (strcmp(name, "isBackgroundMusicPlaying") == 0)
+    if (strcmp(name, "isBackgroundMusicPlaying") == 0) {
+        if (probe->disable_audio) {
+            ++probe->overkill_audio_skips;
+            return 1;
+        }
         return (uint32_t)audio_is_background_playing();
+    }
     if (strcmp(name, "doesFileExist") == 0)
         return (uint32_t)storage_file_exists(
             guest_ref_string(probe, cursor_word(arguments), path, sizeof(path)));
@@ -3924,10 +3965,20 @@ static uint32_t jni_dispatch_int(ArmProbe *probe, GuestRef *method,
             (int32_t)cursor_word(arguments));
     if (strcmp(name, "getFontSizeAccordingHeight") == 0)
         return cursor_word(arguments);
-    if (strcmp(name, "playEffect") == 0)
+    if (strcmp(name, "playEffect") == 0) {
+        uint32_t path_ref = cursor_word(arguments);
+        int loop = (int)cursor_word(arguments);
+        if (probe->disable_audio) {
+            (void)path_ref;
+            (void)loop;
+            ++probe->overkill_audio_skips;
+            if (++probe->overkill_fake_audio_id == 0)
+                probe->overkill_fake_audio_id = 1;
+            return probe->overkill_fake_audio_id;
+        }
         return audio_play_effect(
-            guest_ref_string(probe, cursor_word(arguments), path, sizeof(path)),
-            (int)cursor_word(arguments));
+            guest_ref_string(probe, path_ref, path, sizeof(path)), loop);
+    }
     return 0;
 }
 
@@ -3943,11 +3994,11 @@ static uint32_t jni_dispatch_float(ArmProbe *probe, GuestRef *method,
         result = storage_get_float(
             guest_ref_string(probe, key_ref, key, sizeof(key)), fallback);
     } else if (strcmp(name, "getBackgroundMusicVolume") == 0)
-        result = audio_get_background_volume();
+        result = probe->disable_audio ? 0.0f : audio_get_background_volume();
     else if (strcmp(name, "getBackgroundMusicTime") == 0)
-        result = audio_get_background_time();
+        result = probe->disable_audio ? 0.0f : audio_get_background_time();
     else if (strcmp(name, "getEffectsVolume") == 0)
-        result = audio_get_effects_volume();
+        result = probe->disable_audio ? 0.0f : audio_get_effects_volume();
     return float_bits(result);
 }
 
@@ -3967,11 +4018,31 @@ static uint64_t jni_dispatch_double(ArmProbe *probe, GuestRef *method,
     return double_bits(result);
 }
 
+static int overkill_is_audio_void_method(const char *name) {
+    static const char *const methods[] = {
+        "playBackgroundMusic", "preloadBackgroundMusic",
+        "stopBackgroundMusic", "pauseBackgroundMusic",
+        "resumeBackgroundMusic", "rewindBackgroundMusic",
+        "setBackgroundMusicTime", "setBackgroundMusicVolume",
+        "preloadEffect", "pauseEffect", "resumeEffect", "stopEffect",
+        "pauseAllEffects", "resumeAllEffects", "stopAllEffects",
+        "unloadEffect", "setEffectsVolume", "end"
+    };
+    unsigned index;
+    for (index = 0; index < sizeof(methods) / sizeof(methods[0]); ++index)
+        if (strcmp(name, methods[index]) == 0) return 1;
+    return 0;
+}
+
 static void jni_dispatch_void(ArmProbe *probe, GuestRef *method,
                               GuestArgCursor *arguments) {
     const char *name = method && method->name ? method->name : "";
     char first[MAX_STRING], second[MAX_STRING];
     guest_method_first_call(method);
+    if (probe->disable_audio && overkill_is_audio_void_method(name)) {
+        ++probe->overkill_audio_skips;
+        return;
+    }
     if (strcmp(name, "setAnimationInterval") == 0) {
         uint64_t bits = cursor_u64(arguments);
         double interval = bits_double((uint32_t)bits, (uint32_t)(bits >> 32));
@@ -4493,6 +4564,7 @@ static size_t gl_get_value_count(ArmProbe *probe, uint32_t parameter) {
         return 2u;
     case 0x86a3u: /* GL_COMPRESSED_TEXTURE_FORMATS */
     case 0x8df8u: { /* GL_SHADER_BINARY_FORMATS */
+        if (probe && probe->headless_gl) return 1u;
         typedef void (WINAPI *GetIntegerFunction)(uint32_t, int *);
         GetIntegerFunction getter =
             (GetIntegerFunction)resolve_gl(probe, "glGetIntegerv");
@@ -4767,6 +4839,151 @@ static uint32_t gl_index_vertex_limit(const void *indices, uint32_t count,
     return count && maximum != UINT32_MAX ? maximum + 1u : 0;
 }
 
+static uint32_t overkill_next_gl_id(ArmProbe *probe) {
+    if (++probe->overkill_next_gl_id == 0)
+        probe->overkill_next_gl_id = 1;
+    return probe->overkill_next_gl_id;
+}
+
+static void overkill_write_gl_ids(ArmProbe *probe, uint32_t count,
+                                  uint32_t destination) {
+    uint32_t *values;
+    uint32_t index;
+    if (!count || !destination || count > 65536u) return;
+    values = (uint32_t *)malloc((size_t)count * sizeof(*values));
+    if (!values) return;
+    for (index = 0; index < count; ++index)
+        values[index] = overkill_next_gl_id(probe);
+    uc_mem_write(probe->uc, destination, values,
+                 (size_t)count * sizeof(*values));
+    free(values);
+}
+
+static uint32_t dispatch_gl_headless(ArmProbe *probe, const char *name,
+                                     ArmGlSpecial special,
+                                     uint32_t *arguments, unsigned count) {
+    uint32_t value = 0;
+    (void)count;
+    ++probe->overkill_headless_gl_calls;
+    if (special == ARM_GL_SPECIAL_BIND_BUFFER) {
+        if (arguments[0] == 0x8892u) probe->gl_array_buffer_binding = arguments[1];
+        if (arguments[0] == 0x8893u) probe->gl_element_array_buffer_binding = arguments[1];
+        return 0;
+    }
+    if (special == ARM_GL_SPECIAL_ENABLE_ATTRIB ||
+        special == ARM_GL_SPECIAL_DISABLE_ATTRIB) {
+        if (arguments[0] < MAX_GL_VERTEX_ATTRIBS)
+            probe->gl_vertex_attribs[arguments[0]].enabled =
+                special == ARM_GL_SPECIAL_ENABLE_ATTRIB;
+        return 0;
+    }
+    if (special == ARM_GL_SPECIAL_VERTEX_ATTRIB_POINTER) {
+        if (arguments[0] < MAX_GL_VERTEX_ATTRIBS) {
+            GuestGlVertexAttrib *attribute = &probe->gl_vertex_attribs[arguments[0]];
+            attribute->size = arguments[1];
+            attribute->type = arguments[2];
+            attribute->normalized = arguments[3];
+            attribute->stride = arguments[4];
+            attribute->guest_pointer = arguments[5];
+            attribute->client_memory = probe->gl_array_buffer_binding == 0;
+        }
+        return 0;
+    }
+    if (special == ARM_GL_SPECIAL_DRAW_ARRAYS ||
+        special == ARM_GL_SPECIAL_DRAW_ELEMENTS) {
+        int32_t draw_count = (int32_t)arguments[
+            special == ARM_GL_SPECIAL_DRAW_ARRAYS ? 2 : 1];
+        ++probe->profile_gl_draw_calls;
+        ++probe->overkill_skipped_draws;
+        if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
+        return 0;
+    }
+    if (strcmp(name, "glCreateProgram") == 0 ||
+        strcmp(name, "glCreateShader") == 0)
+        return overkill_next_gl_id(probe);
+    if (strcmp(name, "glGenBuffers") == 0 ||
+        strcmp(name, "glGenFramebuffers") == 0 ||
+        strcmp(name, "glGenRenderbuffers") == 0 ||
+        strcmp(name, "glGenTextures") == 0) {
+        overkill_write_gl_ids(probe, arguments[0], arguments[1]);
+        return 0;
+    }
+    if (strcmp(name, "glGetString") == 0) {
+        const char *text = "OverkillTest1 headless OpenGL ES 2.0";
+        uint32_t address = guest_alloc(probe, (uint32_t)strlen(text) + 1u);
+        if (address) guest_write_string(probe, address, text,
+                                        (uint32_t)strlen(text) + 1u);
+        return address;
+    }
+    if (strcmp(name, "glCheckFramebufferStatus") == 0)
+        return 0x8cd5u; /* GL_FRAMEBUFFER_COMPLETE */
+    if (strcmp(name, "glGetError") == 0) return 0;
+    if (strcmp(name, "glIsBuffer") == 0 || strcmp(name, "glIsEnabled") == 0 ||
+        strcmp(name, "glIsFramebuffer") == 0 || strcmp(name, "glIsProgram") == 0 ||
+        strcmp(name, "glIsRenderbuffer") == 0 || strcmp(name, "glIsShader") == 0 ||
+        strcmp(name, "glIsTexture") == 0) return 1;
+    if (strcmp(name, "glGetAttribLocation") == 0 ||
+        strcmp(name, "glGetUniformLocation") == 0) return 0;
+    if (strcmp(name, "glGetProgramiv") == 0 ||
+        strcmp(name, "glGetShaderiv") == 0) {
+        uint32_t parameter = arguments[1];
+        if (parameter == 0x8b81u || parameter == 0x8b82u ||
+            parameter == 0x8b83u) value = 1;
+        uc_mem_write(probe->uc, arguments[2], &value, sizeof(value));
+        return 0;
+    }
+    if (strcmp(name, "glGetBooleanv") == 0 ||
+        strcmp(name, "glGetFloatv") == 0 ||
+        strcmp(name, "glGetIntegerv") == 0) {
+        size_t elements = gl_get_value_count(probe, arguments[0]);
+        uint32_t values[16] = {0};
+        if (elements > 16u) elements = 16u;
+        if (strcmp(name, "glGetIntegerv") == 0) {
+            if (arguments[0] == 0x0d33u) values[0] = 4096u; /* MAX_TEXTURE_SIZE */
+            else if (arguments[0] == 0x8869u) values[0] = 8u; /* MAX_VERTEX_ATTRIBS */
+            else if (arguments[0] == 0x8872u || arguments[0] == 0x8b4du)
+                values[0] = 8u;
+            else if (arguments[0] == 0x8894u)
+                values[0] = probe->gl_array_buffer_binding;
+            else if (arguments[0] == 0x8895u)
+                values[0] = probe->gl_element_array_buffer_binding;
+            else if (arguments[0] == 0x0ba2u && elements >= 4u) {
+                values[2] = (uint32_t)probe->host.native_width;
+                values[3] = (uint32_t)probe->host.native_height;
+            }
+        }
+        uc_mem_write(probe->uc, arguments[1], values,
+                     elements * (strcmp(name, "glGetBooleanv") == 0 ? 1u : 4u));
+        return 0;
+    }
+    if (strcmp(name, "glGetProgramInfoLog") == 0 ||
+        strcmp(name, "glGetShaderInfoLog") == 0 ||
+        strcmp(name, "glGetShaderSource") == 0) {
+        uint32_t zero = 0;
+        if (arguments[2]) uc_mem_write(probe->uc, arguments[2], &zero, sizeof(zero));
+        if (arguments[3]) uc_mem_write(probe->uc, arguments[3], &zero, 1u);
+        return 0;
+    }
+    if (strcmp(name, "glReadPixels") == 0 && arguments[6]) {
+        size_t bytes = gl_pixel_bytes(arguments[2], arguments[3],
+                                      arguments[4], arguments[5]);
+        if (bytes && bytes <= MAX_GL_CLIENT_ARRAY_BYTES) {
+            unsigned char *zeroes = (unsigned char *)calloc(1, bytes);
+            if (zeroes) {
+                uc_mem_write(probe->uc, arguments[6], zeroes, bytes);
+                free(zeroes);
+            }
+        }
+        return 0;
+    }
+    if (strcmp(name, "glTexImage2D") == 0 ||
+        strcmp(name, "glTexSubImage2D") == 0 ||
+        strcmp(name, "glCompressedTexImage2D") == 0 ||
+        strcmp(name, "glCompressedTexSubImage2D") == 0)
+        ++probe->overkill_texture_skips;
+    return 0;
+}
+
 static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
                             uint32_t r0, uint32_t r1, uint32_t r2,
                             uint32_t r3, uint32_t sp) {
@@ -4789,6 +5006,17 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
     }
     for (index = 0; index < count && index < 9; ++index)
         arguments[index] = import_argument(probe, r0,r1,r2,r3,sp,index);
+
+    if (probe->headless_gl)
+        return dispatch_gl_headless(probe, name, special, arguments, count);
+    if (probe->skip_texture_uploads &&
+        (strcmp(name, "glTexImage2D") == 0 ||
+         strcmp(name, "glTexSubImage2D") == 0 ||
+         strcmp(name, "glCompressedTexImage2D") == 0 ||
+         strcmp(name, "glCompressedTexSubImage2D") == 0)) {
+        ++probe->overkill_texture_skips;
+        return 0;
+    }
 
     if (strcmp(name, "glClearDepthf") == 0) {
         typedef void (WINAPI *ClearDepthFunction)(double);
@@ -4863,6 +5091,10 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         uint32_t draw_result = 0;
         ++probe->profile_gl_draw_calls;
         if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
+        if (probe->skip_draw_calls) {
+            ++probe->overkill_skipped_draws;
+            return 0;
+        }
         if (limit > UINT32_MAX ||
             !gl_prepare_client_arrays(probe, (uint32_t)limit,
                                       copies, &prepared)) {
@@ -4887,6 +5119,10 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         if (draw_count < 0 || !index_size) return 0;
         ++probe->profile_gl_draw_calls;
         if (draw_count > 0) probe->profile_gl_vertices += (uint32_t)draw_count;
+        if (probe->skip_draw_calls) {
+            ++probe->overkill_skipped_draws;
+            return 0;
+        }
         if (!probe->gl_element_array_buffer_binding && draw_count) {
             uint64_t bytes = (uint64_t)(uint32_t)draw_count * index_size;
             GuestMemoryRegion *region;
@@ -4987,6 +5223,20 @@ shader_done:
             ((Function)function)(arguments[0],(ptrdiff_t)arguments[1],(ptrdiff_t)arguments[2],data);
         }
         free(owned); return 0;
+    }
+    if (probe->solid_textures &&
+        (strcmp(name,"glTexImage2D")==0 || strcmp(name,"glTexSubImage2D")==0 ||
+         strcmp(name,"glCompressedTexImage2D")==0 ||
+         strcmp(name,"glCompressedTexSubImage2D")==0)) {
+        static const unsigned char white_pixel[4] = {255,255,255,255};
+        PROC texture_function = strcmp(name,"glTexImage2D")==0
+            ? function : resolve_gl(probe, "glTexImage2D");
+        uint32_t tiny[9] = {arguments[0], arguments[1], 0x1908u, 1u, 1u,
+                            0u, 0x1908u, 0x1401u,
+                            (uint32_t)(uintptr_t)white_pixel};
+        if (texture_function) call_gl_raw(texture_function, tiny, 9);
+        ++probe->overkill_texture_skips;
+        return 0;
     }
     if (strcmp(name,"glTexImage2D")==0 || strcmp(name,"glTexSubImage2D")==0) {
         uint32_t width_index = strcmp(name,"glTexImage2D")==0 ? 3u : 4u;
@@ -6628,6 +6878,170 @@ static void return_from_guest_function(uc_engine *uc, uint32_t result) {
     uc_reg_write(uc, UC_ARM_REG_PC, &lr);
 }
 
+static int overkill_prepare_patch(ArmProbe *probe, GuestNoopPatch *patch,
+                                  const char *name, int return_zero) {
+    uint32_t address = find_export(probe, name) & ~1u;
+    if (!address ||
+        uc_mem_read(probe->uc, address, patch->original,
+                    sizeof(patch->original)) != UC_ERR_OK)
+        return 0;
+    patch->name = name;
+    patch->address = address;
+    patch->return_zero = return_zero;
+    patch->ready = 1;
+    return 1;
+}
+
+static int overkill_apply_patch(ArmProbe *probe, GuestNoopPatch *patch,
+                                int enabled) {
+    static const unsigned char thumb_void_return[4] = {0x70,0x47,0xc0,0x46};
+    static const unsigned char thumb_zero_return[4] = {0x00,0x20,0x70,0x47};
+    const unsigned char *bytes;
+    if (!patch || !patch->ready || patch->active == enabled) return 1;
+    bytes = enabled ? (patch->return_zero ? thumb_zero_return : thumb_void_return)
+                    : patch->original;
+    if (uc_mem_write(probe->uc, patch->address, bytes, 4u) != UC_ERR_OK ||
+        uc_ctl_remove_cache(probe->uc, patch->address,
+                            patch->address + 4u) != UC_ERR_OK)
+        return 0;
+    patch->active = enabled;
+    return 1;
+}
+
+static int overkill_set_particles(ArmProbe *probe, int disabled) {
+    unsigned index;
+    for (index = 0; index < probe->overkill_particle_patch_count; ++index)
+        if (!overkill_apply_patch(probe,
+                                  &probe->overkill_particle_patches[index],
+                                  disabled)) return 0;
+    probe->disable_particles = disabled;
+    ++probe->overkill_particle_toggles;
+    probe_log("OVERKILL particles/cosmetics: %s (%u guest functions)",
+              disabled ? "REMOVED" : "restored",
+              probe->overkill_particle_patch_count);
+    return 1;
+}
+
+static int overkill_set_node_draws(ArmProbe *probe, int disabled) {
+    unsigned index;
+    for (index = 0; index < probe->overkill_node_draw_patch_count; ++index)
+        if (!overkill_apply_patch(probe,
+                                  &probe->overkill_node_draw_patches[index],
+                                  disabled)) return 0;
+    probe->disable_node_draws = disabled;
+    ++probe->overkill_node_draw_toggles;
+    probe_log("OVERKILL ARM node draw functions: %s (%u patches)",
+              disabled ? "REMOVED" : "restored",
+              probe->overkill_node_draw_patch_count);
+    return 1;
+}
+
+static int overkill_set_scene_visit(ArmProbe *probe, int disabled) {
+    if (!overkill_apply_patch(probe, &probe->overkill_scene_visit_patch,
+                              disabled)) return 0;
+    probe->skip_scene_visit = disabled;
+    ++probe->overkill_scene_toggles;
+    probe_log("OVERKILL scene traversal: %s",
+              disabled ? "REMOVED (logic-only diagnostic)" : "restored");
+    return 1;
+}
+
+static int overkill_prepare_patches(ArmProbe *probe) {
+    struct PatchDescription { const char *name; int return_zero; };
+    static const struct PatchDescription particle_patches[] = {
+        {"_ZN7cocos2d16CCParticleSystem6updateEf", 0},
+        {"_ZN7cocos2d16CCParticleSystem11addParticleEv", 1},
+        {"_ZN7cocos2d16CCParticleSystem8isActiveEv", 1},
+        {"_ZN7cocos2d16CCParticleSystem16getParticleCountEv", 1},
+        {"_ZN7cocos2d16CCParticleSystem16updateWithNoTimeEv", 0},
+        {"_ZN7cocos2d20CCParticleSystemQuad4drawEv", 0},
+        {"_ZN7cocos2d20CCParticleSystemQuad8postStepEv", 0},
+        {"_ZN7cocos2d19CCParticleBatchNode4drawEv", 0},
+        {"_ZN7cocos2d19CCParticleBatchNode5visitEv", 0},
+        {"_ZN7cocos2d14CCMotionStreak6updateEf", 0},
+        {"_ZN7cocos2d14CCMotionStreak4drawEv", 0},
+        {"_ZN16GhostTrailEffect13trailSnapshotEv", 0},
+        {"_ZN16GhostTrailEffect4drawEv", 0},
+        {"_ZN12PlayerObject14activateStreakEv", 0},
+        {"_ZN12CCCircleWave4drawEv", 0},
+        {"_ZN12CCLightStrip4drawEv", 0},
+        {"_ZN13GJGroundLayer4drawEv", 0},
+        {"_ZN18GameEffectsManager13scaleParticleEPN7cocos2d20CCParticleSystemQuadEf", 0}
+    };
+    unsigned index;
+    for (index = 0; index < sizeof(particle_patches) /
+                                  sizeof(particle_patches[0]); ++index) {
+        GuestNoopPatch *patch;
+        if (probe->overkill_particle_patch_count >= MAX_OVERKILL_PATCHES) break;
+        patch = &probe->overkill_particle_patches[
+            probe->overkill_particle_patch_count];
+        if (overkill_prepare_patch(probe, patch, particle_patches[index].name,
+                                   particle_patches[index].return_zero))
+            ++probe->overkill_particle_patch_count;
+    }
+    {
+        static const char *const draw_patches[] = {
+            "_ZN7cocos2d8CCSprite4drawEv",
+            "_ZN7cocos2d17CCSpriteBatchNode4drawEv",
+            "_ZN7cocos2d11CCAtlasNode4drawEv",
+            "_ZN7cocos2d12CCLayerColor4drawEv",
+            "_ZN7cocos2d15CCProgressTimer4drawEv",
+            "_ZN7cocos2d14CCTextFieldTTF4drawEv",
+            "_ZN7cocos2d11CCLightning4drawEv"
+        };
+        for (index = 0; index < sizeof(draw_patches) / sizeof(draw_patches[0]);
+             ++index) {
+            GuestNoopPatch *patch;
+            if (probe->overkill_node_draw_patch_count >= MAX_OVERKILL_PATCHES)
+                break;
+            patch = &probe->overkill_node_draw_patches[
+                probe->overkill_node_draw_patch_count];
+            if (overkill_prepare_patch(probe, patch, draw_patches[index], 0))
+                ++probe->overkill_node_draw_patch_count;
+        }
+    }
+    if (!overkill_prepare_patch(probe, &probe->overkill_scene_visit_patch,
+                                "_ZN7cocos2d6CCNode5visitEv", 0))
+        probe_log("WARNING: OVERKILL CCNode::visit patch unavailable");
+    probe_log("OVERKILL guest patch table ready: cosmetics=%u draws=%u scene=%s",
+              probe->overkill_particle_patch_count,
+              probe->overkill_node_draw_patch_count,
+              probe->overkill_scene_visit_patch.ready ? "ready" : "missing");
+    if (probe->disable_particles && !overkill_set_particles(probe, 1)) return 0;
+    if (probe->disable_node_draws && !overkill_set_node_draws(probe, 1)) return 0;
+    if (probe->skip_scene_visit && !overkill_set_scene_visit(probe, 1)) return 0;
+    return 1;
+}
+
+static void overkill_log_state(ArmProbe *probe) {
+    probe_log("OVERKILL state: audio=%s particles=%s arm-draw=%s host-draw=%s "
+              "scene=%s native-render=%s headless-gl=%s textures=%s vsync=%s",
+              probe->disable_audio ? "REMOVED" : "on",
+              probe->disable_particles ? "REMOVED" : "on",
+              probe->disable_node_draws ? "REMOVED" : "on",
+              probe->skip_draw_calls ? "REMOVED" : "on",
+              probe->skip_scene_visit ? "REMOVED" : "on",
+              probe->skip_native_render ? "REMOVED" : "on",
+              probe->headless_gl ? "REMOVED" : "on",
+              probe->skip_texture_uploads ? "REMOVED" :
+                  (probe->solid_textures ? "1x1 solid" : "on"),
+              probe->disable_vsync ? "off" : "on");
+}
+
+static const unsigned char g_overkill_white_png[] = {
+    0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,
+    0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+    0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,0x89,0x00,0x00,0x00,
+    0x0d,0x49,0x44,0x41,0x54,0x78,0xda,0x63,0xf8,0xff,0xff,0xff,
+    0x7f,0x00,0x09,0xfb,0x03,0xfd,0xf5,0xd8,0xf1,0x9a,0x00,0x00,
+    0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82
+};
+
+static int overkill_is_png_member(const char *name) {
+    size_t length = name ? strlen(name) : 0;
+    return length >= 4u && _stricmp(name + length - 4u, ".png") == 0;
+}
+
 static void zip_get_file_data_hook(uc_engine *uc, uint64_t address,
                                    uint32_t size, void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -6667,9 +7081,17 @@ static void zip_get_file_data_hook(uc_engine *uc, uint64_t address,
         }
         return;
     }
-    if (!apk_extract_member_cached(probe, resolved, &payload, &payload_size,
-                                   &owned) ||
-        !payload || !payload_size || payload_size > UINT32_MAX) {
+    if ((probe->solid_textures || probe->skip_texture_uploads ||
+         probe->headless_gl) && overkill_is_png_member(resolved)) {
+        payload = (unsigned char *)g_overkill_white_png;
+        payload_size = sizeof(g_overkill_white_png);
+        owned = 0;
+        ++probe->overkill_texture_skips;
+        if (probe->overkill_texture_skips == 1u)
+            probe_log("OVERKILL original PNG assets replaced by 1x1 white PNG");
+    } else if (!apk_extract_member_cached(probe, resolved, &payload,
+                                          &payload_size, &owned) ||
+               !payload || !payload_size || payload_size > UINT32_MAX) {
         if (owned) free(payload);
         ++probe->zip_accel_fallbacks;
         return;
@@ -7603,6 +8025,10 @@ static int initialize_unicorn(ArmProbe *probe) {
         probe_log("ERROR: cannot install ARM guest hooks");
         return 0;
     }
+    if (!overkill_prepare_patches(probe)) {
+        probe_log("ERROR: cannot prepare OVERKILL guest patches");
+        return 0;
+    }
     for (index = 0; index < probe->header->e_phnum; ++index) {
         const Elf32_Phdr *segment = &probe->program_headers[index];
         uint32_t start;
@@ -8311,6 +8737,53 @@ static LRESULT CALLBACK arm_window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_KEYDOWN:
+        if (wparam == VK_F3) {
+            probe->skip_native_render = !probe->skip_native_render;
+            probe_log("OVERKILL nativeRender: %s",
+                      probe->skip_native_render ? "REMOVED" : "restored");
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F4) {
+            overkill_set_node_draws(probe, !probe->disable_node_draws);
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F5) {
+            overkill_set_particles(probe, !probe->disable_particles);
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F6) {
+            probe->skip_draw_calls = !probe->skip_draw_calls;
+            probe_log("OVERKILL host draw calls: %s",
+                      probe->skip_draw_calls ? "REMOVED" : "restored");
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F7) {
+            overkill_set_scene_visit(probe, !probe->skip_scene_visit);
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F8) {
+            probe->headless_gl = !probe->headless_gl;
+            probe_log("OVERKILL OpenGL bridge: %s",
+                      probe->headless_gl ? "HEADLESS" : "restored");
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F9) {
+            probe->skip_texture_uploads = !probe->skip_texture_uploads;
+            probe_log("OVERKILL future texture uploads: %s",
+                      probe->skip_texture_uploads ? "REMOVED" : "restored");
+            overkill_log_state(probe);
+            return 0;
+        }
+        if (wparam == VK_F10) {
+            overkill_log_state(probe);
+            return 0;
+        }
         if (wparam == VK_ESCAPE && probe->host.native_ready &&
             probe->host.key_down) {
             uint32_t arguments[3] = {GUEST_ENV_OBJECT, 0, 4};
@@ -8368,7 +8841,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest1",
+        "Geometry Dash ARM wrapper 0.9.4-arm-overkilltest1",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -8403,7 +8876,8 @@ static int create_arm_opengl_window(ArmProbe *probe) {
         return 0;
     }
     swap_interval = (SwapIntervalFunction)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval && swap_interval(1)) probe->host.vsync_enabled = 1;
+    if (swap_interval && swap_interval(probe->disable_vsync ? 0 : 1))
+        probe->host.vsync_enabled = !probe->disable_vsync;
     probe_log("OpenGL vertical sync: %s",
               probe->host.vsync_enabled ? "enabled" : "unavailable");
     probe_log("OpenGL vendor: %s", glGetString(GL_VENDOR));
@@ -8634,10 +9108,12 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
             probe->block_profile_entries[index].calls = 0;
         probe->profile_block_dropped = 0;
     }
-    probe_log("ARM performance-test profile: gl-proc-cache=%llu/%llu "
+    probe_log("ARM overkill-test profile: gl-proc-cache=%llu/%llu "
               "redundant-binds=%llu direct-uploads=%llu "
               "zip-get/exist/miss/fallback=%llu/%llu/%llu/%llu "
-              "particle-guards=%u/%u",
+              "particle-guards=%u/%u audio-skips=%llu skipped-draws=%llu "
+              "headless-gl=%llu texture-skips=%llu native-render-skips=%llu "
+              "flags=P%d,A%d,D%d,S%d,N%d,H%d,T%d",
               (unsigned long long)probe->profile_gl_proc_cache_hits,
               (unsigned long long)probe->profile_gl_proc_cache_misses,
               (unsigned long long)probe->profile_gl_redundant_binds,
@@ -8647,7 +9123,16 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               (unsigned long long)probe->zip_accel_misses,
               (unsigned long long)probe->zip_accel_fallbacks,
               probe->particle_claim_guards,
-              probe->particle_unclaim_guards);
+              probe->particle_unclaim_guards,
+              (unsigned long long)probe->overkill_audio_skips,
+              (unsigned long long)probe->overkill_skipped_draws,
+              (unsigned long long)probe->overkill_headless_gl_calls,
+              (unsigned long long)probe->overkill_texture_skips,
+              (unsigned long long)probe->overkill_native_render_skips,
+              probe->disable_particles, probe->disable_node_draws,
+              probe->skip_draw_calls, probe->skip_scene_visit,
+              probe->skip_native_render, probe->headless_gl,
+              probe->skip_texture_uploads);
     arm_frame_profile_reset(probe);
 }
 
@@ -8676,8 +9161,13 @@ static int run_arm_message_loop(ArmProbe *probe) {
                 arm_frame_profile_reset(probe);
                 performance_active = 1;
             }
-            if (!host_call(probe, probe->host.render, arguments, 2,
-                           "nativeRender")) return 0;
+            if (probe->skip_native_render) {
+                probe->profile_last_render_microseconds = 0;
+                ++probe->overkill_native_render_skips;
+            } else if (!host_call(probe, probe->host.render, arguments, 2,
+                                  "nativeRender")) {
+                return 0;
+            }
             swap_started = host_monotonic_units(UINT64_C(1000000));
             SwapBuffers(probe->host.device);
             swap_elapsed = host_monotonic_units(UINT64_C(1000000)) -
@@ -8713,7 +9203,7 @@ static int run_arm_message_loop(ArmProbe *probe) {
                     performance_frames = 0;
                 }
             }
-            if (!probe->host.vsync_enabled) Sleep(1);
+            if (!probe->host.vsync_enabled && !probe->uncapped) Sleep(1);
         } else {
             if (performance_active) {
                 performance_started = GetTickCount();
@@ -8805,7 +9295,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-performancetest1");
+              "0.9.4-arm-overkilltest1");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -8821,7 +9311,34 @@ int main(int argc, char **argv) {
             probe.deep_diagnostics = 1;
         else if (strcmp(argv[index], "--no-particle-guards") == 0)
             probe.disable_particle_guards = 1;
-        else if (strcmp(argv[index], "--profile-import-time") == 0)
+        else if (strcmp(argv[index], "--no-audio") == 0)
+            probe.disable_audio = 1;
+        else if (strcmp(argv[index], "--no-particles") == 0 ||
+                 strcmp(argv[index], "--no-cosmetics") == 0)
+            probe.disable_particles = 1;
+        else if (strcmp(argv[index], "--no-node-draws") == 0)
+            probe.disable_node_draws = 1;
+        else if (strcmp(argv[index], "--skip-native-render") == 0)
+            probe.skip_native_render = 1;
+        else if (strcmp(argv[index], "--skip-draws") == 0)
+            probe.skip_draw_calls = 1;
+        else if (strcmp(argv[index], "--skip-scene-visit") == 0)
+            probe.skip_scene_visit = 1;
+        else if (strcmp(argv[index], "--headless-gl") == 0)
+            probe.headless_gl = 1;
+        else if (strcmp(argv[index], "--no-textures") == 0)
+            probe.skip_texture_uploads = 1;
+        else if (strcmp(argv[index], "--solid-textures") == 0)
+            probe.solid_textures = 1;
+        else if (strcmp(argv[index], "--no-vsync") == 0)
+            probe.disable_vsync = 1;
+        else if (strcmp(argv[index], "--uncapped") == 0)
+            probe.uncapped = 1;
+        else if (strcmp(argv[index], "--overkill") == 0) {
+            probe.disable_audio = 1;
+            probe.disable_particles = 1;
+            probe.solid_textures = 1;
+        } else if (strcmp(argv[index], "--profile-import-time") == 0)
             probe.profile_import_timing = 1;
         else if (strcmp(argv[index], "--profile-arm-blocks") == 0)
             probe.profile_arm_blocks = 1;
@@ -8850,9 +9367,17 @@ int main(int argc, char **argv) {
              probe.executable_directory);
     CreateDirectoryA(probe.writable_path, NULL);
     storage_initialize(probe.writable_path);
-    audio_initialize(probe.executable_directory);
-    audio_set_apk_path(absolute_apk);
+    if (!probe.disable_audio) {
+        audio_initialize(probe.executable_directory);
+        audio_set_apk_path(absolute_apk);
+    } else {
+        probe_log("OVERKILL audio subsystem REMOVED before initialization");
+    }
 
+    overkill_log_state(&probe);
+    probe_log("OVERKILL hotkeys: F3 nativeRender, F4 ARM node draws, "
+              "F5 particles, F6 host draws, F7 scene visit, "
+              "F8 headless GL, F9 future textures, F10 state");
     probe_log("Input: %s", input_path);
     if (!load_arm_input(input_path, &probe.file_data, &probe.file_size,
                         &probe.apk_data, &probe.apk_size)) {
@@ -8953,7 +9478,7 @@ finished:
     host_pause(&probe, "wrapper shutdown");
     probe.host.native_ready = 0;
     destroy_arm_opengl_window(&probe);
-    audio_shutdown();
+    if (!probe.disable_audio) audio_shutdown();
     storage_shutdown();
     if (probe.host.opengl) FreeLibrary(probe.host.opengl);
     probe.host.opengl = NULL;
