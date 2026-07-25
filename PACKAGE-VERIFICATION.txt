@@ -1,14 +1,15 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest6
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest7
 Package verification
 
 Base used:
-  GeometryDashArmWrapper-0.9.4-arm-dynarmictest4-full-source.zip
-  Base archive bytes: 33899073
+  GeometryDashArmWrapper-0.9.4-arm-dynarmictest6-full-source.zip
+  Base source files preserved: 1114/1114
 
 Preservation checks:
   game.apk: present
   game.apk bytes: 24704408
   game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
+  total source-package files before ZIP: 1118
   src files: preserved
   third_party files: preserved
   tools files: preserved
@@ -17,19 +18,25 @@ Preservation checks:
   build-dynarmic-x64.ps1: present
   dynarmic-x64/CMakeLists.txt: present
 
-Test6 changes:
-  - reclaiming guest allocator in src/dynarmic_probe.cpp
-  - correct free/realloc/mmap/munmap behavior
-  - qsort scratch allocation leak fix
-  - 256 MiB guest heap mapping
-  - retained fatal diagnostics with heap statistics
-  - Test6 build/version/output naming and documentation
+Test7 changes:
+  - mapped 256-byte guest FILE objects allocated from the reclaiming heap
+  - initialized Bionic FILE flag/descriptor fields
+  - guest FILE object reclamation after fclose
+  - __sF stdin/stdout/stderr mapping updated for allocated handles
+  - Windows MCI audio backend linked into the Dynarmic target
+  - JNI background music/effect/volume/pause/seek controls connected
+  - minimal APK audio extractor and embedded-effect fallback stub
+  - Test7 build/version/output naming and documentation
 
-Validation:
+Validation performed:
   - C++20 syntax check against a minimal Dynarmic A32 API stub
-  - allocator model stress test
+  - C11 syntax checks for APK audio extraction and embedded-effect stub
+  - Test6-to-Test7 source-file preservation comparison
   - APK size/hash verification
-  - ZIP integrity and required-file checks
+  - extracted assets/menuLoop.mp3 from game.apk: 480723 bytes, ID3 header
+  - extracted assets/playSound_01.ogg from game.apk: 14209 bytes, OggS header
+  - decoded playSound_01.ogg with packaged stb_vorbis: 56469 mono samples at 44100 Hz
+  - audio_win.c is byte-identical to the previously used wrapper backend
 
-A complete Windows/Dynarmic executable is not built in this Linux packaging environment.
+A complete Windows/Dynarmic executable was not built in this Linux packaging environment.
 Run BUILD_DYNARMIC_X64.cmd on 64-bit Windows.

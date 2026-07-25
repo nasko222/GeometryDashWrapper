@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest6"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest7"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -401,6 +401,10 @@ Write-Host "Refreshing Dynarmic probe source timestamps to prevent stale Ninja o
 $ProbeSourcesToRefresh = @(
     (Join-Path $Root "src\dynarmic_probe.cpp"),
     (Join-Path $Root "src\storage_win.c"),
+    (Join-Path $Root "src\audio_win.c"),
+    (Join-Path $Root "src\apk_extract_audio.c"),
+    (Join-Path $Root "src\embedded_effects_stub.c"),
+    (Join-Path $Root "third_party\stb\stb_vorbis.c"),
     (Join-Path $Root "dynarmic-x64\CMakeLists.txt")
 )
 $RefreshTime = Get-Date
@@ -427,8 +431,8 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$Test6Notes = Join-Path $Root "DYNARMICTEST6-NOTES.md"
-if (Test-Path $Test6Notes) { Copy-Item -Force $Test6Notes (Join-Path $Output "DYNARMICTEST6-NOTES.md") }
+$Test7Notes = Join-Path $Root "DYNARMICTEST7-NOTES.md"
+if (Test-Path $Test7Notes) { Copy-Item -Force $Test7Notes (Join-Path $Output "DYNARMICTEST7-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $Launcher = @'
@@ -456,6 +460,6 @@ exit /b %RESULT%
 [IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE_ONLY.cmd"), $ProbeLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 Test6 allocator-fix build ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 Test7 save-and-audio build ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Run RUN_DYNARMIC_INTERACTIVE.cmd"

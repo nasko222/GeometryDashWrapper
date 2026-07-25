@@ -48,6 +48,7 @@
 extern "C" {
 #include "zlib.h"
 #include "storage_win.h"
+#include "audio_win.h"
 }
 
 using u8 = std::uint8_t;
@@ -90,6 +91,12 @@ constexpr u32 kEnvObject = kControlBase + 0x10000u;
 constexpr u32 kEnvTable = kControlBase + 0x11000u;
 constexpr u32 kEnvStubs = kControlBase + 0x12000u;
 constexpr u32 kFakeRefBase = kControlBase + 0x30000u;
+constexpr u32 kGuestFileObjectSize = 0x100u;
+constexpr u32 kBionicFileFlagsOffset = 12u;
+constexpr u32 kBionicFileDescriptorOffset = 14u;
+constexpr u16 kBionicFileReadFlag = 0x0004u;
+constexpr u16 kBionicFileWriteFlag = 0x0008u;
+constexpr u16 kBionicFileReadWriteFlag = 0x0080u;
 constexpr u32 kSvcReturn = 0x00FFFFFEu;
 constexpr u32 kSvcVmBase = 0x00F00000u;
 constexpr u32 kSvcJniBase = 0x00E00000u;
@@ -787,6 +794,7 @@ struct GuestFile {
     std::FILE* stream = nullptr;
     bool standard = false;
     std::string path;
+    std::string mode;
 };
 
 enum class HostEventType {
@@ -834,7 +842,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest6Window";
+        const char* class_name = "GeometryDashDynarmicTest7Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -846,7 +854,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test6",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test7",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1115,6 +1123,10 @@ public:
             if (stream.kind == ZStreamKind::Inflate) inflateEnd(&stream.host);
             else if (stream.kind == ZStreamKind::Deflate) deflateEnd(&stream.host);
         }
+        if (audio_initialized_) {
+            audio_shutdown();
+            audio_initialized_ = false;
+        }
         storage_shutdown();
     }
 
@@ -1125,14 +1137,23 @@ public:
         CreateDirectoryA(writable_path_.c_str(), nullptr);
 #endif
         storage_initialize(writable_path_.c_str());
-        const u32 stdin_handle = NewGuestFile(stdin, true, "stdin");
-        const u32 stdout_handle = NewGuestFile(stdout, true, "stdout");
-        const u32 stderr_handle = NewGuestFile(stderr, true, "stderr");
+        const std::filesystem::path executable_directory =
+            std::filesystem::path(apk_path_).parent_path();
+        const std::string executable_directory_string =
+            executable_directory.empty() ? std::string(".") : executable_directory.string();
+        audio_initialize(executable_directory_string.c_str());
+        audio_set_apk_path(apk_path_.c_str());
+        audio_initialized_ = true;
+        stdin_handle_ = NewGuestFile(stdin, true, "stdin", "rb");
+        stdout_handle_ = NewGuestFile(stdout, true, "stdout", "wb");
+        stderr_handle_ = NewGuestFile(stderr, true, "stderr", "wb");
+        if (!stdin_handle_ || !stdout_handle_ || !stderr_handle_)
+            throw std::runtime_error("could not allocate mapped guest stdio objects");
         for (const auto& object : runtime_.objects) {
             if (object.name == "__sF") {
-                env_.MemoryWrite32(object.address + 0u, stdin_handle);
-                env_.MemoryWrite32(object.address + 84u, stdout_handle);
-                env_.MemoryWrite32(object.address + 168u, stderr_handle);
+                env_.MemoryWrite32(object.address + 0u, stdin_handle_);
+                env_.MemoryWrite32(object.address + 84u, stdout_handle_);
+                env_.MemoryWrite32(object.address + 168u, stderr_handle_);
             }
         }
     }
@@ -2009,7 +2030,8 @@ private:
             const std::string path = RefString(arguments.Word());
             return static_cast<u32>(storage_file_exists(path.c_str()));
         }
-        if (name == "isBackgroundMusicPlaying") return background_music_playing_ ? 1u : 0u;
+        if (name == "isBackgroundMusicPlaying") return audio_is_background_playing() ? 1u : 0u;
+        if (name == "isEffectPlaying") return audio_is_effect_playing(arguments.Word()) ? 1u : 0u;
         return 0;
     }
     u32 DispatchJniInt(GuestRef* method, ArgCursor& arguments) {
@@ -2022,7 +2044,18 @@ private:
             return static_cast<u32>(storage_get_integer(key.c_str(), static_cast<s32>(arguments.Word())));
         }
         if (name == "getFontSizeAccordingHeight") return arguments.Word();
-        if (name == "playEffect") { (void)arguments.Word(); (void)arguments.Word(); return next_effect_id_++; }
+        if (name == "playEffect") {
+            const std::string path = RefString(arguments.Word());
+            const bool loop = arguments.Word() != 0;
+            const float pitch = arguments.FloatArgument();
+            const float pan = arguments.FloatArgument();
+            const float gain = arguments.FloatArgument();
+            (void)pitch;
+            (void)pan;
+            const u32 identifier = audio_play_effect(path.c_str(), loop ? 1 : 0);
+            if (identifier) audio_set_effect_volume(identifier, gain);
+            return identifier;
+        }
         return 0;
     }
     u32 DispatchJniFloat(GuestRef* method, ArgCursor& arguments) {
@@ -2032,9 +2065,9 @@ private:
         if (method->name == "getFloatForKey") {
             const std::string key = RefString(arguments.Word());
             result = storage_get_float(key.c_str(), arguments.FloatArgument());
-        } else if (method->name == "getBackgroundMusicVolume") result = background_volume_;
-        else if (method->name == "getEffectsVolume") result = effects_volume_;
-        else if (method->name == "getBackgroundMusicTime") result = 0.0f;
+        } else if (method->name == "getBackgroundMusicVolume") result = audio_get_background_volume();
+        else if (method->name == "getEffectsVolume") result = audio_get_effects_volume();
+        else if (method->name == "getBackgroundMusicTime") result = audio_get_background_time();
         return FloatToWord(result);
     }
     u64 DispatchJniDouble(GuestRef* method, ArgCursor& arguments) {
@@ -2083,18 +2116,33 @@ private:
         } else if (name == "playBackgroundMusic") {
             const std::string path = RefString(arguments.Word());
             const bool loop = arguments.Word() != 0;
-            background_music_playing_ = true;
-            log_ << "Audio stub: playBackgroundMusic " << path << " loop=" << loop << '\n';
-        } else if (name == "stopBackgroundMusic") background_music_playing_ = false;
-        else if (name == "pauseBackgroundMusic") background_music_playing_ = false;
-        else if (name == "resumeBackgroundMusic") background_music_playing_ = true;
-        else if (name == "setBackgroundMusicVolume") {
-            const u64 bits = arguments.U64();
-            background_volume_ = static_cast<float>(WordsToDouble(static_cast<u32>(bits), static_cast<u32>(bits >> 32)));
-        } else if (name == "setEffectsVolume") effects_volume_ = arguments.FloatArgument();
-        else if (name == "preloadBackgroundMusic" || name == "preloadEffect" || name == "unloadEffect") {
+            audio_play_background(path.c_str(), loop ? 1 : 0);
+        } else if (name == "stopBackgroundMusic") audio_stop_background();
+        else if (name == "pauseBackgroundMusic") audio_pause_background();
+        else if (name == "resumeBackgroundMusic") audio_resume_background();
+        else if (name == "rewindBackgroundMusic") audio_rewind_background();
+        else if (name == "resumeBackgroundMusicFrom") audio_resume_background_from(arguments.FloatArgument());
+        else if (name == "setBackgroundMusicTime") audio_set_background_time(arguments.FloatArgument());
+        else if (name == "setBackgroundMusicVolume") audio_set_background_volume(arguments.FloatArgument());
+        else if (name == "setEffectsVolume") audio_set_effects_volume(arguments.FloatArgument());
+        else if (name == "preloadBackgroundMusic") {
             const std::string path = RefString(arguments.Word());
-            log_ << "Audio stub: " << name << ' ' << path << '\n';
+            audio_preload_background(path.c_str());
+        } else if (name == "preloadEffect") {
+            const std::string path = RefString(arguments.Word());
+            audio_preload_effect(path.c_str());
+        } else if (name == "unloadEffect") {
+            const std::string path = RefString(arguments.Word());
+            audio_unload_effect(path.c_str());
+        } else if (name == "pauseAllEffects") audio_pause_all_effects();
+        else if (name == "resumeAllEffects") audio_resume_all_effects();
+        else if (name == "stopAllEffects") audio_stop_all_effects();
+        else if (name == "pauseEffect") audio_pause_effect(arguments.Word());
+        else if (name == "resumeEffect") audio_resume_effect(arguments.Word());
+        else if (name == "stopEffect") audio_stop_effect(arguments.Word());
+        else if (name == "setEffectVolume") {
+            const u32 identifier = arguments.Word();
+            audio_set_effect_volume(identifier, arguments.FloatArgument());
         } else if (name == "showMessageBox") {
             const std::string title = RefString(arguments.Word());
             const std::string text = RefString(arguments.Word());
@@ -2251,9 +2299,29 @@ private:
         cpu_.Regs()[1] = words.second;
     }
 
-    u32 NewGuestFile(std::FILE* stream, bool standard, const std::string& path) {
-        const u32 handle = 0x23000000u + next_file_id_++ * 0x100u;
-        files_[handle] = GuestFile{handle, stream, standard, path};
+    u16 GuestFileFlagsForMode(const std::string& mode) const {
+        const bool read = mode.find('r') != std::string::npos ||
+                          mode.find('+') != std::string::npos;
+        const bool write = mode.find('w') != std::string::npos ||
+                           mode.find('a') != std::string::npos ||
+                           mode.find('+') != std::string::npos;
+        if (read && write) return kBionicFileReadWriteFlag;
+        return write ? kBionicFileWriteFlag : kBionicFileReadFlag;
+    }
+    u32 NewGuestFile(std::FILE* stream, bool standard, const std::string& path,
+                     const std::string& mode) {
+        const u32 handle = AllocateAligned(kGuestFileObjectSize, 16u);
+        if (!handle) {
+            if (stream && !standard) std::fclose(stream);
+            return 0;
+        }
+        std::array<u8, kGuestFileObjectSize> layout{};
+        env_.WriteBytes(handle, layout.data(), layout.size());
+        env_.MemoryWrite16(handle + kBionicFileFlagsOffset, GuestFileFlagsForMode(mode));
+        env_.MemoryWrite16(handle + kBionicFileDescriptorOffset,
+                           static_cast<u16>(next_file_id_ & 0x7fffu));
+        files_[handle] = GuestFile{handle, stream, standard, path, mode};
+        ++next_file_id_;
         return handle;
     }
     GuestFile* FindGuestFile(u32 handle) {
@@ -2264,9 +2332,9 @@ private:
             if (object.name != "__sF") continue;
             if (handle >= object.address && handle < object.address + kPageSize) {
                 const u32 offset = handle - object.address;
-                if (offset < 84u) return FindGuestFile(0x23000100u);
-                if (offset < 168u) return FindGuestFile(0x23000200u);
-                return FindGuestFile(0x23000300u);
+                if (offset < 84u) return FindGuestFile(stdin_handle_);
+                if (offset < 168u) return FindGuestFile(stdout_handle_);
+                return FindGuestFile(stderr_handle_);
             }
         }
         return nullptr;
@@ -2306,7 +2374,7 @@ private:
         }
         log_ << "Dynarmic file open: " << guest_path << " -> " << host_path << " mode=" << mode << '\n';
         log_.flush();
-        return NewGuestFile(stream, false, host_path);
+        return NewGuestFile(stream, false, host_path, mode);
     }
     u32 ReadGuestFile(u32 destination, u32 element_size, u32 count, u32 handle) {
         GuestFile* file = FindGuestFile(handle);
@@ -2328,10 +2396,18 @@ private:
     }
     u32 CloseGuestFile(u32 handle) {
         auto found = files_.find(handle);
-        if (found == files_.end()) return static_cast<u32>(-1);
-        if (!found->second.standard && found->second.stream) std::fclose(found->second.stream);
+        if (found == files_.end()) {
+            log_ << "Dynarmic fclose ignored unknown guest FILE*=0x"
+                 << std::hex << handle << std::dec << '\n';
+            return static_cast<u32>(-1);
+        }
+        int close_result = 0;
+        if (!found->second.standard && found->second.stream)
+            close_result = std::fclose(found->second.stream);
+        const bool standard = found->second.standard;
         files_.erase(found);
-        return 0;
+        if (!standard) Free(handle);
+        return static_cast<u32>(close_result);
     }
 
     struct FormatCursor {
@@ -3298,6 +3374,9 @@ private:
     std::set<u32> unimplemented_jni_slots_;
     std::unordered_map<u32,GuestFile> files_;
     u32 next_file_id_=1;
+    u32 stdin_handle_=0;
+    u32 stdout_handle_=0;
+    u32 stderr_handle_=0;
     std::set<std::string> logged_file_failures_;
     u32 strtok_state_=0;
     std::unordered_map<u32,GuestZStream> zstreams_;
@@ -3310,10 +3389,7 @@ private:
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
     u64 logged_guest_stdio_=0;
-    bool background_music_playing_=false;
-    float background_volume_=1.0f;
-    float effects_volume_=1.0f;
-    u32 next_effect_id_=1;
+    bool audio_initialized_=false;
     u32 touch_ids_=0;
     u32 touch_xs_=0;
     u32 touch_ys_=0;
@@ -3358,11 +3434,20 @@ static void RunThumbSmoke() {
 
 } // namespace
 
+static std::ostream* g_runtime_log_stream = nullptr;
+
 extern "C" void runtime_log(const char* format, ...) {
     if (!format) return;
-    std::fprintf(stderr, "[storage] ");
-    va_list args; va_start(args,format); std::vfprintf(stderr,format,args); va_end(args);
-    std::fputc('\n',stderr);
+    std::array<char, 4096> buffer{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer.data(), buffer.size(), format, args);
+    va_end(args);
+    std::cerr << "[host] " << buffer.data() << '\n';
+    if (g_runtime_log_stream) {
+        *g_runtime_log_stream << "[host] " << buffer.data() << '\n';
+        g_runtime_log_stream->flush();
+    }
 }
 
 int main(int argc,char** argv) {
@@ -3373,13 +3458,14 @@ int main(int argc,char** argv) {
             log_path = std::string(argument.substr(6));
     }
     std::ofstream log_file(log_path,std::ios::trunc);
+    g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest6");
-        emit("Milestone: reclaiming Dynarmic guest heap and level-start bad_alloc fix");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest7");
+        emit("Milestone: mapped guest FILE objects, persistent save stability, and Windows audio bridge");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest6 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest7 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -3436,7 +3522,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP6_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP7_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -3520,7 +3606,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test6 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test7 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -3537,11 +3623,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP6_OK");
+        emit("RESULT: DYNARMIC_BRINGUP7_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP6_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP7_FAILED");
         return 1;
     }
 }

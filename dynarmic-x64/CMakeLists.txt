@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashDynarmicTest6 LANGUAGES C CXX)
+project(GeometryDashDynarmicTest7 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -26,6 +26,10 @@ set(GD_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 add_executable(GeometryDashDynarmicProbe
     "${GD_ROOT}/src/dynarmic_probe.cpp"
     "${GD_ROOT}/src/storage_win.c"
+    "${GD_ROOT}/src/audio_win.c"
+    "${GD_ROOT}/src/apk_extract_audio.c"
+    "${GD_ROOT}/src/embedded_effects_stub.c"
+    "${GD_ROOT}/third_party/stb/stb_vorbis.c"
     "${GD_ROOT}/third_party/zlib/adler32.c"
     "${GD_ROOT}/third_party/zlib/compress.c"
     "${GD_ROOT}/third_party/zlib/crc32.c"
@@ -47,6 +51,7 @@ target_compile_definitions(GeometryDashDynarmicProbe PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
+    _WIN32_WINNT=0x0600
     crc32=gd_z_crc32
 )
 target_compile_options(GeometryDashDynarmicProbe PRIVATE
@@ -59,6 +64,8 @@ target_link_libraries(GeometryDashDynarmicProbe PRIVATE
     opengl32
     user32
     gdi32
+    winmm
+    ole32
 )
 
 set_target_properties(GeometryDashDynarmicProbe PROPERTIES
