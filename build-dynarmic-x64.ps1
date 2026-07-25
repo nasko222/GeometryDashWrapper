@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest2-fix1"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest3-fix1"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -391,6 +391,24 @@ Invoke-External -FilePath $CMakeExe -Arguments @(
     "-DCMAKE_BUILD_TYPE=Release"
 )
 [IO.File]::WriteAllText($Stamp, $BuilderRevision, [Text.Encoding]::ASCII)
+
+# ZIP extraction can preserve source timestamps older than an existing Ninja object.
+# In that case Ninja may incorrectly reuse a stale probe executable even though the
+# source contents changed. Refresh only the wrapper probe sources before building;
+# Dynarmic's 173-object static library remains cached.
+Write-Host "Refreshing Dynarmic probe source timestamps to prevent stale Ninja output"
+$ProbeSourcesToRefresh = @(
+    (Join-Path $Root "src\dynarmic_probe.cpp"),
+    (Join-Path $Root "src\storage_win.c"),
+    (Join-Path $Root "dynarmic-x64\CMakeLists.txt")
+)
+$RefreshTime = Get-Date
+foreach ($ProbeSource in $ProbeSourcesToRefresh) {
+    if (Test-Path -LiteralPath $ProbeSource) {
+        [IO.File]::SetLastWriteTime($ProbeSource, $RefreshTime)
+    }
+}
+
 Invoke-External -FilePath $CMakeExe -Arguments @("--build", $BuildDir, "--parallel")
 
 $ProbeMatches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashDynarmicProbe.exe" -File -Recurse)
@@ -407,22 +425,37 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
+$Test3Notes = Join-Path $Root "DYNARMICTEST3-NOTES.md"
+if (Test-Path $Test3Notes) { Copy-Item -Force $Test3Notes (Join-Path $Output "DYNARMICTEST3-NOTES.md") }
+$Test3Fix1Notes = Join-Path $Root "DYNARMICTEST3-FIX1.md"
+if (Test-Path $Test3Fix1Notes) { Copy-Item -Force $Test3Fix1Notes (Join-Path $Output "DYNARMICTEST3-FIX1.md") }
+New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $Launcher = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-GeometryDashDynarmicProbe.exe game.apk
+GeometryDashDynarmicProbe.exe game.apk --frames=180 --log=gd-dynarmic-first-frame.log
 set "RESULT=%ERRORLEVEL%"
 echo.
-if not "%RESULT%"=="0" echo Dynarmic bring-up probe failed. See gd-dynarmic-probe.log.
-if "%RESULT%"=="0" echo Dynarmic x64 milestone 2 fix 1 passed. See gd-dynarmic-probe.log.
+if not "%RESULT%"=="0" echo Dynarmic first-frame bring-up failed. See gd-dynarmic-first-frame.log.
+if "%RESULT%"=="0" echo Dynarmic x64 milestone 3 fix 1 first-frame test passed. See gd-dynarmic-first-frame.log.
 pause
 exit /b %RESULT%
 '@
-[IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE.cmd"), $Launcher, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_FIRST_FRAME.cmd"), $Launcher, [Text.Encoding]::ASCII)
+$ProbeLauncher = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+GeometryDashDynarmicProbe.exe game.apk --probe-only --log=gd-dynarmic-probe-only.log
+set "RESULT=%ERRORLEVEL%"
+pause
+exit /b %RESULT%
+'@
+[IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE_ONLY.cmd"), $ProbeLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 milestone 2 fix 1 probe ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 milestone 3 fix 1 first-frame build ready:" -ForegroundColor Green
 Write-Host "  $Output"
-Write-Host "Run RUN_DYNARMIC_PROBE.cmd"
+Write-Host "Run RUN_DYNARMIC_FIRST_FRAME.cmd"

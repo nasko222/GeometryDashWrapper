@@ -1,3 +1,0 @@
-Copy this folder's contents into the root of an existing 0.9.4-arm-dynarmictest1 source tree and replace files.
-Then run BUILD_DYNARMIC_X64.cmd.
-The cached Dynarmic/Boost/Zig/CMake/Ninja toolchain is reused.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashDynarmicBringup2Fix1 LANGUAGES C CXX)
+project(GeometryDashDynarmicTest3 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -25,6 +25,7 @@ set(GD_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
 add_executable(GeometryDashDynarmicProbe
     "${GD_ROOT}/src/dynarmic_probe.cpp"
+    "${GD_ROOT}/src/storage_win.c"
     "${GD_ROOT}/third_party/zlib/adler32.c"
     "${GD_ROOT}/third_party/zlib/compress.c"
     "${GD_ROOT}/third_party/zlib/crc32.c"
@@ -39,6 +40,7 @@ add_executable(GeometryDashDynarmicProbe
 )
 
 target_include_directories(GeometryDashDynarmicProbe PRIVATE
+    "${GD_ROOT}/src"
     "${GD_ROOT}/third_party/zlib"
 )
 target_compile_definitions(GeometryDashDynarmicProbe PRIVATE
@@ -52,7 +54,12 @@ target_compile_options(GeometryDashDynarmicProbe PRIVATE
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
 )
-target_link_libraries(GeometryDashDynarmicProbe PRIVATE dynarmic)
+target_link_libraries(GeometryDashDynarmicProbe PRIVATE
+    dynarmic
+    opengl32
+    user32
+    gdi32
+)
 
 set_target_properties(GeometryDashDynarmicProbe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/probe-output"

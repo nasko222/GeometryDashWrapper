@@ -1,6 +1,6 @@
 # Dynarmic x64 branch
 
-The current experimental milestone is **0.9.4-arm-dynarmictest2-fix1**. Build it with `BUILD_DYNARMIC_X64.cmd`, not the older `BUILD_WINDOWS.cmd`. Git for Windows is used only for a non-interactive checkout of the public GitLab Dynarmic mirror at pinned commit `a41c380246d3`; no GitHub sign-in is required. Zig/CMake/Ninja remain portable. This first x64 milestone is a backend/ELF bring-up probe, not yet a playable game; see `DYNARMICTEST1-NOTES.md`.
+The current experimental milestone is **0.9.4-arm-dynarmictest3-fix1**. Build it with `BUILD_DYNARMIC_X64.cmd`, not the older `BUILD_WINDOWS.cmd`. Git for Windows is used only for a non-interactive checkout of the public GitLab Dynarmic mirror at pinned commit `a41c380246d3`; no GitHub sign-in is required. Zig/CMake/Ninja remain portable. Test3 Fix1 executes `nativeSetPaths`, `nativeInit`, and a guarded `nativeRender` loop in a real Win32 OpenGL window. It removes the false 500-million-tick `nativeInit` cutoff, uses wall-clock safety guards, writes separate first-frame/probe logs, and reports PC/LR/symbol/recent-trap/top-import state if guest execution actually stalls; see `DYNARMICTEST3-FIX1.md`. It is still an iterative first-frame milestone, not yet the stable gameplay wrapper.
 
 ---
 
@@ -45,6 +45,6 @@ The Dynarmic x64 builder automatically handles the vendored fmt 10.1
 `<__std_stream>` incompatibility in Zig 0.14.1. No libc++ or fmt installation is
 required.
 
-## DynarmicTest2 fix 1
+## DynarmicTest3
 
-This revision changes callback traps from tick-counter polling to Dynarmic's explicit JIT halt mechanism. It also prints the exact execution failure to the console. See `DYNARMICTEST2-FIX1.md`.
+This revision connects the proven Dynarmic execution core to JNI, files, zlib, storage, Win32 OpenGL, `nativeInit`, and `nativeRender`. Run `RUN_DYNARMIC_FIRST_FRAME.cmd`; see `DYNARMICTEST3-NOTES.md`.
