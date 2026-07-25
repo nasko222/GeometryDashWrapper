@@ -51,6 +51,27 @@ def write_launchers(output: Path) -> None:
             "GeometryDashArmWrapper.exe --apk=game.apk\r\n"
             "if errorlevel 1 pause\r\n"
         ),
+        "RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo WARNING: particle compatibility hooks are disabled.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --no-particle-guards\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
+        "RUN_PROFILE_IMPORT_TIME.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Diagnostic callback-timing run; test one heavy section.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --profile-import-time\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
+        "RUN_PROFILE_ARM_BLOCKS.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Diagnostic ARM block profiler; test one heavy section.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
         "RUN_ARM_PROBE.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
@@ -119,7 +140,7 @@ def main() -> int:
         *sorted((root / "third_party/zlib").glob("*.c")),
     ]
     command = [
-        str(zig), "cc", "-target", "x86-windows-gnu", "-std=c11", "-O2",
+        str(zig), "cc", "-target", "x86-windows-gnu", "-std=c11", "-O3",
         "-Wall", "-Wextra", "-Wno-cast-function-type",
         "-Wno-deprecated-non-prototype", "-mstackrealign",
         "-Dcrc32=gd_z_crc32",
@@ -141,13 +162,15 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap15\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest1\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
-        "RUN_ARM_NATIVE_BOOT.cmd. Bootstrap15 keeps bootstrap14's corruption "
-        "and save protections while testing direct host-backed guest RAM, "
-        "direct OpenGL client arrays, direct zlib buffers, cached APK members, "
-        "fast import dispatch, guest-side pthread no-op stubs, and persistent "
-        "pre-opened MCI effect voices. Deep parser hooks are disabled by "
+        "RUN_ARM_NATIVE_BOOT.cmd. PerformanceTest1 keeps bootstrap15's corruption "
+        "and save protections while testing Unicorn's flat virtual TLB, a 256 MiB "
+        "translation cache, cached OpenGL function pointers, direct VBO uploads, "
+        "redundant bind suppression, narrower register reads, and fast math/import "
+        "dispatch. The import-time and ARM-block profiling launchers add overhead "
+        "but reveal expensive bridge callbacks and hot guest code addresses. "
+        "Deep parser hooks are disabled by "
         "default; use --deep-diagnostics only for corruption investigation. "
         "Send the complete gd-arm-wrapper.log after menu load, Clutterfunk, "
         "Xstep, Cycles, editor load/save, repeated deaths, and audio timing.\n",

@@ -1,0 +1,9 @@
+Geometry Dash ARM Wrapper performancetest1 source update
+
+Copy this folder's CONTENTS over a complete bootstrap15 full-source tree and allow files to be replaced.
+Then run BUILD_WINDOWS.cmd or:
+
+powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+
+The output folder is dist-arm-wrapper-performancetest1.
+Use RUN_ARM_NATIVE_BOOT.cmd for the normal FPS test. Profiling launchers intentionally add overhead.

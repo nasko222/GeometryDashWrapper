@@ -5,7 +5,7 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host. Bootstrap15 maps guest RAM
+ * complete nativeInit/nativeRender lifecycle host. PerformanceTest1 maps guest RAM
  * onto host-owned backing memory so bridge operations can avoid expensive
  * per-call Unicorn memory copies while preserving the ARM execution model.
  */
@@ -51,6 +51,7 @@
 #define GUEST_CALLBACK_RETURN (GUEST_RETURN_BASE + 0x00000004u)
 #define GUEST_IMPORT_BASE 0x0f000000u
 #define GUEST_IMPORT_SIZE 0x00100000u
+#define GUEST_TCG_BUFFER_SIZE (256u * 1024u * 1024u)
 #define GUEST_OBJECT_BASE 0x20000000u
 #define GUEST_OBJECT_SIZE 0x00400000u
 #define GUEST_HEAP_BASE 0x30000000u
@@ -66,6 +67,7 @@
 #define GUEST_KUSER_SIZE 0x00010000u
 
 #define MAX_IMPORTS 4096
+#define MAX_BLOCK_PROFILE_ENTRIES 65536u
 #define MAX_OBJECTS 256
 #define MAX_ALLOCS 1048576
 #define MAX_STRING 65536
@@ -74,6 +76,7 @@
 #define MAX_GUEST_REFS 4096
 #define MAX_GUEST_FILES 256
 #define MAX_APK_MEMBER_CACHE 512
+#define MAX_APK_INDEX_ENTRIES 65535u
 #define MAX_APK_MEMBER_CACHE_BYTES (256u * 1024u * 1024u)
 #define MAX_GUEST_ZSTREAMS 64
 #define MAX_REGISTERED_NATIVES 512
@@ -129,14 +132,41 @@ typedef enum {
     IMPORT_PTHREAD_NOOP,
     IMPORT_LRAND48,
     IMPORT_FREAD,
+    IMPORT_SIN,
+    IMPORT_COS,
+    IMPORT_ACOS,
+    IMPORT_ATAN2,
+    IMPORT_POW,
+    IMPORT_FMOD,
+    IMPORT_AEABI_UIDIV,
+    IMPORT_AEABI_IDIV,
+    IMPORT_AEABI_UIDIVMOD,
+    IMPORT_AEABI_IDIVMOD,
     IMPORT_OPENGL
 } ArmImportKind;
+
+typedef enum {
+    ARM_GL_SPECIAL_NONE = 0,
+    ARM_GL_SPECIAL_BIND_BUFFER,
+    ARM_GL_SPECIAL_ENABLE_ATTRIB,
+    ARM_GL_SPECIAL_DISABLE_ATTRIB,
+    ARM_GL_SPECIAL_VERTEX_ATTRIB_POINTER,
+    ARM_GL_SPECIAL_DRAW_ARRAYS,
+    ARM_GL_SPECIAL_DRAW_ELEMENTS,
+    ARM_GL_SPECIAL_BUFFER_DATA,
+    ARM_GL_SPECIAL_BUFFER_SUB_DATA,
+    ARM_GL_SPECIAL_DELETE_BUFFERS,
+    ARM_GL_SPECIAL_UNIFORM_VECTOR
+} ArmGlSpecial;
 
 typedef struct {
     char *name;
     uint32_t address;
     unsigned calls;
     ArmImportKind kind;
+    PROC host_function;
+    unsigned char gl_argument_count;
+    unsigned char gl_special;
 } ArmImport;
 
 typedef struct {
@@ -146,6 +176,12 @@ typedef struct {
     int direct_write;
     int owned;
 } GuestMemoryRegion;
+
+typedef struct {
+    uint32_t address;
+    uint32_t size;
+    uint64_t calls;
+} ArmBlockProfileEntry;
 
 #define MAX_GUEST_MEMORY_REGIONS 9
 
@@ -198,6 +234,16 @@ typedef struct {
     size_t size;
     uint64_t hits;
 } ApkMemberCacheEntry;
+
+typedef struct {
+    char *name;
+    uint32_t data_offset;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint32_t expected_crc;
+    uint16_t method;
+    uint16_t flags;
+} ApkIndexEntry;
 
 typedef enum {
     GUEST_ZSTREAM_NONE = 0,
@@ -342,10 +388,18 @@ typedef struct {
     uint64_t direct_memory_reads;
     uint64_t direct_memory_writes;
     int deep_diagnostics;
+    int disable_particle_guards;
+    int profile_import_timing;
+    int profile_arm_blocks;
+    LARGE_INTEGER profile_import_frequency;
+    ArmBlockProfileEntry *block_profile_entries;
+    uint64_t profile_block_dropped;
     unsigned char *file_data;
     size_t file_size;
     unsigned char *apk_data;
     size_t apk_size;
+    ApkIndexEntry *apk_index;
+    unsigned apk_index_count;
     unsigned char *image_data;
     int image_data_virtual;
     uint32_t image_size;
@@ -373,6 +427,10 @@ typedef struct {
     size_t apk_member_cache_bytes;
     uint64_t apk_member_cache_hits;
     uint64_t apk_member_cache_misses;
+    uint64_t zip_accel_get_hits;
+    uint64_t zip_accel_exist_hits;
+    uint64_t zip_accel_misses;
+    uint64_t zip_accel_fallbacks;
     GuestZStream zstreams[MAX_GUEST_ZSTREAMS];
     unsigned zstream_count;
     RegisteredNative natives[MAX_REGISTERED_NATIVES];
@@ -388,6 +446,8 @@ typedef struct {
     uint32_t tm_zone_storage;
     uint32_t gl_array_buffer_binding;
     uint32_t gl_element_array_buffer_binding;
+    PROC gl_bind_buffer_function;
+    PROC gl_vertex_attrib_pointer_function;
     GuestGlVertexAttrib gl_vertex_attribs[MAX_GL_VERTEX_ATTRIBS];
     unsigned char *gl_client_buffers[MAX_GL_VERTEX_ATTRIBS];
     size_t gl_client_buffer_capacities[MAX_GL_VERTEX_ATTRIBS];
@@ -449,6 +509,10 @@ typedef struct {
     uint64_t profile_gl_client_copies;
     uint64_t profile_gl_direct_arrays;
     uint64_t profile_gl_client_bytes;
+    uint64_t profile_gl_proc_cache_hits;
+    uint64_t profile_gl_proc_cache_misses;
+    uint64_t profile_gl_redundant_binds;
+    uint64_t profile_gl_direct_uploads;
     uint64_t profile_alloc_calls;
     uint64_t profile_alloc_bytes;
     uint64_t profile_free_calls;
@@ -461,6 +525,7 @@ typedef struct {
     uint64_t profile_frames_over_50ms;
     unsigned profile_slow_native_logs;
     unsigned profile_import_baseline[MAX_IMPORTS];
+    uint64_t profile_import_ticks[MAX_IMPORTS];
     uint64_t profile_direct_read_baseline;
     uint64_t profile_direct_write_baseline;
     uint64_t profile_apk_cache_hit_baseline;
@@ -828,6 +893,164 @@ static int apk_extract_one(const unsigned char *apk, size_t apk_size,
     return 0;
 }
 
+static int apk_index_compare(const void *left, const void *right) {
+    const ApkIndexEntry *first = (const ApkIndexEntry *)left;
+    const ApkIndexEntry *second = (const ApkIndexEntry *)right;
+    return strcmp(first->name, second->name);
+}
+
+static const ApkIndexEntry *apk_index_find(const ArmProbe *probe,
+                                            const char *member_name) {
+    unsigned low = 0;
+    unsigned high;
+    if (!probe || !probe->apk_index || !member_name) return NULL;
+    high = probe->apk_index_count;
+    while (low < high) {
+        unsigned middle = low + (high - low) / 2u;
+        int comparison = strcmp(member_name, probe->apk_index[middle].name);
+        if (!comparison) return &probe->apk_index[middle];
+        if (comparison < 0) high = middle;
+        else low = middle + 1u;
+    }
+    return NULL;
+}
+
+static int apk_build_index(ArmProbe *probe) {
+    size_t eocd;
+    size_t search_limit;
+    size_t central;
+    uint16_t entries;
+    uint16_t entry_index;
+    ApkIndexEntry *index;
+    if (!probe || !probe->apk_data || probe->apk_size < 22u) return 0;
+    eocd = probe->apk_size - 22u;
+    search_limit = eocd > 0xffffu ? eocd - 0xffffu : 0u;
+    for (;;) {
+        if (range_valid(eocd, 22u, probe->apk_size) &&
+            read_u32_host(probe->apk_data + eocd) == 0x06054b50u)
+            break;
+        if (eocd == search_limit) return 0;
+        --eocd;
+    }
+    if (read_u16_host(probe->apk_data + eocd + 4u) != 0u ||
+        read_u16_host(probe->apk_data + eocd + 6u) != 0u)
+        return 0;
+    entries = read_u16_host(probe->apk_data + eocd + 10u);
+    if (!entries) return 0;
+    central = read_u32_host(probe->apk_data + eocd + 16u);
+    if (!range_valid(central,
+                     read_u32_host(probe->apk_data + eocd + 12u),
+                     probe->apk_size))
+        return 0;
+    index = (ApkIndexEntry *)calloc(entries, sizeof(*index));
+    if (!index) return 0;
+    for (entry_index = 0; entry_index < entries; ++entry_index) {
+        uint16_t name_length;
+        uint16_t extra_length;
+        uint16_t comment_length;
+        uint32_t local_offset;
+        size_t entry_size;
+        size_t data_offset;
+        if (!range_valid(central, 46u, probe->apk_size) ||
+            read_u32_host(probe->apk_data + central) != 0x02014b50u)
+            goto failed;
+        name_length = read_u16_host(probe->apk_data + central + 28u);
+        extra_length = read_u16_host(probe->apk_data + central + 30u);
+        comment_length = read_u16_host(probe->apk_data + central + 32u);
+        entry_size = 46u + name_length + extra_length + comment_length;
+        if (!name_length || !range_valid(central, entry_size, probe->apk_size))
+            goto failed;
+        index[entry_index].name = (char *)malloc((size_t)name_length + 1u);
+        if (!index[entry_index].name) goto failed;
+        memcpy(index[entry_index].name, probe->apk_data + central + 46u,
+               name_length);
+        index[entry_index].name[name_length] = 0;
+        index[entry_index].flags =
+            read_u16_host(probe->apk_data + central + 8u);
+        index[entry_index].method =
+            read_u16_host(probe->apk_data + central + 10u);
+        index[entry_index].expected_crc =
+            read_u32_host(probe->apk_data + central + 16u);
+        index[entry_index].compressed_size =
+            read_u32_host(probe->apk_data + central + 20u);
+        index[entry_index].uncompressed_size =
+            read_u32_host(probe->apk_data + central + 24u);
+        local_offset = read_u32_host(probe->apk_data + central + 42u);
+        if (!range_valid(local_offset, 30u, probe->apk_size) ||
+            read_u32_host(probe->apk_data + local_offset) != 0x04034b50u)
+            goto failed;
+        data_offset = (size_t)local_offset + 30u +
+                      read_u16_host(probe->apk_data + local_offset + 26u) +
+                      read_u16_host(probe->apk_data + local_offset + 28u);
+        if (data_offset > UINT32_MAX ||
+            !range_valid(data_offset, index[entry_index].compressed_size,
+                         probe->apk_size))
+            goto failed;
+        index[entry_index].data_offset = (uint32_t)data_offset;
+        central += entry_size;
+    }
+    qsort(index, entries, sizeof(*index), apk_index_compare);
+    probe->apk_index = index;
+    probe->apk_index_count = entries;
+    probe_log("ARM APK central-directory index ready: entries=%u", entries);
+    return 1;
+
+failed:
+    for (entry_index = 0; entry_index < entries; ++entry_index)
+        free(index[entry_index].name);
+    free(index);
+    return 0;
+}
+
+static int apk_extract_indexed(ArmProbe *probe, const ApkIndexEntry *entry,
+                               unsigned char **output,
+                               size_t *output_size) {
+    unsigned char *payload;
+    int inflate_result;
+    if (!probe || !entry || !output || !output_size ||
+        (entry->flags & 1u) != 0u ||
+        (entry->method != 0u && entry->method != 8u) ||
+        !entry->uncompressed_size)
+        return 0;
+    payload = (unsigned char *)malloc(entry->uncompressed_size);
+    if (!payload) return 0;
+    if (entry->method == 0u) {
+        if (entry->compressed_size != entry->uncompressed_size) {
+            free(payload);
+            return 0;
+        }
+        memcpy(payload, probe->apk_data + entry->data_offset,
+               entry->uncompressed_size);
+    } else {
+        z_stream stream;
+        memset(&stream, 0, sizeof(stream));
+        stream.next_in = (Bytef *)(probe->apk_data + entry->data_offset);
+        stream.avail_in = entry->compressed_size;
+        stream.next_out = payload;
+        stream.avail_out = entry->uncompressed_size;
+        inflate_result = inflateInit2(&stream, -MAX_WBITS);
+        if (inflate_result == Z_OK) {
+            inflate_result = inflate(&stream, Z_FINISH);
+            inflateEnd(&stream);
+        }
+        if (inflate_result != Z_STREAM_END ||
+            stream.total_out != entry->uncompressed_size) {
+            free(payload);
+            return 0;
+        }
+    }
+    if ((uint32_t)crc32(crc32(0L, Z_NULL, 0), payload,
+                        entry->uncompressed_size) != entry->expected_crc) {
+        free(payload);
+        return 0;
+    }
+    *output = payload;
+    *output_size = entry->uncompressed_size;
+    probe_log("Loaded %s through indexed APK lookup (%u bytes)",
+              entry->name, entry->uncompressed_size);
+    return 1;
+}
+
 static int load_arm_input(const char *path, unsigned char **data,
                           size_t *size, unsigned char **apk_data,
                           size_t *apk_size) {
@@ -909,9 +1132,16 @@ static int apk_extract_member_cached(ArmProbe *probe,
         }
     }
     ++probe->apk_member_cache_misses;
-    if (!apk_extract_one(probe->apk_data, probe->apk_size, member_name,
-                         &payload, &payload_size))
-        return 0;
+    {
+        const ApkIndexEntry *indexed = apk_index_find(probe, member_name);
+        if (indexed) {
+            if (!apk_extract_indexed(probe, indexed, &payload, &payload_size))
+                return 0;
+        } else if (!apk_extract_one(probe->apk_data, probe->apk_size,
+                                    member_name, &payload, &payload_size)) {
+            return 0;
+        }
+    }
     if (probe->apk_member_cache_count < MAX_APK_MEMBER_CACHE &&
         payload_size <= MAX_APK_MEMBER_CACHE_BYTES -
                             probe->apk_member_cache_bytes) {
@@ -1041,8 +1271,46 @@ static ArmImportKind classify_import(const char *name) {
         return IMPORT_PTHREAD_NOOP;
     if (strcmp(name, "lrand48") == 0) return IMPORT_LRAND48;
     if (strcmp(name, "fread") == 0) return IMPORT_FREAD;
+    if (strcmp(name, "sin") == 0) return IMPORT_SIN;
+    if (strcmp(name, "cos") == 0) return IMPORT_COS;
+    if (strcmp(name, "acos") == 0) return IMPORT_ACOS;
+    if (strcmp(name, "atan2") == 0) return IMPORT_ATAN2;
+    if (strcmp(name, "pow") == 0) return IMPORT_POW;
+    if (strcmp(name, "fmod") == 0) return IMPORT_FMOD;
+    if (strcmp(name, "__aeabi_uidiv") == 0) return IMPORT_AEABI_UIDIV;
+    if (strcmp(name, "__aeabi_idiv") == 0) return IMPORT_AEABI_IDIV;
+    if (strcmp(name, "__aeabi_uidivmod") == 0)
+        return IMPORT_AEABI_UIDIVMOD;
+    if (strcmp(name, "__aeabi_idivmod") == 0)
+        return IMPORT_AEABI_IDIVMOD;
     if (name[0] == 'g' && name[1] == 'l') return IMPORT_OPENGL;
     return IMPORT_SLOW;
+}
+
+static ArmGlSpecial classify_gl_special(const char *name) {
+    if (!name) return ARM_GL_SPECIAL_NONE;
+    if (strcmp(name, "glBindBuffer") == 0)
+        return ARM_GL_SPECIAL_BIND_BUFFER;
+    if (strcmp(name, "glEnableVertexAttribArray") == 0)
+        return ARM_GL_SPECIAL_ENABLE_ATTRIB;
+    if (strcmp(name, "glDisableVertexAttribArray") == 0)
+        return ARM_GL_SPECIAL_DISABLE_ATTRIB;
+    if (strcmp(name, "glVertexAttribPointer") == 0)
+        return ARM_GL_SPECIAL_VERTEX_ATTRIB_POINTER;
+    if (strcmp(name, "glDrawArrays") == 0)
+        return ARM_GL_SPECIAL_DRAW_ARRAYS;
+    if (strcmp(name, "glDrawElements") == 0)
+        return ARM_GL_SPECIAL_DRAW_ELEMENTS;
+    if (strcmp(name, "glBufferData") == 0)
+        return ARM_GL_SPECIAL_BUFFER_DATA;
+    if (strcmp(name, "glBufferSubData") == 0)
+        return ARM_GL_SPECIAL_BUFFER_SUB_DATA;
+    if (strcmp(name, "glDeleteBuffers") == 0)
+        return ARM_GL_SPECIAL_DELETE_BUFFERS;
+    if (strncmp(name, "glUniform", 9) == 0 &&
+        (strstr(name, "fv") || strstr(name, "iv")))
+        return ARM_GL_SPECIAL_UNIFORM_VECTOR;
+    return ARM_GL_SPECIAL_NONE;
 }
 
 static uint32_t ensure_import(ArmProbe *probe, const char *name) {
@@ -1056,6 +1324,10 @@ static uint32_t ensure_import(ArmProbe *probe, const char *name) {
     probe->imports[index].name = copy_string(name);
     probe->imports[index].address = GUEST_IMPORT_BASE + index * 4u + 1u;
     probe->imports[index].kind = classify_import(name);
+    probe->imports[index].host_function = NULL;
+    probe->imports[index].gl_argument_count = 0xffu;
+    probe->imports[index].gl_special =
+        (unsigned char)classify_gl_special(name);
     return probe->imports[index].address;
 }
 
@@ -4344,6 +4616,23 @@ static void *guest_buffer_copy(ArmProbe *probe, uint32_t address, size_t size) {
     return buffer;
 }
 
+static const void *guest_buffer_view(ArmProbe *probe, uint32_t address,
+                                     size_t size, void **owned) {
+    GuestMemoryRegion *region;
+    if (owned) *owned = NULL;
+    if (!address || !size) return NULL;
+    region = guest_memory_region(probe, address, size);
+    if (region) {
+        ++probe->direct_memory_reads;
+        return region->host + (size_t)(address - region->base);
+    }
+    if (owned) {
+        *owned = guest_buffer_copy(probe, address, size);
+        return *owned;
+    }
+    return NULL;
+}
+
 static size_t gl_vertex_element_bytes(uint32_t components, uint32_t type) {
     size_t component_size;
     if (components < 1u || components > 4u) return 0;
@@ -4371,8 +4660,16 @@ static size_t gl_vertex_element_bytes(uint32_t components, uint32_t type) {
 
 static int gl_prepare_client_arrays(ArmProbe *probe, uint32_t vertex_limit,
                                     void **copies, unsigned *prepared_count) {
-    PROC vertex_pointer = resolve_gl(probe, "glVertexAttribPointer");
-    PROC bind_buffer = resolve_gl(probe, "glBindBuffer");
+    PROC vertex_pointer = probe->gl_vertex_attrib_pointer_function;
+    PROC bind_buffer = probe->gl_bind_buffer_function;
+    if (!vertex_pointer) {
+        vertex_pointer = resolve_gl(probe, "glVertexAttribPointer");
+        probe->gl_vertex_attrib_pointer_function = vertex_pointer;
+    }
+    if (!bind_buffer) {
+        bind_buffer = resolve_gl(probe, "glBindBuffer");
+        probe->gl_bind_buffer_function = bind_buffer;
+    }
     unsigned index;
     if (prepared_count) *prepared_count = 0;
     if (!vertex_limit) return 1;
@@ -4470,11 +4767,20 @@ static uint32_t gl_index_vertex_limit(const void *indices, uint32_t count,
     return count && maximum != UINT32_MAX ? maximum + 1u : 0;
 }
 
-static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
+static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
                             uint32_t r0, uint32_t r1, uint32_t r2,
                             uint32_t r3, uint32_t sp) {
+    const char *name = import->name;
+    ArmGlSpecial special = (ArmGlSpecial)import->gl_special;
     uint32_t arguments[9] = {0};
-    unsigned count = gl_argument_count(name);
+    unsigned count;
+    if (import->gl_argument_count == 0xffu) {
+        count = gl_argument_count(name);
+        import->gl_argument_count = count <= 9u ? (unsigned char)count : 0xfeu;
+    } else {
+        count = import->gl_argument_count == 0xfeu
+                    ? UINT32_MAX : import->gl_argument_count;
+    }
     unsigned index;
     PROC function;
     if (count == UINT32_MAX) {
@@ -4490,26 +4796,39 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         if (clear_depth) clear_depth((double)bits_float(r0));
         return 0;
     }
-    function = resolve_gl(probe, name);
+    function = import->host_function;
+    if (function) {
+        ++probe->profile_gl_proc_cache_hits;
+    } else {
+        function = resolve_gl(probe, name);
+        import->host_function = function;
+        ++probe->profile_gl_proc_cache_misses;
+    }
     if (!function) {
         probe_log("OpenGL host function unavailable: %s", name);
         return 0;
     }
-    if (strcmp(name, "glBindBuffer") == 0) {
+    if (special == ARM_GL_SPECIAL_BIND_BUFFER) {
+        uint32_t *binding = NULL;
         if (arguments[0] == 0x8892u) /* GL_ARRAY_BUFFER */
-            probe->gl_array_buffer_binding = arguments[1];
+            binding = &probe->gl_array_buffer_binding;
         else if (arguments[0] == 0x8893u) /* GL_ELEMENT_ARRAY_BUFFER */
-            probe->gl_element_array_buffer_binding = arguments[1];
+            binding = &probe->gl_element_array_buffer_binding;
+        if (binding && *binding == arguments[1]) {
+            ++probe->profile_gl_redundant_binds;
+            return 0;
+        }
+        if (binding) *binding = arguments[1];
         return call_gl_raw(function, arguments, 2);
     }
-    if (strcmp(name, "glEnableVertexAttribArray") == 0 ||
-        strcmp(name, "glDisableVertexAttribArray") == 0) {
+    if (special == ARM_GL_SPECIAL_ENABLE_ATTRIB ||
+        special == ARM_GL_SPECIAL_DISABLE_ATTRIB) {
         if (arguments[0] < MAX_GL_VERTEX_ATTRIBS)
             probe->gl_vertex_attribs[arguments[0]].enabled =
-                strcmp(name, "glEnableVertexAttribArray") == 0;
+                special == ARM_GL_SPECIAL_ENABLE_ATTRIB;
         return call_gl_raw(function, arguments, 1);
     }
-    if (strcmp(name, "glVertexAttribPointer") == 0) {
+    if (special == ARM_GL_SPECIAL_VERTEX_ATTRIB_POINTER) {
         if (arguments[0] < MAX_GL_VERTEX_ATTRIBS) {
             GuestGlVertexAttrib *attribute =
                 &probe->gl_vertex_attribs[arguments[0]];
@@ -4531,7 +4850,7 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         }
         return call_gl_raw(function, arguments, 6);
     }
-    if (strcmp(name, "glDrawArrays") == 0) {
+    if (special == ARM_GL_SPECIAL_DRAW_ARRAYS) {
         void *copies[MAX_GL_VERTEX_ATTRIBS] = {0};
         int32_t first = (int32_t)arguments[1];
         int32_t draw_count = (int32_t)arguments[2];
@@ -4556,7 +4875,7 @@ static uint32_t dispatch_gl(ArmProbe *probe, const char *name,
         if (log_draw < 8u) probe_log("OpenGL draw returned: glDrawArrays");
         return draw_result;
     }
-    if (strcmp(name, "glDrawElements") == 0) {
+    if (special == ARM_GL_SPECIAL_DRAW_ELEMENTS) {
         void *copies[MAX_GL_VERTEX_ATTRIBS] = {0};
         void *indices = NULL;
         int32_t draw_count = (int32_t)arguments[1];
@@ -4652,18 +4971,22 @@ shader_done:
         if (strings) for(index=0;index<(unsigned)source_count;++index) free(strings[index]);
         free(strings); free(lengths); free(guest_strings); return 0;
     }
-    if (strcmp(name,"glBufferData")==0 || strcmp(name,"glBufferSubData")==0) {
-        size_t size = arguments[1 + (strcmp(name,"glBufferSubData")==0)];
-        uint32_t data_address = arguments[2 + (strcmp(name,"glBufferSubData")==0)];
-        void *data = guest_buffer_copy(probe,data_address,size);
-        if (strcmp(name,"glBufferData")==0) {
+    if (special == ARM_GL_SPECIAL_BUFFER_DATA ||
+        special == ARM_GL_SPECIAL_BUFFER_SUB_DATA) {
+        int sub_data = special == ARM_GL_SPECIAL_BUFFER_SUB_DATA;
+        size_t size = arguments[1 + sub_data];
+        uint32_t data_address = arguments[2 + sub_data];
+        void *owned = NULL;
+        const void *data = guest_buffer_view(probe, data_address, size, &owned);
+        if (data && !owned) ++probe->profile_gl_direct_uploads;
+        if (special == ARM_GL_SPECIAL_BUFFER_DATA) {
             typedef void (WINAPI *Function)(uint32_t,ptrdiff_t,const void*,uint32_t);
             ((Function)function)(arguments[0],(ptrdiff_t)arguments[1],data,arguments[3]);
         } else {
             typedef void (WINAPI *Function)(uint32_t,ptrdiff_t,ptrdiff_t,const void*);
             ((Function)function)(arguments[0],(ptrdiff_t)arguments[1],(ptrdiff_t)arguments[2],data);
         }
-        free(data); return 0;
+        free(owned); return 0;
     }
     if (strcmp(name,"glTexImage2D")==0 || strcmp(name,"glTexSubImage2D")==0) {
         uint32_t width_index = strcmp(name,"glTexImage2D")==0 ? 3u : 4u;
@@ -4684,9 +5007,27 @@ shader_done:
         arguments[8]=(uint32_t)(uintptr_t)pixels;
         call_gl_raw(function,arguments,9); free(pixels); return 0;
     }
+    if (special == ARM_GL_SPECIAL_DELETE_BUFFERS) {
+        size_t bytes = (size_t)arguments[0] * sizeof(uint32_t);
+        uint32_t *values = (uint32_t *)guest_buffer_copy(
+            probe, arguments[1], bytes);
+        unsigned value_index;
+        if (values) {
+            for (value_index = 0; value_index < arguments[0]; ++value_index) {
+                if (values[value_index] == probe->gl_array_buffer_binding)
+                    probe->gl_array_buffer_binding = 0;
+                if (values[value_index] == probe->gl_element_array_buffer_binding)
+                    probe->gl_element_array_buffer_binding = 0;
+            }
+        }
+        arguments[1] = (uint32_t)(uintptr_t)values;
+        call_gl_raw(function, arguments, 2);
+        free(values);
+        return 0;
+    }
     if (strcmp(name,"glGenBuffers")==0 || strcmp(name,"glGenFramebuffers")==0 ||
         strcmp(name,"glGenRenderbuffers")==0 || strcmp(name,"glGenTextures")==0 ||
-        strcmp(name,"glDeleteBuffers")==0 || strcmp(name,"glDeleteFramebuffers")==0 ||
+        strcmp(name,"glDeleteFramebuffers")==0 ||
         strcmp(name,"glDeleteRenderbuffers")==0 || strcmp(name,"glDeleteTextures")==0) {
         int deleting = strncmp(name,"glDelete",8)==0;
         size_t bytes=(size_t)arguments[0]*4u;
@@ -4730,8 +5071,7 @@ shader_done:
         if(buffer_address&&buffer) uc_mem_write(probe->uc,buffer_address,buffer,(size_t)capacity);
         free(buffer); return 0;
     }
-    if (strncmp(name,"glUniform",9)==0 &&
-        (strstr(name,"fv") || strstr(name,"iv"))) {
+    if (special == ARM_GL_SPECIAL_UNIFORM_VECTOR) {
         unsigned components=1;
         if (strstr(name,"Matrix2")) components=4;
         else if (strstr(name,"Matrix3")) components=9;
@@ -4740,9 +5080,12 @@ shader_done:
         {
             unsigned pointer_index=strstr(name,"Matrix")?3u:2u;
             size_t bytes=(size_t)arguments[1]*components*4u;
-            void *values=guest_buffer_copy(probe,arguments[pointer_index],bytes);
+            void *owned = NULL;
+            const void *values = guest_buffer_view(
+                probe, arguments[pointer_index], bytes, &owned);
+            if (values && !owned) ++probe->profile_gl_direct_uploads;
             arguments[pointer_index]=(uint32_t)(uintptr_t)values;
-            call_gl_raw(function,arguments,count); free(values); return 0;
+            call_gl_raw(function,arguments,count); free(owned); return 0;
         }
     }
     if (strcmp(name,"glReadPixels")==0) {
@@ -5164,8 +5507,54 @@ static void dispatch_import(ArmProbe *probe, ArmImport *import,
         result = r1 ? (uint32_t)(actual / r1) : 0;
         goto import_done;
     }
+    case IMPORT_SIN:
+    case IMPORT_COS:
+    case IMPORT_ACOS: {
+        double value = bits_double(r0, r1);
+        if (import->kind == IMPORT_SIN) value = sin(value);
+        else if (import->kind == IMPORT_COS) value = cos(value);
+        else value = acos(value);
+        set_r0_r1_u64(probe->uc, double_bits(value));
+        return;
+    }
+    case IMPORT_ATAN2:
+    case IMPORT_POW:
+    case IMPORT_FMOD: {
+        double first_value = bits_double(r0, r1);
+        double second_value = bits_double(r2, r3);
+        if (import->kind == IMPORT_ATAN2)
+            first_value = atan2(first_value, second_value);
+        else if (import->kind == IMPORT_POW)
+            first_value = pow(first_value, second_value);
+        else
+            first_value = fmod(first_value, second_value);
+        set_r0_r1_u64(probe->uc, double_bits(first_value));
+        return;
+    }
+    case IMPORT_AEABI_UIDIV:
+        result = r1 ? r0 / r1 : 0;
+        goto import_done;
+    case IMPORT_AEABI_IDIV:
+        result = r1 ? (uint32_t)((int32_t)r0 / (int32_t)r1) : 0;
+        goto import_done;
+    case IMPORT_AEABI_UIDIVMOD: {
+        uint32_t quotient = r1 ? r0 / r1 : 0;
+        uint32_t remainder = r1 ? r0 % r1 : 0;
+        uc_reg_write(probe->uc, UC_ARM_REG_R0, &quotient);
+        uc_reg_write(probe->uc, UC_ARM_REG_R1, &remainder);
+        return;
+    }
+    case IMPORT_AEABI_IDIVMOD: {
+        int32_t dividend = (int32_t)r0;
+        int32_t divisor = (int32_t)r1;
+        int32_t quotient = divisor ? dividend / divisor : 0;
+        int32_t remainder = divisor ? dividend % divisor : 0;
+        uc_reg_write(probe->uc, UC_ARM_REG_R0, &quotient);
+        uc_reg_write(probe->uc, UC_ARM_REG_R1, &remainder);
+        return;
+    }
     case IMPORT_OPENGL:
-        result = dispatch_gl(probe, name, r0, r1, r2, r3, sp);
+        result = dispatch_gl(probe, import, r0, r1, r2, r3, sp);
         goto import_done;
     case IMPORT_SLOW:
     default:
@@ -6024,7 +6413,7 @@ uncompress_finished:
         set_r0_r1_u64(probe->uc, double_bits(first_value));
         return;
     } else if (strncmp(name, "gl", 2) == 0) {
-        result = dispatch_gl(probe, name, r0, r1, r2, r3, sp);
+        result = dispatch_gl(probe, import, r0, r1, r2, r3, sp);
     } else if (strcmp(name, "abort") == 0 || strcmp(name, "exit") == 0 ||
                strcmp(name, "__stack_chk_fail") == 0 ||
                strcmp(name, "longjmp") == 0 ||
@@ -6061,6 +6450,67 @@ import_done:
     set_r0(probe->uc, result);
 }
 
+static unsigned import_register_count(const ArmImport *import) {
+    unsigned arguments;
+    if (!import) return 5u;
+    switch (import->kind) {
+    case IMPORT_MALLOC:
+    case IMPORT_FREE:
+    case IMPORT_STRLEN:
+        return 1u;
+    case IMPORT_CALLOC:
+    case IMPORT_REALLOC:
+    case IMPORT_STRCMP:
+        return 2u;
+    case IMPORT_MEMCPY:
+    case IMPORT_MEMMOVE:
+    case IMPORT_MEMSET:
+    case IMPORT_MEMCMP:
+    case IMPORT_STRNCMP:
+        return 3u;
+    case IMPORT_PTHREAD_NOOP:
+    case IMPORT_LRAND48:
+        return 0u;
+    case IMPORT_FREAD:
+        return 4u;
+    case IMPORT_SIN:
+    case IMPORT_COS:
+    case IMPORT_ACOS:
+        return 2u;
+    case IMPORT_ATAN2:
+    case IMPORT_POW:
+    case IMPORT_FMOD:
+        return 4u;
+    case IMPORT_AEABI_UIDIV:
+    case IMPORT_AEABI_IDIV:
+    case IMPORT_AEABI_UIDIVMOD:
+    case IMPORT_AEABI_IDIVMOD:
+        return 2u;
+    case IMPORT_OPENGL:
+        arguments = import->gl_argument_count;
+        if (arguments == 0xffu || arguments == 0xfeu)
+            arguments = gl_argument_count(import->name);
+        if (arguments == UINT32_MAX) return 5u;
+        return arguments > 4u ? 5u : arguments;
+    default:
+        return 5u;
+    }
+}
+
+static int read_import_registers(uc_engine *uc, const ArmImport *import,
+                                 uint32_t *r0, uint32_t *r1,
+                                 uint32_t *r2, uint32_t *r3,
+                                 uint32_t *sp) {
+    static const int registers[5] = {
+        UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2,
+        UC_ARM_REG_R3, UC_ARM_REG_SP
+    };
+    void *values[5] = {r0, r1, r2, r3, sp};
+    unsigned count = import_register_count(import);
+    return !count ||
+        uc_reg_read_batch(uc, registers, values, (int)count) == UC_ERR_OK;
+}
+
 static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
                         void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -6076,20 +6526,24 @@ static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
         probe->import_count * 4u) return;
     index = (unsigned)((address - GUEST_IMPORT_BASE) / 4u);
     {
-        static const int registers[5] = {
-            UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2,
-            UC_ARM_REG_R3, UC_ARM_REG_SP
-        };
-        void *values[5] = {&r0, &r1, &r2, &r3, &sp};
-        if (uc_reg_read_batch(uc, registers, values, 5) != UC_ERR_OK) {
+        LARGE_INTEGER timing_start = {0};
+        LARGE_INTEGER timing_end = {0};
+        int timing = probe->profile_import_timing &&
+                     QueryPerformanceCounter(&timing_start);
+        if (!read_import_registers(uc, &probe->imports[index],
+                                   &r0, &r1, &r2, &r3, &sp)) {
             probe->failed = 1;
             snprintf(probe->failure, sizeof(probe->failure),
                      "cannot read ARM import registers");
             uc_emu_stop(uc);
             return;
         }
+        dispatch_import(probe, &probe->imports[index], r0, r1, r2, r3, sp);
+        if (timing && QueryPerformanceCounter(&timing_end) &&
+            timing_end.QuadPart >= timing_start.QuadPart)
+            probe->profile_import_ticks[index] +=
+                (uint64_t)(timing_end.QuadPart - timing_start.QuadPart);
     }
-    dispatch_import(probe, &probe->imports[index], r0, r1, r2, r3, sp);
 }
 
 static int install_import_hooks(ArmProbe *probe) {
@@ -6117,6 +6571,152 @@ static int install_import_hooks(ArmProbe *probe) {
     }
     probe_log("ARM fast pthread stubs ready: hook-spans=%u", hook_spans);
     return 1;
+}
+
+static int zip_path_is_current_apk(const ArmProbe *probe,
+                                   const char *zip_path) {
+    char normalized[MAX_PATH * 2];
+    if (!probe || !zip_path || !*zip_path) return 0;
+    snprintf(normalized, sizeof(normalized), "%s", zip_path);
+    path_slashes(normalized);
+    return _stricmp(normalized, probe->input_path) == 0;
+}
+
+static void normalize_apk_member_name(const char *source, char *destination,
+                                      size_t capacity) {
+    size_t index;
+    while (source && (*source == '/' || *source == '\\')) ++source;
+    snprintf(destination, capacity, "%s", source ? source : "");
+    for (index = 0; destination[index]; ++index)
+        if (destination[index] == '\\') destination[index] = '/';
+}
+
+static const ApkIndexEntry *apk_index_find_variant(const ArmProbe *probe,
+                                                    const char *member_name,
+                                                    char *resolved,
+                                                    size_t capacity) {
+    const ApkIndexEntry *entry;
+    normalize_apk_member_name(member_name, resolved, capacity);
+    entry = apk_index_find(probe, resolved);
+    if (!entry && !path_has_prefix(resolved, "assets/")) {
+        char with_assets[MAX_PATH * 4];
+        snprintf(with_assets, sizeof(with_assets), "assets/%s", resolved);
+        entry = apk_index_find(probe, with_assets);
+        if (entry) snprintf(resolved, capacity, "%s", with_assets);
+    }
+    return entry;
+}
+
+static int guest_write_host_bytes(ArmProbe *probe, uint32_t destination,
+                                  const void *source, size_t size) {
+    GuestMemoryRegion *region;
+    if (!size) return 1;
+    region = guest_memory_region(probe, destination, size);
+    if (region && region->direct_write) {
+        memcpy(region->host + (size_t)(destination - region->base),
+               source, size);
+        ++probe->direct_memory_writes;
+        return 1;
+    }
+    return uc_mem_write(probe->uc, destination, source, size) == UC_ERR_OK;
+}
+
+static void return_from_guest_function(uc_engine *uc, uint32_t result) {
+    uint32_t lr = 0;
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    uc_reg_write(uc, UC_ARM_REG_R0, &result);
+    uc_reg_write(uc, UC_ARM_REG_PC, &lr);
+}
+
+static void zip_get_file_data_hook(uc_engine *uc, uint64_t address,
+                                   uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t zip_address = 0, member_address = 0, size_address = 0;
+    char zip_path[MAX_PATH * 2];
+    char member_name[MAX_PATH * 4];
+    char resolved[MAX_PATH * 4];
+    const ApkIndexEntry *entry;
+    unsigned char *payload = NULL;
+    size_t payload_size = 0;
+    int owned = 0;
+    uint32_t guest_payload = 0;
+    uint32_t guest_size = 0;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R1, &zip_address);
+    uc_reg_read(uc, UC_ARM_REG_R2, &member_address);
+    uc_reg_read(uc, UC_ARM_REG_R3, &size_address);
+    if (!size_address ||
+        !guest_read_string(probe, zip_address, zip_path, sizeof(zip_path)) ||
+        !zip_path_is_current_apk(probe, zip_path) ||
+        !guest_read_string(probe, member_address, member_name,
+                           sizeof(member_name))) {
+        ++probe->zip_accel_fallbacks;
+        return;
+    }
+    entry = apk_index_find_variant(probe, member_name, resolved,
+                                   sizeof(resolved));
+    if (!entry) {
+        guest_size = 0;
+        if (uc_mem_write(uc, size_address, &guest_size,
+                         sizeof(guest_size)) == UC_ERR_OK) {
+            ++probe->zip_accel_misses;
+            return_from_guest_function(uc, 0);
+        } else {
+            ++probe->zip_accel_fallbacks;
+        }
+        return;
+    }
+    if (!apk_extract_member_cached(probe, resolved, &payload, &payload_size,
+                                   &owned) ||
+        !payload || !payload_size || payload_size > UINT32_MAX) {
+        if (owned) free(payload);
+        ++probe->zip_accel_fallbacks;
+        return;
+    }
+    guest_payload = guest_alloc(probe, (uint32_t)payload_size);
+    guest_size = (uint32_t)payload_size;
+    if (!guest_payload ||
+        !guest_write_host_bytes(probe, guest_payload, payload, payload_size) ||
+        uc_mem_write(uc, size_address, &guest_size,
+                     sizeof(guest_size)) != UC_ERR_OK) {
+        if (guest_payload) guest_free(probe, guest_payload);
+        if (owned) free(payload);
+        ++probe->zip_accel_fallbacks;
+        return;
+    }
+    if (owned) free(payload);
+    ++probe->zip_accel_get_hits;
+    if (probe->zip_accel_get_hits == 1u)
+        probe_log("ARM indexed ZIP accelerator active: %s (%u bytes)",
+                  resolved, guest_size);
+    return_from_guest_function(uc, guest_payload);
+}
+
+static void zip_exist_file_data_hook(uc_engine *uc, uint64_t address,
+                                     uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t zip_address = 0, member_address = 0;
+    char zip_path[MAX_PATH * 2];
+    char member_name[MAX_PATH * 4];
+    char resolved[MAX_PATH * 4];
+    const ApkIndexEntry *entry;
+    (void)address;
+    (void)size;
+    uc_reg_read(uc, UC_ARM_REG_R1, &zip_address);
+    uc_reg_read(uc, UC_ARM_REG_R2, &member_address);
+    if (!guest_read_string(probe, zip_address, zip_path, sizeof(zip_path)) ||
+        !zip_path_is_current_apk(probe, zip_path) ||
+        !guest_read_string(probe, member_address, member_name,
+                           sizeof(member_name))) {
+        ++probe->zip_accel_fallbacks;
+        return;
+    }
+    entry = apk_index_find_variant(probe, member_name, resolved,
+                                   sizeof(resolved));
+    if (entry) ++probe->zip_accel_exist_hits;
+    else ++probe->zip_accel_misses;
+    return_from_guest_function(uc, entry ? 1u : 0u);
 }
 
 static unsigned char png_paeth_predictor(unsigned char left,
@@ -6712,6 +7312,37 @@ static void level_string_trace_hook(uc_engine *uc, uint64_t address,
     level_string_trace(probe, stage, owner, string_object, lr);
 }
 
+static void arm_block_profile_hook(uc_engine *uc, uint64_t address,
+                                   uint32_t size, void *user_data) {
+    ArmProbe *probe = (ArmProbe *)user_data;
+    uint32_t guest_address = (uint32_t)address;
+    uint32_t index;
+    uint32_t attempt;
+    (void)uc;
+    if (!probe || !probe->block_profile_entries ||
+        address < GUEST_IMAGE_BASE ||
+        address >= (uint64_t)GUEST_IMAGE_BASE + probe->image_size)
+        return;
+    index = (guest_address * UINT32_C(2654435761)) &
+            (MAX_BLOCK_PROFILE_ENTRIES - 1u);
+    for (attempt = 0; attempt < MAX_BLOCK_PROFILE_ENTRIES; ++attempt) {
+        ArmBlockProfileEntry *entry =
+            &probe->block_profile_entries[index];
+        if (!entry->address || entry->address == guest_address) {
+            if (!entry->address) {
+                entry->address = guest_address;
+                entry->size = size;
+            } else if (size > entry->size) {
+                entry->size = size;
+            }
+            ++entry->calls;
+            return;
+        }
+        index = (index + 1u) & (MAX_BLOCK_PROFILE_ENTRIES - 1u);
+    }
+    ++probe->profile_block_dropped;
+}
+
 static bool invalid_memory_hook(uc_engine *uc, uc_mem_type type,
                                 uint64_t address, int size, int64_t value,
                                 void *user_data) {
@@ -6748,12 +7379,15 @@ static int initialize_unicorn(ArmProbe *probe) {
     uc_hook vm_trace;
     uc_hook png_filter_trace;
     uc_hook png_error_trace;
+    uc_hook zip_get_trace;
+    uc_hook zip_exist_trace;
     uc_hook ds_step_entry_trace;
     uc_hook ds_step_loop_trace;
     uc_hook claim_particle_trace;
     uc_hook unclaim_particle_trace;
     uc_hook label_bmfont_set_string_trace;
     uc_hook label_bmfont_trace;
+    uc_hook arm_block_trace;
     uc_hook level_string_traces[7];
     unsigned char *stubs;
     unsigned index;
@@ -6771,6 +7405,28 @@ static int initialize_unicorn(ArmProbe *probe) {
         probe_log("ERROR: uc_open: %s", uc_strerror(error));
         return 0;
     }
+    error = uc_ctl_set_tcg_buffer_size(probe->uc, GUEST_TCG_BUFFER_SIZE);
+    if (error != UC_ERR_OK) {
+        probe_log("ERROR: cannot set Unicorn TCG cache: %s",
+                  uc_strerror(error));
+        return 0;
+    }
+    {
+        uint32_t actual_tcg_size = GUEST_TCG_BUFFER_SIZE;
+        if (uc_ctl_get_tcg_buffer_size(probe->uc, &actual_tcg_size) !=
+            UC_ERR_OK)
+            actual_tcg_size = GUEST_TCG_BUFFER_SIZE;
+        /* Keep Unicorn's normal CPU TLB. UC_TLB_VIRTUAL was measured with
+           this exact ARM workload pattern and made repeated guest memory
+           accesses several times slower because it bypasses the normal TLB
+           fast path. */
+        probe_log("ARM Unicorn translation cache ready: TCG cache=%u MiB, "
+                  "CPU TLB=default",
+                  actual_tcg_size / (1024u * 1024u));
+    }
+    if (!apk_build_index(probe))
+        probe_log("WARNING: APK central-directory index unavailable; "
+                  "using original lookup paths");
     if (!map_guest_memory(probe, GUEST_IMAGE_BASE, probe->image_size,
                           UC_PROT_ALL, probe->image_data, 0) ||
         !map_guest_memory(probe, GUEST_RETURN_BASE, 0x1000u,
@@ -6845,6 +7501,19 @@ static int initialize_unicorn(ArmProbe *probe) {
                       probe->objects[index].name);
             return 0;
         }
+    }
+    if (probe->profile_arm_blocks) {
+        probe->block_profile_entries = (ArmBlockProfileEntry *)calloc(
+            MAX_BLOCK_PROFILE_ENTRIES, sizeof(*probe->block_profile_entries));
+        if (!probe->block_profile_entries ||
+            uc_hook_add(probe->uc, &arm_block_trace, UC_HOOK_BLOCK,
+                        arm_block_profile_hook, probe, GUEST_IMAGE_BASE,
+                        GUEST_IMAGE_BASE + probe->image_size - 1u) !=
+                UC_ERR_OK) {
+            probe_log("ERROR: cannot enable ARM block profiler");
+            return 0;
+        }
+        probe_log("ARM block profiler enabled: diagnostic overhead expected");
     }
     if (probe->deep_diagnostics) {
         uint32_t ds_step_address =
@@ -6955,7 +7624,7 @@ static int initialize_unicorn(ArmProbe *probe) {
                   "0x%08x-0x%08x", start, end);
         break;
     }
-    {
+    if (!probe->disable_particle_guards) {
         static const unsigned char claim_particle_signature[] = {
             0x28, 0x1c, 0x31, 0x1c, 0x6a, 0xf0, 0x0d, 0xf8
         };
@@ -6988,7 +7657,7 @@ static int initialize_unicorn(ArmProbe *probe) {
                       "guest signature differs");
         }
     }
-    {
+    if (!probe->disable_particle_guards) {
         static const unsigned char unclaim_guard_signature[] = {
             0x30, 0x1c, 0x21, 0x1c, 0x01, 0x22, 0x6a, 0xf0,
             0x87, 0xf8
@@ -7024,6 +7693,8 @@ static int initialize_unicorn(ArmProbe *probe) {
                       "guest signature differs");
         }
     }
+    if (probe->disable_particle_guards)
+        probe_log("ARM particle compatibility hooks disabled for performance test");
     {
         static const unsigned char set_string_signature[] = {
             0xf0, 0xb5, 0x5f, 0x46, 0x56, 0x46, 0x4d, 0x46,
@@ -7082,6 +7753,30 @@ static int initialize_unicorn(ArmProbe *probe) {
         } else {
             probe_log("ARM CCLabelBMFont compatibility guard inactive: "
                       "guest signature differs");
+        }
+    }
+    {
+        uint32_t zip_get_address = find_export(
+            probe, "_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm") &
+            ~1u;
+        uint32_t zip_exist_address = find_export(
+            probe, "_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_") &
+            ~1u;
+        if (probe->apk_index && zip_get_address && zip_exist_address) {
+            if (uc_hook_add(probe->uc, &zip_get_trace, UC_HOOK_CODE,
+                            zip_get_file_data_hook, probe, zip_get_address,
+                            zip_get_address) != UC_ERR_OK ||
+                uc_hook_add(probe->uc, &zip_exist_trace, UC_HOOK_CODE,
+                            zip_exist_file_data_hook, probe, zip_exist_address,
+                            zip_exist_address) != UC_ERR_OK) {
+                probe_log("ERROR: cannot install indexed ZIP accelerator");
+                return 0;
+            }
+            probe_log("ARM indexed ZIP accelerator ready: get=0x%08x "
+                      "exist=0x%08x",
+                      zip_get_address | 1u, zip_exist_address | 1u);
+        } else {
+            probe_log("ARM indexed ZIP accelerator inactive");
         }
     }
     {
@@ -7318,6 +8013,9 @@ static void destroy_probe(ArmProbe *probe) {
         free(probe->apk_member_cache[index].name);
         free(probe->apk_member_cache[index].payload);
     }
+    for (index = 0; index < probe->apk_index_count; ++index)
+        free(probe->apk_index[index].name);
+    free(probe->apk_index);
     free(probe->apk_data);
     if (probe->image_data_virtual && probe->image_data)
         VirtualFree(probe->image_data, 0, MEM_RELEASE);
@@ -7326,6 +8024,7 @@ static void destroy_probe(ArmProbe *probe) {
     free(probe->file_data);
     free(probe->allocations);
     free(probe->free_allocation_next);
+    free(probe->block_profile_entries);
 }
 
 static uint32_t find_registered_native(const ArmProbe *probe,
@@ -7669,7 +8368,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-bootstrap15",
+        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest1",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -7744,6 +8443,10 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
     probe->profile_gl_client_copies = 0;
     probe->profile_gl_direct_arrays = 0;
     probe->profile_gl_client_bytes = 0;
+    probe->profile_gl_proc_cache_hits = 0;
+    probe->profile_gl_proc_cache_misses = 0;
+    probe->profile_gl_redundant_binds = 0;
+    probe->profile_gl_direct_uploads = 0;
     probe->profile_alloc_calls = 0;
     probe->profile_alloc_bytes = 0;
     probe->profile_free_calls = 0;
@@ -7758,8 +8461,10 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
     probe->profile_direct_write_baseline = probe->direct_memory_writes;
     probe->profile_apk_cache_hit_baseline = probe->apk_member_cache_hits;
     probe->profile_apk_cache_miss_baseline = probe->apk_member_cache_misses;
-    for (index = 0; index < probe->import_count; ++index)
+    for (index = 0; index < probe->import_count; ++index) {
         probe->profile_import_baseline[index] = probe->imports[index].calls;
+        probe->profile_import_ticks[index] = 0;
+    }
 }
 
 static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
@@ -7848,6 +8553,101 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               (unsigned long long)(probe->apk_member_cache_misses -
                                    probe->profile_apk_cache_miss_baseline),
               hot_text);
+    if (probe->profile_import_timing &&
+        probe->profile_import_frequency.QuadPart > 0) {
+        unsigned rank;
+        char timing_text[768];
+        size_t used = 0;
+        timing_text[0] = 0;
+        for (rank = 0; rank < 8u; ++rank) {
+            unsigned best = UINT32_MAX;
+            uint64_t best_ticks = 0;
+            for (index = 0; index < probe->import_count; ++index) {
+                if (probe->profile_import_ticks[index] > best_ticks) {
+                    best = index;
+                    best_ticks = probe->profile_import_ticks[index];
+                }
+            }
+            if (best == UINT32_MAX || !best_ticks) break;
+            {
+                double milliseconds =
+                    (double)best_ticks * 1000.0 /
+                    (double)probe->profile_import_frequency.QuadPart;
+                int written = snprintf(
+                    timing_text + used, sizeof(timing_text) - used,
+                    "%s%s:%.2fms", used ? "," : "",
+                    probe->imports[best].name, milliseconds);
+                if (written < 0 || (size_t)written >=
+                                     sizeof(timing_text) - used)
+                    break;
+                used += (size_t)written;
+                probe->profile_import_ticks[best] = 0;
+            }
+        }
+        probe_log("ARM timed import profile: %s",
+                  timing_text[0] ? timing_text : "no callbacks");
+    }
+    if (probe->profile_arm_blocks && probe->block_profile_entries) {
+        enum { TOP_BLOCKS = 12 };
+        unsigned top_indices[TOP_BLOCKS];
+        uint64_t top_scores[TOP_BLOCKS] = {0};
+        char block_text[1536];
+        size_t block_used = 0;
+        unsigned place;
+        memset(top_indices, 0xff, sizeof(top_indices));
+        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index) {
+            ArmBlockProfileEntry *entry =
+                &probe->block_profile_entries[index];
+            uint64_t score = entry->calls * (entry->size ? entry->size : 2u);
+            if (!score) continue;
+            for (place = 0; place < TOP_BLOCKS; ++place) {
+                if (score > top_scores[place]) {
+                    unsigned move;
+                    for (move = TOP_BLOCKS - 1u; move > place; --move) {
+                        top_scores[move] = top_scores[move - 1u];
+                        top_indices[move] = top_indices[move - 1u];
+                    }
+                    top_scores[place] = score;
+                    top_indices[place] = index;
+                    break;
+                }
+            }
+        }
+        block_text[0] = 0;
+        for (place = 0; place < TOP_BLOCKS && top_scores[place]; ++place) {
+            ArmBlockProfileEntry *entry =
+                &probe->block_profile_entries[top_indices[place]];
+            int written = snprintf(
+                block_text + block_used, sizeof(block_text) - block_used,
+                "%s0x%08x(+0x%06x):%llux%u", place ? "," : "",
+                entry->address, entry->address - GUEST_IMAGE_BASE,
+                (unsigned long long)entry->calls, entry->size);
+            if (written < 0 || (size_t)written >=
+                                 sizeof(block_text) - block_used)
+                break;
+            block_used += (size_t)written;
+        }
+        probe_log("ARM hot block profile: %s dropped=%llu",
+                  block_text[0] ? block_text : "none",
+                  (unsigned long long)probe->profile_block_dropped);
+        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index)
+            probe->block_profile_entries[index].calls = 0;
+        probe->profile_block_dropped = 0;
+    }
+    probe_log("ARM performance-test profile: gl-proc-cache=%llu/%llu "
+              "redundant-binds=%llu direct-uploads=%llu "
+              "zip-get/exist/miss/fallback=%llu/%llu/%llu/%llu "
+              "particle-guards=%u/%u",
+              (unsigned long long)probe->profile_gl_proc_cache_hits,
+              (unsigned long long)probe->profile_gl_proc_cache_misses,
+              (unsigned long long)probe->profile_gl_redundant_binds,
+              (unsigned long long)probe->profile_gl_direct_uploads,
+              (unsigned long long)probe->zip_accel_get_hits,
+              (unsigned long long)probe->zip_accel_exist_hits,
+              (unsigned long long)probe->zip_accel_misses,
+              (unsigned long long)probe->zip_accel_fallbacks,
+              probe->particle_claim_guards,
+              probe->particle_unclaim_guards);
     arm_frame_profile_reset(probe);
 }
 
@@ -8005,7 +8805,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-bootstrap15");
+              "0.9.4-arm-performancetest1");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -8019,7 +8819,22 @@ int main(int argc, char **argv) {
             probe.host.native_height = atoi(argv[index] + 9);
         else if (strcmp(argv[index], "--deep-diagnostics") == 0)
             probe.deep_diagnostics = 1;
+        else if (strcmp(argv[index], "--no-particle-guards") == 0)
+            probe.disable_particle_guards = 1;
+        else if (strcmp(argv[index], "--profile-import-time") == 0)
+            probe.profile_import_timing = 1;
+        else if (strcmp(argv[index], "--profile-arm-blocks") == 0)
+            probe.profile_arm_blocks = 1;
         else if (argv[index][0] != '-') apk_path = argv[index];
+    }
+    if (probe.profile_import_timing) {
+        if (!QueryPerformanceFrequency(&probe.profile_import_frequency) ||
+            probe.profile_import_frequency.QuadPart <= 0) {
+            probe_log("WARNING: import timing profiler unavailable");
+            probe.profile_import_timing = 0;
+        } else {
+            probe_log("ARM import timing profiler enabled");
+        }
     }
     if (probe.host.native_width < 320) probe.host.native_width = 320;
     if (probe.host.native_height < 240) probe.host.native_height = 240;

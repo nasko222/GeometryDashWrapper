@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-bootstrap15"
+$Output = Join-Path $Root "dist-arm-wrapper-performancetest1"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -227,7 +227,7 @@ $Sources += @(Get-ChildItem -LiteralPath (Join-Path $Root "third_party\zlib") -F
 
 $ExePath = Join-Path $Output "GeometryDashArmWrapper.exe"
 $CompileArguments = @(
-    "cc", "-target", "x86-windows-gnu", "-std=c11", "-O2",
+    "cc", "-target", "x86-windows-gnu", "-std=c11", "-O3",
     "-Wall", "-Wextra", "-Wno-cast-function-type",
     "-Wno-deprecated-non-prototype", "-mstackrealign",
     "-Dcrc32=gd_z_crc32",
@@ -265,6 +265,27 @@ cd /d "%~dp0"
 GeometryDashArmWrapper.exe --apk=game.apk
 if errorlevel 1 pause
 '@
+Write-AsciiFile -Path (Join-Path $Output "RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo WARNING: experimental comparison run with particle compatibility hooks disabled.
+GeometryDashArmWrapper.exe --apk=game.apk --no-particle-guards
+if errorlevel 1 pause
+'@
+Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_IMPORT_TIME.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo Diagnostic run: callback timing adds overhead. Test one heavy level section, then close the game.
+GeometryDashArmWrapper.exe --apk=game.apk --profile-import-time
+if errorlevel 1 pause
+'@
+Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_ARM_BLOCKS.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo Diagnostic run: ARM block profiling is slow. Test one heavy section, then close the game.
+GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks
+if errorlevel 1 pause
+'@
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_PROBE.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
@@ -278,22 +299,24 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap15
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest1
 
 Run RUN_ARM_NATIVE_BOOT.cmd. Keep your existing save folder beside the EXE.
-Bootstrap15 is a performance experiment: direct host-backed guest RAM, direct
-OpenGL client arrays, direct zlib buffers, cached APK members, fast import
-classification/register batching, disabled deep parser hooks by default, and
-persistent pre-opened MCI effect voices. Send the complete gd-arm-wrapper.log
-after testing menu load, Clutterfunk, Xstep, Cycles, editor load/save, repeated
-deaths, and audio timing.
+PerformanceTest1 keeps bootstrap15 integrity protections and enables Unicorn's
+flat virtual TLB with a 256 MiB translation cache. It also caches OpenGL entry
+points, uploads directly from host-backed guest RAM, suppresses redundant buffer
+binds, narrows ARM register reads, and fast-dispatches common math/division calls.
+Send the complete gd-arm-wrapper.log after testing Clutterfunk, Xstep, Cycles,
+editor load/save and repeated deaths.
 
+RUN_PROFILE_IMPORT_TIME.cmd times imported callbacks. RUN_PROFILE_ARM_BLOCKS.cmd
+identifies the hottest guest ARM blocks for later native replacement. Both add
+diagnostic overhead and should be used for only one heavy level section.
 Use --deep-diagnostics only when investigating parser or level corruption.
-It intentionally adds expensive per-instruction tracing.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-bootstrap15
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest1
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion
