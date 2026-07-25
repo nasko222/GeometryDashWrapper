@@ -1,4 +1,4 @@
-# GD Wrapper 0.9.4-arm-performancetest2
+# GD Wrapper 0.9.4-arm-performancetest3
 
 Experimental performance branch built from stable bootstrap15.
 
@@ -13,7 +13,7 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 The portable builder downloads Zig, CMake and Ninja into `.build-tools` and writes:
 
 ```text
-dist-arm-wrapper-performancetest2\
+dist-arm-wrapper-performancetest3\
 ```
 
 No Visual Studio, WSL, MSYS2, administrator rights, or Developer Mode is required.
@@ -29,3 +29,8 @@ Use `RUN_PROFILE_ARM_BLOCKS.cmd` for one short heavy gameplay section. It identi
 Use `RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd` only as an A/B comparison after the normal build is verified stable.
 
 See `PERFORMANCETEST1-NOTES.md` for the exact test procedure.
+
+
+## PerformanceTest3 massive profiler
+
+PerformanceTest2 proved pretranslation is not the steady-state fix. Run `RUN_MASSIVE_PROFILER.cmd`, reach the exact laggy section, and press F11 once. The wrapper captures ten seconds of guest block execution and host import timing, then restores normal translation speed automatically.

@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-performancetest2"
+$Output = Join-Path $Root "dist-arm-wrapper-performancetest3"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -254,14 +254,8 @@ if ($Apk) {
 }
 if ($SelectedApk) {
     $OutputApk = Join-Path $Output "game.apk"
-    $UnpackedAssets = Join-Path $Output "apk-unpacked"
     Copy-Item -LiteralPath $SelectedApk -Destination $OutputApk -Force
     Write-Host "Copied APK: $SelectedApk"
-    if (Test-Path $UnpackedAssets) { Remove-Item -LiteralPath $UnpackedAssets -Recurse -Force }
-    New-Item -ItemType Directory -Path $UnpackedAssets -Force | Out-Null
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($OutputApk, $UnpackedAssets)
-    Write-Host "Pre-extracted complete APK: $UnpackedAssets"
 } else {
     Write-Warning "No APK was supplied. Place game.apk beside the built EXE before running it."
 }
@@ -269,13 +263,15 @@ if ($SelectedApk) {
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_NATIVE_BOOT.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-GeometryDashArmWrapper.exe --apk=game.apk --unpacked-assets=apk-unpacked --pretranslate-all
+GeometryDashArmWrapper.exe --apk=game.apk
 if errorlevel 1 pause
 '@
-Write-AsciiFile -Path (Join-Path $Output "RUN_NO_PRETRANSLATE_BASELINE.cmd") -Content @'
+Write-AsciiFile -Path (Join-Path $Output "RUN_MASSIVE_PROFILER.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-GeometryDashArmWrapper.exe --apk=game.apk --unpacked-assets=apk-unpacked
+echo Reach the exact laggy section, then press F11 ONCE.
+echo The ten-second capture intentionally runs slower and stops automatically.
+GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_PERFORMANCE_NO_PARTICLE_GUARDS.cmd") -Content @'
@@ -288,15 +284,14 @@ if errorlevel 1 pause
 Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_IMPORT_TIME.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Diagnostic run: callback timing adds overhead. Test one heavy level section, then close the game.
 GeometryDashArmWrapper.exe --apk=game.apk --profile-import-time
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_PROFILE_ARM_BLOCKS.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
-echo Diagnostic run: ARM block profiling is slow. Test one heavy section, then close the game.
-GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks
+echo Full-run block profiling is extremely slow. Prefer RUN_MASSIVE_PROFILER.cmd and F11.
+GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks --profile-import-time
 if errorlevel 1 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "RUN_ARM_PROBE.cmd") -Content @'
@@ -312,24 +307,25 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest2
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3
 
-Run RUN_ARM_NATIVE_BOOT.cmd. Keep your existing save folder beside the EXE.
-PerformanceTest1 keeps bootstrap15 integrity protections and enables Unicorn's
-flat virtual TLB with a 256 MiB translation cache. It also caches OpenGL entry
-points, uploads directly from host-backed guest RAM, suppresses redundant buffer
-binds, narrows ARM register reads, and fast-dispatches common math/division calls.
-Send the complete gd-arm-wrapper.log after testing Clutterfunk, Xstep, Cycles,
-editor load/save and repeated deaths.
+RUN_ARM_NATIVE_BOOT.cmd is the normal stable test path.
 
-RUN_PROFILE_IMPORT_TIME.cmd times imported callbacks. RUN_PROFILE_ARM_BLOCKS.cmd
-identifies the hottest guest ARM blocks for later native replacement. Both add
-diagnostic overhead and should be used for only one heavy level section.
-Use --deep-diagnostics only when investigating parser or level corruption.
+For the massive profiler:
+1. Run RUN_MASSIVE_PROFILER.cmd.
+2. Reach the exact heavy Clutterfunk, Xstep or Cycles section.
+3. Press F11 once.
+4. Keep playing for ten seconds. Profiling intentionally makes this interval slower.
+5. The profiler stops automatically and restores normal translation speed.
+6. Close the game and send gd-arm-wrapper.log.
+
+The report separates import callback body time from the remaining guest/TCG time,
+prints frame p50/p90/p95/p99, lists the 16 most expensive imports by measured
+wall time, and maps the 32 hottest ARM blocks to nearest ELF symbols.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest2
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion

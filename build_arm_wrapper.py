@@ -48,99 +48,38 @@ def write_launchers(output: Path) -> None:
         "RUN_ARM_NATIVE_BOOT.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "echo OVERKILL visual mode: audio and cosmetics removed; textures become 1x1 white.\r\n"
-            "echo Hotkeys: F3 nativeRender, F4 ARM draws, F5 particles, F6 host draws, F7 scene, F8 GL, F9 textures, F10 state, F11 ARM profiler.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --overkill\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_CONTROL_PERFORMANCETEST1.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Control run: all normal performancetest1 subsystems enabled.\r\n"
             "GeometryDashArmWrapper.exe --apk=game.apk\r\n"
             "if errorlevel 1 pause\r\n"
         ),
-        "RUN_AUTO_PROFILE_ORIGINAL.cmd": (
+        "RUN_MASSIVE_PROFILER.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "echo Original audio/textures/cosmetics; automatic ARM profiler starts only on sustained clean lag.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --auto-profile-slow\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_BARE_MINIMUM.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Bare minimum: audio, particles, ARM draw methods, textures and host OpenGL removed.\r\n"
-            "echo Game update/collision and scene traversal still execute. Window will be blank.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --headless-gl --no-vsync --uncapped\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_ZERO_RENDER.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Zero-render baseline: nativeRender is never called. Window will be blank.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --skip-native-render --no-vsync --uncapped\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_NO_ARM_DRAWS.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo ARM sprite, batch, atlas, layer, label and shape draw methods removed.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --no-vsync --uncapped\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_NO_TEXTURES.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Audio, cosmetics and all texture uploads removed.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-textures\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_NO_DRAWS.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Diagnostic: ARM still builds the scene, but every host draw call is discarded.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-textures --skip-draws --no-vsync --uncapped\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_LOGIC_ONLY.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Diagnostic: CCNode scene traversal is removed. Window may be blank.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --no-node-draws --no-textures --skip-scene-visit --headless-gl --no-vsync --uncapped\r\n"
-            "if errorlevel 1 pause\r\n"
-        ),
-        "RUN_OVERKILL_HEADLESS_GL.cmd": (
-            "@echo off\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "echo Diagnostic: all OpenGL calls use a fake headless backend. Window will be blank.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --no-audio --no-particles --headless-gl --no-vsync --uncapped\r\n"
+            "echo Reach the exact laggy section, then press F11 ONCE.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler\r\n"
             "if errorlevel 1 pause\r\n"
         ),
         "RUN_PROFILE_IMPORT_TIME.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "echo Diagnostic callback-timing run; test one heavy section.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --overkill --profile-import-time\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --profile-import-time\r\n"
             "if errorlevel 1 pause\r\n"
         ),
         "RUN_PROFILE_ARM_BLOCKS.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "echo Diagnostic ARM block profiler; test one heavy section.\r\n"
-            "GeometryDashArmWrapper.exe --apk=game.apk --overkill --profile-arm-blocks\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --profile-arm-blocks --profile-import-time\r\n"
             "if errorlevel 1 pause\r\n"
         ),
         "RUN_ARM_PROBE.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "GeometryDashArmWrapper.exe --probe --apk=game.apk --no-audio\r\n"
+            "GeometryDashArmWrapper.exe --probe --apk=game.apk\r\n"
             "pause\r\n"
         ),
         "RUN_ARM_RELOCATION_ONLY.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "GeometryDashArmWrapper.exe --relocate-only --apk=game.apk --no-audio\r\n"
+            "GeometryDashArmWrapper.exe --relocate-only --apk=game.apk\r\n"
             "pause\r\n"
         ),
     }
@@ -221,18 +160,18 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-overkilltest3\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest3\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
-        "RUN_ARM_NATIVE_BOOT.cmd. OverkillTest3 keeps performancetest1's integrity protections but adds destructive "
-        "diagnostic modes. Audio can be removed before initialization; particle, trail "
-        "and cosmetic guest functions are hot-patched to return; original PNG assets "
-        "can be replaced by a 70-byte 1x1 image; ARM sprite/label/shape draw methods, "
-        "host draw calls, CCNode scene traversal, nativeRender itself, and the complete "
-        "host OpenGL backend can each be disabled independently. Use the included "
-        "launchers and F3-F11 hotkeys. "
+        "RUN_ARM_NATIVE_BOOT.cmd. PerformanceTest3 keeps bootstrap15's corruption "
+        "and save protections while testing Unicorn's flat virtual TLB, a 256 MiB "
+        "translation cache, cached OpenGL function pointers, direct VBO uploads, "
+        "redundant bind suppression, narrower register reads, and fast math/import "
+        "dispatch. The import-time and ARM-block profiling launchers add overhead "
+        "but reveal expensive bridge callbacks and hot guest code addresses. "
         "Deep parser hooks are disabled by "
         "default; use --deep-diagnostics only for corruption investigation. "
-        "Send the complete gd-arm-wrapper.log after the same heavy Clutterfunk section in each diagnostic mode.\n",
+        "Send the complete gd-arm-wrapper.log after menu load, Clutterfunk, "
+        "Xstep, Cycles, editor load/save, repeated deaths, and audio timing.\n",
         encoding="utf-8",
     )
     print(output / "GeometryDashArmWrapper.exe")

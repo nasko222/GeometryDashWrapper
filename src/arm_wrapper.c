@@ -5,7 +5,7 @@
  * the window, OpenGL context, audio, save directory and JNI facade. Every host
  * service is reached through a guest trap; ARM pointers are never cast to host
  * pointers. This grows the successful 0.9.4-arm-probe1 loader into the first
- * complete nativeInit/nativeRender lifecycle host. PerformanceTest1 maps guest RAM
+ * complete nativeInit/nativeRender lifecycle host. PerformanceTest3 maps guest RAM
  * onto host-owned backing memory so bridge operations can avoid expensive
  * per-call Unicorn memory copies while preserving the ARM execution model.
  */
@@ -67,7 +67,8 @@
 #define GUEST_KUSER_SIZE 0x00010000u
 
 #define MAX_IMPORTS 4096
-#define MAX_BLOCK_PROFILE_ENTRIES 65536u
+#define MAX_BLOCK_PROFILE_ENTRIES 262144u
+#define MAX_FRAME_PROFILE_SAMPLES 4096u
 #define MAX_OBJECTS 256
 #define MAX_ALLOCS 1048576
 #define MAX_STRING 65536
@@ -391,6 +392,9 @@ typedef struct {
     int disable_particle_guards;
     int profile_import_timing;
     int profile_arm_blocks;
+    int massive_profiler;
+    DWORD block_profile_deadline;
+    uc_hook arm_block_trace;
     int pretranslate_all;
     char unpacked_assets[MAX_PATH * 2];
     LARGE_INTEGER profile_import_frequency;
@@ -528,6 +532,8 @@ typedef struct {
     unsigned profile_slow_native_logs;
     unsigned profile_import_baseline[MAX_IMPORTS];
     uint64_t profile_import_ticks[MAX_IMPORTS];
+    uint64_t profile_frame_samples[MAX_FRAME_PROFILE_SAMPLES];
+    unsigned profile_frame_sample_count;
     uint64_t profile_direct_read_baseline;
     uint64_t profile_direct_write_baseline;
     uint64_t profile_apk_cache_hit_baseline;
@@ -7523,19 +7529,6 @@ static int initialize_unicorn(ArmProbe *probe) {
             return 0;
         }
     }
-    if (probe->profile_arm_blocks) {
-        probe->block_profile_entries = (ArmBlockProfileEntry *)calloc(
-            MAX_BLOCK_PROFILE_ENTRIES, sizeof(*probe->block_profile_entries));
-        if (!probe->block_profile_entries ||
-            uc_hook_add(probe->uc, &arm_block_trace, UC_HOOK_BLOCK,
-                        arm_block_profile_hook, probe, GUEST_IMAGE_BASE,
-                        GUEST_IMAGE_BASE + probe->image_size - 1u) !=
-                UC_ERR_OK) {
-            probe_log("ERROR: cannot enable ARM block profiler");
-            return 0;
-        }
-        probe_log("ARM block profiler enabled: diagnostic overhead expected");
-    }
     if (probe->deep_diagnostics) {
         uint32_t ds_step_address =
             find_export(probe,
@@ -7898,6 +7891,185 @@ static uint32_t find_export(const ArmProbe *probe, const char *name) {
         }
     }
     return 0;
+}
+
+
+static const char *find_nearest_export(const ArmProbe *probe,
+                                       uint32_t guest_address,
+                                       uint32_t *symbol_address) {
+    uint32_t image_offset;
+    uint32_t best_value = 0;
+    const char *best_name = NULL;
+    uint16_t section_index;
+    if (symbol_address) *symbol_address = 0;
+    if (!probe || guest_address < GUEST_IMAGE_BASE) return NULL;
+    image_offset = guest_address - GUEST_IMAGE_BASE;
+    for (section_index = 0; section_index < probe->header->e_shnum;
+         ++section_index) {
+        const Elf32_Shdr *symbols_section =
+            &probe->section_headers[section_index];
+        const Elf32_Shdr *strings_section;
+        const Elf32_Sym *symbols;
+        const char *strings;
+        uint32_t count;
+        uint32_t index;
+        if ((symbols_section->sh_type != SHT_DYNSYM &&
+             symbols_section->sh_type != SHT_SYMTAB) ||
+            symbols_section->sh_entsize != sizeof(Elf32_Sym))
+            continue;
+        strings_section = section_at(probe, symbols_section->sh_link);
+        if (!strings_section) continue;
+        symbols = (const Elf32_Sym *)(probe->file_data +
+                                      symbols_section->sh_offset);
+        strings = (const char *)(probe->file_data +
+                                  strings_section->sh_offset);
+        count = symbols_section->sh_size / sizeof(Elf32_Sym);
+        for (index = 0; index < count; ++index) {
+            const Elf32_Sym *symbol = &symbols[index];
+            const char *name;
+            if (symbol->st_shndx == SHN_UNDEF || !symbol->st_value ||
+                symbol->st_value > image_offset ||
+                symbol->st_name >= strings_section->sh_size)
+                continue;
+            name = strings + symbol->st_name;
+            if (!*name) continue;
+            if (!best_name || symbol->st_value > best_value) {
+                best_name = name;
+                best_value = symbol->st_value;
+            }
+        }
+    }
+    if (best_name && symbol_address)
+        *symbol_address = GUEST_IMAGE_BASE + best_value;
+    return best_name;
+}
+
+static void arm_block_profile_clear(ArmProbe *probe) {
+    if (!probe || !probe->block_profile_entries) return;
+    memset(probe->block_profile_entries, 0,
+           MAX_BLOCK_PROFILE_ENTRIES * sizeof(*probe->block_profile_entries));
+    probe->profile_block_dropped = 0;
+}
+
+static void arm_block_profile_report(ArmProbe *probe, const char *reason) {
+    enum { TOP_BLOCKS = 32 };
+    unsigned top_indices[TOP_BLOCKS];
+    uint64_t top_scores[TOP_BLOCKS] = {0};
+    uint64_t total_calls = 0;
+    uint64_t total_weight = 0;
+    unsigned index;
+    unsigned place;
+    if (!probe || !probe->block_profile_entries) return;
+    memset(top_indices, 0xff, sizeof(top_indices));
+    for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index) {
+        ArmBlockProfileEntry *entry = &probe->block_profile_entries[index];
+        uint64_t score = entry->calls * (entry->size ? entry->size : 2u);
+        if (!score) continue;
+        total_calls += entry->calls;
+        total_weight += score;
+        for (place = 0; place < TOP_BLOCKS; ++place) {
+            if (score > top_scores[place]) {
+                unsigned move;
+                for (move = TOP_BLOCKS - 1u; move > place; --move) {
+                    top_scores[move] = top_scores[move - 1u];
+                    top_indices[move] = top_indices[move - 1u];
+                }
+                top_scores[place] = score;
+                top_indices[place] = index;
+                break;
+            }
+        }
+    }
+    probe_log("ARM MASSIVE block summary (%s): executions=%llu weighted-bytes=%llu dropped=%llu",
+              reason ? reason : "sample",
+              (unsigned long long)total_calls,
+              (unsigned long long)total_weight,
+              (unsigned long long)probe->profile_block_dropped);
+    for (place = 0; place < TOP_BLOCKS && top_scores[place]; ++place) {
+        ArmBlockProfileEntry *entry =
+            &probe->block_profile_entries[top_indices[place]];
+        uint32_t symbol_address = 0;
+        const char *symbol =
+            find_nearest_export(probe, entry->address, &symbol_address);
+        double share = total_weight ?
+            (double)top_scores[place] * 100.0 / (double)total_weight : 0.0;
+        if (symbol) {
+            probe_log("ARM MASSIVE block #%02u: %5.2f%% pc=0x%08x calls=%llu size=%u symbol=%s+0x%x",
+                      place + 1u, share, entry->address,
+                      (unsigned long long)entry->calls, entry->size,
+                      symbol, entry->address - symbol_address);
+        } else {
+            probe_log("ARM MASSIVE block #%02u: %5.2f%% pc=0x%08x elf+0x%06x calls=%llu size=%u",
+                      place + 1u, share, entry->address,
+                      entry->address - GUEST_IMAGE_BASE,
+                      (unsigned long long)entry->calls, entry->size);
+        }
+    }
+}
+
+static int arm_block_profiler_set(ArmProbe *probe, int enabled,
+                                  int timed_sample) {
+    uc_err error;
+    if (!probe || !probe->uc) return 0;
+    if (enabled) {
+        if (probe->profile_arm_blocks) return 1;
+        if (!probe->block_profile_entries) {
+            probe->block_profile_entries = (ArmBlockProfileEntry *)calloc(
+                MAX_BLOCK_PROFILE_ENTRIES,
+                sizeof(*probe->block_profile_entries));
+            if (!probe->block_profile_entries) {
+                probe_log("ERROR: cannot allocate massive ARM profiler table");
+                return 0;
+            }
+        }
+        arm_block_profile_clear(probe);
+        error = uc_hook_add(probe->uc, &probe->arm_block_trace, UC_HOOK_BLOCK,
+                            arm_block_profile_hook, probe, GUEST_IMAGE_BASE,
+                            GUEST_IMAGE_BASE + probe->image_size - 1u);
+        if (error != UC_ERR_OK) {
+            probe_log("ERROR: cannot enable massive ARM profiler: %s",
+                      uc_strerror(error));
+            probe->arm_block_trace = 0;
+            return 0;
+        }
+        /* Existing translated blocks do not gain newly-added hooks. Flush only
+           the executable image so the profiled translations are regenerated. */
+        error = uc_ctl_remove_cache(
+            probe->uc, (uint64_t)GUEST_IMAGE_BASE,
+            (uint64_t)GUEST_IMAGE_BASE + probe->image_size);
+        if (error != UC_ERR_OK) {
+            uc_hook_del(probe->uc, probe->arm_block_trace);
+            probe->arm_block_trace = 0;
+            probe_log("ERROR: cannot activate massive ARM profiler: %s",
+                      uc_strerror(error));
+            return 0;
+        }
+        probe->profile_arm_blocks = 1;
+        probe->block_profile_deadline =
+            timed_sample ? GetTickCount() + 10000u : 0u;
+        probe_log("ARM MASSIVE profiler ENABLED%s; gameplay will be much slower during capture",
+                  timed_sample ? " for 10 seconds" : "");
+        return 1;
+    }
+    if (!probe->profile_arm_blocks) return 1;
+    if (probe->arm_block_trace) {
+        error = uc_hook_del(probe->uc, probe->arm_block_trace);
+        if (error != UC_ERR_OK)
+            probe_log("WARNING: cannot remove massive ARM profiler hook: %s",
+                      uc_strerror(error));
+        probe->arm_block_trace = 0;
+    }
+    error = uc_ctl_remove_cache(
+        probe->uc, (uint64_t)GUEST_IMAGE_BASE,
+        (uint64_t)GUEST_IMAGE_BASE + probe->image_size);
+    if (error != UC_ERR_OK)
+        probe_log("WARNING: cannot restore normal ARM translation cache: %s",
+                  uc_strerror(error));
+    arm_block_profile_report(probe, "completed 10-second heavy-section sample");
+    probe->profile_arm_blocks = 0;
+    probe->block_profile_deadline = 0;
+    probe_log("ARM MASSIVE profiler DISABLED; normal-speed translations restored");
+    return 1;
 }
 
 static int run_guest(ArmProbe *probe, uint32_t entry,
@@ -8363,6 +8535,12 @@ static LRESULT CALLBACK arm_window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_KEYDOWN:
+        if (wparam == VK_F11) {
+            /* Ignore Windows key-repeat: exactly one profiler toggle per press. */
+            if ((lparam & ((LPARAM)1 << 30)) == 0)
+                arm_block_profiler_set(probe, !probe->profile_arm_blocks, 1);
+            return 0;
+        }
         if (wparam == VK_ESCAPE && probe->host.native_ready &&
             probe->host.key_down) {
             uint32_t arguments[3] = {GUEST_ENV_OBJECT, 0, 4};
@@ -8420,7 +8598,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest2",
+        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest3",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -8509,6 +8687,7 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
     probe->profile_frames_over_20ms = 0;
     probe->profile_frames_over_33ms = 0;
     probe->profile_frames_over_50ms = 0;
+    probe->profile_frame_sample_count = 0;
     probe->profile_direct_read_baseline = probe->direct_memory_reads;
     probe->profile_direct_write_baseline = probe->direct_memory_writes;
     probe->profile_apk_cache_hit_baseline = probe->apk_member_cache_hits;
@@ -8517,6 +8696,25 @@ static void arm_frame_profile_reset(ArmProbe *probe) {
         probe->profile_import_baseline[index] = probe->imports[index].calls;
         probe->profile_import_ticks[index] = 0;
     }
+}
+
+
+static int compare_u64_values(const void *left, const void *right) {
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static uint64_t percentile_u64(const uint64_t *values, unsigned count,
+                               unsigned percentile) {
+    uint64_t sorted[MAX_FRAME_PROFILE_SAMPLES];
+    unsigned index;
+    if (!values || !count) return 0;
+    if (count > MAX_FRAME_PROFILE_SAMPLES) count = MAX_FRAME_PROFILE_SAMPLES;
+    memcpy(sorted, values, count * sizeof(*values));
+    qsort(sorted, count, sizeof(*sorted), compare_u64_values);
+    index = (unsigned)(((uint64_t)(count - 1u) * percentile) / 100u);
+    return sorted[index];
 }
 
 static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
@@ -8577,6 +8775,18 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               (unsigned long long)probe->profile_frames_over_50ms,
               frames ? (double)probe->profile_gl_draw_calls / frames : 0.0,
               frames ? (double)probe->profile_gl_vertices / frames : 0.0);
+    if (probe->profile_frame_sample_count) {
+        probe_log("ARM frame percentiles: p50=%.2f p90=%.2f p95=%.2f p99=%.2f ms samples=%u",
+                  (double)percentile_u64(probe->profile_frame_samples,
+                                        probe->profile_frame_sample_count, 50u) / 1000.0,
+                  (double)percentile_u64(probe->profile_frame_samples,
+                                        probe->profile_frame_sample_count, 90u) / 1000.0,
+                  (double)percentile_u64(probe->profile_frame_samples,
+                                        probe->profile_frame_sample_count, 95u) / 1000.0,
+                  (double)percentile_u64(probe->profile_frame_samples,
+                                        probe->profile_frame_sample_count, 99u) / 1000.0,
+                  probe->profile_frame_sample_count);
+    }
     probe_log("ARM bridge profile: imports/frame=%.0f client-copies/frame=%.1f "
               "direct-arrays/frame=%.1f client-copy=%.2f MiB/s "
               "direct-r/w=%llu/%llu "
@@ -8607,84 +8817,61 @@ static void arm_frame_profile_log(ArmProbe *probe, unsigned frames,
               hot_text);
     if (probe->profile_import_timing &&
         probe->profile_import_frequency.QuadPart > 0) {
+        enum { TOP_TIMED_IMPORTS = 16 };
+        unsigned top_indices[TOP_TIMED_IMPORTS];
+        uint64_t top_ticks[TOP_TIMED_IMPORTS] = {0};
+        uint64_t total_ticks = 0;
+        uint64_t render_us = probe->profile_render_microseconds;
         unsigned rank;
-        char timing_text[768];
-        size_t used = 0;
-        timing_text[0] = 0;
-        for (rank = 0; rank < 8u; ++rank) {
-            unsigned best = UINT32_MAX;
-            uint64_t best_ticks = 0;
-            for (index = 0; index < probe->import_count; ++index) {
-                if (probe->profile_import_ticks[index] > best_ticks) {
-                    best = index;
-                    best_ticks = probe->profile_import_ticks[index];
-                }
-            }
-            if (best == UINT32_MAX || !best_ticks) break;
-            {
-                double milliseconds =
-                    (double)best_ticks * 1000.0 /
-                    (double)probe->profile_import_frequency.QuadPart;
-                int written = snprintf(
-                    timing_text + used, sizeof(timing_text) - used,
-                    "%s%s:%.2fms", used ? "," : "",
-                    probe->imports[best].name, milliseconds);
-                if (written < 0 || (size_t)written >=
-                                     sizeof(timing_text) - used)
-                    break;
-                used += (size_t)written;
-                probe->profile_import_ticks[best] = 0;
-            }
-        }
-        probe_log("ARM timed import profile: %s",
-                  timing_text[0] ? timing_text : "no callbacks");
-    }
-    if (probe->profile_arm_blocks && probe->block_profile_entries) {
-        enum { TOP_BLOCKS = 12 };
-        unsigned top_indices[TOP_BLOCKS];
-        uint64_t top_scores[TOP_BLOCKS] = {0};
-        char block_text[1536];
-        size_t block_used = 0;
-        unsigned place;
         memset(top_indices, 0xff, sizeof(top_indices));
-        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index) {
-            ArmBlockProfileEntry *entry =
-                &probe->block_profile_entries[index];
-            uint64_t score = entry->calls * (entry->size ? entry->size : 2u);
-            if (!score) continue;
-            for (place = 0; place < TOP_BLOCKS; ++place) {
-                if (score > top_scores[place]) {
+        for (index = 0; index < probe->import_count; ++index) {
+            uint64_t ticks = probe->profile_import_ticks[index];
+            unsigned place;
+            total_ticks += ticks;
+            if (!ticks) continue;
+            for (place = 0; place < TOP_TIMED_IMPORTS; ++place) {
+                if (ticks > top_ticks[place]) {
                     unsigned move;
-                    for (move = TOP_BLOCKS - 1u; move > place; --move) {
-                        top_scores[move] = top_scores[move - 1u];
+                    for (move = TOP_TIMED_IMPORTS - 1u; move > place; --move) {
+                        top_ticks[move] = top_ticks[move - 1u];
                         top_indices[move] = top_indices[move - 1u];
                     }
-                    top_scores[place] = score;
+                    top_ticks[place] = ticks;
                     top_indices[place] = index;
                     break;
                 }
             }
         }
-        block_text[0] = 0;
-        for (place = 0; place < TOP_BLOCKS && top_scores[place]; ++place) {
-            ArmBlockProfileEntry *entry =
-                &probe->block_profile_entries[top_indices[place]];
-            int written = snprintf(
-                block_text + block_used, sizeof(block_text) - block_used,
-                "%s0x%08x(+0x%06x):%llux%u", place ? "," : "",
-                entry->address, entry->address - GUEST_IMAGE_BASE,
-                (unsigned long long)entry->calls, entry->size);
-            if (written < 0 || (size_t)written >=
-                                 sizeof(block_text) - block_used)
-                break;
-            block_used += (size_t)written;
+        {
+            double import_ms = (double)total_ticks * 1000.0 /
+                (double)probe->profile_import_frequency.QuadPart;
+            double render_ms = (double)render_us / 1000.0;
+            double guest_ms = render_ms > import_ms ? render_ms - import_ms : 0.0;
+            probe_log("ARM MASSIVE CPU split: total-render=%.2fms import-hook-body=%.2fms (%.1f%%) guest-TCG-and-hook-entry=%.2fms (%.1f%%)",
+                      render_ms, import_ms,
+                      render_ms > 0.0 ? import_ms * 100.0 / render_ms : 0.0,
+                      guest_ms,
+                      render_ms > 0.0 ? guest_ms * 100.0 / render_ms : 0.0);
         }
-        probe_log("ARM hot block profile: %s dropped=%llu",
-                  block_text[0] ? block_text : "none",
-                  (unsigned long long)probe->profile_block_dropped);
-        for (index = 0; index < MAX_BLOCK_PROFILE_ENTRIES; ++index)
-            probe->block_profile_entries[index].calls = 0;
-        probe->profile_block_dropped = 0;
+        for (rank = 0; rank < TOP_TIMED_IMPORTS && top_ticks[rank]; ++rank) {
+            unsigned import_index = top_indices[rank];
+            uint64_t calls = (unsigned)(probe->imports[import_index].calls -
+                                        probe->profile_import_baseline[import_index]);
+            double milliseconds = (double)top_ticks[rank] * 1000.0 /
+                (double)probe->profile_import_frequency.QuadPart;
+            probe_log("ARM MASSIVE import #%02u: %8.3fms calls=%llu avg=%.3fus name=%s",
+                      rank + 1u, milliseconds,
+                      (unsigned long long)calls,
+                      calls ? milliseconds * 1000.0 / (double)calls : 0.0,
+                      probe->imports[import_index].name);
+        }
+        for (index = 0; index < probe->import_count; ++index)
+            probe->profile_import_ticks[index] = 0;
+    }
+    if (probe->profile_arm_blocks && probe->block_profile_entries &&
+        !probe->block_profile_deadline) {
+        arm_block_profile_report(probe, "current five-second window");
+        arm_block_profile_clear(probe);
     }
     probe_log("ARM performance-test profile: gl-proc-cache=%llu/%llu "
               "redundant-binds=%llu direct-uploads=%llu "
@@ -8739,6 +8926,9 @@ static int run_arm_message_loop(ArmProbe *probe) {
                 probe->profile_swap_max_microseconds = swap_elapsed;
             frame_elapsed = probe->profile_last_render_microseconds +
                             swap_elapsed;
+            if (probe->profile_frame_sample_count < MAX_FRAME_PROFILE_SAMPLES)
+                probe->profile_frame_samples[probe->profile_frame_sample_count++] =
+                    frame_elapsed;
             if (frame_elapsed > UINT64_C(20000))
                 ++probe->profile_frames_over_20ms;
             if (frame_elapsed > UINT64_C(33333))
@@ -8764,6 +8954,9 @@ static int run_arm_message_loop(ArmProbe *probe) {
                     performance_started = now;
                     performance_frames = 0;
                 }
+                if (probe->profile_arm_blocks && probe->block_profile_deadline &&
+                    (LONG)(now - probe->block_profile_deadline) >= 0)
+                    arm_block_profiler_set(probe, 0, 0);
             }
             if (!probe->host.vsync_enabled) Sleep(1);
         } else {
@@ -8857,7 +9050,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-performancetest2");
+              "0.9.4-arm-performancetest3");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -8877,6 +9070,10 @@ int main(int argc, char **argv) {
             probe.profile_import_timing = 1;
         else if (strcmp(argv[index], "--profile-arm-blocks") == 0)
             probe.profile_arm_blocks = 1;
+        else if (strcmp(argv[index], "--massive-profiler") == 0) {
+            probe.massive_profiler = 1;
+            probe.profile_import_timing = 1;
+        }
         else if (strcmp(argv[index], "--pretranslate-all") == 0)
             probe.pretranslate_all = 1;
         else if (strncmp(argv[index], "--unpacked-assets=", 18) == 0)
@@ -8932,6 +9129,12 @@ int main(int argc, char **argv) {
         goto finished;
     }
     pretranslate_guest_image(&probe);
+    if (probe.profile_arm_blocks) {
+        probe.profile_arm_blocks = 0;
+        if (!arm_block_profiler_set(&probe, 1, 0)) goto finished;
+    }
+    if (probe.massive_profiler)
+        probe_log("ARM MASSIVE profiler armed: reach the slow section and press F11 once for an automatic 10-second capture");
     probe_log("RESULT: ARM_RELOCATION_OK");
     if (mode == 0) { exit_code = 0; goto finished; }
     if (!run_constructors(&probe)) {
