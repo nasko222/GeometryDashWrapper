@@ -58,6 +58,13 @@ def write_launchers(output: Path) -> None:
             "GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler\r\n"
             "if errorlevel 1 pause\r\n"
         ),
+        "RUN_UPDATE_PATH_HUD.cmd": (
+            "@echo off\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "echo Live one-second gameplay update HUD. Pause in the laggy area for ACTIVE versus PAUSED.\r\n"
+            "GeometryDashArmWrapper.exe --apk=game.apk --update-hud\r\n"
+            "if errorlevel 1 pause\r\n"
+        ),
         "RUN_LIVE_OBJECT_HUD.cmd": (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
@@ -174,7 +181,7 @@ def main() -> int:
         shutil.copy2(apk, output / "game.apk")
     write_launchers(output)
     (output / "README-ARM-TEST.txt").write_text(
-        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4\n\n"
+        "Geometry Dash ARM Wrapper 0.9.4-arm-performancetest5\n\n"
         "Place a supported ARM APK beside the EXE as game.apk, then run "
         "RUN_ARM_NATIVE_BOOT.cmd. PerformanceTest4 keeps bootstrap15's corruption "
         "and save protections while adding a live one-second object/render HUD. "

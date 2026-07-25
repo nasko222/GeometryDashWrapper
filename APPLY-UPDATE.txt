@@ -1,6 +1,3 @@
-Geometry Dash ARM Wrapper overkilltest1 source update
+PerformanceTest4 -> PerformanceTest5 source update
 
-This update is for the complete 0.9.4-arm-performancetest1 source folder.
-Open this ZIP, open the overkilltest1-source-update folder, then copy all
-of its contents into the PerformanceTest1 full-source folder and replace
-the existing files. Run BUILD_WINDOWS.cmd afterward.
+Copy everything inside this folder into the root of your existing PerformanceTest4 source tree and replace files. Then run BUILD_WINDOWS.cmd.

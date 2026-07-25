@@ -350,6 +350,27 @@ typedef struct {
     uint32_t once_control;
 } GuestCallbackFrame;
 
+typedef enum {
+    UPDATE_HUD_PLAY_UPDATE = 0,
+    UPDATE_HUD_COLLISION_CHECK,
+    UPDATE_HUD_VISIBILITY,
+    UPDATE_HUD_SPAWN_CHECK,
+    UPDATE_HUD_CAMERA_UPDATE,
+    UPDATE_HUD_PLAYER_UPDATE,
+    UPDATE_HUD_PLAYER_JUMP,
+    UPDATE_HUD_OBJECT_COLLISION,
+    UPDATE_HUD_OBJECT_ACTIVATE,
+    UPDATE_HUD_OBJECT_DEACTIVATE,
+    UPDATE_HUD_SCHEDULER_UPDATE,
+    UPDATE_HUD_ACTION_UPDATE,
+    UPDATE_HUD_COUNTER_COUNT
+} UpdateHudCounter;
+
+typedef struct {
+    void *probe;
+    unsigned counter;
+} UpdateHudHookContext;
+
 typedef struct {
     HWND window;
     HDC device;
@@ -395,9 +416,17 @@ typedef struct {
     int massive_profiler;
     int object_hud;
     int object_hud_full;
+    int update_hud;
     DWORD block_profile_deadline;
     uc_hook object_hud_hooks[8];
     unsigned object_hud_hook_count;
+    uc_hook update_hud_hooks[UPDATE_HUD_COUNTER_COUNT];
+    UpdateHudHookContext update_hud_contexts[UPDATE_HUD_COUNTER_COUNT];
+    unsigned update_hud_hook_count;
+    uint64_t hud_frame_updates[UPDATE_HUD_COUNTER_COUNT];
+    uint64_t hud_interval_updates[UPDATE_HUD_COUNTER_COUNT];
+    uint64_t hud_interval_active_frames;
+    uint64_t hud_interval_static_frames;
     uint64_t hud_frame_nodes;
     uint64_t hud_frame_sprites;
     uint64_t hud_frame_batches;
@@ -4914,7 +4943,7 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         unsigned log_draw = probe->gl_draw_logs++;
         uint32_t draw_result = 0;
         ++probe->profile_gl_draw_calls;
-        if (probe->object_hud) {
+        if ((probe && (probe->object_hud || probe->update_hud))) {
             ++probe->hud_frame_gl_draws;
             if (draw_count > 0) probe->hud_frame_vertices += (uint32_t)draw_count;
         }
@@ -4942,7 +4971,7 @@ static uint32_t dispatch_gl(ArmProbe *probe, ArmImport *import,
         uint32_t draw_result = 0;
         if (draw_count < 0 || !index_size) return 0;
         ++probe->profile_gl_draw_calls;
-        if (probe->object_hud) {
+        if ((probe && (probe->object_hud || probe->update_hud))) {
             ++probe->hud_frame_gl_draws;
             if (draw_count > 0) probe->hud_frame_vertices += (uint32_t)draw_count;
         }
@@ -6654,6 +6683,73 @@ static int install_object_hud_hooks(ArmProbe *probe) {
     return 1;
 }
 
+static void update_hud_counter_hook(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data) {
+    UpdateHudHookContext *context = (UpdateHudHookContext *)user_data;
+    ArmProbe *probe = context ? (ArmProbe *)context->probe : NULL;
+    (void)uc; (void)address; (void)size;
+    if (!probe || context->counter >= UPDATE_HUD_COUNTER_COUNT) return;
+    ++probe->hud_frame_updates[context->counter];
+}
+
+static int update_hud_add_hook(ArmProbe *probe, UpdateHudCounter counter,
+                               const char *symbol) {
+    uint32_t address;
+    uc_err error;
+    uc_hook *hook;
+    UpdateHudHookContext *context;
+    if (!probe || !symbol || counter >= UPDATE_HUD_COUNTER_COUNT ||
+        probe->update_hud_hook_count >= UPDATE_HUD_COUNTER_COUNT) return 0;
+    address = find_export(probe, symbol) & ~1u;
+    if (!address) {
+        probe_log("WARNING: ARM update HUD symbol missing: %s", symbol);
+        return 1;
+    }
+    hook = &probe->update_hud_hooks[probe->update_hud_hook_count];
+    context = &probe->update_hud_contexts[probe->update_hud_hook_count];
+    context->probe = probe;
+    context->counter = (unsigned)counter;
+    error = uc_hook_add(probe->uc, hook, UC_HOOK_CODE,
+                        (void *)update_hud_counter_hook, context,
+                        address, address);
+    if (error != UC_ERR_OK) {
+        probe_log("WARNING: ARM update HUD hook failed: %s (%s)",
+                  symbol, uc_strerror(error));
+        return 1;
+    }
+    ++probe->update_hud_hook_count;
+    return 1;
+}
+
+static int install_update_hud_hooks(ArmProbe *probe) {
+    static const struct {
+        UpdateHudCounter counter;
+        const char *symbol;
+    } hooks[] = {
+        {UPDATE_HUD_PLAY_UPDATE, "_ZN9PlayLayer6updateEf"},
+        {UPDATE_HUD_COLLISION_CHECK, "_ZN9PlayLayer15checkCollisionsEf"},
+        {UPDATE_HUD_VISIBILITY, "_ZN9PlayLayer16updateVisibilityEv"},
+        {UPDATE_HUD_SPAWN_CHECK, "_ZN9PlayLayer17checkSpawnObjectsEv"},
+        {UPDATE_HUD_CAMERA_UPDATE, "_ZN9PlayLayer12updateCameraEf"},
+        {UPDATE_HUD_PLAYER_UPDATE, "_ZN12PlayerObject6updateEf"},
+        {UPDATE_HUD_PLAYER_JUMP, "_ZN12PlayerObject10updateJumpEf"},
+        {UPDATE_HUD_OBJECT_COLLISION, "_ZN12PlayerObject18collidedWithObjectEfP10GameObject"},
+        {UPDATE_HUD_OBJECT_ACTIVATE, "_ZN10GameObject14activateObjectEv"},
+        {UPDATE_HUD_OBJECT_DEACTIVATE, "_ZN10GameObject16deactivateObjectEv"},
+        {UPDATE_HUD_SCHEDULER_UPDATE, "_ZN7cocos2d11CCScheduler6updateEf"},
+        {UPDATE_HUD_ACTION_UPDATE, "_ZN7cocos2d15CCActionManager6updateEf"}
+    };
+    unsigned index;
+    if (!probe || !probe->update_hud) return 1;
+    for (index = 0; index < sizeof(hooks) / sizeof(hooks[0]); ++index) {
+        if (!update_hud_add_hook(probe, hooks[index].counter,
+                                 hooks[index].symbol)) return 0;
+    }
+    probe_log("ARM update-path HUD hooks ready: gameplay/collision/visibility/player/scheduler/action (%u hooks)",
+              probe->update_hud_hook_count);
+    return 1;
+}
+
 static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
                         void *user_data) {
     ArmProbe *probe = (ArmProbe *)user_data;
@@ -6668,7 +6764,7 @@ static void import_hook(uc_engine *uc, uint64_t address, uint32_t size,
     if (address < GUEST_IMPORT_BASE || address >= GUEST_IMPORT_BASE +
         probe->import_count * 4u) return;
     index = (unsigned)((address - GUEST_IMPORT_BASE) / 4u);
-    if (probe->object_hud) ++probe->hud_frame_imports;
+    if ((probe && (probe->object_hud || probe->update_hud))) ++probe->hud_frame_imports;
     {
         LARGE_INTEGER timing_start = {0};
         LARGE_INTEGER timing_end = {0};
@@ -8715,7 +8811,7 @@ static int create_arm_opengl_window(ArmProbe *probe) {
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
     probe->host.window = CreateWindowExA(
         0, window_class.lpszClassName,
-        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest4",
+        "Geometry Dash ARM wrapper 0.9.4-arm-performancetest5",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
         NULL, NULL, window_class.hInstance, NULL);
@@ -9012,7 +9108,8 @@ static void object_hud_finish_frame(ArmProbe *probe,
     DWORD now;
     DWORD elapsed;
     uint64_t drawn;
-    if (!probe || !probe->object_hud) return;
+    unsigned update_index;
+    if (!(probe && (probe->object_hud || probe->update_hud))) return;
     ++probe->hud_interval_frames;
     probe->hud_interval_frame_microseconds += frame_microseconds;
     probe->hud_interval_nodes += probe->hud_frame_nodes;
@@ -9023,6 +9120,14 @@ static void object_hud_finish_frame(ArmProbe *probe,
     probe->hud_interval_gl_draws += probe->hud_frame_gl_draws;
     probe->hud_interval_vertices += probe->hud_frame_vertices;
     probe->hud_interval_imports += probe->hud_frame_imports;
+    for (update_index = 0; update_index < UPDATE_HUD_COUNTER_COUNT;
+         ++update_index)
+        probe->hud_interval_updates[update_index] +=
+            probe->hud_frame_updates[update_index];
+    if (probe->hud_frame_updates[UPDATE_HUD_PLAY_UPDATE])
+        ++probe->hud_interval_active_frames;
+    else
+        ++probe->hud_interval_static_frames;
     drawn = probe->hud_frame_sprites + probe->hud_frame_batches +
             probe->hud_frame_particles + probe->hud_frame_other_draws;
     if (probe->hud_frame_nodes > probe->hud_max_nodes)
@@ -9036,6 +9141,7 @@ static void object_hud_finish_frame(ArmProbe *probe,
     probe->hud_frame_gl_draws = 0;
     probe->hud_frame_vertices = 0;
     probe->hud_frame_imports = 0;
+    memset(probe->hud_frame_updates, 0, sizeof(probe->hud_frame_updates));
     now = GetTickCount();
     if (!probe->hud_interval_started) probe->hud_interval_started = now;
     elapsed = now - probe->hud_interval_started;
@@ -9053,22 +9159,58 @@ static void object_hud_finish_frame(ArmProbe *probe,
         double gl_draws = (double)probe->hud_interval_gl_draws / frames;
         double vertices = (double)probe->hud_interval_vertices / frames;
         double imports = (double)probe->hud_interval_imports / frames;
-        char title[512];
-        snprintf(title, sizeof(title),
-                 "GD ARM PT4 | %.1f FPS %.1fms | nodes %.0f | cocos-draw %.0f "
-                 "(S%.0f B%.0f P%.0f O%.0f) | GL %.1f verts %.0f | imports %.0f",
-                 fps, frame_ms, nodes, cocos_drawn, sprites, batches,
-                 particles, other, gl_draws, vertices, imports);
-        if (probe->host.window) SetWindowTextA(probe->host.window, title);
-        probe_log("ARM LIVE OBJECT HUD: fps=%.1f frame=%.2fms nodes/frame=%.1f "
-                  "nodes-max=%llu cocos-draw/frame=%.1f draw-max=%llu "
-                  "sprites=%.1f batches=%.1f particles=%.1f other=%.1f "
-                  "gl-draws=%.1f vertices=%.0f imports=%.0f",
-                  fps, frame_ms, nodes,
-                  (unsigned long long)probe->hud_max_nodes, cocos_drawn,
-                  (unsigned long long)probe->hud_max_drawn,
-                  sprites, batches, particles, other, gl_draws, vertices,
-                  imports);
+        char title[768];
+        if (probe->update_hud) {
+            double play_update = (double)probe->hud_interval_updates[UPDATE_HUD_PLAY_UPDATE] / frames;
+            double collision_checks = (double)probe->hud_interval_updates[UPDATE_HUD_COLLISION_CHECK] / frames;
+            double visibility = (double)probe->hud_interval_updates[UPDATE_HUD_VISIBILITY] / frames;
+            double spawn_checks = (double)probe->hud_interval_updates[UPDATE_HUD_SPAWN_CHECK] / frames;
+            double camera_updates = (double)probe->hud_interval_updates[UPDATE_HUD_CAMERA_UPDATE] / frames;
+            double player_updates = (double)probe->hud_interval_updates[UPDATE_HUD_PLAYER_UPDATE] / frames;
+            double player_jumps = (double)probe->hud_interval_updates[UPDATE_HUD_PLAYER_JUMP] / frames;
+            double object_collisions = (double)probe->hud_interval_updates[UPDATE_HUD_OBJECT_COLLISION] / frames;
+            double activations = (double)probe->hud_interval_updates[UPDATE_HUD_OBJECT_ACTIVATE] / frames;
+            double deactivations = (double)probe->hud_interval_updates[UPDATE_HUD_OBJECT_DEACTIVATE] / frames;
+            double scheduler_updates = (double)probe->hud_interval_updates[UPDATE_HUD_SCHEDULER_UPDATE] / frames;
+            double action_updates = (double)probe->hud_interval_updates[UPDATE_HUD_ACTION_UPDATE] / frames;
+            double active_percent = 100.0 * (double)probe->hud_interval_active_frames / frames;
+            const char *state = active_percent >= 50.0 ? "ACTIVE" : "PAUSED/STATIC";
+            snprintf(title, sizeof(title),
+                     "GD ARM PT5 %s %.0f%% | %.1f FPS %.1fms | coll %.1f hit %.1f | vis %.1f spawn %.1f | player %.1f jump %.1f | act %.1f/%.1f | sched %.1f action %.1f | verts %.0f imp %.0f",
+                     state, active_percent, fps, frame_ms, collision_checks,
+                     object_collisions, visibility, spawn_checks,
+                     player_updates, player_jumps, activations,
+                     deactivations, scheduler_updates, action_updates,
+                     vertices, imports);
+            if (probe->host.window) SetWindowTextA(probe->host.window, title);
+            probe_log("ARM LIVE UPDATE HUD: state=%s active=%.1f%% fps=%.1f frame=%.2fms "
+                      "play-update=%.2f collisions=%.2f object-hits=%.2f visibility=%.2f "
+                      "spawn=%.2f camera=%.2f player-update=%.2f player-jump=%.2f "
+                      "activate=%.2f deactivate=%.2f scheduler=%.2f actions=%.2f "
+                      "gl-draws=%.1f vertices=%.0f imports=%.0f",
+                      state, active_percent, fps, frame_ms, play_update,
+                      collision_checks, object_collisions, visibility,
+                      spawn_checks, camera_updates, player_updates,
+                      player_jumps, activations, deactivations,
+                      scheduler_updates, action_updates, gl_draws, vertices,
+                      imports);
+        } else {
+            snprintf(title, sizeof(title),
+                     "GD ARM PT5 | %.1f FPS %.1fms | nodes %.0f | cocos-draw %.0f "
+                     "(S%.0f B%.0f P%.0f O%.0f) | GL %.1f verts %.0f | imports %.0f",
+                     fps, frame_ms, nodes, cocos_drawn, sprites, batches,
+                     particles, other, gl_draws, vertices, imports);
+            if (probe->host.window) SetWindowTextA(probe->host.window, title);
+            probe_log("ARM LIVE OBJECT HUD: fps=%.1f frame=%.2fms nodes/frame=%.1f "
+                      "nodes-max=%llu cocos-draw/frame=%.1f draw-max=%llu "
+                      "sprites=%.1f batches=%.1f particles=%.1f other=%.1f "
+                      "gl-draws=%.1f vertices=%.0f imports=%.0f",
+                      fps, frame_ms, nodes,
+                      (unsigned long long)probe->hud_max_nodes, cocos_drawn,
+                      (unsigned long long)probe->hud_max_drawn,
+                      sprites, batches, particles, other, gl_draws, vertices,
+                      imports);
+        }
         probe->hud_interval_nodes = 0;
         probe->hud_interval_sprites = 0;
         probe->hud_interval_batches = 0;
@@ -9077,6 +9219,10 @@ static void object_hud_finish_frame(ArmProbe *probe,
         probe->hud_interval_gl_draws = 0;
         probe->hud_interval_vertices = 0;
         probe->hud_interval_imports = 0;
+        memset(probe->hud_interval_updates, 0,
+               sizeof(probe->hud_interval_updates));
+        probe->hud_interval_active_frames = 0;
+        probe->hud_interval_static_frames = 0;
         probe->hud_interval_frame_microseconds = 0;
         probe->hud_max_nodes = 0;
         probe->hud_max_drawn = 0;
@@ -9246,7 +9392,7 @@ int main(int argc, char **argv) {
     g_active_probe = &probe;
     SetUnhandledExceptionFilter(log_unhandled_exception);
     probe_log("Geometry Dash ARM native compatibility wrapper "
-              "0.9.4-arm-performancetest4");
+              "0.9.4-arm-performancetest5");
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--relocate-only") == 0) mode = 0;
@@ -9276,6 +9422,8 @@ int main(int argc, char **argv) {
             probe.object_hud = 1;
             probe.object_hud_full = 1;
         }
+        else if (strcmp(argv[index], "--update-hud") == 0)
+            probe.update_hud = 1;
         else if (strcmp(argv[index], "--pretranslate-all") == 0)
             probe.pretranslate_all = 1;
         else if (strncmp(argv[index], "--unpacked-assets=", 18) == 0)
@@ -9335,7 +9483,14 @@ int main(int argc, char **argv) {
         exit_code = 2;
         goto finished;
     }
-    if (probe.object_hud)
+    if (!install_update_hud_hooks(&probe)) {
+        probe_log("RESULT: ARM_UPDATE_HUD_FAILED");
+        exit_code = 2;
+        goto finished;
+    }
+    if (probe.update_hud)
+        probe_log("ARM live update-path HUD enabled: title bar and log update every second (12 exact gameplay hooks)");
+    else if (probe.object_hud)
         probe_log("ARM live HUD enabled: title bar and log update every second (%s counters)",
                   probe.object_hud_full ? "Cocos object + render" : "low-overhead render");
     pretranslate_guest_image(&probe);

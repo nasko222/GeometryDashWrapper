@@ -15,7 +15,7 @@ $BuildRoot = Join-Path $Root "build-cache-windows"
 $UnicornSource = Join-Path $Root "third_party\unicorn-2.1.4\unicorn-2.1.4"
 $UnicornBuild = Join-Path $BuildRoot "unicorn-win32-arm"
 $WrapperCache = Join-Path $BuildRoot "wrapper"
-$Output = Join-Path $Root "dist-arm-wrapper-performancetest4"
+$Output = Join-Path $Root "dist-arm-wrapper-performancetest5"
 
 $ZigVersion = "0.14.1"
 $CMakeVersion = "3.31.10"
@@ -274,6 +274,13 @@ echo The ten-second capture intentionally runs slower and stops automatically.
 GeometryDashArmWrapper.exe --apk=game.apk --massive-profiler
 if errorlevel 1 pause
 '@
+Write-AsciiFile -Path (Join-Path $Output "RUN_UPDATE_PATH_HUD.cmd") -Content @'
+@echo off
+cd /d "%~dp0"
+echo Live one-second gameplay update HUD. Pause in the laggy area for a direct ACTIVE versus PAUSED comparison.
+GeometryDashArmWrapper.exe --apk=game.apk --update-hud
+if errorlevel 1 pause
+'@
 Write-AsciiFile -Path (Join-Path $Output "RUN_LIVE_OBJECT_HUD.cmd") -Content @'
 @echo off
 cd /d "%~dp0"
@@ -321,24 +328,26 @@ GeometryDashArmWrapper.exe --relocate-only --apk=game.apk
 pause
 '@
 Write-AsciiFile -Path (Join-Path $Output "README-ARM-TEST.txt") -Content @'
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest5
 
 RUN_ARM_NATIVE_BOOT.cmd is the normal stable path.
 
-Live correlation test:
-1. Run RUN_LIVE_OBJECT_HUD.cmd.
-2. The game window title and gd-arm-wrapper.log update every second.
-3. Compare nodes/frame, Cocos draw methods/frame, GL draws/frame, vertices/frame,
-   imports/frame, frame milliseconds and FPS in the exact same level section.
-4. This full mode installs exact Cocos hooks and adds diagnostic overhead.
-5. Run RUN_RENDER_HUD_LOW_OVERHEAD.cmd for the same section; it omits Cocos
-   hooks and reports only the bridge counters, providing the overhead baseline.
+Gameplay update-path correlation test:
+1. Run RUN_UPDATE_PATH_HUD.cmd.
+2. Play into the exact laggy area and remain active for several seconds.
+3. Pause in that same area for several seconds, then resume.
+4. The title and gd-arm-wrapper.log update once per second with ACTIVE/PAUSED,
+   FPS, frame time, PlayLayer updates, collision checks, object collision
+   callbacks, visibility/spawn/camera work, player update/jump, object
+   activation/deactivation, scheduler/action updates, vertices and imports.
+5. The exact same visible scene while paused is the control sample.
 
-RUN_MASSIVE_PROFILER.cmd remains available for F11 hot-block captures.
+RUN_LIVE_OBJECT_HUD.cmd, RUN_RENDER_HUD_LOW_OVERHEAD.cmd and
+RUN_MASSIVE_PROFILER.cmd remain available for previous diagnostics.
 '@
 
 $BuildInfo = @"
-Geometry Dash ARM Wrapper 0.9.4-arm-performancetest4
+Geometry Dash ARM Wrapper 0.9.4-arm-performancetest5
 Built: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss K'))
 Zig: $ZigVersion
 CMake: $CMakeVersion
