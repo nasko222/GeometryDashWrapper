@@ -78,7 +78,7 @@ constexpr u32 kImportRegionSize = 0x00100000u;
 constexpr u32 kControlBase = 0x22000000u;
 constexpr u32 kControlRegionSize = 0x00100000u;
 constexpr u32 kHeapBase = 0x30000000u;
-constexpr u32 kHeapSize = 0x08000000u;
+constexpr u32 kHeapSize = 0x10000000u;
 constexpr u32 kStackBase = 0x70000000u;
 constexpr u32 kStackSize = 0x01000000u;
 constexpr u32 kPageSize = 0x1000u;
@@ -834,7 +834,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest5Window";
+        const char* class_name = "GeometryDashDynarmicTest6Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -846,7 +846,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test5",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test6",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1149,6 +1149,7 @@ public:
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+    void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
 
     bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
         if (!function) return true;
@@ -1468,7 +1469,7 @@ private:
         const u32 pc = cpu_.Regs()[15];
         const u32 lr = cpu_.Regs()[14];
         const u32 sp = cpu_.Regs()[13];
-        log_ << "===== DYNARMIC TEST5 GUEST FATAL DIAGNOSTIC =====\n";
+        log_ << "===== DYNARMIC TEST6 GUEST FATAL DIAGNOSTIC =====\n";
         log_ << "Fatal import: " << import_name << '\n';
         log_ << "Active guest call depth: " << active_calls_.size() << '\n';
         if (!active_calls_.empty()) {
@@ -1493,6 +1494,7 @@ private:
         } else {
             log_ << "Last guest message box: none recorded\n";
         }
+        LogHeapStatus("fatal");
         if (!recent_events_.empty()) {
             log_ << "Recent guest/JNI/host events:\n";
             for (const std::string& event : recent_events_) log_ << "  " << event << '\n';
@@ -1524,7 +1526,7 @@ private:
         } else {
             log_ << "Guest stack window: unreadable at SP=0x" << std::hex << sp << std::dec << '\n';
         }
-        log_ << "===== END DYNARMIC TEST5 GUEST FATAL DIAGNOSTIC =====\n";
+        log_ << "===== END DYNARMIC TEST6 GUEST FATAL DIAGNOSTIC =====\n";
         log_.flush();
     }
     bool FatalImport(const std::string& import_name) {
@@ -1586,15 +1588,226 @@ private:
         return true;
     }
 
-    u32 Allocate(u32 requested) {
-        const u32 size = std::max<u32>(requested, 1u);
-        const u32 aligned = AlignUp(size, 16u);
-        if (heap_cursor_ > kHeapBase + kHeapSize - aligned) return 0;
-        const u32 address = heap_cursor_;
-        heap_cursor_ += aligned;
-        allocations_[address] = aligned;
-        return address;
+    static bool IsPowerOfTwo(u32 value) {
+        return value != 0u && (value & (value - 1u)) == 0u;
     }
+
+    u32 AlignAddress(u32 value, u32 alignment) const {
+        if (!IsPowerOfTwo(alignment) || value > std::numeric_limits<u32>::max() - (alignment - 1u)) return 0;
+        return (value + alignment - 1u) & ~(alignment - 1u);
+    }
+
+    void AccountAllocation(u32 size) {
+        live_allocation_bytes_ += size;
+        peak_live_allocation_bytes_ = std::max(peak_live_allocation_bytes_, live_allocation_bytes_);
+        ++allocation_calls_;
+    }
+
+    void AccountFree(u32 size) {
+        live_allocation_bytes_ = size > live_allocation_bytes_ ? 0u : live_allocation_bytes_ - size;
+        ++free_calls_;
+    }
+
+    void AddFreeBlock(u32 address, u32 size) {
+        if (!size) return;
+        auto next = free_blocks_.lower_bound(address);
+        if (next != free_blocks_.begin()) {
+            auto previous = std::prev(next);
+            if (static_cast<u64>(previous->first) + previous->second == address) {
+                address = previous->first;
+                size += previous->second;
+                free_blocks_.erase(previous);
+            }
+        }
+        next = free_blocks_.lower_bound(address);
+        if (next != free_blocks_.end() && static_cast<u64>(address) + size == next->first) {
+            size += next->second;
+            free_blocks_.erase(next);
+        }
+        free_blocks_[address] = size;
+
+        // Return free blocks at the top of the arena to the bump cursor.
+        for (;;) {
+            auto upper = free_blocks_.upper_bound(heap_cursor_);
+            if (upper == free_blocks_.begin()) break;
+            auto top = std::prev(upper);
+            if (static_cast<u64>(top->first) + top->second != heap_cursor_) break;
+            heap_cursor_ = top->first;
+            free_blocks_.erase(top);
+        }
+    }
+
+    u32 AllocateAligned(u32 requested, u32 alignment) {
+        const u32 size = std::max<u32>(requested, 1u);
+        alignment = std::max<u32>(alignment, 16u);
+        if (!IsPowerOfTwo(alignment) || size > std::numeric_limits<u32>::max() - 15u) return 0;
+        const u32 aligned_size = (size + 15u) & ~15u;
+
+        // Best-fit reuse avoids wasting large image buffers on tiny C++ allocations.
+        auto best = free_blocks_.end();
+        u32 best_address = 0;
+        u32 best_waste = std::numeric_limits<u32>::max();
+        for (auto it = free_blocks_.begin(); it != free_blocks_.end(); ++it) {
+            const u32 candidate = AlignAddress(it->first, alignment);
+            if (!candidate || candidate < it->first) continue;
+            const u64 prefix = static_cast<u64>(candidate) - it->first;
+            const u64 needed = prefix + aligned_size;
+            if (needed > it->second) continue;
+            const u32 waste = it->second - static_cast<u32>(needed);
+            if (waste < best_waste) {
+                best = it;
+                best_address = candidate;
+                best_waste = waste;
+                if (waste == 0u && prefix == 0u) break;
+            }
+        }
+        if (best != free_blocks_.end()) {
+            const u32 block_address = best->first;
+            const u32 block_size = best->second;
+            free_blocks_.erase(best);
+            const u32 prefix = best_address - block_address;
+            const u32 suffix_address = best_address + aligned_size;
+            const u32 suffix = block_size - prefix - aligned_size;
+            if (prefix) AddFreeBlock(block_address, prefix);
+            if (suffix) AddFreeBlock(suffix_address, suffix);
+            allocations_[best_address] = aligned_size;
+            AccountAllocation(aligned_size);
+            return best_address;
+        }
+
+        const u32 address = AlignAddress(heap_cursor_, alignment);
+        if (!address || address < heap_cursor_) return 0;
+        const u32 prefix = address - heap_cursor_;
+        const u64 end = static_cast<u64>(address) + aligned_size;
+        const u64 heap_end = static_cast<u64>(kHeapBase) + kHeapSize;
+        if (end <= heap_end) {
+            if (prefix) free_blocks_[heap_cursor_] = prefix;
+            heap_cursor_ = static_cast<u32>(end);
+            allocations_[address] = aligned_size;
+            AccountAllocation(aligned_size);
+            return address;
+        }
+
+        ++allocation_failures_;
+        if (allocation_failures_ <= 16u) {
+            u64 free_total = 0;
+            u32 largest_free = 0;
+            for (const auto& [free_address, free_size] : free_blocks_) {
+                (void)free_address;
+                free_total += free_size;
+                largest_free = std::max(largest_free, free_size);
+            }
+            log_ << "Dynarmic guest allocation failed: requested=" << requested
+                 << " aligned=" << aligned_size
+                 << " alignment=" << alignment
+                 << " cursor=0x" << std::hex << heap_cursor_ << std::dec
+                 << " arena_used=" << (heap_cursor_ - kHeapBase) << '/' << kHeapSize
+                 << " live=" << live_allocation_bytes_
+                 << " peak_live=" << peak_live_allocation_bytes_
+                 << " allocations=" << allocations_.size()
+                 << " free_blocks=" << free_blocks_.size()
+                 << " free_bytes=" << free_total
+                 << " largest_free=" << largest_free << '\n';
+            log_.flush();
+        }
+        return 0;
+    }
+
+    u32 Allocate(u32 requested) {
+        return AllocateAligned(requested, 16u);
+    }
+
+    void Free(u32 address) {
+        if (!address) return;
+        const auto found = allocations_.find(address);
+        if (found == allocations_.end()) {
+            ++ignored_free_calls_;
+            if (ignored_free_calls_ <= 8u) {
+                log_ << "Dynarmic guest free ignored unknown pointer 0x" << std::hex << address << std::dec << '\n';
+                log_.flush();
+            }
+            return;
+        }
+        const u32 size = found->second;
+        allocations_.erase(found);
+        AccountFree(size);
+        AddFreeBlock(address, size);
+    }
+
+    u32 Reallocate(u32 address, u32 requested) {
+        ++reallocation_calls_;
+        if (!address) return Allocate(requested);
+        if (!requested) {
+            Free(address);
+            return 0;
+        }
+        const auto found = allocations_.find(address);
+        if (found == allocations_.end()) return 0;
+        if (requested > std::numeric_limits<u32>::max() - 15u) return 0;
+        const u32 old_size = found->second;
+        const u32 new_size = (std::max<u32>(requested, 1u) + 15u) & ~15u;
+        if (new_size == old_size) return address;
+
+        if (new_size < old_size) {
+            found->second = new_size;
+            const u32 released = old_size - new_size;
+            live_allocation_bytes_ -= released;
+            AddFreeBlock(address + new_size, released);
+            return address;
+        }
+
+        const u32 extra = new_size - old_size;
+        const u32 adjacent_address = address + old_size;
+        auto adjacent = free_blocks_.find(adjacent_address);
+        if (adjacent != free_blocks_.end() && adjacent->second >= extra) {
+            const u32 remaining = adjacent->second - extra;
+            free_blocks_.erase(adjacent);
+            if (remaining) free_blocks_[adjacent_address + extra] = remaining;
+            found->second = new_size;
+            live_allocation_bytes_ += extra;
+            peak_live_allocation_bytes_ = std::max(peak_live_allocation_bytes_, live_allocation_bytes_);
+            return address;
+        }
+        if (adjacent_address == heap_cursor_ &&
+            static_cast<u64>(heap_cursor_) + extra <= static_cast<u64>(kHeapBase) + kHeapSize) {
+            heap_cursor_ += extra;
+            found->second = new_size;
+            live_allocation_bytes_ += extra;
+            peak_live_allocation_bytes_ = std::max(peak_live_allocation_bytes_, live_allocation_bytes_);
+            return address;
+        }
+
+        const u32 replacement = Allocate(requested);
+        if (!replacement) return 0;
+        if (!CopyGuest(replacement, address, std::min(old_size, requested))) {
+            Free(replacement);
+            return 0;
+        }
+        Free(address);
+        return replacement;
+    }
+
+    void LogHeapStatus(const char* reason) {
+        u64 free_total = 0;
+        u32 largest_free = 0;
+        for (const auto& [address, size] : free_blocks_) {
+            (void)address;
+            free_total += size;
+            largest_free = std::max(largest_free, size);
+        }
+        log_ << "Dynarmic guest heap [" << reason << "]: arena_used="
+             << (heap_cursor_ - kHeapBase) << '/' << kHeapSize
+             << " live=" << live_allocation_bytes_
+             << " peak_live=" << peak_live_allocation_bytes_
+             << " allocations=" << allocations_.size()
+             << " free_blocks=" << free_blocks_.size()
+             << " free_bytes=" << free_total
+             << " largest_free=" << largest_free
+             << " alloc/free/realloc=" << allocation_calls_ << '/' << free_calls_ << '/' << reallocation_calls_
+             << " failures=" << allocation_failures_ << '\n';
+        log_.flush();
+    }
+
     u32 AllocateString(const std::string& value) {
         const u32 address = Allocate(static_cast<u32>(value.size() + 1u));
         if (address) env_.WriteBytes(address, value.c_str(), value.size() + 1u);
@@ -2697,12 +2910,14 @@ private:
         if (count < 2 || size == 0) return true;
         if (count > 100000u || size > 1024u * 1024u) return Fail("qsort dimensions outside safety limit");
         std::vector<u8> pivot(size);
+        const u32 scratch = Allocate(size);
+        if (!scratch) return false;
+        ScopeExit release_scratch([&]() { Free(scratch); });
         for (u32 i = 1; i < count; ++i) {
-            if (!env_.ReadBytes(base + i * size, pivot.data(), size)) return false;
+            if (!env_.ReadBytes(base + i * size, pivot.data(), size) ||
+                !env_.WriteBytes(scratch, pivot.data(), size)) return false;
             u32 j = i;
             while (j > 0) {
-                const u32 scratch = Allocate(size);
-                if (!scratch || !env_.WriteBytes(scratch, pivot.data(), size)) return false;
                 s32 comparison = 0;
                 if (!CallGuestComparator(comparator, base + (j - 1u) * size, scratch, comparison)) return false;
                 if (comparison <= 0) break;
@@ -2739,20 +2954,14 @@ private:
         else if (name == "calloc") {
             const u64 total = static_cast<u64>(r0) * r1;
             result = total <= std::numeric_limits<u32>::max() ? Allocate(static_cast<u32>(total)) : 0;
-            if (result && total) std::memset(env_.HostPointer(result, static_cast<std::size_t>(total)), 0, static_cast<std::size_t>(total));
-        } else if (name == "realloc") {
-            if (!r0) result = Allocate(r1);
-            else if (!r1) result = 0;
-            else {
-                const auto found = allocations_.find(r0);
-                const u32 old_size = found == allocations_.end() ? 0u : found->second;
-                if (old_size >= r1) result = r0;
-                else {
-                    result = Allocate(r1);
-                    if (result && old_size) CopyGuest(result, r0, old_size);
-                }
+            if (result && total) {
+                void* destination = env_.HostPointer(result, static_cast<std::size_t>(total));
+                if (!destination) { Free(result); result = 0; }
+                else std::memset(destination, 0, static_cast<std::size_t>(total));
             }
-        } else if (name == "free" || name == "__cxa_finalize") result = 0;
+        } else if (name == "realloc") result = Reallocate(r0, r1);
+        else if (name == "free") { Free(r0); result = 0; }
+        else if (name == "__cxa_finalize") result = 0;
         else if (name == "memcpy" || name == "memmove") result = CopyGuest(r0, r1, r2) ? r0 : 0;
         else if (name == "memset") {
             void* destination = env_.HostPointer(r0, r2);
@@ -3038,8 +3247,8 @@ private:
             FormatCursor cursor{*this,3u,0u}; const std::string text=FormatGuestString(r2,cursor); log_ << "android log: " << text << '\n'; result=static_cast<u32>(text.size());
         } else if (name == "__gnu_Unwind_Find_exidx") { if(r1)env_.MemoryWrite32(r1,0); result=0; }
         else if (name == "dlopen" || name == "dlsym" || name == "dlclose" || name == "dlerror") result=0;
-        else if (name == "mmap") result=Allocate(r1);
-        else if (name == "munmap") result=0;
+        else if (name == "mmap") result=AllocateAligned(r1, kPageSize);
+        else if (name == "munmap") { Free(r0); result=0; }
         else if (name == "socket" || name == "accept" || name == "bind" || name == "connect" || name == "listen" || name == "recv" || name == "recvfrom" || name == "send" || name == "sendto" || name == "setsockopt" || name == "getsockopt" || name == "getpeername" || name == "getsockname" || name == "poll" || name == "ioctl" || name == "fcntl" || name == "getaddrinfo" || name == "freeaddrinfo" || name == "inet_ntop" || name == "inet_pton" || name == "alarm" || name == "raise" || name == "sigaction") result = name == "freeaddrinfo" ? 0u : static_cast<u32>(-1);
         else {
             ++permissive_stub_calls_;
@@ -3058,6 +3267,14 @@ private:
     Dynarmic::A32::Jit cpu_;
     u32 heap_cursor_=0;
     std::map<u32,u32> allocations_;
+    std::map<u32,u32> free_blocks_;
+    u64 live_allocation_bytes_=0;
+    u64 peak_live_allocation_bytes_=0;
+    u64 allocation_calls_=0;
+    u64 free_calls_=0;
+    u64 reallocation_calls_=0;
+    u64 allocation_failures_=0;
+    u64 ignored_free_calls_=0;
     u32 errno_address_=0;
     u32 c_locale_address_=0;
     u32 tm_address_=0;
@@ -3158,11 +3375,11 @@ int main(int argc,char** argv) {
     std::ofstream log_file(log_path,std::ios::trunc);
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest5");
-        emit("Milestone: interactive Dynarmic x64 fatal-call diagnostics and symbolized guest crash context");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest6");
+        emit("Milestone: reclaiming Dynarmic guest heap and level-start bad_alloc fix");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest5 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest6 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -3219,7 +3436,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP5_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP6_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -3230,6 +3447,7 @@ int main(int argc,char** argv) {
         if(!executor.RunFunction(runtime.native_init,{kEnvObject,0u,static_cast<u32>(width),static_cast<u32>(height)},&result,"nativeInit",0u,std::chrono::milliseconds(120000))) throw std::runtime_error(executor.LastError());
         const double init_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-init_start).count();
         emit("RESULT: DYNARMIC_NATIVE_INIT_RETURNED time_ms="+std::to_string(init_ms));
+        executor.ReportHeapStatus("after-nativeInit");
         emit("RESULT: DYNARMIC_INPUT_BRIDGE_READY");
         emit("RESULT: DYNARMIC_RENDER_LOOP_ENTERED");
 
@@ -3285,7 +3503,11 @@ int main(int argc,char** argv) {
             ++frame_count;
             ++interval_frames;
             interval_render_ms+=elapsed;
-            if(!first_frame){first_frame=true;emit("RESULT: DYNARMIC_FIRST_FRAME_OK frame_ms="+std::to_string(elapsed));}
+            if(!first_frame){
+                first_frame=true;
+                emit("RESULT: DYNARMIC_FIRST_FRAME_OK frame_ms="+std::to_string(elapsed));
+                executor.ReportHeapStatus("first-frame");
+            }
 
             const auto now=std::chrono::steady_clock::now();
             const double interval_ms=std::chrono::duration<double,std::milli>(now-interval_start).count();
@@ -3296,8 +3518,9 @@ int main(int argc,char** argv) {
                 line<<std::fixed<<std::setprecision(1)<<"Dynarmic interactive performance: "<<fps
                     <<" FPS avg-frame="<<std::setprecision(2)<<avg_ms<<" ms total-frames="<<frame_count;
                 emit(line.str());
+                executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test5 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test6 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -3314,11 +3537,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP5_OK");
+        emit("RESULT: DYNARMIC_BRINGUP6_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP5_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP6_FAILED");
         return 1;
     }
 }

@@ -1,21 +1,16 @@
-# DynarmicTest5 source contents
+# DynarmicTest6 source contents
 
-This is a full working-source package based on the corrected 33.9 MB DynarmicTest4 full-source tree, with Test5 fatal diagnostics added.
+This is the complete working-source package based on the corrected DynarmicTest4 full-source tree, with the Test5 fatal diagnostics and the Test6 guest-heap repair.
 
-## Explicitly retained
+Included:
 
 - `game.apk`
-- Entire `src/` directory, including the Dynarmic runtime and existing Unicorn wrapper sources
-- Entire `third_party/` directory, including zlib, STB, Unicorn archive/license content
-- Entire `tools/` directory
-- Entire `patches/` directory
-- `BUILD_DYNARMIC_X64.cmd`, `build-dynarmic-x64.ps1`, and older build scripts required by retained source
-- `dynarmic-x64/CMakeLists.txt`
-- Current Test5 documentation and version metadata
+- all files under `src/`
+- all files under `third_party/`
+- build scripts and toolchain helpers
+- Dynarmic x64 CMake project
+- patches and licenses
+- historical Test5 notes/changelog
+- current Test6 notes/changelog and version metadata
 
-## Removed or replaced only as obsolete documentation
-
-- Test4 milestone notes/changelog, replaced by Test5 files
-- No source file, APK, vendor dependency, build helper, or license
-
-No destructive cleanup script is included.
+The allocator and qsort fixes are in `src/dynarmic_probe.cpp`.
