@@ -1,15 +1,15 @@
-# Source contents — DynarmicTest12
+# Source contents — DynarmicTest13
 
-This is the complete source tree based on DynarmicTest11. No game APK, source file, vendor dependency, tool, patch, previous diagnostic note, or build script was removed.
+This is the complete source tree based on DynarmicTest12. No APK, source file, dependency, tool, patch, build script, or previous diagnostic/changelog file was removed.
 
-Test12-specific files:
+Test13-specific files:
 
-- `CHANGELOG-0.9.4-arm-dynarmictest12.md`
-- `DYNARMICTEST12-NOTES.md`
+- `CHANGELOG-0.9.4-arm-dynarmictest13.md`
+- `DYNARMICTEST13-NOTES.md`
 
 Core changed files:
 
-- `src/dynarmic_probe.cpp` — select-based guest poll, bounded nonblocking send/receive waits, diagnostics, and Test12 labels.
-- `dynarmic-x64/CMakeLists.txt` — Test12 project name; existing `shell32` and `ws2_32` linkage retained.
-- `build-dynarmic-x64.ps1` — Test12 output folder and notes.
-- `README.md`, `VERSION.txt`, and package verification metadata.
+- `src/dynarmic_probe.cpp` — guest page lookup, typed memory callbacks, cached OpenGL dispatch, buffered diagnostics, host/import sampling, GPU query timing, per-frame profiler, CSV/summary output, and Test13 labels.
+- `dynarmic-x64/CMakeLists.txt` — Test13 project name and `psapi` linkage for process-memory diagnostics.
+- `build-dynarmic-x64.ps1` — Test13 output directory, notes, debug-everything launcher, and profiler-file guidance.
+- `README.md`, `VERSION.txt`, and `PACKAGE-VERIFICATION.txt` — Test13 metadata.

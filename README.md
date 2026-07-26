@@ -1,15 +1,15 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest12
+# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest13
 
-DynarmicTest12 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic.
+DynarmicTest13 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic. Test12 established working GDPS upload/download and browser links. Test13 focuses on low-end-PC performance and useful diagnostics.
 
-## Test12 changes
+## Test13 changes
 
-- Replaces the Winsock `WSAPoll` translation with a POSIX-style `poll()` bridge implemented using Windows `select()`.
-- When the old ARM libcurl calls `recv()` before the first response byte arrives, waits for socket readability and retries instead of immediately returning `WSAEWOULDBLOCK` into its fragile receive path.
-- Applies the same bounded writable wait to `send()` if a nonblocking socket temporarily fills.
-- Adds bounded diagnostics for requested/ready poll events, receive waits, EOF, guest-buffer rejection, and real Winsock errors.
-- Keeps Test11's correct `SO_ERROR` mapping and direct `CCApplication::openURL` hook. Browser buttons were confirmed working in the Test11 runtime log.
-- Keeps host APK-member caching, Windows audio, mapped guest files, clean exit, editor text-input handling, and high-performance GPU preference.
+- Replaces repeated linear guest-memory mapping searches with a constant-time 4 KiB page lookup.
+- Uses one bounds check and one copy for 16/32/64-bit guest memory accesses.
+- Caches OpenGL host function pointers and argument metadata.
+- Buffers routine logging instead of flushing the disk on every input/JNI/file event.
+- Creates a per-frame “debug everything” profile with CPU, GPU, swap, imports, GL, draw, heap, and scene information.
+- Writes a compact summary containing percentiles, threshold counts, hot imports, sampled host costs, and the 50 worst frames.
 
 ## Build
 
@@ -22,21 +22,32 @@ BUILD_DYNARMIC_X64.cmd
 Output:
 
 ```text
-dist-arm-wrapper-dynarmictest12
+dist-arm-wrapper-dynarmictest13
 ```
 
-Use `RUN_DYNARMIC_INTERACTIVE.cmd` from that folder. A custom GDPS APK can be passed to the PowerShell builder or copied over the output `game.apk` after building.
+Run `RUN_DYNARMIC_INTERACTIVE.cmd`. A custom GDPS APK may be passed to `build-dynarmic-x64.ps1` or copied as `game.apk` into the output folder.
 
-## Important network log lines
+## Send these files after testing
 
 ```text
-RESULT: DYNARMIC_WINSOCK_BRIDGE_READY
-RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count=1
-[host] Socket connect ... status=connected ...
-[host] Socket SO_ERROR ... host=0 guest=0
-[host] Socket first send ...
-[host] Socket poll ...
-[host] Socket recv wait ... result=...
-[host] Socket first recv ...
-android log: response code: 200
+gd-dynarmic-interactive.log
+gd-dynarmic-profile.csv
+gd-dynarmic-profile-summary.txt
 ```
+
+The normal launcher enables the profiler automatically. For an A/B run without profiling overhead:
+
+```text
+GeometryDashDynarmicProbe.exe game.apk --no-profile --log=gd-dynarmic-no-profile.log
+```
+
+## Important startup markers
+
+```text
+RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY
+RESULT: DYNARMIC_DEBUG_EVERYTHING_READY
+RESULT: DYNARMIC_OPENGL_IMPORT_CACHE_READY
+RESULT: DYNARMIC_GPU_TIMER_READY
+```
+
+`DYNARMIC_GPU_TIMER_UNAVAILABLE` is not fatal; CPU, import, swap, draw, and heap profiling still work.

@@ -12,6 +12,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -43,6 +44,7 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <windows.h>
+#include <psapi.h>
 #include <shellapi.h>
 #include <GL/gl.h>
 #include <direct.h>
@@ -509,6 +511,8 @@ struct MemoryRegion {
 
 class ProbeEnvironment final : public Dynarmic::A32::UserCallbacks {
 public:
+    ProbeEnvironment() : page_regions_(kGuestPageCount, kUnmappedPage) {}
+
     u64 ticks_left = 0;
     bool invalid_access = false;
     bool interpreter_fallback = false;
@@ -521,75 +525,113 @@ public:
     u32 exception_pc = 0;
 
     void Map(u32 base, std::size_t size, bool executable) {
-        if (size == 0 || size > std::numeric_limits<u32>::max()) throw std::runtime_error("invalid guest mapping size");
+        if (size == 0 || size > std::numeric_limits<u32>::max())
+            throw std::runtime_error("invalid guest mapping size");
         const u64 end = static_cast<u64>(base) + size;
-        if (end > 0x100000000ull) throw std::runtime_error("guest mapping exceeds 32-bit address space");
+        if (end > 0x100000000ull)
+            throw std::runtime_error("guest mapping exceeds 32-bit address space");
         for (const auto& region : regions_) {
             const u64 existing_end = static_cast<u64>(region.base) + region.data.size();
-            if (!(end <= region.base || base >= existing_end)) throw std::runtime_error("overlapping guest mapping");
+            if (!(end <= region.base || base >= existing_end))
+                throw std::runtime_error("overlapping guest mapping");
         }
         regions_.push_back(MemoryRegion{base, std::vector<u8>(size), executable});
-        std::sort(regions_.begin(), regions_.end(), [](const MemoryRegion& lhs, const MemoryRegion& rhs) { return lhs.base < rhs.base; });
+        std::sort(regions_.begin(), regions_.end(),
+                  [](const MemoryRegion& lhs, const MemoryRegion& rhs) {
+                      return lhs.base < rhs.base;
+                  });
+        RebuildPageLookup();
     }
+
     void CopyIn(u32 address, const u8* source, std::size_t size) {
         MemoryRegion* region = FindMutable(address, size);
         if (!region) throw std::runtime_error("CopyIn outside mapped guest memory");
         std::memcpy(region->data.data() + (address - region->base), source, size);
     }
+
     bool ReadBytes(u32 address, void* output, std::size_t size) const {
+        if (size == 0) return true;
         const MemoryRegion* region = Find(address, size);
         if (!region) return false;
         std::memcpy(output, region->data.data() + (address - region->base), size);
         return true;
     }
+
     bool WriteBytes(u32 address, const void* source, std::size_t size) {
+        if (size == 0) return true;
         MemoryRegion* region = FindMutable(address, size);
         if (!region) return false;
         std::memcpy(region->data.data() + (address - region->base), source, size);
         return true;
     }
-    bool ReadCString(u32 address, std::string& output, std::size_t maximum = 1u << 20) const {
+
+    bool ReadCString(u32 address, std::string& output,
+                     std::size_t maximum = 1u << 20) const {
         output.clear();
-        for (std::size_t i = 0; i < maximum; ++i) {
-            u8 value = 0;
-            if (!ReadBytes(address + static_cast<u32>(i), &value, 1)) return false;
-            if (value == 0) return true;
-            output.push_back(static_cast<char>(value));
+        while (output.size() < maximum) {
+            const u64 current64 = static_cast<u64>(address) +
+                                  output.size();
+            if (current64 > std::numeric_limits<u32>::max()) return false;
+            std::size_t available = 0;
+            const u8* data = HostPointerToRegionEnd(
+                static_cast<u32>(current64), available);
+            if (!data || available == 0) return false;
+            const std::size_t remaining = maximum - output.size();
+            const std::size_t chunk = std::min(available, remaining);
+            const void* terminator = std::memchr(data, 0, chunk);
+            const std::size_t length = terminator
+                ? static_cast<const u8*>(terminator) - data
+                : chunk;
+            output.append(reinterpret_cast<const char*>(data), length);
+            if (terminator) return true;
+            if (chunk == 0) break;
         }
         return false;
     }
+
     void* HostPointer(u32 address, std::size_t size) {
         MemoryRegion* region = FindMutable(address, size);
-        return region ? static_cast<void*>(region->data.data() + (address - region->base)) : nullptr;
+        return region ? static_cast<void*>(region->data.data() +
+                                           (address - region->base))
+                      : nullptr;
     }
+
     const void* HostPointer(u32 address, std::size_t size) const {
         const MemoryRegion* region = Find(address, size);
-        return region ? static_cast<const void*>(region->data.data() + (address - region->base)) : nullptr;
+        return region ? static_cast<const void*>(region->data.data() +
+                                                 (address - region->base))
+                      : nullptr;
     }
-    const u8* HostPointerToRegionEnd(u32 address, std::size_t& available) const {
-        for (const auto& region : regions_) {
-            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
-            if (address >= region.base && static_cast<u64>(address) < region_end) {
-                available = static_cast<std::size_t>(region_end - address);
-                return region.data.data() + (address - region.base);
-            }
+
+    const u8* HostPointerToRegionEnd(u32 address,
+                                     std::size_t& available) const {
+        const MemoryRegion* region = FindContaining(address);
+        if (!region) {
+            available = 0;
+            return nullptr;
         }
-        available = 0;
-        return nullptr;
+        const u64 region_end = static_cast<u64>(region->base) + region->data.size();
+        available = static_cast<std::size_t>(region_end - address);
+        return region->data.data() + (address - region->base);
     }
+
     u8* HostPointerToRegionEnd(u32 address, std::size_t& available) {
-        for (auto& region : regions_) {
-            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
-            if (address >= region.base && static_cast<u64>(address) < region_end) {
-                available = static_cast<std::size_t>(region_end - address);
-                return region.data.data() + (address - region.base);
-            }
+        MemoryRegion* region = FindContainingMutable(address);
+        if (!region) {
+            available = 0;
+            return nullptr;
         }
-        available = 0;
-        return nullptr;
+        const u64 region_end = static_cast<u64>(region->base) + region->data.size();
+        available = static_cast<std::size_t>(region_end - address);
+        return region->data.data() + (address - region->base);
     }
-    bool IsMapped(u32 address, std::size_t size = 1) const { return Find(address, size) != nullptr; }
+
+    bool IsMapped(u32 address, std::size_t size = 1) const {
+        return Find(address, size) != nullptr;
+    }
+
     void AttachCpu(Dynarmic::A32::Jit* cpu) { attached_cpu_ = cpu; }
+
     void ResetStopState() {
         invalid_access = false;
         interpreter_fallback = false;
@@ -601,71 +643,183 @@ public:
         fallback_count = 0;
         exception_pc = 0;
     }
+
     u8 MemoryRead8(u32 vaddr) override {
-        const MemoryRegion* region = Find(vaddr, 1);
-        if (!region) { invalid_access = true; fault_address = vaddr; RequestHalt(); return 0; }
+        const MemoryRegion* region = Find(vaddr, sizeof(u8));
+        if (!region) return ReadFault<u8>(vaddr);
         return region->data[vaddr - region->base];
     }
+
     u16 MemoryRead16(u32 vaddr) override {
-        return static_cast<u16>(MemoryRead8(vaddr)) | static_cast<u16>(static_cast<u16>(MemoryRead8(vaddr + 1)) << 8);
+        return ReadTyped<u16>(vaddr);
     }
+
     u32 MemoryRead32(u32 vaddr) override {
-        return static_cast<u32>(MemoryRead16(vaddr)) | (static_cast<u32>(MemoryRead16(vaddr + 2)) << 16);
+        return ReadTyped<u32>(vaddr);
     }
+
     u64 MemoryRead64(u32 vaddr) override {
-        return static_cast<u64>(MemoryRead32(vaddr)) | (static_cast<u64>(MemoryRead32(vaddr + 4)) << 32);
+        return ReadTyped<u64>(vaddr);
     }
+
     void MemoryWrite8(u32 vaddr, u8 value) override {
-        MemoryRegion* region = FindMutable(vaddr, 1);
-        if (!region) { invalid_access = true; fault_address = vaddr; RequestHalt(); return; }
+        MemoryRegion* region = FindMutable(vaddr, sizeof(value));
+        if (!region) {
+            WriteFault(vaddr);
+            return;
+        }
         region->data[vaddr - region->base] = value;
     }
+
     void MemoryWrite16(u32 vaddr, u16 value) override {
-        MemoryWrite8(vaddr, static_cast<u8>(value));
-        MemoryWrite8(vaddr + 1, static_cast<u8>(value >> 8));
+        WriteTyped(vaddr, value);
     }
+
     void MemoryWrite32(u32 vaddr, u32 value) override {
-        MemoryWrite16(vaddr, static_cast<u16>(value));
-        MemoryWrite16(vaddr + 2, static_cast<u16>(value >> 16));
+        WriteTyped(vaddr, value);
     }
+
     void MemoryWrite64(u32 vaddr, u64 value) override {
-        MemoryWrite32(vaddr, static_cast<u32>(value));
-        MemoryWrite32(vaddr + 4, static_cast<u32>(value >> 32));
+        WriteTyped(vaddr, value);
     }
+
     void InterpreterFallback(u32 pc, std::size_t count) override {
-        interpreter_fallback = true; fallback_pc = pc; fallback_count = count; RequestHalt();
+        interpreter_fallback = true;
+        fallback_pc = pc;
+        fallback_count = count;
+        RequestHalt();
     }
+
     void CallSVC(u32 swi) override {
-        svc_pending = true; pending_svc = swi; RequestHalt();
+        svc_pending = true;
+        pending_svc = swi;
+        RequestHalt();
     }
+
     void ExceptionRaised(u32 pc, Dynarmic::A32::Exception) override {
-        exception_seen = true; exception_pc = pc; RequestHalt();
+        exception_seen = true;
+        exception_pc = pc;
+        RequestHalt();
     }
-    void AddTicks(u64 ticks) override { ticks_left = ticks > ticks_left ? 0 : ticks_left - ticks; }
+
+    void AddTicks(u64 ticks) override {
+        ticks_left = ticks > ticks_left ? 0 : ticks_left - ticks;
+    }
+
     u64 GetTicksRemaining() override { return ticks_left; }
 
 private:
+    static constexpr u32 kGuestPageShift = 12u;
+    static constexpr std::size_t kGuestPageCount =
+        static_cast<std::size_t>(1u) << (32u - kGuestPageShift);
+    static constexpr std::int16_t kUnmappedPage = -1;
+
     void RequestHalt() {
         if (attached_cpu_) attached_cpu_->HaltExecution(kCallbackHalt);
         ticks_left = 0;
     }
+
+    void RebuildPageLookup() {
+        std::fill(page_regions_.begin(), page_regions_.end(), kUnmappedPage);
+        if (regions_.size() > static_cast<std::size_t>(
+                                  std::numeric_limits<std::int16_t>::max()))
+            throw std::runtime_error("too many guest memory regions");
+        for (std::size_t index = 0; index < regions_.size(); ++index) {
+            const MemoryRegion& region = regions_[index];
+            const u64 begin_page = static_cast<u64>(region.base) >>
+                                   kGuestPageShift;
+            const u64 end_address = static_cast<u64>(region.base) +
+                                    region.data.size() - 1u;
+            const u64 end_page = end_address >> kGuestPageShift;
+            if (end_page >= page_regions_.size())
+                throw std::runtime_error("guest page lookup overflow");
+            for (u64 page = begin_page; page <= end_page; ++page)
+                page_regions_[static_cast<std::size_t>(page)] =
+                    static_cast<std::int16_t>(index);
+        }
+    }
+
+    const MemoryRegion* FindContaining(u32 address) const {
+        const std::int16_t index =
+            page_regions_[static_cast<std::size_t>(address >> kGuestPageShift)];
+        if (index < 0) return nullptr;
+        const MemoryRegion& region = regions_[static_cast<std::size_t>(index)];
+        const u64 end = static_cast<u64>(region.base) + region.data.size();
+        return address >= region.base && static_cast<u64>(address) < end
+            ? &region
+            : nullptr;
+    }
+
+    MemoryRegion* FindContainingMutable(u32 address) {
+        const std::int16_t index =
+            page_regions_[static_cast<std::size_t>(address >> kGuestPageShift)];
+        if (index < 0) return nullptr;
+        MemoryRegion& region = regions_[static_cast<std::size_t>(index)];
+        const u64 end = static_cast<u64>(region.base) + region.data.size();
+        return address >= region.base && static_cast<u64>(address) < end
+            ? &region
+            : nullptr;
+    }
+
     const MemoryRegion* Find(u32 address, std::size_t size) const {
+        if (size == 0) return FindContaining(address);
         const u64 end = static_cast<u64>(address) + size;
-        for (const auto& region : regions_) {
-            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
-            if (address >= region.base && end <= region_end) return &region;
-        }
-        return nullptr;
+        if (end > 0x100000000ull) return nullptr;
+        const MemoryRegion* region = FindContaining(address);
+        if (!region) return nullptr;
+        const u64 region_end = static_cast<u64>(region->base) +
+                               region->data.size();
+        return end <= region_end ? region : nullptr;
     }
+
     MemoryRegion* FindMutable(u32 address, std::size_t size) {
+        if (size == 0) return FindContainingMutable(address);
         const u64 end = static_cast<u64>(address) + size;
-        for (auto& region : regions_) {
-            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
-            if (address >= region.base && end <= region_end) return &region;
-        }
-        return nullptr;
+        if (end > 0x100000000ull) return nullptr;
+        MemoryRegion* region = FindContainingMutable(address);
+        if (!region) return nullptr;
+        const u64 region_end = static_cast<u64>(region->base) +
+                               region->data.size();
+        return end <= region_end ? region : nullptr;
     }
+
+    template <typename T>
+    T ReadFault(u32 address) {
+        invalid_access = true;
+        fault_address = address;
+        RequestHalt();
+        return T{};
+    }
+
+    void WriteFault(u32 address) {
+        invalid_access = true;
+        fault_address = address;
+        RequestHalt();
+    }
+
+    template <typename T>
+    T ReadTyped(u32 address) {
+        const MemoryRegion* region = Find(address, sizeof(T));
+        if (!region) return ReadFault<T>(address);
+        T value{};
+        std::memcpy(&value, region->data.data() + (address - region->base),
+                    sizeof(value));
+        return value;
+    }
+
+    template <typename T>
+    void WriteTyped(u32 address, T value) {
+        MemoryRegion* region = FindMutable(address, sizeof(T));
+        if (!region) {
+            WriteFault(address);
+            return;
+        }
+        std::memcpy(region->data.data() + (address - region->base), &value,
+                    sizeof(value));
+    }
+
     std::vector<MemoryRegion> regions_;
+    std::vector<std::int16_t> page_regions_;
     Dynarmic::A32::Jit* attached_cpu_ = nullptr;
 };
 
@@ -675,6 +829,38 @@ struct ImportRecord {
     u32 svc = 0;
     u64 calls = 0;
     bool warned = false;
+    bool is_gl = false;
+    void* resolved_host_function = nullptr;
+    int gl_argument_count = -1;
+    u64 sampled_host_nanoseconds = 0;
+    u64 sampled_host_calls = 0;
+};
+
+struct ProfilerCounters {
+    u64 import_calls = 0;
+    u64 jni_svc_calls = 0;
+    u64 gl_calls = 0;
+    u64 draw_calls = 0;
+    u64 draw_vertices = 0;
+    u64 buffer_upload_bytes = 0;
+    u64 texture_upload_bytes = 0;
+    u64 allocation_calls = 0;
+    u64 free_calls = 0;
+    u64 reallocation_calls = 0;
+    u64 apk_read_calls = 0;
+    u64 apk_read_bytes = 0;
+    u64 live_heap_bytes = 0;
+    u64 peak_heap_bytes = 0;
+};
+
+struct GuestCallMetrics {
+    std::string label;
+    double elapsed_ms = 0.0;
+    u64 estimated_ticks = 0;
+    u64 jit_runs = 0;
+    u64 svc_calls = 0;
+    ProfilerCounters before;
+    ProfilerCounters after;
 };
 struct ObjectRecord {
     std::string name;
@@ -798,7 +984,12 @@ static u32 EnsureImport(ElfRuntime& runtime, ProbeEnvironment& env, const std::s
     if ((index + 1u) * 8u > kImportRegionSize) throw std::runtime_error("too many imported functions");
     const u32 svc = static_cast<u32>(index + 1u);
     const u32 address = kImportBase + static_cast<u32>(index * 8u);
-    runtime.imports.push_back(ImportRecord{name, address, svc, 0, false});
+    ImportRecord record;
+    record.name = name;
+    record.address = address;
+    record.svc = svc;
+    record.is_gl = name.rfind("gl", 0) == 0;
+    runtime.imports.push_back(std::move(record));
     WriteArmSvcStub(env, address, svc);
     return address;
 }
@@ -1148,6 +1339,15 @@ struct HostEvent {
 #ifndef GL_RENDERBUFFER
 #define GL_RENDERBUFFER 0x8D41
 #endif
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
 using GLsizeiptr_ = std::ptrdiff_t;
 using GLintptr_ = std::ptrdiff_t;
 
@@ -1162,7 +1362,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest12Window";
+        const char* class_name = "GeometryDashDynarmicTest13Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1174,7 +1374,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test12",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test13",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1206,6 +1406,7 @@ public:
             << " version=" << (version ? version : "<null>") << '\n';
         opengl_ = LoadLibraryA("opengl32.dll");
         if (!opengl_) return Fail("opengl32.dll could not be loaded");
+        InitializeGpuProfiler();
 
         using SwapInterval = BOOL (WINAPI*)(int);
         if (auto* swap = reinterpret_cast<SwapInterval>(Resolve("wglSwapIntervalEXT"))) swap(1);
@@ -1215,6 +1416,7 @@ public:
     }
 
     void Destroy() {
+        DestroyGpuProfiler();
         if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
         if (device_ && window_) { ReleaseDC(window_, device_); device_ = nullptr; }
         if (window_) { DestroyWindow(window_); window_ = nullptr; }
@@ -1257,6 +1459,41 @@ public:
     }
 
     void Swap() { if (device_) SwapBuffers(device_); }
+    void BeginGpuFrame(u64 frame) {
+        PollGpuProfiler();
+        if (!gpu_profiler_ready_ || active_gpu_query_ >= 0) return;
+        const std::size_t index = static_cast<std::size_t>(
+            frame % gpu_queries_.size());
+        GpuQuerySlot& slot = gpu_queries_[index];
+        if (slot.pending || slot.id == 0) return;
+        begin_query_(GL_TIME_ELAPSED, slot.id);
+        slot.frame = frame;
+        active_gpu_query_ = static_cast<int>(index);
+    }
+    void EndGpuFrame() {
+        if (!gpu_profiler_ready_ || active_gpu_query_ < 0) return;
+        end_query_(GL_TIME_ELAPSED);
+        gpu_queries_[static_cast<std::size_t>(active_gpu_query_)].pending = true;
+        active_gpu_query_ = -1;
+    }
+    std::vector<std::pair<u64, double>> TakeGpuTimings() {
+        PollGpuProfiler();
+        std::vector<std::pair<u64, double>> results;
+        results.reserve(gpu_results_.size());
+        while (!gpu_results_.empty()) {
+            results.push_back(gpu_results_.front());
+            gpu_results_.pop_front();
+        }
+        return results;
+    }
+    std::vector<std::pair<u64, double>> FinishGpuTimings() {
+        if (gpu_profiler_ready_) {
+            if (active_gpu_query_ >= 0) EndGpuFrame();
+            glFinish();
+            PollGpuProfiler(true);
+        }
+        return TakeGpuTimings();
+    }
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
@@ -1277,6 +1514,83 @@ public:
     }
 
 private:
+    using GenQueriesFn = void (APIENTRY*)(GLsizei, GLuint*);
+    using DeleteQueriesFn = void (APIENTRY*)(GLsizei, const GLuint*);
+    using BeginQueryFn = void (APIENTRY*)(GLenum, GLuint);
+    using EndQueryFn = void (APIENTRY*)(GLenum);
+    using GetQueryObjectivFn = void (APIENTRY*)(GLuint, GLenum, GLint*);
+    using GetQueryObjectui64vFn =
+        void (APIENTRY*)(GLuint, GLenum, unsigned long long*);
+
+    struct GpuQuerySlot {
+        GLuint id = 0;
+        u64 frame = 0;
+        bool pending = false;
+    };
+
+    void InitializeGpuProfiler() {
+        gen_queries_ = reinterpret_cast<GenQueriesFn>(Resolve("glGenQueries"));
+        delete_queries_ =
+            reinterpret_cast<DeleteQueriesFn>(Resolve("glDeleteQueries"));
+        begin_query_ = reinterpret_cast<BeginQueryFn>(Resolve("glBeginQuery"));
+        end_query_ = reinterpret_cast<EndQueryFn>(Resolve("glEndQuery"));
+        get_query_object_iv_ = reinterpret_cast<GetQueryObjectivFn>(
+            Resolve("glGetQueryObjectiv"));
+        get_query_object_ui64v_ = reinterpret_cast<GetQueryObjectui64vFn>(
+            Resolve("glGetQueryObjectui64v"));
+        if (!get_query_object_ui64v_)
+            get_query_object_ui64v_ =
+                reinterpret_cast<GetQueryObjectui64vFn>(
+                    Resolve("glGetQueryObjectui64vEXT"));
+        gpu_profiler_ready_ = gen_queries_ && delete_queries_ &&
+            begin_query_ && end_query_ && get_query_object_iv_ &&
+            get_query_object_ui64v_;
+        if (!gpu_profiler_ready_) {
+            if (log_) *log_ << "RESULT: DYNARMIC_GPU_TIMER_UNAVAILABLE\n";
+            return;
+        }
+        std::array<GLuint, 8> ids{};
+        gen_queries_(static_cast<GLsizei>(ids.size()), ids.data());
+        for (std::size_t index = 0; index < ids.size(); ++index)
+            gpu_queries_[index].id = ids[index];
+        if (log_)
+            *log_ << "RESULT: DYNARMIC_GPU_TIMER_READY queries="
+                  << ids.size() << '\n';
+    }
+
+    void PollGpuProfiler(bool force = false) {
+        if (!gpu_profiler_ready_) return;
+        for (GpuQuerySlot& slot : gpu_queries_) {
+            if (!slot.pending || slot.id == 0) continue;
+            GLint available = 0;
+            if (!force)
+                get_query_object_iv_(
+                    slot.id, GL_QUERY_RESULT_AVAILABLE, &available);
+            if (!force && !available) continue;
+            unsigned long long nanoseconds = 0;
+            get_query_object_ui64v_(
+                slot.id, GL_QUERY_RESULT, &nanoseconds);
+            gpu_results_.emplace_back(
+                slot.frame,
+                static_cast<double>(nanoseconds) / 1000000.0);
+            slot.pending = false;
+        }
+    }
+
+    void DestroyGpuProfiler() {
+        if (!gpu_profiler_ready_) return;
+        if (active_gpu_query_ >= 0) {
+            end_query_(GL_TIME_ELAPSED);
+            active_gpu_query_ = -1;
+        }
+        std::array<GLuint, 8> ids{};
+        for (std::size_t index = 0; index < gpu_queries_.size(); ++index)
+            ids[index] = gpu_queries_[index].id;
+        delete_queries_(static_cast<GLsizei>(ids.size()), ids.data());
+        gpu_profiler_ready_ = false;
+        gpu_results_.clear();
+    }
+
     void Queue(HostEvent event) {
         if (event.type == HostEventType::TouchMove && !events_.empty() &&
             events_.back().type == HostEventType::TouchMove) {
@@ -1427,6 +1741,16 @@ private:
     float last_y_ = 0.0f;
     std::deque<HostEvent> events_;
     std::unordered_map<std::string, void*> functions_;
+    bool gpu_profiler_ready_ = false;
+    int active_gpu_query_ = -1;
+    std::array<GpuQuerySlot, 8> gpu_queries_{};
+    std::deque<std::pair<u64, double>> gpu_results_;
+    GenQueriesFn gen_queries_ = nullptr;
+    DeleteQueriesFn delete_queries_ = nullptr;
+    BeginQueryFn begin_query_ = nullptr;
+    EndQueryFn end_query_ = nullptr;
+    GetQueryObjectivFn get_query_object_iv_ = nullptr;
+    GetQueryObjectui64vFn get_query_object_ui64v_ = nullptr;
 };
 #else
 class WinGlHost {
@@ -1437,6 +1761,10 @@ public:
     bool PumpMessages() { return false; }
     std::vector<HostEvent> TakeEvents() { return {}; }
     void Swap() {}
+    void BeginGpuFrame(u64) {}
+    void EndGpuFrame() {}
+    std::vector<std::pair<u64, double>> TakeGpuTimings() { return {}; }
+    std::vector<std::pair<u64, double>> FinishGpuTimings() { return {}; }
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
@@ -1535,6 +1863,14 @@ public:
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
     void SwapBuffersHost() { gl_.Swap(); }
+    void BeginGpuFrame(u64 frame) { gl_.BeginGpuFrame(frame); }
+    void EndGpuFrame() { gl_.EndGpuFrame(); }
+    std::vector<std::pair<u64, double>> TakeGpuTimings() {
+        return gl_.TakeGpuTimings();
+    }
+    std::vector<std::pair<u64, double>> FinishGpuTimings() {
+        return gl_.FinishGpuTimings();
+    }
     double FrameInterval() const { return frame_interval_; }
     u64 PermissiveStubCalls() const { return permissive_stub_calls_; }
     const std::set<std::string>& PermissiveNames() const { return permissive_names_; }
@@ -1544,6 +1880,114 @@ public:
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
     bool TerminationRequested() const { return termination_requested_; }
     void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
+    void FlushDiagnostics() { log_.flush(); }
+    const GuestCallMetrics& LastCallMetrics() const { return last_call_metrics_; }
+    const std::string& LastAndroidLog() const { return last_android_log_; }
+
+    ProfilerCounters CaptureProfilerCounters() const {
+        ProfilerCounters counters;
+        counters.import_calls = total_import_calls_;
+        counters.jni_svc_calls = jni_svc_calls_;
+        counters.gl_calls = gl_calls_;
+        counters.draw_calls = gl_draw_calls_;
+        counters.draw_vertices = gl_draw_vertices_;
+        counters.buffer_upload_bytes = gl_buffer_upload_bytes_;
+        counters.texture_upload_bytes = gl_texture_upload_bytes_;
+        counters.allocation_calls = allocation_calls_;
+        counters.free_calls = free_calls_;
+        counters.reallocation_calls = reallocation_calls_;
+        counters.apk_read_calls = apk_memory_read_calls_;
+        counters.apk_read_bytes = apk_memory_read_bytes_;
+        counters.live_heap_bytes = live_allocation_bytes_;
+        counters.peak_heap_bytes = peak_live_allocation_bytes_;
+        return counters;
+    }
+
+    std::vector<u64> CaptureImportCounts() const {
+        std::vector<u64> counts;
+        counts.reserve(runtime_.imports.size());
+        for (const ImportRecord& import : runtime_.imports)
+            counts.push_back(import.calls);
+        return counts;
+    }
+
+    std::string DescribeTopImportDeltas(
+        const std::vector<u64>& before,
+        const std::vector<u64>& after,
+        std::size_t limit,
+        bool gl_only = false) const {
+        struct Delta {
+            const ImportRecord* import = nullptr;
+            u64 calls = 0;
+        };
+        std::vector<Delta> deltas;
+        const std::size_t count =
+            std::min({before.size(), after.size(), runtime_.imports.size()});
+        deltas.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            const ImportRecord& import = runtime_.imports[index];
+            if (gl_only && !import.is_gl) continue;
+            const u64 delta = after[index] >= before[index]
+                ? after[index] - before[index]
+                : 0;
+            if (delta) deltas.push_back(Delta{&import, delta});
+        }
+        std::sort(deltas.begin(), deltas.end(),
+                  [](const Delta& lhs, const Delta& rhs) {
+                      return lhs.calls > rhs.calls;
+                  });
+        std::ostringstream output;
+        const std::size_t shown = std::min(limit, deltas.size());
+        for (std::size_t index = 0; index < shown; ++index) {
+            if (index) output << '|';
+            output << deltas[index].import->name << ':' << deltas[index].calls;
+        }
+        return output.str();
+    }
+
+    std::string DescribeTopImports(std::size_t limit,
+                                   bool gl_only = false) const {
+        std::vector<u64> zero(runtime_.imports.size(), 0u);
+        return DescribeTopImportDeltas(zero, CaptureImportCounts(), limit,
+                                       gl_only);
+    }
+
+    std::string DescribeTopImportHostSamples(std::size_t limit) const {
+        struct Sample {
+            const ImportRecord* import = nullptr;
+            double estimated_total_ms = 0.0;
+            double sampled_average_ns = 0.0;
+        };
+        std::vector<Sample> samples;
+        for (const ImportRecord& import : runtime_.imports) {
+            if (!import.sampled_host_calls || !import.calls) continue;
+            const double average_ns =
+                static_cast<double>(import.sampled_host_nanoseconds) /
+                static_cast<double>(import.sampled_host_calls);
+            samples.push_back(Sample{
+                &import,
+                average_ns * static_cast<double>(import.calls) / 1000000.0,
+                average_ns});
+        }
+        std::sort(samples.begin(), samples.end(),
+                  [](const Sample& lhs, const Sample& rhs) {
+                      return lhs.estimated_total_ms >
+                             rhs.estimated_total_ms;
+                  });
+        std::ostringstream output;
+        const std::size_t shown = std::min(limit, samples.size());
+        output << std::fixed << std::setprecision(2);
+        for (std::size_t index = 0; index < shown; ++index) {
+            if (index) output << '|';
+            output << samples[index].import->name
+                   << ":estimated_ms=" << samples[index].estimated_total_ms
+                   << ":sample_avg_ns="
+                   << samples[index].sampled_average_ns
+                   << ":samples="
+                   << samples[index].import->sampled_host_calls;
+        }
+        return output.str();
+    }
 
     bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
         if (!function) return true;
@@ -1647,7 +2091,10 @@ public:
         const bool unlimited_ticks = tick_budget == 0;
         u64 budget = tick_budget;
         u64 estimated_ticks = 0;
+        u64 jit_runs = 0;
+        u64 svc_calls = 0;
         bool returned = false;
+        const ProfilerCounters counters_before = CaptureProfilerCounters();
         const u64 import_calls_before = total_import_calls_;
         const auto started = std::chrono::steady_clock::now();
         auto next_progress = started + std::chrono::seconds(5);
@@ -1663,6 +2110,7 @@ public:
             const u64 chunk = unlimited_ticks ? 5000000u : std::min<u64>(budget, 5000000u);
             env_.ResetStopState();
             env_.ticks_left = chunk;
+            ++jit_runs;
             const Dynarmic::HaltReason halt_reason = cpu_.Run();
             cpu_.ClearHalt(kCallbackHalt);
 
@@ -1686,6 +2134,7 @@ public:
                 return Fail(error.str());
             }
             if (env_.svc_pending) {
+                ++svc_calls;
                 estimated_ticks += 1024u;
                 if (env_.pending_svc == kSvcReturn) {
                     returned = true;
@@ -1724,6 +2173,14 @@ public:
         }
         if (result) *result = cpu_.Regs()[0];
         const auto completed_elapsed = std::chrono::steady_clock::now() - started;
+        last_call_metrics_.label = label;
+        last_call_metrics_.elapsed_ms =
+            std::chrono::duration<double, std::milli>(completed_elapsed).count();
+        last_call_metrics_.estimated_ticks = estimated_ticks;
+        last_call_metrics_.jit_runs = jit_runs;
+        last_call_metrics_.svc_calls = svc_calls;
+        last_call_metrics_.before = counters_before;
+        last_call_metrics_.after = CaptureProfilerCounters();
         if (label.rfind("native", 0) == 0 &&
             completed_elapsed >= std::chrono::milliseconds(250)) {
             log_ << "Dynarmic guest call timing: " << label
@@ -1871,7 +2328,6 @@ private:
              << " (" << DescribeAddress(function) << ')' << std::dec;
         if (!details.empty()) log_ << ' ' << details;
         log_ << '\n';
-        log_.flush();
     }
     void DumpFatalGuestState(const std::string& import_name) {
         const u32 pc = cpu_.Regs()[15];
@@ -1983,6 +2439,21 @@ private:
             import.name == "siglongjmp";
         if (diagnostic_import || (total_import_calls_ & 0x0fffu) == 0u)
             RememberEvent("import:" + import.name);
+
+        // Sample one host dispatch out of every 1024 calls per import. This
+        // identifies expensive bridges without putting a clock read around
+        // every libc/OpenGL trap on low-end systems.
+        if ((import.calls & 0x03ffu) == 1u) {
+            const auto host_started = std::chrono::steady_clock::now();
+            const bool ok = DispatchImport(import);
+            const auto host_elapsed =
+                std::chrono::steady_clock::now() - host_started;
+            import.sampled_host_nanoseconds += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    host_elapsed).count());
+            ++import.sampled_host_calls;
+            return ok;
+        }
         return DispatchImport(import);
     }
     void ResumeAfterStub(u32 stub_address) {
@@ -2286,7 +2757,6 @@ private:
         if (!ref) return 0;
         ref->class_name = name;
         log_ << "JNI FindClass: " << name << '\n';
-        log_.flush();
         return handle;
     }
     u32 NewMethodRef(u32 class_handle, const std::string& name, const std::string& signature) {
@@ -2302,7 +2772,6 @@ private:
         ref->name = name;
         ref->signature = signature;
         log_ << "JNI method: " << class_name << '.' << name << ' ' << signature << '\n';
-        log_.flush();
         return handle;
     }
     std::string RefString(u32 handle) const {
@@ -2314,7 +2783,6 @@ private:
         if (!method) return;
         if (method->calls++ == 0) {
             log_ << "JNI call: " << method->class_name << '.' << method->name << ' ' << method->signature << '\n';
-            log_.flush();
         }
     }
     u32 NewArrayRef(RefKind kind, u32 length, u32 element_size) {
@@ -2606,10 +3074,10 @@ private:
         } else {
             // The remaining Android activity calls are safe no-ops for the first-frame milestone.
         }
-        log_.flush();
     }
 
     bool HandleJni(u32 index) {
+        ++jni_svc_calls_;
         const u32 r1 = cpu_.Regs()[1];
         const u32 r2 = cpu_.Regs()[2];
         const u32 r3 = cpu_.Regs()[3];
@@ -2848,7 +3316,6 @@ private:
         }
         if (file_open_logs_++ < 256u || host_path != apk_path_)
             log_ << "Dynarmic file open: " << guest_path << " -> " << host_path << " mode=" << mode << '\n';
-        log_.flush();
         return NewGuestFile(stream, false, host_path, mode);
     }
     u32 ReadGuestFile(u32 destination, u32 element_size, u32 count, u32 handle) {
@@ -3298,20 +3765,54 @@ private:
     }
     bool DispatchGl(ImportRecord& import) {
         const std::string& name = import.name;
+        ++gl_calls_;
         if (name == "glClearDepthf") {
-            void* clear_depth = gl_.Resolve("glClearDepth");
+            void* clear_depth = import.resolved_host_function;
+            if (!clear_depth) {
+                clear_depth = gl_.Resolve("glClearDepth");
+                import.resolved_host_function = clear_depth;
+            }
             if (!clear_depth) return Fail("OpenGL function unavailable: glClearDepth");
-            reinterpret_cast<void (APIENTRY*)(double)>(clear_depth)(static_cast<double>(WordToFloat(ArgWord(0))));
+            reinterpret_cast<void (APIENTRY*)(double)>(clear_depth)(
+                static_cast<double>(WordToFloat(ArgWord(0))));
             cpu_.Regs()[0] = 0;
             ResumeAfterStub(import.address);
             return true;
         }
-        void* function = gl_.Resolve(name);
+        void* function = import.resolved_host_function;
+        if (!function) {
+            function = gl_.Resolve(name);
+            import.resolved_host_function = function;
+        }
         if (!function) return Fail("OpenGL function unavailable: " + name);
         std::array<GlWord, 9> arguments{};
-        const unsigned count = GlArgumentCount(name);
-        if (count == std::numeric_limits<unsigned>::max()) return Fail("OpenGL argument descriptor missing: " + name);
+        unsigned count = 0;
+        if (import.gl_argument_count < 0) {
+            const unsigned resolved_count = GlArgumentCount(name);
+            if (resolved_count == std::numeric_limits<unsigned>::max())
+                return Fail("OpenGL argument descriptor missing: " + name);
+            import.gl_argument_count = static_cast<int>(resolved_count);
+        }
+        count = static_cast<unsigned>(import.gl_argument_count);
         for (unsigned i = 0; i < count; ++i) arguments[i] = ArgWord(i);
+
+        if (name == "glDrawArrays" || name == "glDrawElements") {
+            ++gl_draw_calls_;
+            gl_draw_vertices_ += static_cast<u64>(arguments[1]);
+        } else if (name == "glBufferData") {
+            gl_buffer_upload_bytes_ += static_cast<u64>(arguments[1]);
+        } else if (name == "glBufferSubData") {
+            gl_buffer_upload_bytes_ += static_cast<u64>(arguments[2]);
+        } else if (name == "glTexImage2D") {
+            gl_texture_upload_bytes_ += GlPixelBytes(
+                static_cast<u32>(arguments[3]),
+                static_cast<u32>(arguments[4]),
+                static_cast<u32>(arguments[6]),
+                static_cast<u32>(arguments[7]));
+        } else if (name == "glCompressedTexImage2D") {
+            gl_texture_upload_bytes_ += static_cast<u64>(arguments[6]);
+        }
+
         GlWord result = 0;
 
         if (name == "glGetString") {
@@ -4278,7 +4779,7 @@ private:
         u32 result = 0;
         bool result_set = true;
 
-        if (name.rfind("gl", 0) == 0) return DispatchGl(import);
+        if (import.is_gl) return DispatchGl(import);
 
         auto finish_hot = [&](u32 value) {
             cpu_.Regs()[0] = value;
@@ -4656,7 +5157,11 @@ private:
         else if (name == "qsort") { if (!GuestQsort(r0,r1,r2,r3)) return false; result=0; }
         else if (name == "bsearch") result = GuestBsearch(r0,r1,r2,r3,ArgWord(4));
         else if (name == "__android_log_print") {
-            FormatCursor cursor{*this,3u,0u}; const std::string text=FormatGuestString(r2,cursor); log_ << "android log: " << text << '\n'; result=static_cast<u32>(text.size());
+            FormatCursor cursor{*this,3u,0u};
+            const std::string text=FormatGuestString(r2,cursor);
+            last_android_log_ = text.size() <= 160u ? text : text.substr(0, 160u);
+            log_ << "android log: " << text << '\n';
+            result=static_cast<u32>(text.size());
         } else if (name == "__gnu_Unwind_Find_exidx") { if(r1)env_.MemoryWrite32(r1,0); result=0; }
         else if (name == "dlopen" || name == "dlsym" || name == "dlclose" || name == "dlerror") result=0;
         else if (name == "mmap") result=AllocateAligned(r1, kPageSize);
@@ -4819,6 +5324,13 @@ private:
     unsigned call_depth_=0;
     u64 permissive_stub_calls_=0;
     u64 total_import_calls_=0;
+    u64 jni_svc_calls_=0;
+    u64 gl_calls_=0;
+    u64 gl_draw_calls_=0;
+    u64 gl_draw_vertices_=0;
+    u64 gl_buffer_upload_bytes_=0;
+    u64 gl_texture_upload_bytes_=0;
+    GuestCallMetrics last_call_metrics_;
     std::set<std::string> permissive_names_;
     std::deque<std::string> recent_events_;
     std::vector<std::string> active_calls_;
@@ -4827,6 +5339,7 @@ private:
     u64 last_assert_sequence_=0;
     std::string last_assert_title_;
     std::string last_assert_text_;
+    std::string last_android_log_;
     std::string last_error_;
     std::vector<GuestRef> refs_;
     std::set<u32> unimplemented_jni_slots_;
@@ -4869,6 +5382,406 @@ private:
     u32 touch_ids_=0;
     u32 touch_xs_=0;
     u32 touch_ys_=0;
+};
+
+struct FrameProfileSample {
+    u64 frame = 0;
+    double total_ms = 0.0;
+    double event_ms = 0.0;
+    double render_ms = 0.0;
+    double swap_ms = 0.0;
+    double gpu_ms = -1.0;
+    u64 estimated_ticks = 0;
+    u64 jit_runs = 0;
+    u64 svc_calls = 0;
+    u64 import_calls = 0;
+    u64 jni_calls = 0;
+    u64 gl_calls = 0;
+    u64 draw_calls = 0;
+    u64 draw_vertices = 0;
+    u64 buffer_upload_bytes = 0;
+    u64 texture_upload_bytes = 0;
+    u64 allocation_calls = 0;
+    u64 free_calls = 0;
+    u64 reallocation_calls = 0;
+    u64 live_heap_bytes = 0;
+    std::string scene_hint;
+    std::string top_imports;
+    std::string top_gl;
+};
+
+static u64 CounterDelta(u64 before, u64 after) {
+    return after >= before ? after - before : 0u;
+}
+
+static std::string CsvField(const std::string& value) {
+    bool quote = false;
+    for (const char c : value) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            quote = true;
+            break;
+        }
+    }
+    if (!quote) return value;
+    std::string result;
+    result.reserve(value.size() + 2u);
+    result.push_back('"');
+    for (const char c : value) {
+        if (c == '"') result.push_back('"');
+        result.push_back(c);
+    }
+    result.push_back('"');
+    return result;
+}
+
+static double Percentile(std::vector<double> values, double percentile) {
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const double position = std::clamp(percentile, 0.0, 1.0) *
+                            static_cast<double>(values.size() - 1u);
+    const std::size_t low = static_cast<std::size_t>(position);
+    const std::size_t high = std::min(low + 1u, values.size() - 1u);
+    const double fraction = position - static_cast<double>(low);
+    return values[low] + (values[high] - values[low]) * fraction;
+}
+
+#ifdef _WIN32
+static double CurrentProcessCpuMilliseconds() {
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+        return 0.0;
+    ULARGE_INTEGER kernel_value{}, user_value{};
+    kernel_value.LowPart = kernel.dwLowDateTime;
+    kernel_value.HighPart = kernel.dwHighDateTime;
+    user_value.LowPart = user.dwLowDateTime;
+    user_value.HighPart = user.dwHighDateTime;
+    return static_cast<double>(kernel_value.QuadPart + user_value.QuadPart) /
+           10000.0;
+}
+
+static std::pair<u64, u64> CurrentProcessMemoryBytes() {
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+            static_cast<DWORD>(sizeof(counters))))
+        return {0u, 0u};
+    return {static_cast<u64>(counters.WorkingSetSize),
+            static_cast<u64>(counters.PrivateUsage)};
+}
+
+static std::string HostSystemProfile() {
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    GlobalMemoryStatusEx(&memory);
+    std::array<char, 256> processor{};
+    const DWORD processor_length = GetEnvironmentVariableA(
+        "PROCESSOR_IDENTIFIER", processor.data(),
+        static_cast<DWORD>(processor.size()));
+    std::ostringstream output;
+    output << "logical_cpus=" << system.dwNumberOfProcessors
+           << " page_size=" << system.dwPageSize
+           << " ram_mb=" << (memory.ullTotalPhys / (1024ull * 1024ull))
+           << " cpu=\"";
+    if (processor_length > 0 && processor_length < processor.size())
+        output << processor.data();
+    else
+        output << "unknown";
+    output << "\"";
+    return output.str();
+}
+#else
+static double CurrentProcessCpuMilliseconds() { return 0.0; }
+static std::pair<u64, u64> CurrentProcessMemoryBytes() { return {0u, 0u}; }
+static std::string HostSystemProfile() { return "host-profile-unavailable"; }
+#endif
+
+class FrameProfiler {
+public:
+    FrameProfiler(std::ostream& log, std::string csv_path,
+                  std::string summary_path, double slow_threshold_ms)
+        : log_(log),
+          csv_path_(std::move(csv_path)),
+          summary_path_(std::move(summary_path)),
+          slow_threshold_ms_(slow_threshold_ms) {}
+
+    std::size_t SampleCount() const { return samples_.size(); }
+
+    void SetGpuTiming(u64 frame, double gpu_ms) {
+        if (frame == 0 || frame > samples_.size()) return;
+        samples_[static_cast<std::size_t>(frame - 1u)].gpu_ms = gpu_ms;
+    }
+
+    void Add(FrameProfileSample sample) {
+        const bool slow = IsSlow(sample);
+        if (slow) {
+            ++slow_frame_count_;
+            sample.top_imports =
+                sample.top_imports.empty() ? "-" : sample.top_imports;
+            sample.top_gl = sample.top_gl.empty() ? "-" : sample.top_gl;
+            log_ << "Dynarmic slow frame #" << sample.frame
+                 << " total_ms=" << std::fixed << std::setprecision(2)
+                 << sample.total_ms
+                 << " event_ms=" << sample.event_ms
+                 << " render_ms=" << sample.render_ms
+                 << " swap_ms=" << sample.swap_ms
+                 << " gpu_ms=" << sample.gpu_ms
+                 << " imports=" << sample.import_calls
+                 << " jni=" << sample.jni_calls
+                 << " gl=" << sample.gl_calls
+                 << " draws=" << sample.draw_calls
+                 << " vertices=" << sample.draw_vertices
+                 << " alloc/free/realloc=" << sample.allocation_calls << '/'
+                 << sample.free_calls << '/' << sample.reallocation_calls
+                 << " ticks=" << sample.estimated_ticks
+                 << " jit_runs=" << sample.jit_runs
+                 << " svc=" << sample.svc_calls
+                 << " scene=\"" << sample.scene_hint << "\""
+                 << " top-imports={" << sample.top_imports << "}"
+                 << " top-gl={" << sample.top_gl << "}\n";
+        }
+        samples_.push_back(std::move(sample));
+    }
+
+    void LogInterval(std::size_t begin, double wall_ms,
+                     double process_cpu_before_ms,
+                     double process_cpu_after_ms) {
+        if (begin >= samples_.size() || wall_ms <= 0.0) return;
+        std::vector<double> total;
+        std::vector<double> render;
+        std::vector<double> swap;
+        std::vector<double> gpu;
+        total.reserve(samples_.size() - begin);
+        render.reserve(samples_.size() - begin);
+        swap.reserve(samples_.size() - begin);
+        gpu.reserve(samples_.size() - begin);
+        u64 imports = 0;
+        u64 gl_calls = 0;
+        u64 draws = 0;
+        u64 slow = 0;
+        for (std::size_t index = begin; index < samples_.size(); ++index) {
+            const FrameProfileSample& sample = samples_[index];
+            total.push_back(sample.total_ms);
+            render.push_back(sample.render_ms);
+            swap.push_back(sample.swap_ms);
+            if (sample.gpu_ms >= 0.0) gpu.push_back(sample.gpu_ms);
+            imports += sample.import_calls;
+            gl_calls += sample.gl_calls;
+            draws += sample.draw_calls;
+            if (IsSlow(sample)) ++slow;
+        }
+        const double fps = static_cast<double>(total.size()) * 1000.0 / wall_ms;
+        const double cpu_delta =
+            std::max(0.0, process_cpu_after_ms - process_cpu_before_ms);
+        const double cpu_percent = wall_ms > 0.0 ? cpu_delta * 100.0 / wall_ms : 0.0;
+        const auto [working_set, private_bytes] = CurrentProcessMemoryBytes();
+        log_ << std::fixed << std::setprecision(1)
+             << "Dynarmic debug-everything interval: fps=" << fps
+             << " frames=" << total.size()
+             << " frame_p50/p95/p99/max_ms="
+             << std::setprecision(2)
+             << Percentile(total, 0.50) << '/'
+             << Percentile(total, 0.95) << '/'
+             << Percentile(total, 0.99) << '/'
+             << *std::max_element(total.begin(), total.end())
+             << " render_p95_ms=" << Percentile(render, 0.95)
+             << " swap_p95_ms=" << Percentile(swap, 0.95);
+        if (!gpu.empty())
+            log_ << " gpu_p95_ms=" << Percentile(gpu, 0.95);
+        log_ << " slow=" << slow
+             << " imports/frame=" << (imports / total.size())
+             << " gl/frame=" << (gl_calls / total.size())
+             << " draws/frame=" << (draws / total.size())
+             << " process_cpu=" << std::setprecision(1) << cpu_percent << '%'
+             << " working_set_mb=" << std::setprecision(1)
+             << static_cast<double>(working_set) / (1024.0 * 1024.0)
+             << " private_mb="
+             << static_cast<double>(private_bytes) / (1024.0 * 1024.0)
+             << '\n';
+    }
+
+    void WriteFiles(const GuestExecutor& executor) const {
+        WriteCsv();
+        WriteSummary(executor);
+    }
+
+private:
+    bool IsSlow(const FrameProfileSample& sample) const {
+        return sample.total_ms >= slow_threshold_ms_ ||
+               sample.event_ms >= slow_threshold_ms_ ||
+               sample.render_ms >= slow_threshold_ms_ ||
+               sample.swap_ms >= slow_threshold_ms_;
+    }
+
+    void WriteCsv() const {
+        std::ofstream file(csv_path_, std::ios::trunc);
+        if (!file) {
+            log_ << "WARNING: could not create frame profile CSV: "
+                 << csv_path_ << '\n';
+            return;
+        }
+        file << "frame,total_ms,event_ms,render_ms,swap_ms,gpu_ms,"
+                "estimated_ticks,jit_runs,svc_calls,import_calls,jni_calls,"
+                "gl_calls,draw_calls,draw_vertices,buffer_upload_bytes,"
+                "texture_upload_bytes,allocation_calls,free_calls,"
+                "reallocation_calls,live_heap_bytes,scene_hint,top_imports,"
+                "top_gl\n";
+        file << std::fixed << std::setprecision(4);
+        for (const FrameProfileSample& sample : samples_) {
+            file << sample.frame << ','
+                 << sample.total_ms << ','
+                 << sample.event_ms << ','
+                 << sample.render_ms << ','
+                 << sample.swap_ms << ','
+                 << sample.gpu_ms << ','
+                 << sample.estimated_ticks << ','
+                 << sample.jit_runs << ','
+                 << sample.svc_calls << ','
+                 << sample.import_calls << ','
+                 << sample.jni_calls << ','
+                 << sample.gl_calls << ','
+                 << sample.draw_calls << ','
+                 << sample.draw_vertices << ','
+                 << sample.buffer_upload_bytes << ','
+                 << sample.texture_upload_bytes << ','
+                 << sample.allocation_calls << ','
+                 << sample.free_calls << ','
+                 << sample.reallocation_calls << ','
+                 << sample.live_heap_bytes << ','
+                 << CsvField(sample.scene_hint) << ','
+                 << CsvField(sample.top_imports) << ','
+                 << CsvField(sample.top_gl) << '\n';
+        }
+    }
+
+    void WriteSummary(const GuestExecutor& executor) const {
+        std::ofstream file(summary_path_, std::ios::trunc);
+        if (!file) {
+            log_ << "WARNING: could not create frame profile summary: "
+                 << summary_path_ << '\n';
+            return;
+        }
+        std::vector<double> total;
+        std::vector<double> event;
+        std::vector<double> render;
+        std::vector<double> swap;
+        std::vector<double> gpu;
+        total.reserve(samples_.size());
+        event.reserve(samples_.size());
+        render.reserve(samples_.size());
+        swap.reserve(samples_.size());
+        gpu.reserve(samples_.size());
+        u64 over_16 = 0;
+        u64 over_20 = 0;
+        u64 over_25 = 0;
+        u64 over_33 = 0;
+        u64 over_50 = 0;
+        u64 imports = 0;
+        u64 gl_calls = 0;
+        u64 draw_calls = 0;
+        u64 vertices = 0;
+        u64 allocations = 0;
+        u64 frees = 0;
+        for (const FrameProfileSample& sample : samples_) {
+            total.push_back(sample.total_ms);
+            event.push_back(sample.event_ms);
+            render.push_back(sample.render_ms);
+            swap.push_back(sample.swap_ms);
+            if (sample.gpu_ms >= 0.0) gpu.push_back(sample.gpu_ms);
+            if (sample.total_ms > 16.667) ++over_16;
+            if (sample.total_ms > 20.0) ++over_20;
+            if (sample.total_ms > 25.0) ++over_25;
+            if (sample.total_ms > 33.333) ++over_33;
+            if (sample.total_ms > 50.0) ++over_50;
+            imports += sample.import_calls;
+            gl_calls += sample.gl_calls;
+            draw_calls += sample.draw_calls;
+            vertices += sample.draw_vertices;
+            allocations += sample.allocation_calls;
+            frees += sample.free_calls;
+        }
+        file << "Geometry Dash ARM wrapper DynarmicTest13 debug-everything profile\n";
+        file << "frames=" << samples_.size() << '\n';
+        file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
+        file << "slow_frames=" << slow_frame_count_ << '\n';
+        if (!samples_.empty()) {
+            const auto average = [](const std::vector<double>& values) {
+                return std::accumulate(values.begin(), values.end(), 0.0) /
+                       static_cast<double>(values.size());
+            };
+            file << std::fixed << std::setprecision(4);
+            file << "frame_avg_ms=" << average(total) << '\n';
+            file << "frame_p50_ms=" << Percentile(total, 0.50) << '\n';
+            file << "frame_p90_ms=" << Percentile(total, 0.90) << '\n';
+            file << "frame_p95_ms=" << Percentile(total, 0.95) << '\n';
+            file << "frame_p99_ms=" << Percentile(total, 0.99) << '\n';
+            file << "frame_p999_ms=" << Percentile(total, 0.999) << '\n';
+            file << "frame_max_ms="
+                 << *std::max_element(total.begin(), total.end()) << '\n';
+            file << "event_p95_ms=" << Percentile(event, 0.95) << '\n';
+            file << "render_p95_ms=" << Percentile(render, 0.95) << '\n';
+            file << "swap_p95_ms=" << Percentile(swap, 0.95) << '\n';
+            if (!gpu.empty()) {
+                file << "gpu_p50_ms=" << Percentile(gpu, 0.50) << '\n';
+                file << "gpu_p95_ms=" << Percentile(gpu, 0.95) << '\n';
+                file << "gpu_p99_ms=" << Percentile(gpu, 0.99) << '\n';
+                file << "gpu_max_ms="
+                     << *std::max_element(gpu.begin(), gpu.end()) << '\n';
+            }
+        }
+        file << "frames_over_16_667_ms=" << over_16 << '\n';
+        file << "frames_over_20_ms=" << over_20 << '\n';
+        file << "frames_over_25_ms=" << over_25 << '\n';
+        file << "frames_over_33_333_ms=" << over_33 << '\n';
+        file << "frames_over_50_ms=" << over_50 << '\n';
+        file << "profiled_import_calls=" << imports << '\n';
+        file << "profiled_gl_calls=" << gl_calls << '\n';
+        file << "profiled_draw_calls=" << draw_calls << '\n';
+        file << "profiled_draw_vertices=" << vertices << '\n';
+        file << "profiled_allocations=" << allocations << '\n';
+        file << "profiled_frees=" << frees << '\n';
+        file << "top_imports=" << executor.DescribeTopImports(20u, false)
+             << '\n';
+        file << "top_gl=" << executor.DescribeTopImports(20u, true) << '\n';
+        file << "sampled_host_costs="
+             << executor.DescribeTopImportHostSamples(20u) << '\n';
+
+        std::vector<const FrameProfileSample*> worst;
+        worst.reserve(samples_.size());
+        for (const FrameProfileSample& sample : samples_)
+            worst.push_back(&sample);
+        std::sort(worst.begin(), worst.end(),
+                  [](const FrameProfileSample* lhs,
+                     const FrameProfileSample* rhs) {
+                      return lhs->total_ms > rhs->total_ms;
+                  });
+        file << "\nWorst frames:\n";
+        const std::size_t shown = std::min<std::size_t>(50u, worst.size());
+        for (std::size_t index = 0; index < shown; ++index) {
+            const FrameProfileSample& sample = *worst[index];
+            file << "frame=" << sample.frame
+                 << " total_ms=" << sample.total_ms
+                 << " event_ms=" << sample.event_ms
+                 << " render_ms=" << sample.render_ms
+                 << " swap_ms=" << sample.swap_ms
+                 << " imports=" << sample.import_calls
+                 << " gl=" << sample.gl_calls
+                 << " draws=" << sample.draw_calls
+                 << " scene=" << sample.scene_hint
+                 << " top_imports=" << sample.top_imports
+                 << " top_gl=" << sample.top_gl << '\n';
+        }
+    }
+
+    std::ostream& log_;
+    std::string csv_path_;
+    std::string summary_path_;
+    double slow_threshold_ms_ = 20.0;
+    u64 slow_frame_count_ = 0;
+    std::vector<FrameProfileSample> samples_;
 };
 
 static std::string Utf8FromCodepoint(u32 codepoint) {
@@ -4920,30 +5833,68 @@ extern "C" void runtime_log(const char* format, ...) {
     std::vsnprintf(buffer.data(), buffer.size(), format, args);
     va_end(args);
     std::cerr << "[host] " << buffer.data() << '\n';
-    if (g_runtime_log_stream) {
+    if (g_runtime_log_stream)
         *g_runtime_log_stream << "[host] " << buffer.data() << '\n';
-        g_runtime_log_stream->flush();
-    }
 }
 
 int main(int argc,char** argv) {
     std::string log_path = "gd-dynarmic-interactive.log";
+    std::string profile_path = "gd-dynarmic-profile.csv";
+    std::string profile_summary_path = "gd-dynarmic-profile-summary.txt";
+    double slow_frame_ms = 20.0;
+    bool profile_enabled = true;
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
         if (argument.rfind("--log=", 0) == 0 && argument.size() > 6u)
             log_path = std::string(argument.substr(6));
+        else if (argument.rfind("--profile=", 0) == 0 &&
+                 argument.size() > 10u)
+            profile_path = std::string(argument.substr(10));
+        else if (argument.rfind("--profile-summary=", 0) == 0 &&
+                 argument.size() > 18u)
+            profile_summary_path = std::string(argument.substr(18));
+        else if (argument.rfind("--slow-frame-ms=", 0) == 0 &&
+                 argument.size() > 16u)
+            slow_frame_ms = std::max(
+                5.0, std::stod(std::string(argument.substr(16))));
+        else if (argument == "--no-profile")
+            profile_enabled = false;
     }
-    std::ofstream log_file(log_path,std::ios::trunc);
+
+    std::array<char, 1024u * 1024u> log_buffer{};
+    std::ofstream log_file;
+    log_file.rdbuf()->pubsetbuf(log_buffer.data(),
+                                static_cast<std::streamsize>(log_buffer.size()));
+    log_file.open(log_path, std::ios::trunc);
+    if (!log_file) {
+        std::cerr << "Could not create log file: " << log_path << '\n';
+        return 1;
+    }
     g_runtime_log_stream = &log_file;
-    auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
+    auto emit=[&](const std::string& line){
+        std::cout<<line<<'\n';
+        log_file<<line<<'\n';
+        log_file.flush();
+    };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest12");
-        emit("Milestone: reliable HTTP receive waits, select-based polling, browser links, and APK member caching");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest13");
+        emit("Milestone: debug everything profiler, constant-time guest memory, cached OpenGL dispatch, and low-end PC diagnostics");
         emit("Log file: " + log_path);
+        if (profile_enabled) {
+            emit("Frame profile CSV: " + profile_path);
+            emit("Frame profile summary: " + profile_summary_path);
+            emit("Slow frame threshold: " + std::to_string(slow_frame_ms) +
+                 " ms");
+        }
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest12 must be compiled as a 64-bit executable");
+        emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
+        if(sizeof(void*)!=8)
+            throw std::runtime_error(
+                "DynarmicTest13 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
+        emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
+        emit("RESULT: DYNARMIC_DEBUG_EVERYTHING_READY frame-csv=1 slow-frame-dumps=1 import-gl-heap-counters=1");
 
         std::string apk_path="game.apk";
         bool probe_only=false;
@@ -4951,169 +5902,419 @@ int main(int argc,char** argv) {
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
             if(argument=="--probe-only") probe_only=true;
-            else if(argument.rfind("--frames=",0)==0) max_frames=std::max(1,std::stoi(std::string(argument.substr(9))));
-            else if(argument.rfind("--width=",0)==0) width=std::max(320,std::stoi(std::string(argument.substr(8))));
-            else if(argument.rfind("--height=",0)==0) height=std::max(240,std::stoi(std::string(argument.substr(9))));
-            else if(!argument.empty()&&argument[0]!='-') apk_path=std::string(argument);
+            else if(argument=="--debug-everything") {}
+            else if(argument.rfind("--frames=",0)==0)
+                max_frames=std::max(
+                    1,std::stoi(std::string(argument.substr(9))));
+            else if(argument.rfind("--width=",0)==0)
+                width=std::max(
+                    320,std::stoi(std::string(argument.substr(8))));
+            else if(argument.rfind("--height=",0)==0)
+                height=std::max(
+                    240,std::stoi(std::string(argument.substr(9))));
+            else if(!argument.empty()&&argument[0]!='-')
+                apk_path=std::string(argument);
         }
-        const std::filesystem::path absolute_apk=std::filesystem::absolute(apk_path);
-        const std::filesystem::path writable=std::filesystem::absolute("save");
+        const std::filesystem::path absolute_apk=
+            std::filesystem::absolute(apk_path);
+        const std::filesystem::path writable=
+            std::filesystem::absolute("save");
         emit("Input APK: "+absolute_apk.string());
         const std::vector<u8> apk=ReadFile(absolute_apk.string());
         emit("APK bytes: "+std::to_string(apk.size()));
-        const std::vector<u8> libgame=ExtractZipMember(apk,"lib/armeabi/libgame.so");
-        emit("Extracted lib/armeabi/libgame.so: "+std::to_string(libgame.size())+" bytes");
+        const std::vector<u8> libgame=
+            ExtractZipMember(apk,"lib/armeabi/libgame.so");
+        emit("Extracted lib/armeabi/libgame.so: "+
+             std::to_string(libgame.size())+" bytes");
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
-        const std::size_t zip_hooks = InstallCcFileUtilsZipHooks(runtime, env);
-        if (zip_hooks != 2u) throw std::runtime_error("required cocos2d ZIP hooks were not found");
-        const std::size_t browser_hooks = InstallCcApplicationOpenUrlHook(runtime, env);
-        if (browser_hooks != 1u) throw std::runtime_error("required cocos2d openURL hook was not found");
+        const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
+        if(zip_hooks!=2u)
+            throw std::runtime_error(
+                "required cocos2d ZIP hooks were not found");
+        const std::size_t browser_hooks=
+            InstallCcApplicationOpenUrlHook(runtime,env);
+        if(browser_hooks!=1u)
+            throw std::runtime_error(
+                "required cocos2d openURL hook was not found");
         {
-            std::ostringstream line; line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"<<runtime.image_max<<" entry=0x"<<runtime.entry<<std::dec; emit(line.str());
+            std::ostringstream line;
+            line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
+                <<runtime.image_max<<" entry=0x"<<runtime.entry<<std::dec;
+            emit(line.str());
         }
-        emit("Authentic ARM constructors: "+std::to_string(runtime.constructors.size()));
-        emit("Dynarmic relocation targets: function-imports="+std::to_string(runtime.imports.size())+" objects="+std::to_string(runtime.objects.size()));
+        emit("Authentic ARM constructors: "+
+             std::to_string(runtime.constructors.size()));
+        emit("Dynarmic relocation targets: function-imports="+
+             std::to_string(runtime.imports.size())+" objects="+
+             std::to_string(runtime.objects.size()));
         {
             std::ostringstream line;
             line<<"Exports: JNI_OnLoad=0x"<<std::hex<<runtime.jni_onload
                 <<" nativeSetPaths=0x"<<runtime.native_set_paths
                 <<" nativeInit=0x"<<runtime.native_init
                 <<" nativeRender=0x"<<runtime.native_render
-                <<" touches=0x"<<runtime.native_touch_begin<<"/0x"<<runtime.native_touch_move<<"/0x"<<runtime.native_touch_end
+                <<" touches=0x"<<runtime.native_touch_begin<<"/0x"
+                <<runtime.native_touch_move<<"/0x"<<runtime.native_touch_end
                 <<" key=0x"<<runtime.native_key_down
-                <<" pause/resume=0x"<<runtime.native_pause<<"/0x"<<runtime.native_resume<<std::dec;
+                <<" pause/resume=0x"<<runtime.native_pause<<"/0x"
+                <<runtime.native_resume<<std::dec;
             emit(line.str());
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
-        emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=" + std::to_string(zip_hooks) + " scratch=r0 args=r1-r3-preserved");
-        emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count=" + std::to_string(browser_hooks));
+        emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count="+
+             std::to_string(zip_hooks)+
+             " scratch=r0 args=r1-r3-preserved");
+        emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
+             std::to_string(browser_hooks));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
-        emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes=" + std::to_string(apk.size()));
-        emit("Running "+std::to_string(runtime.constructors.size())+" authentic ARM constructors through Dynarmic");
+        emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
+             std::to_string(apk.size()));
+        emit("RESULT: DYNARMIC_OPENGL_IMPORT_CACHE_READY imports="+
+             std::to_string(std::count_if(
+                 runtime.imports.begin(),runtime.imports.end(),
+                 [](const ImportRecord& import){return import.is_gl;})));
+        emit("Running "+std::to_string(runtime.constructors.size())+
+             " authentic ARM constructors through Dynarmic");
         for(std::size_t index=0;index<runtime.constructors.size();++index){
-            const u32 entry=runtime.constructors[index]; if(entry==0||entry==std::numeric_limits<u32>::max())continue;
-            if(index<8||((index+1u)%32u)==0u||index+1u==runtime.constructors.size()){
-                std::ostringstream line; line<<"constructor "<<(index+1u)<<'/'<<runtime.constructors.size()<<": guest 0x"<<std::hex<<entry<<std::dec;emit(line.str());
+            const u32 entry=runtime.constructors[index];
+            if(entry==0||entry==std::numeric_limits<u32>::max())continue;
+            if(index<8||((index+1u)%32u)==0u||
+               index+1u==runtime.constructors.size()){
+                std::ostringstream line;
+                line<<"constructor "<<(index+1u)<<'/'
+                    <<runtime.constructors.size()<<": guest 0x"
+                    <<std::hex<<entry<<std::dec;
+                emit(line.str());
             }
-            u32 ignored=0; if(!executor.RunFunction(entry,{},&ignored,"constructor "+std::to_string(index+1u))){emit("RESULT: DYNARMIC_CONSTRUCTOR_FAILED index="+std::to_string(index+1u));throw std::runtime_error(executor.LastError());}
+            u32 ignored=0;
+            if(!executor.RunFunction(
+                    entry,{},&ignored,
+                    "constructor "+std::to_string(index+1u))){
+                emit("RESULT: DYNARMIC_CONSTRUCTOR_FAILED index="+
+                     std::to_string(index+1u));
+                throw std::runtime_error(executor.LastError());
+            }
         }
-        emit("RESULT: DYNARMIC_CONSTRUCTORS_OK count="+std::to_string(runtime.constructors.size()));
+        emit("RESULT: DYNARMIC_CONSTRUCTORS_OK count="+
+             std::to_string(runtime.constructors.size()));
         u32 result=0;
-        if(!executor.RunFunction(runtime.jni_onload,{kVmObject,0u},&result,"JNI_OnLoad")) throw std::runtime_error(executor.LastError());
-        {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
-        if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
+        if(!executor.RunFunction(
+                runtime.jni_onload,{kVmObject,0u},&result,"JNI_OnLoad"))
+            throw std::runtime_error(executor.LastError());
+        {
+            std::ostringstream line;
+            line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex
+                <<std::setw(8)<<std::setfill('0')<<result<<std::dec;
+            emit(line.str());
+        }
+        if(result!=kJniVersion14)
+            throw std::runtime_error(
+                "JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP12_PROBE_ONLY_OK");return 0;}
+        if(probe_only){
+            emit("RESULT: DYNARMIC_BRINGUP13_PROBE_ONLY_OK");
+            return 0;
+        }
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
-        if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
+        if(!apk_ref||!executor.RunFunction(
+                runtime.native_set_paths,{kEnvObject,0u,apk_ref},
+                &result,"nativeSetPaths"))
+            throw std::runtime_error(executor.LastError());
         emit("RESULT: DYNARMIC_PATHS_SET");
-        if(!executor.CreateOpenGlWindow(width,height)) throw std::runtime_error("could not create Win32 OpenGL host window");
+        if(!executor.CreateOpenGlWindow(width,height))
+            throw std::runtime_error(
+                "could not create Win32 OpenGL host window");
         emit("RESULT: DYNARMIC_OPENGL_HOST_OK");
         const auto init_start=std::chrono::steady_clock::now();
-        if(!executor.RunFunction(runtime.native_init,{kEnvObject,0u,static_cast<u32>(width),static_cast<u32>(height)},&result,"nativeInit",0u,std::chrono::milliseconds(120000))) throw std::runtime_error(executor.LastError());
-        const double init_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-init_start).count();
-        emit("RESULT: DYNARMIC_NATIVE_INIT_RETURNED time_ms="+std::to_string(init_ms));
+        if(!executor.RunFunction(
+                runtime.native_init,
+                {kEnvObject,0u,static_cast<u32>(width),
+                 static_cast<u32>(height)},
+                &result,"nativeInit",0u,
+                std::chrono::milliseconds(120000)))
+            throw std::runtime_error(executor.LastError());
+        const double init_ms=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-init_start).count();
+        emit("RESULT: DYNARMIC_NATIVE_INIT_RETURNED time_ms="+
+             std::to_string(init_ms));
         executor.ReportHeapStatus("after-nativeInit");
         emit("RESULT: DYNARMIC_INPUT_BRIDGE_READY");
         emit("RESULT: DYNARMIC_RENDER_LOOP_ENTERED");
 
+        FrameProfiler profiler(
+            log_file,profile_path,profile_summary_path,slow_frame_ms);
         bool first_frame=false;
         bool native_paused=false;
         std::uint64_t frame_count=0;
         std::uint64_t interval_frames=0;
         auto interval_start=std::chrono::steady_clock::now();
         double interval_render_ms=0.0;
+        std::size_t interval_profile_begin=0;
+        double interval_cpu_start=CurrentProcessCpuMilliseconds();
         bool running=true;
         while(running){
+            const auto loop_start=std::chrono::steady_clock::now();
+            ProfilerCounters counters_before{};
+            std::vector<u64> imports_before;
+            if(profile_enabled){
+                counters_before=executor.CaptureProfilerCounters();
+                imports_before=executor.CaptureImportCounts();
+            }
+
             const bool window_open=executor.PumpMessages();
             for(const HostEvent& event:executor.TakeHostEvents()){
                 bool ok=true;
                 switch(event.type){
                 case HostEventType::TouchBegin:
-                    if(!native_paused) ok=executor.SendTouchPoint(runtime.native_touch_begin,event.x,event.y,"nativeTouchesBegin");
+                    if(!native_paused)
+                        ok=executor.SendTouchPoint(
+                            runtime.native_touch_begin,event.x,event.y,
+                            "nativeTouchesBegin");
                     break;
                 case HostEventType::TouchMove:
-                    if(!native_paused) ok=executor.SendTouchMove(runtime.native_touch_move,event.x,event.y);
+                    if(!native_paused)
+                        ok=executor.SendTouchMove(
+                            runtime.native_touch_move,event.x,event.y);
                     break;
                 case HostEventType::TouchEnd:
-                    if(!native_paused) ok=executor.SendTouchPoint(runtime.native_touch_end,event.x,event.y,"nativeTouchesEnd");
+                    if(!native_paused)
+                        ok=executor.SendTouchPoint(
+                            runtime.native_touch_end,event.x,event.y,
+                            "nativeTouchesEnd");
                     break;
                 case HostEventType::KeyDown:
-                    if(!native_paused) ok=executor.SendKey(runtime.native_key_down,event.value);
+                    if(!native_paused)
+                        ok=executor.SendKey(
+                            runtime.native_key_down,event.value);
                     break;
                 case HostEventType::TextInput:
-                    if(!native_paused) ok=executor.SendText(runtime.native_insert_text,Utf8FromCodepoint(event.value));
+                    if(!native_paused)
+                        ok=executor.SendText(
+                            runtime.native_insert_text,
+                            Utf8FromCodepoint(event.value));
                     break;
                 case HostEventType::DeleteBackward:
-                    if(!native_paused) ok=executor.SendDeleteBackward(runtime.native_delete_backward);
+                    if(!native_paused)
+                        ok=executor.SendDeleteBackward(
+                            runtime.native_delete_backward);
                     break;
                 case HostEventType::Pause:
-                    if(!native_paused){ok=executor.SendLifecycle(runtime.native_pause,"nativeOnPause");if(ok)native_paused=true;}
+                    if(!native_paused){
+                        ok=executor.SendLifecycle(
+                            runtime.native_pause,"nativeOnPause");
+                        if(ok)native_paused=true;
+                    }
                     break;
                 case HostEventType::Resume:
-                    if(native_paused){ok=executor.SendLifecycle(runtime.native_resume,"nativeOnResume");if(ok)native_paused=false;}
+                    if(native_paused){
+                        ok=executor.SendLifecycle(
+                            runtime.native_resume,"nativeOnResume");
+                        if(ok)native_paused=false;
+                    }
                     break;
                 }
-                if(!ok) throw std::runtime_error(executor.LastError());
-                if(executor.TerminationRequested()){running=false;break;}
+                if(!ok)throw std::runtime_error(executor.LastError());
+                if(executor.TerminationRequested()){
+                    running=false;
+                    break;
+                }
             }
-            if(executor.TerminationRequested()){running=false;break;}
-            if(!window_open){running=false;break;}
+            const auto events_done=std::chrono::steady_clock::now();
+            if(executor.TerminationRequested()){
+                running=false;
+                break;
+            }
+            if(!window_open){
+                running=false;
+                break;
+            }
             if(native_paused||!executor.WindowActive()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
-            const auto start=std::chrono::steady_clock::now();
-            if(!executor.RunFunction(runtime.native_render,{kEnvObject,0u},&result,"nativeRender frame "+std::to_string(frame_count+1u),0u,std::chrono::milliseconds(30000))) throw std::runtime_error(executor.LastError());
-            if(executor.TerminationRequested()){running=false;break;}
+            const auto render_start=std::chrono::steady_clock::now();
+            if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
+            if(!executor.RunFunction(
+                    runtime.native_render,{kEnvObject,0u},&result,
+                    "nativeRender",0u,
+                    std::chrono::milliseconds(30000)))
+                throw std::runtime_error(executor.LastError());
+            if(profile_enabled) executor.EndGpuFrame();
+            const auto render_done=std::chrono::steady_clock::now();
+            if(executor.TerminationRequested()){
+                running=false;
+                break;
+            }
             executor.SwapBuffersHost();
-            const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            const auto frame_done=std::chrono::steady_clock::now();
+
             ++frame_count;
             ++interval_frames;
-            interval_render_ms+=elapsed;
+            const double total_ms=std::chrono::duration<double,std::milli>(
+                frame_done-loop_start).count();
+            const double event_ms=std::chrono::duration<double,std::milli>(
+                events_done-loop_start).count();
+            const double render_ms=std::chrono::duration<double,std::milli>(
+                render_done-render_start).count();
+            const double swap_ms=std::chrono::duration<double,std::milli>(
+                frame_done-render_done).count();
+            interval_render_ms+=total_ms;
+
+            if(profile_enabled){
+                const ProfilerCounters counters_after=
+                    executor.CaptureProfilerCounters();
+                const std::vector<u64> imports_after=
+                    executor.CaptureImportCounts();
+                FrameProfileSample sample;
+                sample.frame=frame_count;
+                sample.total_ms=total_ms;
+                sample.event_ms=event_ms;
+                sample.render_ms=render_ms;
+                sample.swap_ms=swap_ms;
+                const GuestCallMetrics& call=executor.LastCallMetrics();
+                sample.estimated_ticks=call.estimated_ticks;
+                sample.jit_runs=call.jit_runs;
+                sample.svc_calls=call.svc_calls;
+                sample.import_calls=CounterDelta(
+                    counters_before.import_calls,
+                    counters_after.import_calls);
+                sample.jni_calls=CounterDelta(
+                    counters_before.jni_svc_calls,
+                    counters_after.jni_svc_calls);
+                sample.gl_calls=CounterDelta(
+                    counters_before.gl_calls,counters_after.gl_calls);
+                sample.draw_calls=CounterDelta(
+                    counters_before.draw_calls,counters_after.draw_calls);
+                sample.draw_vertices=CounterDelta(
+                    counters_before.draw_vertices,
+                    counters_after.draw_vertices);
+                sample.buffer_upload_bytes=CounterDelta(
+                    counters_before.buffer_upload_bytes,
+                    counters_after.buffer_upload_bytes);
+                sample.texture_upload_bytes=CounterDelta(
+                    counters_before.texture_upload_bytes,
+                    counters_after.texture_upload_bytes);
+                sample.allocation_calls=CounterDelta(
+                    counters_before.allocation_calls,
+                    counters_after.allocation_calls);
+                sample.free_calls=CounterDelta(
+                    counters_before.free_calls,counters_after.free_calls);
+                sample.reallocation_calls=CounterDelta(
+                    counters_before.reallocation_calls,
+                    counters_after.reallocation_calls);
+                sample.live_heap_bytes=counters_after.live_heap_bytes;
+                sample.scene_hint=executor.LastAndroidLog();
+                const bool slow=total_ms>=slow_frame_ms||
+                    event_ms>=slow_frame_ms||
+                    render_ms>=slow_frame_ms||
+                    swap_ms>=slow_frame_ms;
+                if(slow){
+                    sample.top_imports=executor.DescribeTopImportDeltas(
+                        imports_before,imports_after,10u,false);
+                    sample.top_gl=executor.DescribeTopImportDeltas(
+                        imports_before,imports_after,8u,true);
+                }
+                profiler.Add(std::move(sample));
+                for(const auto& [gpu_frame,gpu_ms]:
+                    executor.TakeGpuTimings())
+                    profiler.SetGpuTiming(gpu_frame,gpu_ms);
+            }
+
             if(!first_frame){
                 first_frame=true;
-                emit("RESULT: DYNARMIC_FIRST_FRAME_OK frame_ms="+std::to_string(elapsed));
+                emit("RESULT: DYNARMIC_FIRST_FRAME_OK frame_ms="+
+                     std::to_string(total_ms));
                 executor.ReportHeapStatus("first-frame");
             }
 
             const auto now=std::chrono::steady_clock::now();
-            const double interval_ms=std::chrono::duration<double,std::milli>(now-interval_start).count();
+            const double interval_ms=
+                std::chrono::duration<double,std::milli>(
+                    now-interval_start).count();
             if(interval_ms>=5000.0){
-                const double fps=static_cast<double>(interval_frames)*1000.0/interval_ms;
-                const double avg_ms=interval_frames?interval_render_ms/static_cast<double>(interval_frames):0.0;
+                const double fps=
+                    static_cast<double>(interval_frames)*1000.0/
+                    interval_ms;
+                const double avg_ms=interval_frames?
+                    interval_render_ms/
+                    static_cast<double>(interval_frames):0.0;
                 std::ostringstream line;
-                line<<std::fixed<<std::setprecision(1)<<"Dynarmic interactive performance: "<<fps
-                    <<" FPS avg-frame="<<std::setprecision(2)<<avg_ms<<" ms total-frames="<<frame_count;
+                line<<std::fixed<<std::setprecision(1)
+                    <<"Dynarmic interactive performance: "<<fps
+                    <<" FPS avg-frame="<<std::setprecision(2)
+                    <<avg_ms<<" ms total-frames="<<frame_count;
                 emit(line.str());
+                if(profile_enabled){
+                    const double cpu_now=
+                        CurrentProcessCpuMilliseconds();
+                    profiler.LogInterval(
+                        interval_profile_begin,interval_ms,
+                        interval_cpu_start,cpu_now);
+                    interval_profile_begin=profiler.SampleCount();
+                    interval_cpu_start=cpu_now;
+                }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test12 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test13 | "
+                     <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
                 interval_render_ms=0.0;
+                executor.FlushDiagnostics();
             }
-            if(max_frames>0&&frame_count>=static_cast<std::uint64_t>(max_frames)) running=false;
+            if(max_frames>0&&
+               frame_count>=static_cast<std::uint64_t>(max_frames))
+                running=false;
         }
 
-        if(!executor.TerminationRequested()&&!native_paused&&runtime.native_pause){
-            if(!executor.SendLifecycle(runtime.native_pause,"nativeOnPause shutdown")) throw std::runtime_error(executor.LastError());
+        if(!executor.TerminationRequested()&&!native_paused&&
+           runtime.native_pause){
+            if(!executor.SendLifecycle(
+                    runtime.native_pause,"nativeOnPause shutdown"))
+                throw std::runtime_error(executor.LastError());
             native_paused=true;
         }
-        if(!first_frame) throw std::runtime_error("render loop ended before the first frame");
-        emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
-        emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
-        if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP12_OK");
+        if(!first_frame)
+            throw std::runtime_error(
+                "render loop ended before the first frame");
+        if(profile_enabled){
+            for(const auto& [gpu_frame,gpu_ms]:
+                executor.FinishGpuTimings())
+                profiler.SetGpuTiming(gpu_frame,gpu_ms);
+            profiler.WriteFiles(executor);
+            emit("RESULT: DYNARMIC_FRAME_PROFILE_WRITTEN csv="+
+                 profile_path+" summary="+profile_summary_path);
+        }
+        emit("Dynarmic interactive loop ended after frames="+
+             std::to_string(frame_count));
+        emit("Dynarmic top imports: "+
+             executor.DescribeTopImports(20u,false));
+        emit("Dynarmic top OpenGL imports: "+
+             executor.DescribeTopImports(20u,true));
+        emit("Dynarmic sampled host import costs: "+
+             executor.DescribeTopImportHostSamples(20u));
+        emit("Permissive runtime import calls: "+
+             std::to_string(executor.PermissiveStubCalls())+
+             " unique="+
+             std::to_string(executor.PermissiveNames().size()));
+        if(!executor.PermissiveNames().empty()){
+            std::ostringstream names;
+            names<<"Permissive imports:";
+            for(const auto& name:executor.PermissiveNames())
+                names<<' '<<name;
+            emit(names.str());
+        }
+        emit("RESULT: DYNARMIC_BRINGUP13_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP12_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP13_FAILED");
         return 1;
     }
 }
+

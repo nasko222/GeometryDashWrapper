@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest12"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest13"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,8 +33,8 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder8-test9-fix1-r3-preserve"
-$CompatibleBuilderRevisions = @($BuilderRevision, "dynarmic-x64-builder5-fmt-libcpp", "dynarmictest1-x64-builder5-fmt-libcpp")
+$BuilderRevision = "dynarmic-x64-builder9-test13-debug-everything-page-cache"
+$CompatibleBuilderRevisions = @($BuilderRevision, "dynarmic-x64-builder8-test9-fix1-r3-preserve", "dynarmic-x64-builder5-fmt-libcpp", "dynarmictest1-x64-builder5-fmt-libcpp")
 
 function Invoke-External {
     param([string]$FilePath, [string[]]$Arguments)
@@ -431,19 +431,22 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$Test12Notes = Join-Path $Root "DYNARMICTEST12-NOTES.md"
-if (Test-Path $Test12Notes) { Copy-Item -Force $Test12Notes (Join-Path $Output "DYNARMICTEST12-NOTES.md") }
+$Test13Notes = Join-Path $Root "DYNARMICTEST13-NOTES.md"
+if (Test-Path $Test13Notes) { Copy-Item -Force $Test13Notes (Join-Path $Output "DYNARMICTEST13-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $Launcher = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-GeometryDashDynarmicProbe.exe game.apk --log=gd-dynarmic-interactive.log
+GeometryDashDynarmicProbe.exe game.apk --debug-everything --log=gd-dynarmic-interactive.log --profile=gd-dynarmic-profile.csv --profile-summary=gd-dynarmic-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
 if not "%RESULT%"=="0" echo Dynarmic interactive wrapper failed. See gd-dynarmic-interactive.log.
-if "%RESULT%"=="0" echo Dynarmic interactive wrapper closed cleanly. See gd-dynarmic-interactive.log.
+if "%RESULT%"=="0" echo Dynarmic interactive wrapper closed cleanly.
+echo Main log: gd-dynarmic-interactive.log
+echo Frame CSV: gd-dynarmic-profile.csv
+echo Profile summary: gd-dynarmic-profile-summary.txt
 pause
 exit /b %RESULT%
 '@
@@ -460,6 +463,6 @@ exit /b %RESULT%
 [IO.File]::WriteAllText((Join-Path $Output "RUN_DYNARMIC_PROBE_ONLY.cmd"), $ProbeLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 Test12 receive/poll build ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 Test13 debug-everything build ready:" -ForegroundColor Green
 Write-Host "  $Output"
-Write-Host "Run RUN_DYNARMIC_INTERACTIVE.cmd"
+Write-Host "Run RUN_DYNARMIC_INTERACTIVE.cmd and send all three generated profiler files"
