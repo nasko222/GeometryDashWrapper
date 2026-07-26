@@ -43,6 +43,7 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <GL/gl.h>
 #include <direct.h>
 #endif
@@ -1149,7 +1150,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest9Window";
+        const char* class_name = "GeometryDashDynarmicTest10Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1161,7 +1162,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test9",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test10",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2469,6 +2470,36 @@ private:
         std::memcpy(&bits, &result, sizeof(bits));
         return bits;
     }
+#ifdef _WIN32
+    bool OpenExternalUrl(const std::string& url) {
+        const bool allowed = url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0;
+        if (!allowed) {
+            log_ << "[host] Browser open rejected unsupported URL: " << SanitizeLogText(url) << '\n';
+            return false;
+        }
+        const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                                  url.c_str(), static_cast<int>(url.size()),
+                                                  nullptr, 0);
+        if (required <= 0) {
+            log_ << "[host] Browser open failed UTF-8 conversion url=" << SanitizeLogText(url) << '\n';
+            return false;
+        }
+        std::wstring wide(static_cast<std::size_t>(required), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, url.c_str(),
+                            static_cast<int>(url.size()), wide.data(), required);
+        const HINSTANCE result = ShellExecuteW(nullptr, L"open", wide.c_str(),
+                                               nullptr, nullptr, SW_SHOWNORMAL);
+        const auto shell_code = reinterpret_cast<INT_PTR>(result);
+        const bool ok = shell_code > 32;
+        log_ << "[host] Browser open url=" << SanitizeLogText(url)
+             << " result=" << (ok ? "ok" : "failed")
+             << " shell_code=" << shell_code << '\n';
+        return ok;
+    }
+#else
+    bool OpenExternalUrl(const std::string&) { return false; }
+#endif
+
     void DispatchJniVoid(GuestRef* method, ArgCursor& arguments) {
         if (!method) return;
         LogFirstMethodCall(method);
@@ -2529,6 +2560,10 @@ private:
         else if (name == "setEffectVolume") {
             const u32 identifier = arguments.Word();
             audio_set_effect_volume(identifier, arguments.FloatArgument());
+        } else if (name == "openURL") {
+            const std::string url = RefString(arguments.Word());
+            RememberEvent("JNI:openURL " + url);
+            OpenExternalUrl(url);
         } else if (name == "showMessageBox") {
             const std::string title = RefString(arguments.Word());
             const std::string text = RefString(arguments.Word());
@@ -3579,24 +3614,90 @@ private:
         if (socket_value == INVALID_SOCKET || !ReadGuestSockaddr(address, length, host_address, host_length)) {
             SetGuestErrno(88); return static_cast<u32>(-1);
         }
+
+        char address_text[INET6_ADDRSTRLEN]{};
+        u16 port = 0;
+        if (host_address.ss_family == AF_INET) {
+            const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&host_address);
+            ::inet_ntop(AF_INET, &ipv4->sin_addr, address_text, sizeof(address_text));
+            port = ntohs(ipv4->sin_port);
+        } else if (host_address.ss_family == AF_INET6) {
+            const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&host_address);
+            ::inet_ntop(AF_INET6, &ipv6->sin6_addr, address_text, sizeof(address_text));
+            port = ntohs(ipv6->sin6_port);
+        }
+
+        const auto started = std::chrono::steady_clock::now();
         const int code = ::connect(socket_value, reinterpret_cast<const sockaddr*>(&host_address), host_length);
-        if (network_log_count_++ < 64u) {
-            char address_text[INET6_ADDRSTRLEN]{};
-            u16 port = 0;
-            if (host_address.ss_family == AF_INET) {
-                const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&host_address);
-                ::inet_ntop(AF_INET, &ipv4->sin_addr, address_text, sizeof(address_text));
-                port = ntohs(ipv4->sin_port);
-            } else if (host_address.ss_family == AF_INET6) {
-                const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&host_address);
-                ::inet_ntop(AF_INET6, &ipv6->sin6_addr, address_text, sizeof(address_text));
-                port = ntohs(ipv6->sin6_port);
+        const int initial_error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+        if (code == 0 || initial_error == WSAEISCONN) {
+            SetGuestErrno(0);
+            if (network_log_count_++ < 96u)
+                log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                     << (address_text[0] ? address_text : "?") << ':' << port
+                     << " status=connected immediate=yes\n";
+            return 0u;
+        }
+
+        // Bionic/libcurl uses nonblocking sockets. Windows reports
+        // WSAEWOULDBLOCK while POSIX connect reports EINPROGRESS. Test9
+        // translated it to EAGAIN, making libcurl reject a healthy connection.
+        // Complete the pending connect on the host, then return a connected socket.
+        if (initial_error == WSAEWOULDBLOCK || initial_error == WSAEINPROGRESS ||
+            initial_error == WSAEALREADY) {
+            fd_set writable{};
+            fd_set exceptional{};
+            FD_ZERO(&writable);
+            FD_ZERO(&exceptional);
+            FD_SET(socket_value, &writable);
+            FD_SET(socket_value, &exceptional);
+            timeval timeout{};
+            timeout.tv_sec = 15;
+            timeout.tv_usec = 0;
+            const int ready = ::select(0, nullptr, &writable, &exceptional, &timeout);
+            if (ready > 0) {
+                int socket_error = 0;
+                int socket_error_length = sizeof(socket_error);
+                if (::getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&socket_error), &socket_error_length) == 0 &&
+                    socket_error == 0 && FD_ISSET(socket_value, &writable)) {
+                    SetGuestErrno(0);
+                    if (network_log_count_++ < 96u) {
+                        const double elapsed = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - started).count();
+                        log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                             << (address_text[0] ? address_text : "?") << ':' << port
+                             << " status=connected pending=yes wait_ms=" << std::fixed
+                             << std::setprecision(1) << elapsed << '\n';
+                    }
+                    return 0u;
+                }
+                if (socket_error == 0) socket_error = WSAECONNREFUSED;
+                SetGuestErrno(MapWsaError(socket_error));
+                if (network_log_count_++ < 96u)
+                    log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                         << (address_text[0] ? address_text : "?") << ':' << port
+                         << " status=failed pending=yes wsa=" << socket_error
+                         << " errno=" << MapWsaError(socket_error) << '\n';
+                return static_cast<u32>(-1);
             }
+            const int wait_error = ready == 0 ? WSAETIMEDOUT : WSAGetLastError();
+            SetGuestErrno(MapWsaError(wait_error));
+            if (network_log_count_++ < 96u)
+                log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                     << (address_text[0] ? address_text : "?") << ':' << port
+                     << (ready == 0 ? " status=timeout" : " status=select-failed")
+                     << " wsa=" << wait_error << " errno=" << MapWsaError(wait_error) << '\n';
+            return static_cast<u32>(-1);
+        }
+
+        SetGuestErrno(MapWsaError(initial_error));
+        if (network_log_count_++ < 96u)
             log_ << "[host] Socket connect fd=" << guest_fd << " target="
                  << (address_text[0] ? address_text : "?") << ':' << port
-                 << " result=" << code << (code ? " wsa=" + std::to_string(WSAGetLastError()) : std::string{}) << '\n';
-        }
-        return code == 0 ? 0u : SocketFailure();
+                 << " status=failed immediate=yes wsa=" << initial_error
+                 << " errno=" << MapWsaError(initial_error) << '\n';
+        return static_cast<u32>(-1);
     }
     u32 GuestBind(u32 guest_fd, u32 address, u32 length) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
@@ -4642,11 +4743,11 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest9-fix1");
-        emit("Milestone: Test9 ZIP-hook ABI fix, host-level APK member caching, cooperative HTTP sockets, and high-performance GPU preference");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest10");
+        emit("Milestone: completed nonblocking TCP connects, Windows browser links, APK member caching, and high-performance GPU preference");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest9 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest10 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -4707,7 +4808,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP9_FIX1_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP10_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -4794,7 +4895,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test9 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test10 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -4811,11 +4912,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP9_FIX1_OK");
+        emit("RESULT: DYNARMIC_BRINGUP10_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP9_FIX1_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP10_FAILED");
         return 1;
     }
 }

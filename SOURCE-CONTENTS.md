@@ -1,19 +1,15 @@
-# Source contents — DynarmicTest9
+# Source contents — DynarmicTest10
 
-The package contains the complete Test8 source tree plus the Test9 changes. `game.apk` is preserved byte-for-byte.
+This is the complete source tree based on DynarmicTest9 Fix1. No game source, APK, vendor dependency, tool, patch, or build script was removed.
 
-Important files:
+Test10-specific files:
 
-- `src/dynarmic_probe.cpp` — ELF loading, Dynarmic execution, guest allocator, JNI, files, APK member cache, GPU preference, cooperative worker and Winsock bridge.
-- `src/audio_win.c` / `src/audio_win.h` — Windows music/effect backend.
-- `src/apk_extract_audio.c` — host extraction used by the audio bridge.
-- `third_party/stb/stb_vorbis.c` — OGG decoding.
-- `third_party/zlib/` — compression and APK extraction support.
-- `dynarmic-x64/CMakeLists.txt` — x64 Dynarmic executable and Windows libraries, including `ws2_32`.
-- `build-dynarmic-x64.ps1` — pinned Windows build workflow.
-- `BUILD_DYNARMIC_X64.cmd` — normal build entry point.
-- `game.apk` — preserved ARM game package.
-- `CHANGELOG-0.9.4-arm-dynarmictest9-fix1.md` — user-facing changes.
-- `DYNARMICTEST9-NOTES.md` — implementation and diagnostic notes.
+- `CHANGELOG-0.9.4-arm-dynarmictest10.md`
+- `DYNARMICTEST10-NOTES.md`
 
-All 1,120 files from the Test8 package remain present. Test9 adds two documentation files.
+Core changed files:
+
+- `src/dynarmic_probe.cpp` — completed TCP connections and Windows browser JNI bridge.
+- `dynarmic-x64/CMakeLists.txt` — Test10 project name and `shell32` linkage.
+- `build-dynarmic-x64.ps1` — Test10 output folder and notes.
+- `README.md`, `VERSION.txt`, and package verification metadata.
