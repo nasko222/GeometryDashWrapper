@@ -60,7 +60,7 @@ static char g_music_path[MAX_PATH * 2];
 static EffectSlot g_effects[MAX_EFFECT_SLOTS];
 static EffectAssetCache g_effect_asset_cache[MAX_EFFECT_ASSET_CACHE];
 static unsigned g_effect_asset_cache_count;
-static unsigned g_next_effect_identifier = 1;
+static volatile LONG g_next_effect_identifier;
 static unsigned g_next_effect_slot;
 static float g_music_volume = 1.0f;
 static float g_effects_volume = 1.0f;
@@ -75,6 +75,49 @@ static volatile LONG g_output_peak_logged;
 static volatile LONG g_short_path_logged;
 static volatile LONG g_effect_cache_hit_logged;
 static SRWLOCK g_mci_lock = SRWLOCK_INIT;
+
+static SRWLOCK g_effect_state_lock = SRWLOCK_INIT;
+
+#define EFFECT_COMMAND_QUEUE_CAPACITY 256
+
+typedef enum {
+    EFFECT_COMMAND_PRELOAD = 1,
+    EFFECT_COMMAND_PLAY,
+    EFFECT_COMMAND_SET_VOLUME,
+    EFFECT_COMMAND_PAUSE,
+    EFFECT_COMMAND_RESUME,
+    EFFECT_COMMAND_STOP,
+    EFFECT_COMMAND_PAUSE_ALL,
+    EFFECT_COMMAND_RESUME_ALL,
+    EFFECT_COMMAND_STOP_ALL,
+    EFFECT_COMMAND_UNLOAD,
+    EFFECT_COMMAND_APPLY_MASTER_VOLUME
+} EffectCommandType;
+
+typedef struct {
+    EffectCommandType type;
+    unsigned identifier;
+    int loop;
+    float pitch;
+    float pan;
+    float volume;
+    char path[MAX_PATH * 2];
+} EffectCommand;
+
+static EffectCommand g_effect_commands[EFFECT_COMMAND_QUEUE_CAPACITY];
+static unsigned g_effect_command_read;
+static unsigned g_effect_command_write;
+static unsigned g_effect_command_count;
+static CRITICAL_SECTION g_effect_command_lock;
+static int g_effect_command_lock_initialized;
+static HANDLE g_effect_command_event;
+static HANDLE g_effect_worker_stop;
+static HANDLE g_effect_worker_thread;
+static volatile LONG g_effect_worker_ready;
+static volatile LONG g_effect_queue_overflow_logged;
+
+static void initialize_effect_worker(void);
+static void shutdown_effect_worker(void);
 
 /* Keep the Core Audio GUIDs local so the wrapper does not need uuid.lib. */
 static const GUID g_clsid_mmdevice_enumerator = {
@@ -838,6 +881,8 @@ void audio_initialize(const char *executable_directory) {
              executable_directory ? executable_directory : ".");
     CreateDirectoryA(g_audio_cache_directory, NULL);
     InterlockedExchange(&g_effect_log_count, 0);
+    InterlockedExchange(&g_next_effect_identifier, 0);
+    InterlockedExchange(&g_effect_queue_overflow_logged, 0);
     InterlockedExchange(&g_short_path_logged, 0);
     InterlockedExchange(&g_effect_cache_hit_logged, 0);
     memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
@@ -848,6 +893,7 @@ void audio_initialize(const char *executable_directory) {
                  "gd18_fx_%u", index);
     }
     initialize_output_meter();
+    initialize_effect_worker();
     runtime_log("Windows MCI audio bridge initialized; APK cache: %s",
                 g_audio_cache_directory);
 }
@@ -856,11 +902,13 @@ void audio_set_apk_path(const char *apk_path) {
     if (apk_path && apk_path[0]) {
         if (_stricmp(g_apk_path, apk_path) != 0) {
             unsigned index;
+            AcquireSRWLockExclusive(&g_effect_state_lock);
             for (index = 0; index < MAX_EFFECT_SLOTS; ++index)
                 close_effect_slot(&g_effects[index]);
             memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
             g_effect_asset_cache_count = 0;
             InterlockedExchange(&g_effect_cache_hit_logged, 0);
+            ReleaseSRWLockExclusive(&g_effect_state_lock);
         }
         snprintf(g_apk_path, sizeof(g_apk_path), "%s", apk_path);
     }
@@ -879,12 +927,14 @@ void audio_shutdown(void) {
     }
     InterlockedExchange(&g_output_peak_bits, 0);
     InterlockedExchange(&g_output_peak_logged, 0);
-    audio_stop_all_effects();
+    shutdown_effect_worker();
+    AcquireSRWLockExclusive(&g_effect_state_lock);
     {
         unsigned index;
         for (index = 0; index < MAX_EFFECT_SLOTS; ++index)
             close_effect_slot(&g_effects[index]);
     }
+    ReleaseSRWLockExclusive(&g_effect_state_lock);
     close_music();
 }
 
@@ -1017,7 +1067,57 @@ float audio_get_output_peak(void) {
     return clamp_volume(peak_bits.floating);
 }
 
-void audio_preload_effect(const char *path) {
+
+static unsigned next_effect_identifier(void) {
+    unsigned identifier = (unsigned)InterlockedIncrement(
+        &g_next_effect_identifier);
+    if (!identifier) {
+        identifier = (unsigned)InterlockedIncrement(
+            &g_next_effect_identifier);
+    }
+    return identifier;
+}
+
+static int effect_queue_push(const EffectCommand *command) {
+    int queued = 0;
+    if (!command || !g_effect_command_lock_initialized ||
+        !g_effect_command_event || !g_effect_worker_thread) {
+        return 0;
+    }
+    EnterCriticalSection(&g_effect_command_lock);
+    if (g_effect_command_count < EFFECT_COMMAND_QUEUE_CAPACITY) {
+        g_effect_commands[g_effect_command_write] = *command;
+        g_effect_command_write =
+            (g_effect_command_write + 1u) % EFFECT_COMMAND_QUEUE_CAPACITY;
+        ++g_effect_command_count;
+        queued = 1;
+    }
+    LeaveCriticalSection(&g_effect_command_lock);
+    if (queued) {
+        SetEvent(g_effect_command_event);
+    } else if (InterlockedCompareExchange(
+                   &g_effect_queue_overflow_logged, 1, 0) == 0) {
+        runtime_log("Audio effect command queue overflow; falling back to synchronous playback");
+    }
+    return queued;
+}
+
+static int effect_queue_pop(EffectCommand *command) {
+    int available = 0;
+    if (!command || !g_effect_command_lock_initialized) return 0;
+    EnterCriticalSection(&g_effect_command_lock);
+    if (g_effect_command_count) {
+        *command = g_effect_commands[g_effect_command_read];
+        g_effect_command_read =
+            (g_effect_command_read + 1u) % EFFECT_COMMAND_QUEUE_CAPACITY;
+        --g_effect_command_count;
+        available = 1;
+    }
+    LeaveCriticalSection(&g_effect_command_lock);
+    return available;
+}
+
+static void preload_effect_now(const char *path) {
     char resolved[MAX_PATH * 2];
     EffectSlot *slot;
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return;
@@ -1029,19 +1129,21 @@ void audio_preload_effect(const char *path) {
     }
 }
 
-unsigned audio_play_effect(const char *path, int loop) {
+static unsigned play_effect_now(const char *path, int loop,
+                                float pitch, float pan, float gain,
+                                unsigned identifier) {
     char resolved[MAX_PATH * 2];
     char command[96];
     EffectSlot *slot;
-    unsigned identifier;
+    (void)pitch;
+    (void)pan;
+    if (!identifier) identifier = next_effect_identifier();
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return 0;
     slot = open_effect_slot(resolved, 1);
     if (!slot) return 0;
-    identifier = g_next_effect_identifier++;
-    if (!identifier) identifier = g_next_effect_identifier++;
     slot->identifier = identifier;
     slot->paused = 0;
-    slot->volume = 1.0f;
+    slot->volume = clamp_volume(gain);
     set_alias_volume(slot->alias, g_effects_volume * slot->volume);
     snprintf(command, sizeof(command), "seek %s to start", slot->alias);
     mci_command(command, NULL, 0, 0);
@@ -1052,31 +1154,20 @@ unsigned audio_play_effect(const char *path, int loop) {
         return 0;
     }
     if (InterlockedIncrement(&g_effect_log_count) <= 64) {
-        runtime_log("Audio effect playing: %s (id=%u, loop=%s)",
+        runtime_log("Audio effect playing async: %s (id=%u, loop=%s)",
                     file_name_part(path), identifier, loop ? "yes" : "no");
     }
     return identifier;
 }
 
-int audio_is_effect_playing(unsigned identifier) {
-    EffectSlot *slot = find_effect(identifier);
-    char command[80];
-    char mode[32] = {0};
-    if (!slot) return 0;
-    snprintf(command, sizeof(command), "status %s mode", slot->alias);
-    if (!mci_command(command, mode, sizeof(mode), 0)) return 0;
-    return _stricmp(mode, "playing") == 0 ||
-           _stricmp(mode, "paused") == 0;
-}
-
-void audio_set_effect_volume(unsigned identifier, float volume) {
+static void set_effect_volume_now(unsigned identifier, float volume) {
     EffectSlot *slot = find_effect(identifier);
     if (!slot) return;
     slot->volume = clamp_volume(volume);
     set_alias_volume(slot->alias, g_effects_volume * slot->volume);
 }
 
-void audio_pause_effect(unsigned identifier) {
+static void pause_effect_now(unsigned identifier) {
     EffectSlot *slot = find_effect(identifier);
     char command[80];
     if (!slot) return;
@@ -1084,7 +1175,7 @@ void audio_pause_effect(unsigned identifier) {
     if (mci_command(command, NULL, 0, 0)) slot->paused = 1;
 }
 
-void audio_resume_effect(unsigned identifier) {
+static void resume_effect_now(unsigned identifier) {
     EffectSlot *slot = find_effect(identifier);
     char command[80];
     if (!slot || !slot->paused) return;
@@ -1092,49 +1183,53 @@ void audio_resume_effect(unsigned identifier) {
     if (mci_command(command, NULL, 0, 0)) slot->paused = 0;
 }
 
-void audio_stop_effect(unsigned identifier) {
+static void stop_effect_now(unsigned identifier) {
     park_effect_slot(find_effect(identifier));
 }
 
-void audio_pause_all_effects(void) {
+static void pause_all_effects_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        if (g_effects[index].open && g_effects[index].identifier)
-            audio_pause_effect(g_effects[index].identifier);
+        EffectSlot *slot = &g_effects[index];
+        char command[80];
+        if (!slot->open || !slot->identifier) continue;
+        snprintf(command, sizeof(command), "pause %s", slot->alias);
+        if (mci_command(command, NULL, 0, 0)) slot->paused = 1;
     }
 }
 
-void audio_resume_all_effects(void) {
+static void resume_all_effects_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        if (g_effects[index].open && g_effects[index].identifier)
-            audio_resume_effect(g_effects[index].identifier);
+        EffectSlot *slot = &g_effects[index];
+        char command[80];
+        if (!slot->open || !slot->identifier || !slot->paused) continue;
+        snprintf(command, sizeof(command), "resume %s", slot->alias);
+        if (mci_command(command, NULL, 0, 0)) slot->paused = 0;
     }
 }
 
-void audio_stop_all_effects(void) {
+static void stop_all_effects_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open) park_effect_slot(&g_effects[index]);
     }
 }
 
-void audio_unload_effect(const char *path) {
+static void unload_effect_now(const char *path) {
     char resolved[MAX_PATH * 2];
     unsigned index;
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open &&
-            _stricmp(g_effects[index].path, resolved) == 0)
+            _stricmp(g_effects[index].path, resolved) == 0) {
             close_effect_slot(&g_effects[index]);
+        }
     }
 }
 
-float audio_get_effects_volume(void) { return g_effects_volume; }
-
-void audio_set_effects_volume(float volume) {
+static void apply_master_effect_volume_now(void) {
     unsigned index;
-    g_effects_volume = clamp_volume(volume);
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open) {
             set_alias_volume(g_effects[index].alias,
@@ -1142,3 +1237,240 @@ void audio_set_effects_volume(float volume) {
         }
     }
 }
+
+static void process_effect_command(const EffectCommand *command) {
+    if (!command) return;
+    AcquireSRWLockExclusive(&g_effect_state_lock);
+    switch (command->type) {
+    case EFFECT_COMMAND_PRELOAD:
+        preload_effect_now(command->path);
+        break;
+    case EFFECT_COMMAND_PLAY:
+        play_effect_now(command->path, command->loop, command->pitch,
+                        command->pan, command->volume,
+                        command->identifier);
+        break;
+    case EFFECT_COMMAND_SET_VOLUME:
+        set_effect_volume_now(command->identifier, command->volume);
+        break;
+    case EFFECT_COMMAND_PAUSE:
+        pause_effect_now(command->identifier);
+        break;
+    case EFFECT_COMMAND_RESUME:
+        resume_effect_now(command->identifier);
+        break;
+    case EFFECT_COMMAND_STOP:
+        stop_effect_now(command->identifier);
+        break;
+    case EFFECT_COMMAND_PAUSE_ALL:
+        pause_all_effects_now();
+        break;
+    case EFFECT_COMMAND_RESUME_ALL:
+        resume_all_effects_now();
+        break;
+    case EFFECT_COMMAND_STOP_ALL:
+        stop_all_effects_now();
+        break;
+    case EFFECT_COMMAND_UNLOAD:
+        unload_effect_now(command->path);
+        break;
+    case EFFECT_COMMAND_APPLY_MASTER_VOLUME:
+        apply_master_effect_volume_now();
+        break;
+    default:
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_effect_state_lock);
+}
+
+static DWORD WINAPI effect_worker_thread(void *unused) {
+    HANDLE waits[2];
+    EffectCommand command;
+    (void)unused;
+    waits[0] = g_effect_worker_stop;
+    waits[1] = g_effect_command_event;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    InterlockedExchange(&g_effect_worker_ready, 1);
+    runtime_log("RESULT: DYNARMIC_ASYNC_EFFECT_WORKER_READY queue=%u",
+                EFFECT_COMMAND_QUEUE_CAPACITY);
+    for (;;) {
+        DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait != WAIT_OBJECT_0 + 1) break;
+        while (effect_queue_pop(&command)) process_effect_command(&command);
+    }
+    InterlockedExchange(&g_effect_worker_ready, 0);
+    return 0;
+}
+
+static void initialize_effect_worker(void) {
+    if (g_effect_worker_thread) return;
+    InitializeCriticalSection(&g_effect_command_lock);
+    g_effect_command_lock_initialized = 1;
+    g_effect_command_read = 0;
+    g_effect_command_write = 0;
+    g_effect_command_count = 0;
+    g_effect_command_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_effect_worker_stop = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_effect_command_event || !g_effect_worker_stop) {
+        runtime_log("Async effect worker: event creation failed");
+        return;
+    }
+    g_effect_worker_thread = CreateThread(
+        NULL, 0, effect_worker_thread, NULL, 0, NULL);
+    if (!g_effect_worker_thread) {
+        runtime_log("Async effect worker: thread creation failed");
+    }
+}
+
+static void shutdown_effect_worker(void) {
+    if (g_effect_worker_stop) SetEvent(g_effect_worker_stop);
+    if (g_effect_worker_thread) {
+        WaitForSingleObject(g_effect_worker_thread, INFINITE);
+        CloseHandle(g_effect_worker_thread);
+        g_effect_worker_thread = NULL;
+    }
+    if (g_effect_command_event) {
+        CloseHandle(g_effect_command_event);
+        g_effect_command_event = NULL;
+    }
+    if (g_effect_worker_stop) {
+        CloseHandle(g_effect_worker_stop);
+        g_effect_worker_stop = NULL;
+    }
+    if (g_effect_command_lock_initialized) {
+        DeleteCriticalSection(&g_effect_command_lock);
+        g_effect_command_lock_initialized = 0;
+    }
+    g_effect_command_count = 0;
+}
+
+void audio_preload_effect(const char *path) {
+    EffectCommand command;
+    memset(&command, 0, sizeof(command));
+    command.type = EFFECT_COMMAND_PRELOAD;
+    snprintf(command.path, sizeof(command.path), "%s", path ? path : "");
+    if (!effect_queue_push(&command)) {
+        AcquireSRWLockExclusive(&g_effect_state_lock);
+        preload_effect_now(command.path);
+        ReleaseSRWLockExclusive(&g_effect_state_lock);
+    }
+}
+
+unsigned audio_play_effect_ex(const char *path, int loop, float pitch,
+                              float pan, float gain) {
+    EffectCommand command;
+    memset(&command, 0, sizeof(command));
+    command.type = EFFECT_COMMAND_PLAY;
+    command.identifier = next_effect_identifier();
+    command.loop = loop != 0;
+    command.pitch = pitch;
+    command.pan = pan;
+    command.volume = clamp_volume(gain);
+    snprintf(command.path, sizeof(command.path), "%s", path ? path : "");
+    if (!effect_queue_push(&command)) {
+        unsigned result;
+        AcquireSRWLockExclusive(&g_effect_state_lock);
+        result = play_effect_now(command.path, command.loop, command.pitch,
+                                 command.pan, command.volume,
+                                 command.identifier);
+        ReleaseSRWLockExclusive(&g_effect_state_lock);
+        return result;
+    }
+    return command.identifier;
+}
+
+unsigned audio_play_effect(const char *path, int loop) {
+    return audio_play_effect_ex(path, loop, 1.0f, 0.0f, 1.0f);
+}
+
+int audio_is_effect_playing(unsigned identifier) {
+    EffectSlot *slot;
+    char command[80];
+    char mode[32] = {0};
+    int playing = 0;
+    AcquireSRWLockExclusive(&g_effect_state_lock);
+    slot = find_effect(identifier);
+    if (slot) {
+        snprintf(command, sizeof(command), "status %s mode", slot->alias);
+        if (mci_command(command, mode, sizeof(mode), 0)) {
+            playing = _stricmp(mode, "playing") == 0 ||
+                      _stricmp(mode, "paused") == 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_effect_state_lock);
+    return playing;
+}
+
+void audio_set_effect_volume(unsigned identifier, float volume) {
+    EffectCommand command;
+    memset(&command, 0, sizeof(command));
+    command.type = EFFECT_COMMAND_SET_VOLUME;
+    command.identifier = identifier;
+    command.volume = clamp_volume(volume);
+    if (!effect_queue_push(&command)) {
+        AcquireSRWLockExclusive(&g_effect_state_lock);
+        set_effect_volume_now(identifier, command.volume);
+        ReleaseSRWLockExclusive(&g_effect_state_lock);
+    }
+}
+
+static void enqueue_simple_effect_command(EffectCommandType type,
+                                          unsigned identifier) {
+    EffectCommand command;
+    memset(&command, 0, sizeof(command));
+    command.type = type;
+    command.identifier = identifier;
+    if (!effect_queue_push(&command)) process_effect_command(&command);
+}
+
+void audio_pause_effect(unsigned identifier) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_PAUSE, identifier);
+}
+
+void audio_resume_effect(unsigned identifier) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_RESUME, identifier);
+}
+
+void audio_stop_effect(unsigned identifier) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_STOP, identifier);
+}
+
+void audio_pause_all_effects(void) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_PAUSE_ALL, 0);
+}
+
+void audio_resume_all_effects(void) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_RESUME_ALL, 0);
+}
+
+void audio_stop_all_effects(void) {
+    enqueue_simple_effect_command(EFFECT_COMMAND_STOP_ALL, 0);
+}
+
+void audio_unload_effect(const char *path) {
+    EffectCommand command;
+    memset(&command, 0, sizeof(command));
+    command.type = EFFECT_COMMAND_UNLOAD;
+    snprintf(command.path, sizeof(command.path), "%s", path ? path : "");
+    if (!effect_queue_push(&command)) process_effect_command(&command);
+}
+
+float audio_get_effects_volume(void) {
+    float volume;
+    AcquireSRWLockShared(&g_effect_state_lock);
+    volume = g_effects_volume;
+    ReleaseSRWLockShared(&g_effect_state_lock);
+    return volume;
+}
+
+void audio_set_effects_volume(float volume) {
+    EffectCommand command;
+    AcquireSRWLockExclusive(&g_effect_state_lock);
+    g_effects_volume = clamp_volume(volume);
+    ReleaseSRWLockExclusive(&g_effect_state_lock);
+    memset(&command, 0, sizeof(command));
+    command.type = EFFECT_COMMAND_APPLY_MASTER_VOLUME;
+    if (!effect_queue_push(&command)) process_effect_command(&command);
+}
+

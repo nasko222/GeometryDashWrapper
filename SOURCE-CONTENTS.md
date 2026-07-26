@@ -1,15 +1,17 @@
-# Source contents — DynarmicTest13
+# Source contents — DynarmicTest14
 
-This is the complete source tree based on DynarmicTest12. No APK, source file, dependency, tool, patch, build script, or previous diagnostic/changelog file was removed.
+This is the complete DynarmicTest13 source plus the Test14 direct asynchronous effect and text-input-prewarm changes. No APK, dependency, tool, prior changelog, prior notes, or build material was removed.
 
-Test13-specific files:
+Test14-specific files:
 
-- `CHANGELOG-0.9.4-arm-dynarmictest13.md`
-- `DYNARMICTEST13-NOTES.md`
+- `CHANGELOG-0.9.4-arm-dynarmictest14.md`
+- `DYNARMICTEST14-NOTES.md`
 
-Core changed files:
+Primary changed files:
 
-- `src/dynarmic_probe.cpp` — guest page lookup, typed memory callbacks, cached OpenGL dispatch, buffered diagnostics, host/import sampling, GPU query timing, per-frame profiler, CSV/summary output, and Test13 labels.
-- `dynarmic-x64/CMakeLists.txt` — Test13 project name and `psapi` linkage for process-memory diagnostics.
-- `build-dynarmic-x64.ps1` — Test13 output directory, notes, debug-everything launcher, and profiler-file guidance.
-- `README.md`, `VERSION.txt`, and `PACKAGE-VERIFICATION.txt` — Test13 metadata.
+- `src/audio_win.c` — ordered asynchronous effect command worker and cached decoder-slot operations.
+- `src/audio_win.h` — parameter-preserving `audio_play_effect_ex` interface.
+- `src/dynarmic_probe.cpp` — direct ARM effect hooks, stack-argument decoding, text-input asset prewarm, and Test14 markers.
+- `dynarmic-x64/CMakeLists.txt` — Test14 project name.
+- `build-dynarmic-x64.ps1` — Test14 output folder, builder revision, notes, and messages.
+- `README.md`, `VERSION.txt`, and `PACKAGE-VERIFICATION.txt` — Test14 metadata.

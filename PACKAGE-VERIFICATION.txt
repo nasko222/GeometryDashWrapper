@@ -1,16 +1,16 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest13
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest14
 
 Preservation audit
 ------------------
-Base package: 0.9.4-arm-dynarmictest12
-Base files preserved: 1130 of 1130
+Base package: 0.9.4-arm-dynarmictest13
+Base files preserved: 1132 of 1132
 Missing base files: 0
-New Test13 files: 2
-Total files: 1132
+New Test14 files: 2
+Total files: 1134
 
 New files:
-  - CHANGELOG-0.9.4-arm-dynarmictest13.md
-  - DYNARMICTEST13-NOTES.md
+  - CHANGELOG-0.9.4-arm-dynarmictest14.md
+  - DYNARMICTEST14-NOTES.md
 
 Changed existing files:
   - README.md
@@ -18,29 +18,31 @@ Changed existing files:
   - VERSION.txt
   - build-dynarmic-x64.ps1
   - dynarmic-x64/CMakeLists.txt
+  - src/audio_win.c
+  - src/audio_win.h
   - src/dynarmic_probe.cpp
   - PACKAGE-VERIFICATION.txt
 
 Critical source validation
 --------------------------
-- C++20 syntax validation passed with -Wall -Wextra -Werror for the portable build path.
-- Existing C11 APK/audio helper syntax checks passed with -Wall -Wextra -Werror.
-- Guest memory mappings now use a 4 KiB page-index table instead of a linear region scan.
-- 16/32/64-bit guest reads and writes use one mapping check and one memcpy while retaining unaligned access support.
-- OpenGL imports cache host function addresses and argument descriptors.
-- Profiling captures per-frame event, ARM render, SwapBuffers, asynchronous GPU, import, JNI, OpenGL, draw, upload, guest-tick, JIT, SVC, and heap information.
-- The profile summary reports percentiles, threshold counts, global hot imports/OpenGL calls, sampled host bridge costs, and the 50 worst frames.
-- Routine logging is buffered; fatal/error paths and periodic checkpoints still flush.
-- --no-profile avoids per-frame profiler counter/import snapshots and GPU queries for a clean A/B run.
-- Windows CMake linkage includes psapi for process memory reporting.
-- Windows-only host-profile quoting and size casts were manually audited after portable validation.
+- Portable C++20 syntax validation passed with -Wall -Wextra -Werror using a minimal Dynarmic interface stub for parser/type coverage.
+- The asynchronous effect-worker section passed an isolated C11 syntax/type check with -Wall -Wextra -Werror.
+- ARM symbols were verified directly in the packaged libgame.so:
+    SimpleAudioEngine::preloadEffect = Thumb 0x002036e5, size 10, prologue 0xB510
+    SimpleAudioEngine::playEffect    = Thumb 0x002036fd, size 24, prologue 0xB500
+- Thumb disassembly confirms playEffect receives path/loop/pitch in R1-R3 and pan/gain at original SP+0/SP+4.
+- The direct hook uses R0 (`this`) as scratch and preserves all actual effect arguments.
+- Effect commands use an ordered 256-entry queue serviced by a dedicated Windows worker; overflow falls back to synchronous execution instead of dropping audio.
+- Shutdown joins the worker before closing cached effect decoder aliases.
+- Music remains on the established synchronous MCI path and is otherwise unchanged.
+- Text-input assets are prewarmed only in the native APK-member cache; guest-side first-use font construction is not bypassed.
 
 APK preservation
 ----------------
 game.apk bytes: 24704408
 game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
-Byte-identical to Test12 source APK: yes
+Byte-identical to Test13 source APK: yes
 
 Environment limitation
 ----------------------
-The complete Windows/Dynarmic executable was not built or executed in this Linux packaging environment. Windows-only OpenGL timer-query and psapi runtime paths require the user's normal Windows build and runtime test.
+The complete Windows/Dynarmic executable was not built or executed in this Linux packaging environment. Windows-only MCI worker-thread behavior requires the user's normal Windows build and runtime test.

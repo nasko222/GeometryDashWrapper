@@ -1,53 +1,38 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest13
+# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest14
 
-DynarmicTest13 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic. Test12 established working GDPS upload/download and browser links. Test13 focuses on low-end-PC performance and useful diagnostics.
+DynarmicTest14 keeps Test13's large CPU-emulation speedup, working GDPS networking, browser links, and debug-everything profiler. It targets the remaining short stalls caused by sound effects and the first text-field/keyboard opening.
 
-## Test13 changes
+## Test14 changes
 
-- Replaces repeated linear guest-memory mapping searches with a constant-time 4 KiB page lookup.
-- Uses one bounds check and one copy for 16/32/64-bit guest memory accesses.
-- Caches OpenGL host function pointers and argument metadata.
-- Buffers routine logging instead of flushing the disk on every input/JNI/file event.
-- Creates a per-frame “debug everything” profile with CPU, GPU, swap, imports, GL, draw, heap, and scene information.
-- Writes a compact summary containing percentiles, threshold counts, hot imports, sampled host costs, and the 50 worst frames.
+- Hooks `CocosDenshion::SimpleAudioEngine::playEffect` directly at the ARM entry point.
+- Hooks `SimpleAudioEngine::preloadEffect` directly as well.
+- Skips the old guest JNI/JniHelper effect path, eliminating its per-sound emulation overhead.
+- Queues effect preload/play/volume/pause/resume/stop/unload commands to a dedicated above-normal-priority Windows worker.
+- Keeps decoded WAV effects and MCI decoder slots cached; no synchronous MCI effect commands run on the render thread during normal operation.
+- Preserves pitch, pan, gain, loop, and returned effect identifiers. Pitch and pan remain accepted but are not transformed by the existing MCI backend, matching prior wrapper behavior.
+- Prewarms the chat-font and loading assets in the native APK-member cache to reduce the first text-input hitch.
+- Retains Test13 guest page lookup, typed memory callbacks, cached OpenGL dispatch, profiler CSV/summary, internet, browser links, saves, and audio music behavior.
 
 ## Build
 
 Run:
 
-```text
+```bat
 BUILD_DYNARMIC_X64.cmd
 ```
 
-Output:
+The output is:
 
 ```text
-dist-arm-wrapper-dynarmictest13
+dist-arm-wrapper-dynarmictest14
 ```
 
-Run `RUN_DYNARMIC_INTERACTIVE.cmd`. A custom GDPS APK may be passed to `build-dynarmic-x64.ps1` or copied as `game.apk` into the output folder.
-
-## Send these files after testing
+Run `RUN_DYNARMIC_INTERACTIVE.cmd`. Useful markers include:
 
 ```text
-gd-dynarmic-interactive.log
-gd-dynarmic-profile.csv
-gd-dynarmic-profile-summary.txt
+RESULT: DYNARMIC_SIMPLEAUDIO_EFFECT_HOOKS_READY count=2 play=direct-host preload=direct-host async-worker=1
+RESULT: DYNARMIC_ASYNC_EFFECT_WORKER_READY queue=256
+RESULT: DYNARMIC_TEXT_INPUT_ASSET_PREWARM_READY count=4
 ```
 
-The normal launcher enables the profiler automatically. For an A/B run without profiling overhead:
-
-```text
-GeometryDashDynarmicProbe.exe game.apk --no-profile --log=gd-dynarmic-no-profile.log
-```
-
-## Important startup markers
-
-```text
-RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY
-RESULT: DYNARMIC_DEBUG_EVERYTHING_READY
-RESULT: DYNARMIC_OPENGL_IMPORT_CACHE_READY
-RESULT: DYNARMIC_GPU_TIMER_READY
-```
-
-`DYNARMIC_GPU_TIMER_UNAVAILABLE` is not fatal; CPU, import, swap, draw, and heap profiling still work.
+For the audio test, die repeatedly in a level and verify that the sound still plays without a 100-300 ms frame. Also open a text field twice and compare the first and second opening.

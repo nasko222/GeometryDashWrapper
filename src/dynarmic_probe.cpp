@@ -1059,6 +1059,30 @@ static std::size_t InstallCcApplicationOpenUrlHook(ElfRuntime& runtime, ProbeEnv
     return 1u;
 }
 
+static std::size_t InstallSimpleAudioEffectHooks(ElfRuntime& runtime,
+                                                 ProbeEnvironment& env) {
+    struct Hook { const char* symbol; const char* import; u16 prologue; };
+    static constexpr Hook hooks[] = {
+        {"_ZN13CocosDenshion17SimpleAudioEngine10playEffectEPKcbfff",
+         "__dynarmic_simpleaudio_playEffect", 0xB500u},
+        {"_ZN13CocosDenshion17SimpleAudioEngine13preloadEffectEPKc",
+         "__dynarmic_simpleaudio_preloadEffect", 0xB510u},
+    };
+    std::size_t installed = 0;
+    for (const Hook& hook : hooks) {
+        const SymbolRecord* target = FindSymbol(runtime, hook.symbol);
+        if (!target) continue;
+        const u32 destination = EnsureImport(runtime, env, hook.import);
+        // Both methods use R0 for `this`; R1-R3 and stack arguments contain
+        // the actual sound parameters. The common trampoline may therefore
+        // safely use R0 as scratch without corrupting the effect call.
+        InstallThumbAbsoluteImportHookPreservingArguments(
+            env, runtime, *target, hook.prologue, destination);
+        ++installed;
+    }
+    return installed;
+}
+
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
@@ -1362,7 +1386,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest13Window";
+        const char* class_name = "GeometryDashDynarmicTest14Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1374,7 +1398,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test13",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test14",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1825,6 +1849,22 @@ public:
         writable_path_ = writable_path;
         apk_image_ = &apk_image;
         apk_member_cache_.Initialize(apk_image, writable_path, log_);
+        // Text-entry UI lazily requests these assets the first time a level
+        // name, description, or search field opens. Pull them into the native
+        // member cache during startup so slower disks do not add another
+        // first-keyboard hitch on top of the guest-side font construction.
+        static constexpr const char* kTextInputWarmAssets[] = {
+            "assets/chatFont-hd.fnt",
+            "assets/chatFont-hd.png",
+            "assets/loadingCircle-hd.png",
+            "assets/square02b_001-hd.png",
+        };
+        std::size_t warmed_text_assets = 0;
+        for (const char* member : kTextInputWarmAssets) {
+            if (apk_member_cache_.Load(member)) ++warmed_text_assets;
+        }
+        log_ << "RESULT: DYNARMIC_TEXT_INPUT_ASSET_PREWARM_READY count="
+             << warmed_text_assets << '\n';
 #ifdef _WIN32
         CreateDirectoryA(writable_path_.c_str(), nullptr);
         WSADATA winsock_data{};
@@ -2919,9 +2959,8 @@ private:
             const float gain = arguments.FloatArgument();
             (void)pitch;
             (void)pan;
-            const u32 identifier = audio_play_effect(path.c_str(), loop ? 1 : 0);
-            if (identifier) audio_set_effect_volume(identifier, gain);
-            return identifier;
+            return audio_play_effect_ex(path.c_str(), loop ? 1 : 0,
+                                        pitch, pan, gain);
         }
         return 0;
     }
@@ -4798,6 +4837,21 @@ private:
             OpenExternalUrl(url);
             return finish_hot(0u);
         }
+        if (name == "__dynarmic_simpleaudio_preloadEffect") {
+            const std::string path = ReadCString(r1);
+            audio_preload_effect(path.c_str());
+            return finish_hot(0u);
+        }
+        if (name == "__dynarmic_simpleaudio_playEffect") {
+            const u32 stack = cpu_.Regs()[13];
+            const float pitch = WordToFloat(r3);
+            const float pan = WordToFloat(env_.MemoryRead32(stack + 0u));
+            const float gain = WordToFloat(env_.MemoryRead32(stack + 4u));
+            const std::string path = ReadCString(r1);
+            RememberEvent("SimpleAudioEngine::playEffect " + path);
+            return finish_hot(audio_play_effect_ex(
+                path.c_str(), r2 != 0u ? 1 : 0, pitch, pan, gain));
+        }
         if (name == "fread") return finish_hot(ReadGuestFile(r0, r1, r2, r3));
         if (name == "fseek") return finish_hot(static_cast<u32>(SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2))));
         if (name == "ftell") return finish_hot(static_cast<u32>(TellGuestFile(r0)));
@@ -5703,7 +5757,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper DynarmicTest13 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper DynarmicTest14 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -5877,8 +5931,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest13");
-        emit("Milestone: debug everything profiler, constant-time guest memory, cached OpenGL dispatch, and low-end PC diagnostics");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest14");
+        emit("Milestone: direct asynchronous sound effects, first-text-input asset prewarm, debug-everything profiler, and low-end PC performance");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -5890,11 +5944,11 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "DynarmicTest13 must be compiled as a 64-bit executable");
+                "DynarmicTest14 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_DEBUG_EVERYTHING_READY frame-csv=1 slow-frame-dumps=1 import-gl-heap-counters=1");
+        emit("RESULT: DYNARMIC_DEBUG_EVERYTHING_READY frame-csv=1 slow-frame-dumps=1 import-gl-heap-counters=1 async-effects=1");
 
         std::string apk_path="game.apk";
         bool probe_only=false;
@@ -5937,6 +5991,11 @@ int main(int argc,char** argv) {
         if(browser_hooks!=1u)
             throw std::runtime_error(
                 "required cocos2d openURL hook was not found");
+        const std::size_t audio_effect_hooks=
+            InstallSimpleAudioEffectHooks(runtime,env);
+        if(audio_effect_hooks!=2u)
+            throw std::runtime_error(
+                "required SimpleAudioEngine effect hooks were not found");
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -5967,6 +6026,9 @@ int main(int argc,char** argv) {
              " scratch=r0 args=r1-r3-preserved");
         emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
              std::to_string(browser_hooks));
+        emit("RESULT: DYNARMIC_SIMPLEAUDIO_EFFECT_HOOKS_READY count="+
+             std::to_string(audio_effect_hooks)+
+             " play=direct-host preload=direct-host async-worker=1");
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
@@ -6014,7 +6076,7 @@ int main(int argc,char** argv) {
                 "JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
         if(probe_only){
-            emit("RESULT: DYNARMIC_BRINGUP13_PROBE_ONLY_OK");
+            emit("RESULT: DYNARMIC_BRINGUP14_PROBE_ONLY_OK");
             return 0;
         }
 
@@ -6259,7 +6321,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test13 | "
+                title<<"Geometry Dash ARM - Dynarmic x64 Test14 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -6309,11 +6371,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_BRINGUP13_OK");
+        emit("RESULT: DYNARMIC_BRINGUP14_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP13_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP14_FAILED");
         return 1;
     }
 }
