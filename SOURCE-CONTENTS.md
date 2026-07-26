@@ -1,15 +1,15 @@
-# Source contents — DynarmicTest11
+# Source contents — DynarmicTest12
 
-This is the complete source tree based on DynarmicTest10. No game source, APK, vendor dependency, tool, patch, previous diagnostic note, or build script was removed.
+This is the complete source tree based on DynarmicTest11. No game APK, source file, vendor dependency, tool, patch, previous diagnostic note, or build script was removed.
 
-Test11-specific files:
+Test12-specific files:
 
-- `CHANGELOG-0.9.4-arm-dynarmictest11.md`
-- `DYNARMICTEST11-NOTES.md`
+- `CHANGELOG-0.9.4-arm-dynarmictest12.md`
+- `DYNARMICTEST12-NOTES.md`
 
 Core changed files:
 
-- `src/dynarmic_probe.cpp` — correct zero-valued `SO_ERROR`, direct `CCApplication::openURL` hook, and bounded socket diagnostics.
-- `dynarmic-x64/CMakeLists.txt` — Test11 project name; existing `shell32` and `ws2_32` linkage retained.
-- `build-dynarmic-x64.ps1` — Test11 output folder and notes.
+- `src/dynarmic_probe.cpp` — select-based guest poll, bounded nonblocking send/receive waits, diagnostics, and Test12 labels.
+- `dynarmic-x64/CMakeLists.txt` — Test12 project name; existing `shell32` and `ws2_32` linkage retained.
+- `build-dynarmic-x64.ps1` — Test12 output folder and notes.
 - `README.md`, `VERSION.txt`, and package verification metadata.

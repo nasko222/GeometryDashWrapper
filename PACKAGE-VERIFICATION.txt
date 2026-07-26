@@ -1,33 +1,34 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest11
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest12
 
 Preservation audit
 ------------------
-Base package: 0.9.4-arm-dynarmictest10
-Base files preserved: 1126 of 1126
+Base package: 0.9.4-arm-dynarmictest11
+Base files preserved: 1128 of 1128
 Missing base files: 0
-New Test11 files: 2
-Total files: 1128
+New Test12 files: 2
+Total files: 1130
 
 New files:
-  - CHANGELOG-0.9.4-arm-dynarmictest11.md
-  - DYNARMICTEST11-NOTES.md
+  - CHANGELOG-0.9.4-arm-dynarmictest12.md
+  - DYNARMICTEST12-NOTES.md
 
 Critical source validation
 --------------------------
 - C++20 syntax validation passed with -Wall -Wextra -Werror for the portable build path.
-- MapWsaError returns 0 immediately for host error 0.
-- GuestGetSockOpt writes guest SO_ERROR 0 when Winsock SO_ERROR is 0.
-- Bounded diagnostics cover SO_ERROR, first send, first receive, and real socket failures without logging payload contents.
-- The direct CCApplication::openURL hook targets the exported Thumb symbol, validates prologue 0xB530, preserves R1, and routes HTTP/HTTPS links through ShellExecuteW.
-- The original JNI openURL handler remains present as a fallback.
+- Existing C11 audio/APK helper syntax checks passed with -Wall -Wextra -Werror.
+- The guest poll bridge no longer calls WSAPoll; it translates Linux pollfd events through Windows select read/write/exception sets.
+- A nonblocking recv that initially returns WSAEWOULDBLOCK now waits for readability, verifies SO_ERROR, and retries before returning to legacy ARM libcurl.
+- A temporarily blocked send receives the equivalent bounded writable wait and retry.
+- Diagnostics cover poll readiness, receive waits, first response bytes, EOF, invalid guest buffers, and real Winsock errors without logging payload contents.
+- Test11's correct SO_ERROR translation and direct CCApplication::openURL hook remain present.
 - Existing shell32 and ws2_32 linkage is retained.
 
 APK preservation
 ----------------
 game.apk bytes: 24704408
 game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
-Byte-identical to Test10 source APK: yes
+Byte-identical to Test11 source APK: yes
 
 Environment limitation
 ----------------------
-The complete Windows/Dynarmic executable was not built or executed in this Linux packaging environment. The Winsock and ShellExecuteW runtime paths require the user's normal Windows build and runtime test.
+The complete Windows/Dynarmic executable was not built or executed in this Linux packaging environment. The Winsock receive/poll and ShellExecuteW runtime paths require the user's normal Windows build and runtime test.

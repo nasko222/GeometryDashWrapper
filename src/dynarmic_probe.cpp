@@ -1162,7 +1162,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest11Window";
+        const char* class_name = "GeometryDashDynarmicTest12Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1174,7 +1174,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test11",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test12",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3751,17 +3751,51 @@ private:
     u32 GuestSend(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
         const char* data = static_cast<const char*>(env_.HostPointer(buffer, length));
-        if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
-        const int code = ::send(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
+        if (socket_value == INVALID_SOCKET || (!data && length)) {
+            SetGuestErrno(socket_value == INVALID_SOCKET ? 88 : 14);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Socket send rejected fd=" << guest_fd << " buffer=0x"
+                     << std::hex << buffer << std::dec << " length=" << length
+                     << (socket_value == INVALID_SOCKET ? " invalid-socket" : " invalid-guest-buffer") << '\n';
+            return static_cast<u32>(-1);
+        }
+
+        const int host_length = static_cast<int>(std::min<u32>(length, INT_MAX));
+        int code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
+        int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+
+        // A nonblocking socket can become temporarily unwritable after libcurl
+        // queues headers/body. Wait for Windows to report it writable and retry
+        // once rather than leaking WSAEWOULDBLOCK through the old Android curl.
+        if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
+            fd_set writable{};
+            fd_set exceptional{};
+            FD_ZERO(&writable);
+            FD_ZERO(&exceptional);
+            FD_SET(socket_value, &writable);
+            FD_SET(socket_value, &exceptional);
+            timeval timeout{};
+            timeout.tv_sec = 15;
+            const int ready = ::select(0, nullptr, &writable, &exceptional, &timeout);
+            if (ready > 0 && FD_ISSET(socket_value, &writable) && !FD_ISSET(socket_value, &exceptional)) {
+                code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
+                error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+            } else if (ready == 0) {
+                SetGuestErrno(11);
+                return static_cast<u32>(-1);
+            } else if (ready == SOCKET_ERROR) {
+                error = WSAGetLastError();
+            }
+        }
+
         if (code >= 0) {
             if (socket_send_logged_.insert(guest_fd).second)
                 log_ << "[host] Socket first send fd=" << guest_fd << " bytes=" << code << '\n';
             SetGuestErrno(0);
             return static_cast<u32>(code);
         }
-        const int error = WSAGetLastError();
         SetGuestErrno(MapWsaError(error));
-        if (error != WSAEWOULDBLOCK && network_log_count_++ < 128u)
+        if (network_log_count_++ < 128u)
             log_ << "[host] Socket send failed fd=" << guest_fd << " wsa=" << error
                  << " errno=" << MapWsaError(error) << '\n';
         return static_cast<u32>(-1);
@@ -3769,17 +3803,82 @@ private:
     u32 GuestReceive(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
         char* data = static_cast<char*>(env_.HostPointer(buffer, length));
-        if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
-        const int code = ::recv(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
+        if (socket_value == INVALID_SOCKET || (!data && length)) {
+            SetGuestErrno(socket_value == INVALID_SOCKET ? 88 : 14);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Socket recv rejected fd=" << guest_fd << " buffer=0x"
+                     << std::hex << buffer << std::dec << " length=" << length
+                     << (socket_value == INVALID_SOCKET ? " invalid-socket" : " invalid-guest-buffer") << '\n';
+            return static_cast<u32>(-1);
+        }
+
+        const int host_length = static_cast<int>(std::min<u32>(length, INT_MAX));
+        int code = ::recv(socket_value, data, host_length, HostMessageFlags(flags));
+        int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+
+        // Test11 connected and sent correctly, but the old ARM libcurl asks for
+        // recv immediately. On Windows that commonly returns WSAEWOULDBLOCK
+        // before the first response byte arrives. Its legacy poll/error path then
+        // turns the harmless race into CURLE_RECV_ERROR. Wait for readability and
+        // retry here so the guest sees actual data, EOF, or a real socket error.
+        if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
+            fd_set readable{};
+            fd_set exceptional{};
+            FD_ZERO(&readable);
+            FD_ZERO(&exceptional);
+            FD_SET(socket_value, &readable);
+            FD_SET(socket_value, &exceptional);
+            timeval timeout{};
+            timeout.tv_sec = 15;
+            const auto started = std::chrono::steady_clock::now();
+            const int ready = ::select(0, &readable, nullptr, &exceptional, &timeout);
+            if (ready > 0 && FD_ISSET(socket_value, &readable)) {
+                int socket_error = 0;
+                int socket_error_length = sizeof(socket_error);
+                if (::getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&socket_error), &socket_error_length) != 0) {
+                    socket_error = WSAGetLastError();
+                }
+                if (socket_error != 0) {
+                    SetGuestErrno(MapWsaError(socket_error));
+                    if (network_log_count_++ < 128u)
+                        log_ << "[host] Socket recv readiness error fd=" << guest_fd
+                             << " wsa=" << socket_error << " errno=" << MapWsaError(socket_error) << '\n';
+                    return static_cast<u32>(-1);
+                }
+                code = ::recv(socket_value, data, host_length, HostMessageFlags(flags));
+                error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+                if (network_log_count_++ < 128u) {
+                    const double elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started).count();
+                    log_ << "[host] Socket recv wait fd=" << guest_fd << " wait_ms="
+                         << std::fixed << std::setprecision(1) << elapsed
+                         << " result=" << code;
+                    if (code == SOCKET_ERROR) log_ << " wsa=" << error;
+                    log_ << '\n';
+                }
+            } else if (ready == 0) {
+                // Keep POSIX nonblocking semantics on timeout. Curl can apply its
+                // own total timeout instead of receiving a fabricated peer error.
+                SetGuestErrno(11);
+                if (network_log_count_++ < 128u)
+                    log_ << "[host] Socket recv wait timeout fd=" << guest_fd << " errno=11\n";
+                return static_cast<u32>(-1);
+            } else {
+                error = ready == SOCKET_ERROR ? WSAGetLastError() : WSAECONNABORTED;
+            }
+        }
+
         if (code >= 0) {
             if (code > 0 && socket_receive_logged_.insert(guest_fd).second)
                 log_ << "[host] Socket first recv fd=" << guest_fd << " bytes=" << code << '\n';
+            if (code == 0 && network_log_count_++ < 128u)
+                log_ << "[host] Socket EOF fd=" << guest_fd << '\n';
             SetGuestErrno(0);
             return static_cast<u32>(code);
         }
-        const int error = WSAGetLastError();
         SetGuestErrno(MapWsaError(error));
-        if (error != WSAEWOULDBLOCK && network_log_count_++ < 128u)
+        if (network_log_count_++ < 128u)
             log_ << "[host] Socket recv failed fd=" << guest_fd << " wsa=" << error
                  << " errno=" << MapWsaError(error) << '\n';
         return static_cast<u32>(-1);
@@ -3888,39 +3987,79 @@ private:
         }
         return 0;
     }
-    static SHORT HostPollEvents(std::int16_t guest_events) {
-        SHORT host = 0;
-        if (guest_events & 0x0001) host |= POLLRDNORM;
-        if (guest_events & 0x0002) host |= POLLPRI;
-        if (guest_events & 0x0004) host |= POLLWRNORM;
-        return host;
-    }
-    static std::int16_t GuestPollEvents(SHORT host_events) {
-        std::int16_t guest = 0;
-        if (host_events & (POLLRDNORM | POLLRDBAND)) guest |= 0x0001;
-        if (host_events & POLLPRI) guest |= 0x0002;
-        if (host_events & POLLWRNORM) guest |= 0x0004;
-        if (host_events & POLLERR) guest |= 0x0008;
-        if (host_events & POLLHUP) guest |= 0x0010;
-        if (host_events & POLLNVAL) guest |= 0x0020;
-        return guest;
-    }
     u32 GuestPoll(u32 pollfds_address, u32 count, s32 timeout) {
         if (count > 4096u) { SetGuestErrno(22); return static_cast<u32>(-1); }
         std::vector<GuestPollFd> guest(count);
-        if (count && !env_.ReadBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd))) return static_cast<u32>(-1);
-        std::vector<WSAPOLLFD> host(count);
-        for (u32 index = 0; index < count; ++index) {
-            host[index].fd = FindHostSocket(static_cast<u32>(guest[index].fd));
-            host[index].events = HostPollEvents(guest[index].events);
-            host[index].revents = 0;
+        if (count && !env_.ReadBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd))) {
+            SetGuestErrno(14);
+            return static_cast<u32>(-1);
         }
-        const int code = WSAPoll(host.data(), static_cast<ULONG>(host.size()), timeout);
-        if (code < 0) return SocketFailure();
-        for (u32 index = 0; index < count; ++index)
-            guest[index].revents = GuestPollEvents(host[index].revents);
-        if (count) env_.WriteBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd));
-        return static_cast<u32>(code);
+
+        fd_set readable{};
+        fd_set writable{};
+        fd_set exceptional{};
+        FD_ZERO(&readable);
+        FD_ZERO(&writable);
+        FD_ZERO(&exceptional);
+        std::vector<SOCKET> host_sockets(count, INVALID_SOCKET);
+        u32 invalid_count = 0;
+        bool have_valid_socket = false;
+        for (u32 index = 0; index < count; ++index) {
+            guest[index].revents = 0;
+            if (guest[index].fd < 0) continue;
+            const SOCKET socket_value = FindHostSocket(static_cast<u32>(guest[index].fd));
+            host_sockets[index] = socket_value;
+            if (socket_value == INVALID_SOCKET) {
+                guest[index].revents = 0x0020; // Linux POLLNVAL
+                ++invalid_count;
+                continue;
+            }
+            have_valid_socket = true;
+            if (guest[index].events & 0x0001) FD_SET(socket_value, &readable);  // POLLIN
+            if (guest[index].events & 0x0002) FD_SET(socket_value, &exceptional); // POLLPRI
+            if (guest[index].events & 0x0004) FD_SET(socket_value, &writable);  // POLLOUT
+            FD_SET(socket_value, &exceptional);
+        }
+
+        timeval timeval_value{};
+        timeval* timeval_pointer = nullptr;
+        if (timeout >= 0) {
+            timeval_value.tv_sec = timeout / 1000;
+            timeval_value.tv_usec = (timeout % 1000) * 1000;
+            timeval_pointer = &timeval_value;
+        }
+
+        int selected = 0;
+        if (have_valid_socket) {
+            selected = ::select(0, &readable, &writable, &exceptional, timeval_pointer);
+            if (selected == SOCKET_ERROR) return SocketFailure();
+        } else if (timeout > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+        }
+
+        u32 ready_count = invalid_count;
+        for (u32 index = 0; index < count; ++index) {
+            const SOCKET socket_value = host_sockets[index];
+            if (socket_value == INVALID_SOCKET) continue;
+            std::int16_t revents = 0;
+            if (FD_ISSET(socket_value, &readable)) revents |= 0x0001;
+            if (FD_ISSET(socket_value, &writable)) revents |= 0x0004;
+            if (FD_ISSET(socket_value, &exceptional)) revents |= 0x0008;
+            guest[index].revents = revents;
+            if (revents) ++ready_count;
+            if (revents && network_poll_log_count_++ < 48u) {
+                log_ << "[host] Socket poll fd=" << guest[index].fd
+                     << " requested=0x" << std::hex << static_cast<u16>(guest[index].events)
+                     << " ready=0x" << static_cast<u16>(revents) << std::dec
+                     << " timeout_ms=" << timeout << '\n';
+            }
+        }
+        if (count && !env_.WriteBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd))) {
+            SetGuestErrno(14);
+            return static_cast<u32>(-1);
+        }
+        SetGuestErrno(0);
+        return ready_count;
     }
     u32 GuestIoctl(u32 guest_fd, u32 request, u32 argument_address) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
@@ -4675,6 +4814,7 @@ private:
     bool cooperative_worker_yielded_=false;
     bool cooperative_worker_done_=false;
     u64 network_worker_runs_=0;
+    u64 network_poll_log_count_=0;
     u64 random_state_=1;
     unsigned call_depth_=0;
     u64 permissive_stub_calls_=0;
@@ -4797,11 +4937,11 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest11");
-        emit("Milestone: correct SO_ERROR translation, direct cocos2d browser links, HTTP socket diagnostics, and APK member caching");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest12");
+        emit("Milestone: reliable HTTP receive waits, select-based polling, browser links, and APK member caching");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest11 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest12 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -4865,7 +5005,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP11_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP12_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -4952,7 +5092,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test11 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test12 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -4969,11 +5109,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP11_OK");
+        emit("RESULT: DYNARMIC_BRINGUP12_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP11_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP12_FAILED");
         return 1;
     }
 }
