@@ -1,9 +1,7 @@
-# Source contents — v22beta bringup3
+# Source contents — v22beta bringup4
 
-- Complete wrapper source and pinned build tooling.
-- No APK files.
-- Raw newer `libcocos2dcpp.so` retained for loader/constructor probing.
-- Current branch documentation only; no historical changelog pile.
-- Build output can package an APK supplied by the user at build time.
+The archive contains the complete wrapper source tree, build scripts, pinned dependency preparation logic, the raw ARMv7 native-library probe input, and Bringup4 documentation.
 
-See `V22BETA-BRINGUP3-NOTES.md`.
+It intentionally contains no APK files and no historical wrapper changelog pile.
+
+See `V22BETA-BRINGUP4-NOTES.md` for the current changes.

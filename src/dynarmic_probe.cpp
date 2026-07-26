@@ -1531,7 +1531,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup3Window";
+        const char* class_name = "GeometryDashV22BetaBringup4Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1960,6 +1960,25 @@ public:
         c_locale_address_ = AllocateString("C");
         tm_address_ = Allocate(sizeof(GuestTmLayout));
         time_zone_address_ = AllocateString("local");
+        empty_cstring_address_ = AllocateString("");
+        for (const SymbolRecord& symbol : runtime_.symbols) {
+            if (symbol.name == "_ZN9PlayLayer29prepareCreateObjectsFromSetupESs") {
+                // The known beta crashes after CCArray::stringAtIndex(0)
+                // returns null and the tiny getCString() accessor attempts
+                // to read null + 0x30. The PC observed after that accessor is
+                // entry + 0x148 in the newer beta. Keep this symbol-relative
+                // so relocation/base changes do not hardcode 0x10273dc8.
+                const u32 entry = symbol.address & ~1u;
+                if (symbol.size == 588u) {
+                    v22_level_setup_null_recovery_pc_ = entry + 0x148u;
+                } else if (symbol.size == 404u) {
+                    // Earlier supplied beta: the same stringAtIndex/getCString
+                    // sequence returns at entry + 0xC2.
+                    v22_level_setup_null_recovery_pc_ = entry + 0x0c2u;
+                }
+                break;
+            }
+        }
     }
 
     ~GuestExecutor() {
@@ -2337,10 +2356,37 @@ public:
             cpu_.ClearHalt(kCallbackHalt);
 
             if (env_.invalid_access) {
+                // Both interactive logs reach PlayLayer and then fault in the
+                // four-byte CCString::getCString accessor because the setup
+                // split array contains no element zero. The accessor has
+                // already returned to the next instruction when Dynarmic
+                // reports the callback fault, so substituting a persistent
+                // empty C string is safe and lets LevelSettingsObject build
+                // its normal default settings instead of killing the process.
+                if (env_.fault_address == 0x30u &&
+                    v22_level_setup_null_recovery_pc_ != 0u &&
+                    cpu_.Regs()[15] == v22_level_setup_null_recovery_pc_ &&
+                    empty_cstring_address_ != 0u) {
+                    cpu_.Regs()[0] = empty_cstring_address_;
+                    env_.ResetStopState();
+                    ++v22_level_setup_null_recoveries_;
+                    if (v22_level_setup_null_recoveries_ <= 8u) {
+                        log_ << "WARNING: V22 level setup header missing; "
+                             << "substituted default empty settings string recovery="
+                             << v22_level_setup_null_recoveries_
+                             << " PC=0x" << std::hex << cpu_.Regs()[15]
+                             << std::dec << '\n';
+                        log_.flush();
+                    }
+                    continue;
+                }
                 std::ostringstream error;
                 error << label << " invalid guest memory at 0x" << std::hex << env_.fault_address
                       << " PC=0x" << cpu_.Regs()[15] << " (" << DescribeAddress(cpu_.Regs()[15]) << ')'
-                      << " LR=0x" << cpu_.Regs()[14] << " (" << DescribeAddress(cpu_.Regs()[14]) << ')';
+                      << " LR=0x" << cpu_.Regs()[14] << " (" << DescribeAddress(cpu_.Regs()[14]) << ')'
+                      << " R0=0x" << cpu_.Regs()[0] << " R1=0x" << cpu_.Regs()[1]
+                      << " R2=0x" << cpu_.Regs()[2] << " R3=0x" << cpu_.Regs()[3]
+                      << " SP=0x" << cpu_.Regs()[13];
                 return Fail(error.str());
             }
             if (env_.interpreter_fallback) {
@@ -3156,6 +3202,17 @@ private:
         if (method->name == "getFloatForKey") {
             const std::string key = RefString(arguments.Word());
             result = storage_get_float(key.c_str(), arguments.FloatArgument());
+        } else if (method->name == "getDeviceRefreshRate") {
+            // Returning the old default 0.0f leaves newer Geometry Dash builds
+            // with an invalid simulation cadence: editor playtest renders one
+            // frame but never advances the cube. Android always reports a
+            // positive display refresh rate here; use the wrapper's 60 Hz
+            // presentation target until variable-refresh support is added.
+            result = 60.0f;
+            if (!refresh_rate_bridge_logged_) {
+                refresh_rate_bridge_logged_ = true;
+                log_ << "RESULT: DYNARMIC_V22_REFRESH_RATE_BRIDGE hz=60\n";
+            }
         } else if (method->name == "getBackgroundMusicVolume") result = audio_get_background_volume();
         else if (method->name == "getEffectsVolume") result = audio_get_effects_volume();
         else if (method->name == "getBackgroundMusicTime") result = audio_get_background_time();
@@ -5021,15 +5078,45 @@ private:
         u32 mode = 0;
         unsigned host_id = 0;
         float volume = 1.0f;
+        bool background = false;
+        bool loop = false;
         bool paused = false;
         bool playing = false;
+        bool started = false;
+        bool stopped = false;
+        bool mixer_paused = false;
+        bool observed_playing = false;
+        bool callback_sent = false;
+        bool initialized = false;
+        bool suspended = false;
+        bool input_metering_enabled = false;
+        bool output_metering_enabled = false;
+        u32 callback_address = 0;
         u32 position_ms = 0;
         u32 stream_buffer_size = 16384;
-        u32 stream_buffer_type = 0;
+        u32 stream_buffer_type = 0x00000008u; // FMOD_TIMEUNIT_RAWBYTES
+        u32 output_type = 0;
+        u32 software_rate = 44100;
+        u32 software_speaker_mode = 3; // FMOD_SPEAKERMODE_STEREO
+        u32 software_raw_speakers = 0;
     };
 
     static bool IsFmodImport(const std::string& name) {
         return IsFmodImportName(name);
+    }
+
+    static bool FmodPathHasExtension(const std::string& path,
+                                     std::string_view extension) {
+        if (path.size() < extension.size()) return false;
+        const std::size_t offset = path.size() - extension.size();
+        for (std::size_t index = 0; index < extension.size(); ++index) {
+            char left = path[offset + index];
+            char right = extension[index];
+            if (left >= 'A' && left <= 'Z') left = static_cast<char>(left - 'A' + 'a');
+            if (right >= 'A' && right <= 'Z') right = static_cast<char>(right - 'A' + 'a');
+            if (left != right) return false;
+        }
+        return true;
     }
 
     u32 NewFmodObject(FmodObjectKind kind, const std::string& path = {}) {
@@ -5040,6 +5127,14 @@ private:
         FmodObjectState state;
         state.kind = kind;
         state.path = path;
+        state.background = kind == FmodObjectKind::Stream ||
+                           FmodPathHasExtension(path, ".mp3");
+        if (kind == FmodObjectKind::System) {
+            state.stream_buffer_size = 16384u;
+            state.stream_buffer_type = 0x00000008u;
+            state.software_rate = 44100u;
+            state.software_speaker_mode = 3u;
+        }
         fmod_objects_[address] = std::move(state);
         return address;
     }
@@ -5049,52 +5144,145 @@ private:
         return found == fmod_objects_.end() ? nullptr : &found->second;
     }
 
+    bool FmodBackendPlaying(FmodObjectState* channel) {
+        if (!channel || channel->kind != FmodObjectKind::Channel || channel->stopped)
+            return false;
+        if (!channel->started) return channel->paused;
+        if (channel->paused) return true;
+        if (channel->background) return audio_is_background_playing() != 0;
+        return channel->host_id && audio_is_effect_playing(channel->host_id) != 0;
+    }
+
+    void StartFmodBackground(FmodObjectState& channel) {
+        if (!channel.background || channel.started || channel.stopped ||
+            channel.path.empty()) return;
+        audio_play_background(channel.path.c_str(), channel.loop ? 1 : 0);
+        channel.started = true;
+        channel.playing = true;
+        if (channel.position_ms) {
+            audio_set_background_time(static_cast<float>(channel.position_ms) / 1000.0f);
+        }
+        audio_set_background_volume(channel.volume);
+        log_ << "[host] FMOD bridge: released deferred music channel path="
+             << SanitizeLogText(channel.path) << " position_ms="
+             << channel.position_ms << " loop=" << (channel.loop ? 1 : 0) << '\n';
+    }
+
+    void SetFmodChannelPaused(FmodObjectState& channel, bool paused) {
+        if (channel.kind != FmodObjectKind::Channel || channel.stopped) return;
+        if (channel.background && !channel.started) {
+            channel.paused = paused;
+            if (!paused) StartFmodBackground(channel);
+            return;
+        }
+        if (channel.paused == paused) return;
+        if (channel.background) {
+            if (paused) {
+                const float seconds = audio_get_background_time();
+                if (seconds >= 0.0f)
+                    channel.position_ms = static_cast<u32>(seconds * 1000.0f + 0.5f);
+                audio_pause_background();
+            } else {
+                audio_resume_background_from(
+                    static_cast<float>(channel.position_ms) / 1000.0f);
+            }
+        } else if (channel.host_id) {
+            if (paused) audio_pause_effect(channel.host_id);
+            else audio_resume_effect(channel.host_id);
+        }
+        channel.paused = paused;
+    }
+
+    void FillFmodMeteringInfo(u32 address, float peak) {
+        if (!address) return;
+        // FMOD_DSP_METERING_INFO in the 1.05 ABI is 264 bytes:
+        // int numsamples; float peak[32]; float rms[32]; short channels/pad.
+        std::array<u8, 264> bytes{};
+        if (!env_.WriteBytes(address, bytes.data(), bytes.size())) return;
+        env_.MemoryWrite32(address + 0u, peak > 0.0f ? 1u : 0u);
+        env_.MemoryWrite32(address + 4u, FloatToWord(peak));
+        env_.MemoryWrite32(address + 8u, FloatToWord(peak));
+        const float rms = peak * 0.70710678f;
+        env_.MemoryWrite32(address + 132u, FloatToWord(rms));
+        env_.MemoryWrite32(address + 136u, FloatToWord(rms));
+        env_.MemoryWrite16(address + 260u, 2u);
+    }
+
     bool DispatchFmod(ImportRecord& import) {
         const std::string& name = import.name;
         const u32 r0 = cpu_.Regs()[0], r1 = cpu_.Regs()[1], r2 = cpu_.Regs()[2], r3 = cpu_.Regs()[3];
         constexpr u32 kFmodOk = 0;
+        constexpr u32 kFmodInvalidParam = 31;
+        constexpr u32 kFmodLoopNormal = 0x00000002u;
         auto finish = [&](u32 value) {
             cpu_.Regs()[0] = value;
             ResumeAfterStub(import.address);
             return true;
         };
+        if (fmod_call_log_count_ < 96u) {
+            ++fmod_call_log_count_;
+            log_ << "[host] FMOD guest call #" << fmod_call_log_count_
+                 << " " << name << " r0=0x" << std::hex << r0
+                 << " r1=0x" << r1 << " r2=0x" << r2
+                 << " r3=0x" << r3 << std::dec << '\n';
+        }
         if (name == "FMOD_System_Create") {
             const u32 system = NewFmodObject(FmodObjectKind::System);
             if (r0) env_.MemoryWrite32(r0, system);
-            if (import.calls == 1) log_ << "RESULT: DYNARMIC_V22_FMOD_BRIDGE_READY system=0x" << std::hex << system << std::dec << '\n';
-            return finish(system ? kFmodOk : 1u);
+            if (import.calls == 1)
+                log_ << "RESULT: DYNARMIC_V22_FMOD_BRIDGE_READY system=0x"
+                     << std::hex << system << std::dec
+                     << " version=0x00010504 deferred-music=1\n";
+            return finish(system ? kFmodOk : kFmodInvalidParam);
         }
         if (name == "_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE" ||
             name == "_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE") {
             const bool stream = name.find("createStream") != std::string::npos;
             const std::string path = ReadCString(r1);
             const u32 object = NewFmodObject(stream ? FmodObjectKind::Stream : FmodObjectKind::Sound, path);
-            if (FmodObjectState* state = FindFmodObject(object)) state->mode = r2;
+            if (FmodObjectState* state = FindFmodObject(object)) {
+                state->mode = r2;
+                state->loop = (r2 & kFmodLoopNormal) != 0;
+            }
             const u32 output = ArgWord(4);
             if (output) env_.MemoryWrite32(output, object);
-            if (stream) audio_preload_background(path.c_str()); else audio_preload_effect(path.c_str());
-            return finish(object ? kFmodOk : 1u);
+            if (stream || FmodPathHasExtension(path, ".mp3"))
+                audio_preload_background(path.c_str());
+            else
+                audio_preload_effect(path.c_str());
+            return finish(object ? kFmodOk : kFmodInvalidParam);
         }
         if (name == "_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE") {
             FmodObjectState* sound = FindFmodObject(r1);
-            const u32 channel = NewFmodObject(FmodObjectKind::Channel, sound ? sound->path : std::string{});
-            FmodObjectState* state = FindFmodObject(channel);
-            if (state && sound) {
-                state->mode = sound->mode;
-                state->paused = r3 != 0;
-                state->playing = true;
-                const bool loop = (sound->mode & 0x2u) != 0;
-                if (sound->kind == FmodObjectKind::Stream) {
-                    audio_play_background(sound->path.c_str(), loop ? 1 : 0);
-                    if (state->paused) audio_pause_background();
+            if (!sound) return finish(kFmodInvalidParam);
+            const u32 channel_address = NewFmodObject(FmodObjectKind::Channel, sound->path);
+            FmodObjectState* channel = FindFmodObject(channel_address);
+            if (channel) {
+                channel->background = sound->background;
+                channel->mode = sound->mode;
+                channel->loop = (sound->mode & kFmodLoopNormal) != 0;
+                channel->paused = r3 != 0;
+                channel->playing = true;
+                channel->stopped = false;
+                if (channel->background) {
+                    channel->volume = audio_get_background_volume();
+                    if (channel->paused) {
+                        log_ << "[host] FMOD bridge: music armed paused path="
+                             << SanitizeLogText(channel->path) << '\n';
+                    } else {
+                        StartFmodBackground(*channel);
+                    }
                 } else {
-                    state->host_id = audio_play_effect(sound->path.c_str(), loop ? 1 : 0);
-                    if (state->paused && state->host_id) audio_pause_effect(state->host_id);
+                    channel->volume = audio_get_effects_volume();
+                    channel->host_id = audio_play_effect(channel->path.c_str(), channel->loop ? 1 : 0);
+                    channel->started = channel->host_id != 0;
+                    if (channel->paused && channel->host_id)
+                        audio_pause_effect(channel->host_id);
                 }
             }
             const u32 output = ArgWord(4);
-            if (output) env_.MemoryWrite32(output, channel);
-            return finish(channel ? kFmodOk : 1u);
+            if (output) env_.MemoryWrite32(output, channel_address);
+            return finish(channel_address ? kFmodOk : kFmodInvalidParam);
         }
         if (name == "_ZN4FMOD6System19setStreamBufferSizeEjj") {
             if (FmodObjectState* state = FindFmodObject(r0)) {
@@ -5106,66 +5294,147 @@ private:
         if (name == "_ZN4FMOD6System19getStreamBufferSizeEPjS1_") {
             FmodObjectState* state = FindFmodObject(r0);
             if (r1) env_.MemoryWrite32(r1, state ? state->stream_buffer_size : 16384u);
-            if (r2) env_.MemoryWrite32(r2, state ? state->stream_buffer_type : 0u);
+            if (r2) env_.MemoryWrite32(r2, state ? state->stream_buffer_type : 0x00000008u);
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD6System10getVersionEPj") {
-            if (r1) env_.MemoryWrite32(r1, 0x00020200u);
+            if (r1) env_.MemoryWrite32(r1, 0x00010504u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System9setOutputE15FMOD_OUTPUTTYPE") {
+            if (FmodObjectState* state = FindFmodObject(r0)) state->output_type = r1;
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System17setSoftwareFormatEi16FMOD_SPEAKERMODEi") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->software_rate = r1 ? r1 : 44100u;
+                state->software_speaker_mode = r2 ? r2 : 3u;
+                state->software_raw_speakers = r3;
+            }
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD6System17getSoftwareFormatEPiP16FMOD_SPEAKERMODES1_") {
-            if (r1) env_.MemoryWrite32(r1, 48000u);
-            if (r2) env_.MemoryWrite32(r2, 2u);
-            if (r3) env_.MemoryWrite32(r3, 0u);
+            FmodObjectState* state = FindFmodObject(r0);
+            if (r1) env_.MemoryWrite32(r1, state ? state->software_rate : 44100u);
+            if (r2) env_.MemoryWrite32(r2, state ? state->software_speaker_mode : 3u);
+            if (r3) env_.MemoryWrite32(r3, state ? state->software_raw_speakers : 0u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System4initEijPv") {
+            if (FmodObjectState* state = FindFmodObject(r0)) state->initialized = true;
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System6updateEv") {
+            // Keep cached position/playing state coherent. Callback delivery is
+            // intentionally deferred until a context-preserving guest callback
+            // trampoline is available; the game does not need it for playback.
+            for (auto& [address, state] : fmod_objects_) {
+                (void)address;
+                if (state.kind != FmodObjectKind::Channel || state.stopped) continue;
+                const bool now_playing = FmodBackendPlaying(&state);
+                if (state.background && state.started) {
+                    const float seconds = audio_get_background_time();
+                    if (seconds >= 0.0f)
+                        state.position_ms = static_cast<u32>(seconds * 1000.0f + 0.5f);
+                }
+                state.observed_playing = now_playing;
+                state.playing = now_playing;
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System12mixerSuspendEv" ||
+            name == "_ZN4FMOD6System11mixerResumeEv") {
+            const bool suspend = name.find("Suspend") != std::string::npos;
+            if (FmodObjectState* system = FindFmodObject(r0)) system->suspended = suspend;
+            for (auto& [address, channel] : fmod_objects_) {
+                (void)address;
+                if (channel.kind != FmodObjectKind::Channel || channel.stopped) continue;
+                if (suspend && !channel.paused) {
+                    SetFmodChannelPaused(channel, true);
+                    channel.mixer_paused = true;
+                } else if (!suspend && channel.mixer_paused) {
+                    channel.mixer_paused = false;
+                    SetFmodChannelPaused(channel, false);
+                }
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System5closeEv") {
+            audio_stop_background();
+            audio_stop_all_effects();
+            if (FmodObjectState* state = FindFmodObject(r0)) state->initialized = false;
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl9setVolumeEf") {
             if (FmodObjectState* state = FindFmodObject(r0)) {
                 state->volume = WordToFloat(r1);
-                if (state->host_id) audio_set_effect_volume(state->host_id, state->volume);
-                else audio_set_background_volume(state->volume);
+                if (state->background) audio_set_background_volume(state->volume);
+                else if (state->host_id) audio_set_effect_volume(state->host_id, state->volume);
             }
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl9getVolumeEPf") {
-            if (r1) env_.MemoryWrite32(r1, FloatToWord(FindFmodObject(r0) ? FindFmodObject(r0)->volume : 1.0f));
+            FmodObjectState* state = FindFmodObject(r0);
+            if (r1) env_.MemoryWrite32(r1, FloatToWord(state ? state->volume : 1.0f));
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl9setPausedEb") {
-            if (FmodObjectState* state = FindFmodObject(r0)) {
-                state->paused = r1 != 0;
-                if (state->host_id) state->paused ? audio_pause_effect(state->host_id) : audio_resume_effect(state->host_id);
-                else state->paused ? audio_pause_background() : audio_resume_background();
-            }
+            if (FmodObjectState* state = FindFmodObject(r0))
+                SetFmodChannelPaused(*state, r1 != 0);
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl9getPausedEPb") {
-            if (r1) env_.MemoryWrite8(r1, FindFmodObject(r0) && FindFmodObject(r0)->paused ? 1u : 0u);
+            FmodObjectState* state = FindFmodObject(r0);
+            if (r1) env_.MemoryWrite8(r1, state && state->paused ? 1u : 0u);
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl9isPlayingEPb") {
-            FmodObjectState* state = FindFmodObject(r0);
-            bool playing = state && state->playing;
-            if (state && state->host_id) playing = audio_is_effect_playing(state->host_id) != 0;
-            else if (state) playing = audio_is_background_playing() != 0;
+            const bool playing = FmodBackendPlaying(FindFmodObject(r0));
             if (r1) env_.MemoryWrite8(r1, playing ? 1u : 0u);
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl4stopEv") {
             if (FmodObjectState* state = FindFmodObject(r0)) {
-                if (state->host_id) audio_stop_effect(state->host_id); else audio_stop_background();
+                if (state->background && state->started) audio_stop_background();
+                else if (state->host_id) audio_stop_effect(state->host_id);
+                state->stopped = true;
                 state->playing = false;
+                state->paused = false;
             }
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl7setModeEj") {
-            if (FmodObjectState* state = FindFmodObject(r0)) state->mode = r1;
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                const bool old_loop = state->loop;
+                state->mode = r1;
+                state->loop = (r1 & kFmodLoopNormal) != 0;
+                if (state->background && state->started && !state->stopped && old_loop != state->loop) {
+                    const float seconds = audio_get_background_time();
+                    if (seconds >= 0.0f)
+                        state->position_ms = static_cast<u32>(seconds * 1000.0f + 0.5f);
+                    audio_play_background(state->path.c_str(), state->loop ? 1 : 0);
+                    if (state->position_ms)
+                        audio_set_background_time(static_cast<float>(state->position_ms) / 1000.0f);
+                    if (state->paused) audio_pause_background();
+                }
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl11setCallbackEPF11FMOD_RESULTP19FMOD_CHANNELCONTROL24FMOD_CHANNELCONTROL_TYPE33FMOD_CHANNELCONTROL_CALLBACK_TYPEPvS6_E") {
+            if (FmodObjectState* state = FindFmodObject(r0)) state->callback_address = r1;
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD7Channel11getPositionEPjj") {
             u32 position = 0;
             if (FmodObjectState* state = FindFmodObject(r0)) {
-                position = state->host_id ? state->position_ms : static_cast<u32>(audio_get_background_time() * 1000.0f);
+                position = state->position_ms;
+                if (state->background && state->started) {
+                    const float seconds = audio_get_background_time();
+                    if (seconds >= 0.0f) {
+                        position = static_cast<u32>(seconds * 1000.0f + 0.5f);
+                        state->position_ms = position;
+                    }
+                }
             }
             if (r1) env_.MemoryWrite32(r1, position);
             return finish(kFmodOk);
@@ -5173,18 +5442,29 @@ private:
         if (name == "_ZN4FMOD7Channel11setPositionEjj") {
             if (FmodObjectState* state = FindFmodObject(r0)) {
                 state->position_ms = r1;
-                if (!state->host_id) audio_set_background_time(static_cast<float>(r1) / 1000.0f);
+                if (state->background && state->started)
+                    audio_set_background_time(static_cast<float>(r1) / 1000.0f);
             }
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD14ChannelControl6getDSPEiPPNS_3DSPE") {
-            const u32 dsp = NewFmodObject(FmodObjectKind::Dsp);
-            if (r2) env_.MemoryWrite32(r2, dsp);
-            return finish(dsp ? kFmodOk : 1u);
+            if (!fmod_dsp_address_) fmod_dsp_address_ = NewFmodObject(FmodObjectKind::Dsp);
+            if (r2) env_.MemoryWrite32(r2, fmod_dsp_address_);
+            return finish(fmod_dsp_address_ ? kFmodOk : kFmodInvalidParam);
+        }
+        if (name == "_ZN4FMOD3DSP18setMeteringEnabledEbb") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->input_metering_enabled = r1 != 0;
+                state->output_metering_enabled = r2 != 0;
+            }
+            return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD3DSP15getMeteringInfoEP22FMOD_DSP_METERING_INFOS2_") {
-            if (r1) { std::array<u8, 128> zero{}; env_.WriteBytes(r1, zero.data(), zero.size()); }
-            if (r2) { std::array<u8, 128> zero{}; env_.WriteBytes(r2, zero.data(), zero.size()); }
+            FmodObjectState* state = FindFmodObject(r0);
+            const float peak = state && (state->input_metering_enabled || state->output_metering_enabled)
+                                   ? audio_get_output_peak() : 0.0f;
+            FillFmodMeteringInfo(r1, state && state->input_metering_enabled ? peak : 0.0f);
+            FillFmodMeteringInfo(r2, state && state->output_metering_enabled ? peak : 0.0f);
             return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD5Sound7releaseEv") {
@@ -5197,8 +5477,6 @@ private:
             Free(r0);
             return finish(kFmodOk);
         }
-        // Remaining system setup/update, callback, DSP-enable and mixer calls are
-        // state-free for the Windows bridge and succeed intentionally.
         return finish(kFmodOk);
     }
 
@@ -5846,6 +6124,12 @@ private:
     GuestCallMetrics last_call_metrics_;
     std::set<std::string> permissive_names_;
     std::unordered_map<u32, FmodObjectState> fmod_objects_;
+    u32 fmod_dsp_address_=0;
+    u64 fmod_call_log_count_=0;
+    u32 empty_cstring_address_=0;
+    u32 v22_level_setup_null_recovery_pc_=0;
+    u64 v22_level_setup_null_recoveries_=0;
+    bool refresh_rate_bridge_logged_=false;
     std::deque<std::string> recent_events_;
     std::vector<std::string> active_calls_;
     u64 host_event_sequence_=0;
@@ -6217,7 +6501,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup1-fix1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup4 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6471,8 +6755,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup3");
-        emit("Milestone: ARMv7 global exclusive monitor, dual-beta APK bring-up, FMOD stream-buffer compatibility, and startup music pre-cache");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup4");
+        emit("Milestone: ARMv7 runtime fixes for deferred FMOD music, 60 Hz simulation timing, and level setup recovery");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -6484,7 +6768,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup3 must be compiled as a 64-bit executable");
+                "V22BetaBringup4 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -6492,7 +6776,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP3_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP4_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -6942,11 +7226,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP1_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP4_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP3_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP4_FAILED");
         return 1;
     }
 }

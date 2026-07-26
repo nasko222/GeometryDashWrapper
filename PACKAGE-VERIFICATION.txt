@@ -1,4 +1,12 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup3
-Source policy: APK-free
-Primary fixes: A32 exclusive write callbacks; dual openURL prologues
-Input raw library: libcocos2dcpp.so
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup4
+
+Package policy:
+- complete source tree retained
+- no APK files included
+- no historical wrapper changelog files included
+- supplied raw libcocos2dcpp.so probe retained
+
+Bringup4 source checks:
+- portable C++20 syntax passed with Dynarmic interface stubs
+- all newer-beta FMOD imports explicitly dispatched
+- refresh-rate bridge and level-setup recovery present

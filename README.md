@@ -1,31 +1,40 @@
-# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 bringup3
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 bringup4
 
-Separate experimental ARMv7-A/Thumb-2/VFPv3/NEON branch. The stable ARMv5 line is untouched.
+This is a separate ARMv7-A / Thumb-2 / VFPv3 / NEON bring-up branch. It does not replace the stable ARMv5 Test14-fix1 branch.
 
-## Build without bundling APKs
+## Build with an external APK
 
-The source archive intentionally contains **no APK files**.
-
-Probe the included raw library:
+No APK is included in this source package.
 
 ```bat
-BUILD_V22BETA_X64.cmd
+BUILD_V22BETA_X64.cmd "D:\path\to\your-2.2-beta.apk"
 ```
 
-Build with one of your own beta APKs:
+Run the generated launcher:
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\your-beta.apk"
+dist-arm-wrapper-v22beta-bringup4\RUN_V22_SELECTED_APK.cmd
 ```
 
-Then use `RUN_V22_SELECTED_APK.cmd` in the generated dist folder. You may also manually place APKs beside the executable as `game-v22beta.apk` or `game-v22beta1.apk` and use the separate newer/earlier launchers.
+## Bringup4 targets
 
-## Bringup3 changes
+- audible menu and level music through the host FMOD 1.05.04 compatibility bridge;
+- a valid 60 Hz Android refresh-rate response for editor/game simulation;
+- recovery from the observed missing level setup-header element instead of the `0x30` null crash;
+- detailed first-call FMOD diagnostics for the next runtime log.
 
-- Implements Dynarmic `MemoryWriteExclusive8/16/32/64` compare-and-write callbacks.
-- Adds an LDREX/STREX startup smoke test matching constructor 1's atomic loop.
-- Accepts both verified `CCApplication::openURL` Thumb prologues used by the supplied betas (`0xB530` and `0xB51F`).
-- Keeps startup music pre-cache, FMOD compatibility, profiling and dual-beta diagnostics.
-- Does not include any APK in the source package.
+Expected markers include:
 
-Future unified x86/ARMv5/ARMv7 auto-selection remains intentionally deferred.
+```text
+RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64
+RESULT: DYNARMIC_V22_REFRESH_RATE_BRIDGE hz=60
+RESULT: DYNARMIC_V22_FMOD_BRIDGE_READY ... version=0x00010504 deferred-music=1
+```
+
+When a beta level lacks element zero in its split setup header, the log reports:
+
+```text
+WARNING: V22 level setup header missing; substituted default empty settings string
+```
+
+That guard is deliberately narrow and applies only to the symbol-relative instruction reached in the supplied newer beta.
