@@ -1,0 +1,31 @@
+Geometry Dash 2.2 beta ARMv7 Bringup6 static audit
+
+Newer libcocos2dcpp.so
+- ZipUtils::decompressString: ELF 0x004a8029 size=276
+- discovered guest string builder: runtime 0x1062bc71
+- discovered relocated empty string data: runtime 0x1092b1bc
+- CreatorLayer::canPlayOnlineLevels: ELF 0x002ee30d size=264
+- CreatorLayer::onMyLevels: ELF 0x002ed8fd size=136
+- CreatorLayer::onOnlyFullVersion: ELF 0x002ed7ad size=240
+
+Earlier libcocos2dcpp.so
+- ZipUtils::decompressString: ELF 0x00450851 size=240
+- discovered guest string builder: runtime 0x105d06f1
+- discovered relocated empty string data: runtime 0x108c6408
+- CreatorLayer::canPlayOnlineLevels: ELF 0x002b1ad9 size=204
+- CreatorLayer::onMyLevels: ELF 0x002b1345 size=132
+- CreatorLayer::onOnlyFullVersion: ELF 0x002b1bf5 size=184
+
+Newer companion libgame.so
+- bytes=636668
+- CRC32=0x90ac09a5
+- SHA-256=f72c7ed18d0db17ff4a6a1d7284eadae7549fe7e52ba268cbc63b815c7be4917
+- NEEDED: libcocos2dcpp.so, libhooking.so
+- exported replacement _Z20canPlayOnlineLevelsHP12CreatorLayer:
+  0x2001  movs r0,#1
+  0x4770  bx lr
+
+Result
+- both beta main libraries support the Bringup6 guest-native string construction path
+- both beta main libraries support the direct canPlayOnlineLevels force-true patch
+- optional companion libgame.so is detected but its Android Dobby engine is not executed

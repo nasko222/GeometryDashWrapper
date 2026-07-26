@@ -1,4 +1,4 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup5
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup6
 
 Package policy:
 - complete source tree retained
@@ -6,10 +6,13 @@ Package policy:
 - no historical wrapper changelog files included
 - raw libcocos2dcpp.so probe retained
 
-Bringup5 validation:
+Bringup6 validation:
 - portable C++20 syntax passed with Dynarmic interface stubs
-- URL-safe Base64/GZIP host decoder expanded level 4001 from 165068 to 1241094 bytes
-- both supplied beta libraries contain compatible ZipUtils::decompressString prologues
-- both supplied beta libraries contain compatible CreatorLayer editor-gate and My Levels symbols
-- obsolete empty-level recovery removed
+- both beta ELF images statically discover their native string byte builder and relocated empty-string singleton
+- newer beta builder=0x1062bc71 empty_data=0x1092b1bc
+- earlier beta builder=0x105d06f1 empty_data=0x108c6408
+- both beta main libraries export CreatorLayer::canPlayOnlineLevels
+- companion libgame.so replacement is exactly movs r0,#1; bx lr
+- host decoder still expands official level 4001 from 165068 encoded bytes to 1241094 decoded bytes
+- no empty-level null recovery remains
 - ZIP integrity and SHA-256 verified after packaging

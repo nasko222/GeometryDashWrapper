@@ -1,6 +1,6 @@
-# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup5
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup6
 
-This is the separate ARMv7-A / Thumb-2 / VFPv3 / NEON branch. It does not replace the stable ARMv5 Test14-fix1 branch.
+Separate ARMv7-A / Thumb-2 / VFPv3 / NEON bring-up branch. It does not replace the stable ARMv5 Test14-fix1 branch.
 
 ## Build with an external APK
 
@@ -13,32 +13,28 @@ BUILD_V22BETA_X64.cmd "D:\path\to\your-2.2-beta.apk"
 Run:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup5\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup6\RUN_V22_SELECTED_APK.cmd
 ```
 
-## Bringup5 changes
+## Bringup6 changes
 
-- Replaces the beta's guest `ZipUtils::decompressString` path with a host URL-safe Base64 + GZIP/zlib decoder.
-- Returns a valid ARM libstdc++ COW `std::string` containing the complete level setup, including every object.
-- Removes Bringup4's empty-settings null recovery. Invalid level memory is fatal again instead of producing an empty level.
-- Redirects `CreatorLayer::onOnlyFullVersion` to the real `CreatorLayer::onMyLevels` callback so the beta's editor gate opens My Levels.
-- Retains Bringup4's working FMOD music bridge and 60 Hz refresh-rate bridge.
+- Builds decoded level strings through the beta's own relocated libstdc++ `std::string` byte routine and empty-string singleton instead of fabricating the COW representation.
+- Validates the guest string byte-for-byte before returning it to `PlayLayer`.
+- Forces `CreatorLayer::canPlayOnlineLevels()` to return true, reproducing the exact editor-unlock hook found in the newer APK's companion `libgame.so`.
+- Detects and reports optional `lib/armeabi-v7a/libgame.so`; its Android Dobby loader is not executed.
+- Retains the older `onOnlyFullVersion -> onMyLevels` redirect as a secondary fallback.
+- Retains FMOD 1.05.04-compatible music, 60 Hz timing, ARM exclusive memory, dual-beta hooks, and host level decompression.
 
-Expected startup markers:
+Expected markers:
 
 ```text
-RESULT: DYNARMIC_V22_DECOMPRESS_HOOK_READY count=1 codec=base64url+gzip max_output_mb=64
-RESULT: DYNARMIC_V22_CREATOR_EDITOR_UNLOCK_READY count=1 redirect=onOnlyFullVersion->onMyLevels
+RESULT: DYNARMIC_V22_COMPANION_LIBGAME_DETECTED ... role=editor-hooks
+RESULT: DYNARMIC_V22_DECOMPRESS_HOOK_READY ... guest_string_builder=0x...
+RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE count=1
 ```
 
-A real official-level load should log a large output, for example:
+A successful level decode now includes `guest_string=<same decoded size>`:
 
 ```text
-[host] V22 decompressString input=165068 compressed=123801 output=1241094 encrypted=0 status=ok
-```
-
-When the gated creator button is invoked:
-
-```text
-[host] V22 creator full-version gate redirected to My Levels call=1
+[host] V22 decompressString ... output=1241094 guest_string=1241094 status=ok
 ```
