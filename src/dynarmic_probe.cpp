@@ -802,29 +802,54 @@ static u32 EnsureImport(ElfRuntime& runtime, ProbeEnvironment& env, const std::s
     return address;
 }
 
-static u32 FindSymbolAddress(const ElfRuntime& runtime, const std::string& name) {
-    for (const SymbolRecord& symbol : runtime.symbols) if (symbol.name == name) return symbol.address;
-    return 0;
+static const SymbolRecord* FindSymbol(const ElfRuntime& runtime, const std::string& name) {
+    for (const SymbolRecord& symbol : runtime.symbols) if (symbol.name == name) return &symbol;
+    return nullptr;
 }
-static void InstallThumbAbsoluteImportHook(ProbeEnvironment& env, u32 target, u32 destination) {
-    const u32 address = target & ~1u;
-    if ((address & 3u) != 0u) throw std::runtime_error("Thumb hook target is not 4-byte aligned");
-    env.MemoryWrite16(address + 0u, 0x4B00u); // ldr r3, [pc, #0]
-    env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+static void InstallThumbAbsoluteImportHookPreservingArguments(
+    ProbeEnvironment& env, const ElfRuntime& runtime, const SymbolRecord& symbol,
+    u16 expected_first_halfword, u32 destination) {
+    if ((symbol.address & 1u) == 0u)
+        throw std::runtime_error("ZIP hook symbol is not marked as Thumb: " + symbol.name);
+    if (symbol.size < 8u)
+        throw std::runtime_error("ZIP hook symbol is too small: " + symbol.name);
+    const u32 address = symbol.address & ~1u;
+    if ((address & 3u) != 0u || address < runtime.image_min ||
+        address > runtime.image_max - 8u)
+        throw std::runtime_error("ZIP hook target is outside the executable image: " + symbol.name);
+    const u16 original = env.MemoryRead16(address);
+    if (original != expected_first_halfword) {
+        std::ostringstream error;
+        error << "ZIP hook prologue mismatch for " << symbol.name
+              << ": expected 0x" << std::hex << expected_first_halfword
+              << " got 0x" << original;
+        throw std::runtime_error(error.str());
+    }
+
+    // R3 is the fourth AAPCS argument and getFileDataFromZip uses it for the
+    // output-size pointer. Test9 incorrectly used R3 as the trampoline scratch
+    // register, replacing that pointer with the import-stub address and then
+    // writing the member size into executable memory. R0 is safe here: both
+    // hooked CCFileUtils methods ignore the `this` value in the host handler,
+    // and R0 is overwritten by the return value before control reaches the
+    // caller. R1-R3 therefore arrive at the host unchanged.
+    env.MemoryWrite16(address + 0u, 0x4800u); // ldr r0, [pc, #0]
+    env.MemoryWrite16(address + 2u, 0x4700u); // bx r0
     env.MemoryWrite32(address + 4u, destination);
 }
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
-    struct Hook { const char* symbol; const char* import; };
+    struct Hook { const char* symbol; const char* import; u16 prologue; };
     static constexpr Hook hooks[] = {
-        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm", "__dynarmic_ccfileutils_getFileDataFromZip"},
-        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_", "__dynarmic_ccfileutils_existFileDataFromZip"},
+        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm", "__dynarmic_ccfileutils_getFileDataFromZip", 0xB5F0u},
+        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_", "__dynarmic_ccfileutils_existFileDataFromZip", 0xB570u},
     };
     std::size_t installed = 0;
     for (const Hook& hook : hooks) {
-        const u32 target = FindSymbolAddress(runtime, hook.symbol);
+        const SymbolRecord* target = FindSymbol(runtime, hook.symbol);
         if (!target) continue;
         const u32 destination = EnsureImport(runtime, env, hook.import);
-        InstallThumbAbsoluteImportHook(env, target, destination);
+        InstallThumbAbsoluteImportHookPreservingArguments(
+            env, runtime, *target, hook.prologue, destination);
         ++installed;
     }
     return installed;
@@ -4617,8 +4642,8 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest9");
-        emit("Milestone: host-level APK member caching, cooperative HTTP sockets, and high-performance GPU preference");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest9-fix1");
+        emit("Milestone: Test9 ZIP-hook ABI fix, host-level APK member caching, cooperative HTTP sockets, and high-performance GPU preference");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
         if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest9 must be compiled as a 64-bit executable");
@@ -4664,7 +4689,7 @@ int main(int argc,char** argv) {
             emit(line.str());
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
-        emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=" + std::to_string(zip_hooks));
+        emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=" + std::to_string(zip_hooks) + " scratch=r0 args=r1-r3-preserved");
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes=" + std::to_string(apk.size()));
@@ -4682,7 +4707,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP9_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP9_FIX1_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -4786,11 +4811,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP9_OK");
+        emit("RESULT: DYNARMIC_BRINGUP9_FIX1_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP9_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP9_FIX1_FAILED");
         return 1;
     }
 }

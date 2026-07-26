@@ -1,4 +1,4 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9-fix1
 
 Base package:
   GeometryDashArmWrapper-0.9.4-arm-dynarmictest8-full-source.zip
@@ -24,3 +24,9 @@ Validation performed:
 Important limitation:
   The full Windows Dynarmic executable was not compiled in this Linux packaging environment.
   The Winsock/CCHttp path is experimental and requires runtime testing on Windows.
+
+Fix1-specific checks:
+  - CCFileUtils hook trampoline uses R0, not argument register R3
+  - exact getFileDataFromZip/existFileDataFromZip Thumb prologues verified
+  - hook target range and symbol size validated before patching
+  - original game.apk retained byte-for-byte

@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest9"
+$Output = Join-Path $Root "dist-arm-wrapper-dynarmictest9-fix1"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder7-test9-member-cache-http"
+$BuilderRevision = "dynarmic-x64-builder8-test9-fix1-r3-preserve"
 $CompatibleBuilderRevisions = @($BuilderRevision, "dynarmic-x64-builder5-fmt-libcpp", "dynarmictest1-x64-builder5-fmt-libcpp")
 
 function Invoke-External {

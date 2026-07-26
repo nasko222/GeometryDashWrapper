@@ -1,4 +1,9 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9
+
+## Test9 Fix1
+
+Use **0.9.4-arm-dynarmictest9-fix1**, not the original Test9 package. Fix1 preserves the ZIP hook's R1-R3 arguments and prevents startup code corruption during `nativeInit`.
+
+# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9-fix1
 
 DynarmicTest9 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic.
 
@@ -24,13 +29,13 @@ BUILD_DYNARMIC_X64.cmd
 The builder creates:
 
 ```text
-dist-arm-wrapper-dynarmictest9
+dist-arm-wrapper-dynarmictest9-fix1
 ```
 
 Launch with:
 
 ```text
-dist-arm-wrapper-dynarmictest9\RUN_DYNARMIC_INTERACTIVE.cmd
+dist-arm-wrapper-dynarmictest9-fix1\RUN_DYNARMIC_INTERACTIVE.cmd
 ```
 
 The first launch may populate audio and APK-member caches. Later launches reuse them.

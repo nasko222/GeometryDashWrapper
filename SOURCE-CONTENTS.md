@@ -13,7 +13,7 @@ Important files:
 - `build-dynarmic-x64.ps1` — pinned Windows build workflow.
 - `BUILD_DYNARMIC_X64.cmd` — normal build entry point.
 - `game.apk` — preserved ARM game package.
-- `CHANGELOG-0.9.4-arm-dynarmictest9.md` — user-facing changes.
+- `CHANGELOG-0.9.4-arm-dynarmictest9-fix1.md` — user-facing changes.
 - `DYNARMICTEST9-NOTES.md` — implementation and diagnostic notes.
 
 All 1,120 files from the Test8 package remain present. Test9 adds two documentation files.
