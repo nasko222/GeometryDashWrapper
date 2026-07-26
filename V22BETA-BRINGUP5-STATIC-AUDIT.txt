@@ -1,0 +1,18 @@
+libcocos2dcpp.so: sha256=c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c bytes=9578364
+  _ZN7cocos2d8ZipUtils16decompressStringESsbi: address=0x004a8029 size=276 prologue=0xe92d thumb=1
+  _ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE: address=0x002ed7ad size=240 prologue=0xe92d thumb=1
+  _ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE: address=0x002ed8fd size=136 prologue=0xb538 thumb=1
+libcocos2dcpp.so: sha256=ec047ac9d5630d9c1fed629cda1d63d09f7912b8673984aed2167c59e316e286 bytes=9144004
+  _ZN7cocos2d8ZipUtils16decompressStringESsbi: address=0x00450851 size=240 prologue=0xe92d thumb=1
+  _ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE: address=0x002b1bf5 size=184 prologue=0xe92d thumb=1
+  _ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE: address=0x002b1345 size=132 prologue=0xb570 thumb=1
+
+Host decoder reference validation:
+  level=4001 encoded=165068 compressed=123801 output=1241094 prefix=kS38
+  codec=url-safe-base64+gzip status=PASS
+
+Package policy:
+  apk_files=0
+  source_files=1115
+  obsolete_empty_level_recovery=absent
+  historical_changelog_pile=absent

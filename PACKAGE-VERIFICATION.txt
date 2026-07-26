@@ -1,12 +1,15 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup4
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup5
 
 Package policy:
 - complete source tree retained
 - no APK files included
 - no historical wrapper changelog files included
-- supplied raw libcocos2dcpp.so probe retained
+- raw libcocos2dcpp.so probe retained
 
-Bringup4 source checks:
+Bringup5 validation:
 - portable C++20 syntax passed with Dynarmic interface stubs
-- all newer-beta FMOD imports explicitly dispatched
-- refresh-rate bridge and level-setup recovery present
+- URL-safe Base64/GZIP host decoder expanded level 4001 from 165068 to 1241094 bytes
+- both supplied beta libraries contain compatible ZipUtils::decompressString prologues
+- both supplied beta libraries contain compatible CreatorLayer editor-gate and My Levels symbols
+- obsolete empty-level recovery removed
+- ZIP integrity and SHA-256 verified after packaging

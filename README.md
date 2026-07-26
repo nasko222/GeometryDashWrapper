@@ -1,6 +1,6 @@
-# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 bringup4
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup5
 
-This is a separate ARMv7-A / Thumb-2 / VFPv3 / NEON bring-up branch. It does not replace the stable ARMv5 Test14-fix1 branch.
+This is the separate ARMv7-A / Thumb-2 / VFPv3 / NEON branch. It does not replace the stable ARMv5 Test14-fix1 branch.
 
 ## Build with an external APK
 
@@ -10,31 +10,35 @@ No APK is included in this source package.
 BUILD_V22BETA_X64.cmd "D:\path\to\your-2.2-beta.apk"
 ```
 
-Run the generated launcher:
+Run:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup4\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup5\RUN_V22_SELECTED_APK.cmd
 ```
 
-## Bringup4 targets
+## Bringup5 changes
 
-- audible menu and level music through the host FMOD 1.05.04 compatibility bridge;
-- a valid 60 Hz Android refresh-rate response for editor/game simulation;
-- recovery from the observed missing level setup-header element instead of the `0x30` null crash;
-- detailed first-call FMOD diagnostics for the next runtime log.
+- Replaces the beta's guest `ZipUtils::decompressString` path with a host URL-safe Base64 + GZIP/zlib decoder.
+- Returns a valid ARM libstdc++ COW `std::string` containing the complete level setup, including every object.
+- Removes Bringup4's empty-settings null recovery. Invalid level memory is fatal again instead of producing an empty level.
+- Redirects `CreatorLayer::onOnlyFullVersion` to the real `CreatorLayer::onMyLevels` callback so the beta's editor gate opens My Levels.
+- Retains Bringup4's working FMOD music bridge and 60 Hz refresh-rate bridge.
 
-Expected markers include:
+Expected startup markers:
 
 ```text
-RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64
-RESULT: DYNARMIC_V22_REFRESH_RATE_BRIDGE hz=60
-RESULT: DYNARMIC_V22_FMOD_BRIDGE_READY ... version=0x00010504 deferred-music=1
+RESULT: DYNARMIC_V22_DECOMPRESS_HOOK_READY count=1 codec=base64url+gzip max_output_mb=64
+RESULT: DYNARMIC_V22_CREATOR_EDITOR_UNLOCK_READY count=1 redirect=onOnlyFullVersion->onMyLevels
 ```
 
-When a beta level lacks element zero in its split setup header, the log reports:
+A real official-level load should log a large output, for example:
 
 ```text
-WARNING: V22 level setup header missing; substituted default empty settings string
+[host] V22 decompressString input=165068 compressed=123801 output=1241094 encrypted=0 status=ok
 ```
 
-That guard is deliberately narrow and applies only to the symbol-relative instruction reached in the supplied newer beta.
+When the gated creator button is invoked:
+
+```text
+[host] V22 creator full-version gate redirected to My Levels call=1
+```
