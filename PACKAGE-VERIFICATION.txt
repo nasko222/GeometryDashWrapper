@@ -1,15 +1,17 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest7
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest8
 Package verification
 
 Base used:
-  GeometryDashArmWrapper-0.9.4-arm-dynarmictest6-full-source.zip
-  Base source files preserved: 1114/1114
+  GeometryDashArmWrapper-0.9.4-arm-dynarmictest7-full-source.zip
+  Base source files preserved: 1118/1118
+  New Test8 documentation files: 2
 
 Preservation checks:
   game.apk: present
   game.apk bytes: 24704408
   game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
-  total source-package files before ZIP: 1118
+  total source-package files before ZIP: 1120
+  missing Test7 files: 0
   src files: preserved
   third_party files: preserved
   tools files: preserved
@@ -18,25 +20,24 @@ Preservation checks:
   build-dynarmic-x64.ps1: present
   dynarmic-x64/CMakeLists.txt: present
 
-Test7 changes:
-  - mapped 256-byte guest FILE objects allocated from the reclaiming heap
-  - initialized Bionic FILE flag/descriptor fields
-  - guest FILE object reclamation after fclose
-  - __sF stdin/stdout/stderr mapping updated for allocated handles
-  - Windows MCI audio backend linked into the Dynarmic target
-  - JNI background music/effect/volume/pause/seek controls connected
-  - minimal APK audio extractor and embedded-effect fallback stub
-  - Test7 build/version/output naming and documentation
+Test8 changes:
+  - read-only game.apk opens use the wrapper's existing immutable APK byte vector
+  - per-handle APK memory seek/tell/read position
+  - direct guest-memory fread/fwrite without a temporary vector per call
+  - early hot import paths for ZIP/level parsing libc calls
+  - sampled normal import-history logging, while fatal calls remain fully recorded
+  - slow native guest-call timing lines for callbacks taking at least 250 ms
+  - guest terminateProcess requests clean render-loop and Win32 window shutdown
+  - Android IME state suppresses gameplay Space while preserving typed spaces
+  - Test8 build/version/output naming and documentation
 
 Validation performed:
   - C++20 syntax check against a minimal Dynarmic A32 API stub
+  - warning-enabled C++ syntax check (only two pre-existing unused OpenGL state fields)
   - C11 syntax checks for APK audio extraction and embedded-effect stub
-  - Test6-to-Test7 source-file preservation comparison
+  - Test7-to-Test8 source-file preservation comparison
   - APK size/hash verification
-  - extracted assets/menuLoop.mp3 from game.apk: 480723 bytes, ID3 header
-  - extracted assets/playSound_01.ogg from game.apk: 14209 bytes, OggS header
-  - decoded playSound_01.ogg with packaged stb_vorbis: 56469 mono samples at 44100 Hz
-  - audio_win.c is byte-identical to the previously used wrapper backend
+  - package path/name audit for current Test8 build markers
 
 A complete Windows/Dynarmic executable was not built in this Linux packaging environment.
 Run BUILD_DYNARMIC_X64.cmd on 64-bit Windows.

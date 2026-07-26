@@ -356,6 +356,28 @@ public:
         const MemoryRegion* region = Find(address, size);
         return region ? static_cast<const void*>(region->data.data() + (address - region->base)) : nullptr;
     }
+    const u8* HostPointerToRegionEnd(u32 address, std::size_t& available) const {
+        for (const auto& region : regions_) {
+            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
+            if (address >= region.base && static_cast<u64>(address) < region_end) {
+                available = static_cast<std::size_t>(region_end - address);
+                return region.data.data() + (address - region.base);
+            }
+        }
+        available = 0;
+        return nullptr;
+    }
+    u8* HostPointerToRegionEnd(u32 address, std::size_t& available) {
+        for (auto& region : regions_) {
+            const u64 region_end = static_cast<u64>(region.base) + region.data.size();
+            if (address >= region.base && static_cast<u64>(address) < region_end) {
+                available = static_cast<std::size_t>(region_end - address);
+                return region.data.data() + (address - region.base);
+            }
+        }
+        available = 0;
+        return nullptr;
+    }
     bool IsMapped(u32 address, std::size_t size = 1) const { return Find(address, size) != nullptr; }
     void AttachCpu(Dynarmic::A32::Jit* cpu) { attached_cpu_ = cpu; }
     void ResetStopState() {
@@ -792,9 +814,13 @@ struct GuestZStream {
 struct GuestFile {
     u32 handle = 0;
     std::FILE* stream = nullptr;
+    const std::vector<u8>* memory = nullptr;
+    std::size_t memory_position = 0;
     bool standard = false;
     std::string path;
     std::string mode;
+
+    bool readable() const { return stream != nullptr || memory != nullptr; }
 };
 
 enum class HostEventType {
@@ -842,7 +868,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest7Window";
+        const char* class_name = "GeometryDashDynarmicTest8Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -854,7 +880,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test7",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test8",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -934,6 +960,21 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
+    void SetTextInputActive(bool active) {
+        text_input_active_ = active;
+        if (active && keyboard_down_) {
+            keyboard_down_ = false;
+            Queue(HostEvent{HostEventType::TouchEnd,
+                            static_cast<float>(native_width_) * 0.5f,
+                            static_cast<float>(native_height_) * 0.5f, 0});
+        }
+    }
+    void RequestClose() {
+        closed_ = true;
+        events_.clear();
+        if (window_) PostMessageA(window_, WM_CLOSE, 0, 0);
+        PostQuitMessage(0);
+    }
 
 private:
     void Queue(HostEvent event) {
@@ -1029,7 +1070,8 @@ private:
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
             }
-            if ((wparam == VK_SPACE || wparam == VK_UP) && !self->keyboard_down_) {
+            if ((wparam == VK_SPACE || wparam == VK_UP) &&
+                !self->text_input_active_ && !self->keyboard_down_) {
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::TouchBegin,
                                       static_cast<float>(self->native_width_) * 0.5f,
@@ -1047,13 +1089,15 @@ private:
             }
             break;
         case WM_CHAR:
+            if (!self->text_input_active_) return 0;
             if (wparam == '\b') self->Queue(HostEvent{HostEventType::DeleteBackward});
             else if (wparam == '\r') self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>('\n')});
             else if (wparam >= 0x20u) self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>(wparam)});
             return 0;
         case WM_UNICHAR:
             if (wparam == UNICODE_NOCHAR) return TRUE;
-            if (wparam <= 0x10FFFFu) self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>(wparam)});
+            if (self->text_input_active_ && wparam <= 0x10FFFFu)
+                self->Queue(HostEvent{HostEventType::TextInput, 0.0f, 0.0f, static_cast<u32>(wparam)});
             return 0;
         default:
             break;
@@ -1076,6 +1120,7 @@ private:
     bool active_ = true;
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
+    bool text_input_active_ = false;
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -1095,6 +1140,8 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
+    void SetTextInputActive(bool) {}
+    void RequestClose() {}
 };
 #endif
 
@@ -1123,6 +1170,11 @@ public:
             if (stream.kind == ZStreamKind::Inflate) inflateEnd(&stream.host);
             else if (stream.kind == ZStreamKind::Deflate) deflateEnd(&stream.host);
         }
+        if (apk_memory_read_calls_) {
+            log_ << "Dynarmic APK memory cache totals: reads=" << apk_memory_read_calls_
+                 << " bytes=" << apk_memory_read_bytes_ << '\n';
+            log_.flush();
+        }
         if (audio_initialized_) {
             audio_shutdown();
             audio_initialized_ = false;
@@ -1130,9 +1182,11 @@ public:
         storage_shutdown();
     }
 
-    void ConfigureHost(const std::string& apk_path, const std::string& writable_path) {
+    void ConfigureHost(const std::string& apk_path, const std::string& writable_path,
+                       const std::vector<u8>& apk_image) {
         apk_path_ = apk_path;
         writable_path_ = writable_path;
+        apk_image_ = &apk_image;
 #ifdef _WIN32
         CreateDirectoryA(writable_path_.c_str(), nullptr);
 #endif
@@ -1170,6 +1224,7 @@ public:
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+    bool TerminationRequested() const { return termination_requested_; }
     void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
 
     bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
@@ -1275,6 +1330,7 @@ public:
         u64 budget = tick_budget;
         u64 estimated_ticks = 0;
         bool returned = false;
+        const u64 import_calls_before = total_import_calls_;
         const auto started = std::chrono::steady_clock::now();
         auto next_progress = started + std::chrono::seconds(5);
 
@@ -1349,6 +1405,15 @@ public:
             return Fail(diagnostic);
         }
         if (result) *result = cpu_.Regs()[0];
+        const auto completed_elapsed = std::chrono::steady_clock::now() - started;
+        if (label.rfind("native", 0) == 0 &&
+            completed_elapsed >= std::chrono::milliseconds(250)) {
+            log_ << "Dynarmic guest call timing: " << label
+                 << " elapsed_ms=" << std::fixed << std::setprecision(1)
+                 << std::chrono::duration<double, std::milli>(completed_elapsed).count()
+                 << " import_calls=" << (total_import_calls_ - import_calls_before) << '\n';
+            log_.flush();
+        }
         return true;
     }
 
@@ -1490,7 +1555,7 @@ private:
         const u32 pc = cpu_.Regs()[15];
         const u32 lr = cpu_.Regs()[14];
         const u32 sp = cpu_.Regs()[13];
-        log_ << "===== DYNARMIC TEST6 GUEST FATAL DIAGNOSTIC =====\n";
+        log_ << "===== DYNARMIC TEST8 GUEST FATAL DIAGNOSTIC =====\n";
         log_ << "Fatal import: " << import_name << '\n';
         log_ << "Active guest call depth: " << active_calls_.size() << '\n';
         if (!active_calls_.empty()) {
@@ -1547,7 +1612,7 @@ private:
         } else {
             log_ << "Guest stack window: unreadable at SP=0x" << std::hex << sp << std::dec << '\n';
         }
-        log_ << "===== END DYNARMIC TEST6 GUEST FATAL DIAGNOSTIC =====\n";
+        log_ << "===== END DYNARMIC TEST8 GUEST FATAL DIAGNOSTIC =====\n";
         log_.flush();
     }
     bool FatalImport(const std::string& import_name) {
@@ -1587,7 +1652,15 @@ private:
         }
         ImportRecord& import = runtime_.imports[svc - 1u];
         ++import.calls;
-        RememberEvent("import:" + import.name);
+        ++total_import_calls_;
+        // Recording a heap-allocated string for every libc trap was itself a
+        // major cost during ZIP scans. Sample normal imports, but always retain
+        // fatal/exception-related calls for diagnostics.
+        const bool diagnostic_import = import.name == "abort" || import.name == "exit" ||
+            import.name == "__stack_chk_fail" || import.name == "longjmp" ||
+            import.name == "siglongjmp";
+        if (diagnostic_import || (total_import_calls_ & 0x0fffu) == 0u)
+            RememberEvent("import:" + import.name);
         return DispatchImport(import);
     }
     void ResumeAfterStub(u32 stub_address) {
@@ -1846,8 +1919,12 @@ private:
         return env_.ReadBytes(source, temporary.data(), size) && env_.WriteBytes(destination, temporary.data(), size);
     }
     u32 CStringLength(u32 address) const {
-        std::string text;
-        return env_.ReadCString(address, text) ? static_cast<u32>(text.size()) : 0;
+        std::size_t available = 0;
+        const u8* bytes = env_.HostPointerToRegionEnd(address, available);
+        if (!bytes) return 0;
+        const std::size_t maximum = std::min<std::size_t>(available, 1u << 20);
+        const void* end = std::memchr(bytes, 0, maximum);
+        return end ? static_cast<u32>(static_cast<const u8*>(end) - bytes) : 0;
     }
     std::string ReadCString(u32 address, std::size_t maximum = 1u << 20) const {
         std::string text;
@@ -2151,6 +2228,25 @@ private:
             last_assert_sequence_ = ++message_box_count_;
             RememberEvent("message-box:" + title + " | " + text);
             log_ << "JNI message box #" << last_assert_sequence_ << ": " << title << " | " << text << '\n';
+        } else if (name == "openIMEKeyboard" || name == "showEditTextDialog") {
+            text_input_active_ = true;
+            gl_.SetTextInputActive(true);
+            log_ << "Dynarmic text input active\n";
+        } else if (name == "closeIMEKeyboard") {
+            text_input_active_ = false;
+            gl_.SetTextInputActive(false);
+            log_ << "Dynarmic text input inactive\n";
+        } else if (name == "setKeyboardState") {
+            text_input_active_ = arguments.Word() != 0;
+            gl_.SetTextInputActive(text_input_active_);
+            log_ << "Dynarmic text input " << (text_input_active_ ? "active" : "inactive") << '\n';
+        } else if (name == "terminateProcess") {
+            termination_requested_ = true;
+            gl_.RequestClose();
+            audio_stop_all_effects();
+            audio_stop_background();
+            RememberEvent("JNI:terminateProcess requested clean shutdown");
+            log_ << "Dynarmic clean shutdown requested by guest terminateProcess\n";
         } else {
             // The remaining Android activity calls are safe no-ops for the first-frame milestone.
         }
@@ -2259,17 +2355,25 @@ private:
     }
 
     int CompareStrings(u32 left, u32 right, u32 maximum, bool limited, bool insensitive) const {
-        std::string a = ReadCString(left);
-        std::string b = ReadCString(right);
-        if (limited) {
-            a.resize(std::min<std::size_t>(a.size(), maximum));
-            b.resize(std::min<std::size_t>(b.size(), maximum));
+        std::size_t left_available = 0, right_available = 0;
+        const u8* a = env_.HostPointerToRegionEnd(left, left_available);
+        const u8* b = env_.HostPointerToRegionEnd(right, right_available);
+        if (!a || !b) return 0;
+        std::size_t limit = std::min(left_available, right_available);
+        limit = std::min<std::size_t>(limit, 1u << 20);
+        if (limited) limit = std::min<std::size_t>(limit, maximum);
+        for (std::size_t index = 0; index < limit; ++index) {
+            unsigned char av = a[index], bv = b[index];
+            if (insensitive) {
+                av = static_cast<unsigned char>(std::tolower(av));
+                bv = static_cast<unsigned char>(std::tolower(bv));
+            }
+            if (av != bv) return av < bv ? -1 : 1;
+            if (av == 0) return 0;
         }
-        if (insensitive) {
-            std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            std::transform(b.begin(), b.end(), b.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        }
-        return a < b ? -1 : a > b ? 1 : 0;
+        if (limited && limit == maximum) return 0;
+        if (left_available == right_available) return 0;
+        return left_available < right_available ? -1 : 1;
     }
 
     bool CallNestedInitializer(u32 control, u32 initializer) {
@@ -2320,7 +2424,7 @@ private:
         env_.MemoryWrite16(handle + kBionicFileFlagsOffset, GuestFileFlagsForMode(mode));
         env_.MemoryWrite16(handle + kBionicFileDescriptorOffset,
                            static_cast<u16>(next_file_id_ & 0x7fffu));
-        files_[handle] = GuestFile{handle, stream, standard, path, mode};
+        files_[handle] = GuestFile{handle, stream, nullptr, 0u, standard, path, mode};
         ++next_file_id_;
         return handle;
     }
@@ -2366,33 +2470,85 @@ private:
             if (!parent.empty()) std::filesystem::create_directories(parent);
         }
 #endif
+        const bool read_only = mode.find('r') != std::string::npos &&
+                               mode.find('w') == std::string::npos &&
+                               mode.find('a') == std::string::npos &&
+                               mode.find('+') == std::string::npos;
+        if (read_only && apk_image_ && host_path == apk_path_) {
+            const u32 handle = NewGuestFile(nullptr, false, host_path, mode);
+            GuestFile* file = FindGuestFile(handle);
+            if (!file) return 0;
+            file->memory = apk_image_;
+            if (apk_memory_open_logs_++ < 8u)
+                log_ << "Dynarmic APK memory open: " << guest_path << " bytes="
+                     << apk_image_->size() << '\n';
+            return handle;
+        }
         std::FILE* stream = std::fopen(host_path.c_str(), mode.c_str());
         if (!stream) {
             env_.MemoryWrite32(errno_address_, static_cast<u32>(errno));
             if (logged_file_failures_.insert(guest_path).second) log_ << "Dynarmic file open failed: " << guest_path << " mode=" << mode << '\n';
             return 0;
         }
-        log_ << "Dynarmic file open: " << guest_path << " -> " << host_path << " mode=" << mode << '\n';
+        if (file_open_logs_++ < 256u || host_path != apk_path_)
+            log_ << "Dynarmic file open: " << guest_path << " -> " << host_path << " mode=" << mode << '\n';
         log_.flush();
         return NewGuestFile(stream, false, host_path, mode);
     }
     u32 ReadGuestFile(u32 destination, u32 element_size, u32 count, u32 handle) {
         GuestFile* file = FindGuestFile(handle);
-        const u64 requested = static_cast<u64>(element_size) * count;
-        if (!file || !file->stream || requested > 512ull * 1024ull * 1024ull) return 0;
-        std::vector<u8> buffer(static_cast<std::size_t>(requested));
-        const std::size_t read = std::fread(buffer.data(), element_size, count, file->stream);
-        const std::size_t bytes = read * element_size;
-        if (bytes && !env_.WriteBytes(destination, buffer.data(), bytes)) return 0;
-        return static_cast<u32>(read);
+        const u64 requested64 = static_cast<u64>(element_size) * count;
+        if (!file || !file->readable() || element_size == 0 || count == 0 ||
+            requested64 > 512ull * 1024ull * 1024ull) return 0;
+        const std::size_t requested = static_cast<std::size_t>(requested64);
+        std::size_t guest_available = 0;
+        u8* output = env_.HostPointerToRegionEnd(destination, guest_available);
+        if (!output || requested > guest_available) return 0;
+        if (file->memory) {
+            const std::size_t available = file->memory_position < file->memory->size()
+                ? file->memory->size() - file->memory_position : 0u;
+            const std::size_t elements = std::min<std::size_t>(count, available / element_size);
+            const std::size_t bytes = elements * element_size;
+            if (bytes) std::memcpy(output, file->memory->data() + file->memory_position, bytes);
+            file->memory_position += bytes;
+            apk_memory_read_calls_++;
+            apk_memory_read_bytes_ += bytes;
+            return static_cast<u32>(elements);
+        }
+        return static_cast<u32>(std::fread(output, element_size, count, file->stream));
     }
     u32 WriteGuestFile(u32 source, u32 element_size, u32 count, u32 handle) {
         GuestFile* file = FindGuestFile(handle);
-        const u64 requested = static_cast<u64>(element_size) * count;
-        if (!file || !file->stream || requested > 512ull * 1024ull * 1024ull) return 0;
-        std::vector<u8> buffer(static_cast<std::size_t>(requested));
-        if (requested && !env_.ReadBytes(source, buffer.data(), buffer.size())) return 0;
-        return static_cast<u32>(std::fwrite(buffer.data(), element_size, count, file->stream));
+        const u64 requested64 = static_cast<u64>(element_size) * count;
+        if (!file || !file->stream || element_size == 0 || count == 0 ||
+            requested64 > 512ull * 1024ull * 1024ull) return 0;
+        const std::size_t requested = static_cast<std::size_t>(requested64);
+        std::size_t guest_available = 0;
+        const u8* input = env_.HostPointerToRegionEnd(source, guest_available);
+        if (!input || requested > guest_available) return 0;
+        return static_cast<u32>(std::fwrite(input, element_size, count, file->stream));
+    }
+    s32 SeekGuestFile(u32 handle, s32 offset, int origin) {
+        GuestFile* file = FindGuestFile(handle);
+        if (!file || !file->readable()) return -1;
+        if (file->memory) {
+            s64 base = 0;
+            if (origin == SEEK_CUR) base = static_cast<s64>(file->memory_position);
+            else if (origin == SEEK_END) base = static_cast<s64>(file->memory->size());
+            else if (origin != SEEK_SET) return -1;
+            const s64 next = base + offset;
+            if (next < 0 || static_cast<u64>(next) > file->memory->size()) return -1;
+            file->memory_position = static_cast<std::size_t>(next);
+            return 0;
+        }
+        return std::fseek(file->stream, offset, origin);
+    }
+    s32 TellGuestFile(u32 handle) {
+        GuestFile* file = FindGuestFile(handle);
+        if (!file || !file->readable()) return -1;
+        if (file->memory) return file->memory_position <= static_cast<std::size_t>(INT32_MAX)
+            ? static_cast<s32>(file->memory_position) : -1;
+        return static_cast<s32>(std::ftell(file->stream));
     }
     u32 CloseGuestFile(u32 handle) {
         auto found = files_.find(handle);
@@ -3026,6 +3182,30 @@ private:
 
         if (name.rfind("gl", 0) == 0) return DispatchGl(import);
 
+        auto finish_hot = [&](u32 value) {
+            cpu_.Regs()[0] = value;
+            ResumeAfterStub(import.address);
+            return true;
+        };
+        // These dominate APK/level loading. Keep them ahead of the large generic
+        // import chain and avoid temporary allocations on every SVC crossing.
+        if (name == "fread") return finish_hot(ReadGuestFile(r0, r1, r2, r3));
+        if (name == "fseek") return finish_hot(static_cast<u32>(SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2))));
+        if (name == "ftell") return finish_hot(static_cast<u32>(TellGuestFile(r0)));
+        if (name == "memcpy" || name == "memmove") return finish_hot(CopyGuest(r0, r1, r2) ? r0 : 0);
+        if (name == "strlen") return finish_hot(CStringLength(r0));
+        if (name == "strcmp" || name == "strcoll") return finish_hot(static_cast<u32>(CompareStrings(r0, r1, 0, false, false)));
+        if (name == "memcmp") {
+            const void* a = env_.HostPointer(r0, r2);
+            const void* b = env_.HostPointer(r1, r2);
+            return finish_hot(a && b ? static_cast<u32>(std::memcmp(a, b, r2)) : 0);
+        }
+        if (name == "memset") {
+            void* destination = env_.HostPointer(r0, r2);
+            return finish_hot(destination ? (std::memset(destination, static_cast<int>(r1 & 0xffu), r2), r0) : 0);
+        }
+        if (name == "pthread_mutex_lock" || name == "pthread_mutex_unlock") return finish_hot(0);
+
         if (name == "malloc") result = Allocate(r0);
         else if (name == "calloc") {
             const u64 total = static_cast<u64>(r0) * r1;
@@ -3158,8 +3338,8 @@ private:
         else if (name == "fwrite") result = WriteGuestFile(r0, r1, r2, r3);
         else if (name == "fclose") result = CloseGuestFile(r0);
         else if (name == "fflush") { GuestFile* file = FindGuestFile(r0); result = file && file->stream ? static_cast<u32>(std::fflush(file->stream)) : 0; }
-        else if (name == "fseek") { GuestFile* file = FindGuestFile(r0); result = file && file->stream ? static_cast<u32>(std::fseek(file->stream, static_cast<s32>(r1), static_cast<int>(r2))) : static_cast<u32>(-1); }
-        else if (name == "ftell") { GuestFile* file = FindGuestFile(r0); result = file && file->stream ? static_cast<u32>(std::ftell(file->stream)) : static_cast<u32>(-1); }
+        else if (name == "fseek") result = static_cast<u32>(SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2)));
+        else if (name == "ftell") result = static_cast<u32>(TellGuestFile(r0));
         else if (name == "fgets") {
             GuestFile* file = FindGuestFile(r2);
             if (!file || !file->stream || r1 == 0) result = 0;
@@ -3181,7 +3361,7 @@ private:
             result = OpenGuestFile(path_address, mode_address);
         } else if (name == "read") result = ReadGuestFile(r1, 1, r2, r0);
         else if (name == "write") result = WriteGuestFile(r1, 1, r2, r0);
-        else if (name == "lseek") { GuestFile* file = FindGuestFile(r0); if (file && file->stream && std::fseek(file->stream, static_cast<s32>(r1), static_cast<int>(r2)) == 0) result = static_cast<u32>(std::ftell(file->stream)); else result = static_cast<u32>(-1); }
+        else if (name == "lseek") { result = SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2)) == 0 ? static_cast<u32>(TellGuestFile(r0)) : static_cast<u32>(-1); }
         else if (name == "close") result = CloseGuestFile(r0);
         else if (name == "stat" || name == "fstat") { if (r1) { std::array<u8,128> zero{}; env_.WriteBytes(r1, zero.data(), zero.size()); } result = 0; }
         else if (name == "setvbuf") result = 0;
@@ -3361,6 +3541,7 @@ private:
     u64 random_state_=1;
     unsigned call_depth_=0;
     u64 permissive_stub_calls_=0;
+    u64 total_import_calls_=0;
     std::set<std::string> permissive_names_;
     std::deque<std::string> recent_events_;
     std::vector<std::string> active_calls_;
@@ -3383,6 +3564,13 @@ private:
     u64 zlib_init_logs_=0;
     std::string apk_path_;
     std::string writable_path_;
+    const std::vector<u8>* apk_image_ = nullptr;
+    u64 apk_memory_open_logs_ = 0;
+    u64 file_open_logs_ = 0;
+    u64 apk_memory_read_calls_ = 0;
+    u64 apk_memory_read_bytes_ = 0;
+    bool text_input_active_ = false;
+    bool termination_requested_ = false;
     WinGlHost gl_;
     double frame_interval_=1.0/60.0;
     std::unordered_map<u32,u32> gl_string_cache_;
@@ -3461,11 +3649,11 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest7");
-        emit("Milestone: mapped guest FILE objects, persistent save stability, and Windows audio bridge");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest8");
+        emit("Milestone: APK memory acceleration, text-safe Space input, and clean guest shutdown");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest7 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest8 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -3507,7 +3695,8 @@ int main(int argc,char** argv) {
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
         GuestExecutor executor(env,runtime,log_file);
-        executor.ConfigureHost(absolute_apk.string(),writable.string());
+        executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
+        emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes=" + std::to_string(apk.size()));
         emit("Running "+std::to_string(runtime.constructors.size())+" authentic ARM constructors through Dynarmic");
         for(std::size_t index=0;index<runtime.constructors.size();++index){
             const u32 entry=runtime.constructors[index]; if(entry==0||entry==std::numeric_limits<u32>::max())continue;
@@ -3522,7 +3711,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP7_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP8_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -3575,7 +3764,9 @@ int main(int argc,char** argv) {
                     break;
                 }
                 if(!ok) throw std::runtime_error(executor.LastError());
+                if(executor.TerminationRequested()){running=false;break;}
             }
+            if(executor.TerminationRequested()){running=false;break;}
             if(!window_open){running=false;break;}
             if(native_paused||!executor.WindowActive()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -3584,6 +3775,7 @@ int main(int argc,char** argv) {
 
             const auto start=std::chrono::steady_clock::now();
             if(!executor.RunFunction(runtime.native_render,{kEnvObject,0u},&result,"nativeRender frame "+std::to_string(frame_count+1u),0u,std::chrono::milliseconds(30000))) throw std::runtime_error(executor.LastError());
+            if(executor.TerminationRequested()){running=false;break;}
             executor.SwapBuffersHost();
             const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
             ++frame_count;
@@ -3606,7 +3798,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test7 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test8 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -3615,7 +3807,7 @@ int main(int argc,char** argv) {
             if(max_frames>0&&frame_count>=static_cast<std::uint64_t>(max_frames)) running=false;
         }
 
-        if(!native_paused&&runtime.native_pause){
+        if(!executor.TerminationRequested()&&!native_paused&&runtime.native_pause){
             if(!executor.SendLifecycle(runtime.native_pause,"nativeOnPause shutdown")) throw std::runtime_error(executor.LastError());
             native_paused=true;
         }
@@ -3623,11 +3815,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP7_OK");
+        emit("RESULT: DYNARMIC_BRINGUP8_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP7_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP8_FAILED");
         return 1;
     }
 }
