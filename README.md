@@ -1,12 +1,13 @@
-# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest10
+# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest11
 
-DynarmicTest10 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic.
+DynarmicTest11 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic.
 
-## Test10 changes
+## Test11 changes
 
-- Fixes GDPS/HTTP connections that Test9 incorrectly rejected while Winsock was still completing a nonblocking TCP connection.
-- Opens Facebook, Twitter, artist, and other in-game HTTP/HTTPS links in the default Windows browser.
-- Keeps the host-level APK member cache, persistent asset cache, Windows audio, mapped guest files, clean exit, editor text input fix, and high-performance GPU preference.
+- Fixes the final libcurl connection rejection: Android `getsockopt(SO_ERROR)` now receives `0` after a successful Winsock connection instead of the incorrect guest `EIO` value `5`.
+- Hooks `cocos2d::CCApplication::openURL` directly, so Facebook, Twitter, YouTube, artist, and RobTop links do not depend on the emulated JNI lookup path.
+- Adds first-send, first-receive, and `SO_ERROR` diagnostics without logging passwords, level data, or HTTP bodies.
+- Keeps Test10's completed nonblocking connect, host APK-member cache, Windows audio, mapped guest files, clean exit, editor text-input fix, and high-performance GPU preference.
 
 ## Build
 
@@ -19,7 +20,7 @@ BUILD_DYNARMIC_X64.cmd
 Output:
 
 ```text
-dist-arm-wrapper-dynarmictest10
+dist-arm-wrapper-dynarmictest11
 ```
 
 Use `RUN_DYNARMIC_INTERACTIVE.cmd` from that output folder. A custom GDPS APK can be passed to the PowerShell builder or copied as `game.apk` into the output folder after building.
@@ -28,14 +29,16 @@ Use `RUN_DYNARMIC_INTERACTIVE.cmd` from that output folder. A custom GDPS APK ca
 
 ```text
 RESULT: DYNARMIC_WINSOCK_BRIDGE_READY
-[host] DNS getaddrinfo ...
+RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count=1
 [host] Socket connect ... status=connected ...
-android log: response code: ...
+[host] Socket SO_ERROR ... host=0 guest=0
+[host] Socket first send ...
+[host] Socket first recv ...
+android log: response code: 200
 ```
 
 For browser buttons, look for:
 
 ```text
-JNI method: org/cocos2dx/lib/Cocos2dxActivity.openURL (Ljava/lang/String;)V
-[host] Browser open url=... result=ok
+[host] Browser open url=https://... result=ok
 ```

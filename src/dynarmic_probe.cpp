@@ -856,6 +856,18 @@ static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironm
     return installed;
 }
 
+static std::size_t InstallCcApplicationOpenUrlHook(ElfRuntime& runtime, ProbeEnvironment& env) {
+    static constexpr const char* kSymbol = "_ZN7cocos2d13CCApplication7openURLEPKc";
+    const SymbolRecord* target = FindSymbol(runtime, kSymbol);
+    if (!target) return 0u;
+    const u32 destination = EnsureImport(runtime, env, "__dynarmic_ccapplication_openURL");
+    // CCApplication::openURL(this, url): R0 is `this`, R1 is the URL. The
+    // absolute hook uses R0 as scratch, preserving the URL in R1.
+    InstallThumbAbsoluteImportHookPreservingArguments(
+        env, runtime, *target, 0xB530u, destination);
+    return 1u;
+}
+
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
@@ -1150,7 +1162,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest10Window";
+        const char* class_name = "GeometryDashDynarmicTest11Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1162,7 +1174,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test10",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test11",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3533,6 +3545,10 @@ private:
         return guest_family;
     }
     static int MapWsaError(int error) {
+        // SO_ERROR reports zero when a nonblocking connection completed
+        // successfully. Test10 converted that zero through the fallback map
+        // into guest EIO (5), so libcurl rejected an already-connected socket.
+        if (error == 0) return 0;
         switch (error) {
         case WSAEWOULDBLOCK: return 11;
         case WSAEINPROGRESS: return 115;
@@ -3737,14 +3753,36 @@ private:
         const char* data = static_cast<const char*>(env_.HostPointer(buffer, length));
         if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
         const int code = ::send(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
-        return code >= 0 ? static_cast<u32>(code) : SocketFailure();
+        if (code >= 0) {
+            if (socket_send_logged_.insert(guest_fd).second)
+                log_ << "[host] Socket first send fd=" << guest_fd << " bytes=" << code << '\n';
+            SetGuestErrno(0);
+            return static_cast<u32>(code);
+        }
+        const int error = WSAGetLastError();
+        SetGuestErrno(MapWsaError(error));
+        if (error != WSAEWOULDBLOCK && network_log_count_++ < 128u)
+            log_ << "[host] Socket send failed fd=" << guest_fd << " wsa=" << error
+                 << " errno=" << MapWsaError(error) << '\n';
+        return static_cast<u32>(-1);
     }
     u32 GuestReceive(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
         char* data = static_cast<char*>(env_.HostPointer(buffer, length));
         if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
         const int code = ::recv(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
-        return code >= 0 ? static_cast<u32>(code) : SocketFailure();
+        if (code >= 0) {
+            if (code > 0 && socket_receive_logged_.insert(guest_fd).second)
+                log_ << "[host] Socket first recv fd=" << guest_fd << " bytes=" << code << '\n';
+            SetGuestErrno(0);
+            return static_cast<u32>(code);
+        }
+        const int error = WSAGetLastError();
+        SetGuestErrno(MapWsaError(error));
+        if (error != WSAEWOULDBLOCK && network_log_count_++ < 128u)
+            log_ << "[host] Socket recv failed fd=" << guest_fd << " wsa=" << error
+                 << " errno=" << MapWsaError(error) << '\n';
+        return static_cast<u32>(-1);
     }
     u32 GuestSendTo(u32 guest_fd, u32 buffer, u32 length, u32 flags, u32 address, u32 address_length) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
@@ -3840,8 +3878,13 @@ private:
         if (code != 0) return SocketFailure();
         env_.MemoryWrite32(length_address, static_cast<u32>(host_length));
         if (level == 1u && option == 4u && host_length >= static_cast<int>(sizeof(int))) {
-            int host_error = 0; std::memcpy(&host_error, value, sizeof(host_error));
-            const int guest_error = MapWsaError(host_error); std::memcpy(value, &guest_error, sizeof(guest_error));
+            int host_error = 0;
+            std::memcpy(&host_error, value, sizeof(host_error));
+            const int guest_error = MapWsaError(host_error);
+            std::memcpy(value, &guest_error, sizeof(guest_error));
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Socket SO_ERROR fd=" << guest_fd
+                     << " host=" << host_error << " guest=" << guest_error << '\n';
         }
         return 0;
     }
@@ -3910,7 +3953,10 @@ private:
         const auto found = sockets_.find(guest_fd);
         if (found == sockets_.end()) return static_cast<u32>(-1);
         const int code = closesocket(found->second);
-        sockets_.erase(found); nonblocking_sockets_.erase(guest_fd);
+        sockets_.erase(found);
+        nonblocking_sockets_.erase(guest_fd);
+        socket_send_logged_.erase(guest_fd);
+        socket_receive_logged_.erase(guest_fd);
         return code == 0 ? 0u : SocketFailure();
     }
     u32 GuestGetAddrInfo(u32 node_address, u32 service_address, u32 hints_address, u32 result_address) {
@@ -4106,6 +4152,12 @@ private:
             return finish_hot(HostGetFileDataFromZip(r1, r2, r3));
         if (name == "__dynarmic_ccfileutils_existFileDataFromZip")
             return finish_hot(HostExistFileDataFromZip(r1, r2));
+        if (name == "__dynarmic_ccapplication_openURL") {
+            const std::string url = ReadCString(r1);
+            RememberEvent("CCApplication::openURL " + url);
+            OpenExternalUrl(url);
+            return finish_hot(0u);
+        }
         if (name == "fread") return finish_hot(ReadGuestFile(r0, r1, r2, r3));
         if (name == "fseek") return finish_hot(static_cast<u32>(SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2))));
         if (name == "ftell") return finish_hot(static_cast<u32>(TellGuestFile(r0)));
@@ -4654,6 +4706,8 @@ private:
     u32 next_socket_fd_=0x4000u;
     std::unordered_map<u32, SOCKET> sockets_;
     std::unordered_set<u32> nonblocking_sockets_;
+    std::unordered_set<u32> socket_send_logged_;
+    std::unordered_set<u32> socket_receive_logged_;
     std::unordered_map<u32, GuestAddrInfoAllocation> guest_addrinfo_;
     u64 network_log_count_=0;
 #endif
@@ -4743,11 +4797,11 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest10");
-        emit("Milestone: completed nonblocking TCP connects, Windows browser links, APK member caching, and high-performance GPU preference");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest11");
+        emit("Milestone: correct SO_ERROR translation, direct cocos2d browser links, HTTP socket diagnostics, and APK member caching");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest10 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest11 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -4773,6 +4827,8 @@ int main(int argc,char** argv) {
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         const std::size_t zip_hooks = InstallCcFileUtilsZipHooks(runtime, env);
         if (zip_hooks != 2u) throw std::runtime_error("required cocos2d ZIP hooks were not found");
+        const std::size_t browser_hooks = InstallCcApplicationOpenUrlHook(runtime, env);
+        if (browser_hooks != 1u) throw std::runtime_error("required cocos2d openURL hook was not found");
         {
             std::ostringstream line; line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"<<runtime.image_max<<" entry=0x"<<runtime.entry<<std::dec; emit(line.str());
         }
@@ -4791,6 +4847,7 @@ int main(int argc,char** argv) {
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
         emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=" + std::to_string(zip_hooks) + " scratch=r0 args=r1-r3-preserved");
+        emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count=" + std::to_string(browser_hooks));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes=" + std::to_string(apk.size()));
@@ -4808,7 +4865,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP10_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP11_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -4895,7 +4952,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test10 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test11 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -4912,11 +4969,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP10_OK");
+        emit("RESULT: DYNARMIC_BRINGUP11_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP10_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP11_FAILED");
         return 1;
     }
 }
