@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashDynarmicTest8 LANGUAGES C CXX)
+project(GeometryDashDynarmicTest9 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -66,6 +66,7 @@ target_link_libraries(GeometryDashDynarmicProbe PRIVATE
     gdi32
     winmm
     ole32
+    ws2_32
 )
 
 set_target_properties(GeometryDashDynarmicProbe PROPERTIES

@@ -33,10 +33,15 @@
 #include <functional>
 #include <memory>
 #include <unordered_set>
+#include <type_traits>
+#include <climits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
 #include <GL/gl.h>
 #include <direct.h>
@@ -57,6 +62,13 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
+
+#ifdef _WIN32
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001u;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 
 class ScopeExit {
 public:
@@ -290,6 +302,203 @@ static std::vector<u8> ExtractZipMember(const std::vector<u8>& zip, std::string_
     }
     throw std::runtime_error("APK member not found: " + std::string(requested_name));
 }
+
+struct ZipEntryRecord {
+    std::string name;
+    u16 method = 0;
+    u32 crc = 0;
+    u32 compressed_size = 0;
+    u32 uncompressed_size = 0;
+    u32 local_offset = 0;
+};
+
+class ApkMemberCache {
+public:
+    void Initialize(const std::vector<u8>& image, const std::string& writable_path, std::ostream& log) {
+        image_ = &image;
+        log_ = &log;
+        BuildIndex();
+        const u32 apk_crc = static_cast<u32>(crc32(
+            0, reinterpret_cast<const Bytef*>(image.data()), static_cast<uInt>(image.size())));
+        std::ostringstream fingerprint;
+        fingerprint << std::hex << std::setw(8) << std::setfill('0') << apk_crc
+                    << '-' << std::dec << image.size();
+        disk_root_ = std::filesystem::path(writable_path) / "apk-member-cache" / fingerprint.str();
+        std::error_code error;
+        std::filesystem::create_directories(disk_root_, error);
+        log << "RESULT: DYNARMIC_APK_MEMBER_INDEX_READY entries=" << entries_.size()
+            << " persistent=" << disk_root_.string() << '\n';
+    }
+
+    bool Exists(std::string requested) const {
+        return FindEntry(NormalizeName(std::move(requested))) != nullptr;
+    }
+
+    std::shared_ptr<const std::vector<u8>> Load(std::string requested) {
+        requested = NormalizeName(std::move(requested));
+        const ZipEntryRecord* entry = FindEntry(requested);
+        if (!entry) return {};
+        const auto cached = memory_cache_.find(entry->name);
+        if (cached != memory_cache_.end()) {
+            ++memory_hits_;
+            return cached->second;
+        }
+        ++memory_misses_;
+        std::shared_ptr<std::vector<u8>> bytes = LoadPersistent(*entry);
+        if (bytes) ++disk_hits_;
+        else {
+            ++disk_misses_;
+            bytes = std::make_shared<std::vector<u8>>(Extract(*entry));
+            SavePersistent(*entry, *bytes);
+        }
+        cached_bytes_ += bytes->size();
+        memory_cache_[entry->name] = bytes;
+        if (log_ && first_load_logs_++ < 48u) {
+            *log_ << "[host] APK member cache "
+                  << (disk_hits_ + disk_misses_ == 1 && disk_hits_ ? "disk-hit" : "ready")
+                  << ": " << entry->name << " bytes=" << bytes->size() << '\n';
+        }
+        return bytes;
+    }
+
+    void Report() const {
+        if (!log_) return;
+        *log_ << "Dynarmic APK member cache totals: entries=" << entries_.size()
+              << " memory_hits=" << memory_hits_ << " memory_misses=" << memory_misses_
+              << " disk_hits=" << disk_hits_ << " disk_misses=" << disk_misses_
+              << " cached_bytes=" << cached_bytes_ << '\n';
+    }
+
+private:
+    static std::string NormalizeName(std::string name) {
+        std::replace(name.begin(), name.end(), '\\', '/');
+        while (!name.empty() && name.front() == '/') name.erase(name.begin());
+        while (name.starts_with("./")) name.erase(0, 2);
+        return name;
+    }
+
+    const ZipEntryRecord* FindEntry(const std::string& name) const {
+        auto found = entries_.find(name);
+        if (found != entries_.end()) return &found->second;
+        if (!name.starts_with("assets/")) {
+            found = entries_.find("assets/" + name);
+            if (found != entries_.end()) return &found->second;
+        }
+        return nullptr;
+    }
+
+    void BuildIndex() {
+        if (!image_) throw std::runtime_error("APK cache has no image");
+        const auto& zip = *image_;
+        constexpr u32 kEocdSignature = 0x06054B50u;
+        constexpr u32 kCentralSignature = 0x02014B50u;
+        const std::size_t search_start = zip.size() > (0xFFFFu + 22u) ? zip.size() - (0xFFFFu + 22u) : 0;
+        std::optional<std::size_t> eocd;
+        if (zip.size() >= 22u) {
+            for (std::size_t pos = zip.size() - 22u;; --pos) {
+                if (ReadLe32(zip, pos) == kEocdSignature) { eocd = pos; break; }
+                if (pos == search_start) break;
+            }
+        }
+        if (!eocd) throw std::runtime_error("APK end-of-central-directory record not found");
+        const u16 count = ReadLe16(zip, *eocd + 10u);
+        std::size_t pos = ReadLe32(zip, *eocd + 16u);
+        for (u16 index = 0; index < count; ++index) {
+            if (pos + 46u > zip.size() || ReadLe32(zip, pos) != kCentralSignature)
+                throw std::runtime_error("invalid APK central-directory entry");
+            ZipEntryRecord entry;
+            entry.method = ReadLe16(zip, pos + 10u);
+            entry.crc = ReadLe32(zip, pos + 16u);
+            entry.compressed_size = ReadLe32(zip, pos + 20u);
+            entry.uncompressed_size = ReadLe32(zip, pos + 24u);
+            const u16 name_length = ReadLe16(zip, pos + 28u);
+            const u16 extra_length = ReadLe16(zip, pos + 30u);
+            const u16 comment_length = ReadLe16(zip, pos + 32u);
+            entry.local_offset = ReadLe32(zip, pos + 42u);
+            const std::size_t next = pos + 46ull + name_length + extra_length + comment_length;
+            if (next > zip.size()) throw std::runtime_error("truncated APK central-directory entry");
+            entry.name.assign(reinterpret_cast<const char*>(zip.data() + pos + 46u), name_length);
+            entry.name = NormalizeName(entry.name);
+            entries_[entry.name] = std::move(entry);
+            pos = next;
+        }
+    }
+
+    std::vector<u8> Extract(const ZipEntryRecord& entry) const {
+        constexpr u32 kLocalSignature = 0x04034B50u;
+        const auto& zip = *image_;
+        if (static_cast<u64>(entry.local_offset) + 30u > zip.size() ||
+            ReadLe32(zip, entry.local_offset) != kLocalSignature)
+            throw std::runtime_error("invalid APK local member header for " + entry.name);
+        const u16 name_length = ReadLe16(zip, entry.local_offset + 26u);
+        const u16 extra_length = ReadLe16(zip, entry.local_offset + 28u);
+        const std::size_t data_offset = static_cast<std::size_t>(entry.local_offset) + 30u + name_length + extra_length;
+        if (data_offset > zip.size() || entry.compressed_size > zip.size() - data_offset)
+            throw std::runtime_error("truncated APK member " + entry.name);
+        std::vector<u8> output;
+        if (entry.method == 0u) {
+            output.assign(zip.begin() + static_cast<std::ptrdiff_t>(data_offset),
+                          zip.begin() + static_cast<std::ptrdiff_t>(data_offset + entry.compressed_size));
+        } else if (entry.method == 8u) {
+            output = InflateRaw(zip.data() + data_offset, entry.compressed_size, entry.uncompressed_size);
+        } else {
+            throw std::runtime_error("unsupported APK method " + std::to_string(entry.method));
+        }
+        if (output.size() != entry.uncompressed_size) throw std::runtime_error("APK member size mismatch");
+        const u32 actual_crc = static_cast<u32>(crc32(
+            0, reinterpret_cast<const Bytef*>(output.data()), static_cast<uInt>(output.size())));
+        if (actual_crc != entry.crc) throw std::runtime_error("APK member CRC mismatch for " + entry.name);
+        return output;
+    }
+
+    std::filesystem::path PersistentPath(const ZipEntryRecord& entry) const {
+        std::ostringstream name;
+        name << std::hex << std::setw(8) << std::setfill('0') << entry.crc
+             << '-' << std::dec << entry.uncompressed_size << ".bin";
+        return disk_root_ / name.str();
+    }
+
+    std::shared_ptr<std::vector<u8>> LoadPersistent(const ZipEntryRecord& entry) const {
+        std::error_code error;
+        const auto path = PersistentPath(entry);
+        if (!std::filesystem::is_regular_file(path, error) ||
+            std::filesystem::file_size(path, error) != entry.uncompressed_size) return {};
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return {};
+        auto output = std::make_shared<std::vector<u8>>(entry.uncompressed_size);
+        if (!output->empty() && !file.read(reinterpret_cast<char*>(output->data()), output->size())) return {};
+        const u32 actual_crc = static_cast<u32>(crc32(
+            0, reinterpret_cast<const Bytef*>(output->data()), static_cast<uInt>(output->size())));
+        return actual_crc == entry.crc ? output : std::shared_ptr<std::vector<u8>>{};
+    }
+
+    void SavePersistent(const ZipEntryRecord& entry, const std::vector<u8>& bytes) const {
+        std::error_code error;
+        std::filesystem::create_directories(disk_root_, error);
+        const auto path = PersistentPath(entry);
+        const auto temporary = path.string() + ".tmp";
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) return;
+        if (!bytes.empty()) file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        file.close();
+        std::filesystem::remove(path, error);
+        error.clear();
+        std::filesystem::rename(temporary, path, error);
+        if (error) std::filesystem::remove(temporary, error);
+    }
+
+    const std::vector<u8>* image_ = nullptr;
+    std::ostream* log_ = nullptr;
+    std::filesystem::path disk_root_;
+    std::unordered_map<std::string, ZipEntryRecord> entries_;
+    std::unordered_map<std::string, std::shared_ptr<std::vector<u8>>> memory_cache_;
+    u64 memory_hits_ = 0;
+    u64 memory_misses_ = 0;
+    u64 disk_hits_ = 0;
+    u64 disk_misses_ = 0;
+    u64 cached_bytes_ = 0;
+    u64 first_load_logs_ = 0;
+};
 
 struct MemoryRegion {
     u32 base = 0;
@@ -593,6 +802,34 @@ static u32 EnsureImport(ElfRuntime& runtime, ProbeEnvironment& env, const std::s
     return address;
 }
 
+static u32 FindSymbolAddress(const ElfRuntime& runtime, const std::string& name) {
+    for (const SymbolRecord& symbol : runtime.symbols) if (symbol.name == name) return symbol.address;
+    return 0;
+}
+static void InstallThumbAbsoluteImportHook(ProbeEnvironment& env, u32 target, u32 destination) {
+    const u32 address = target & ~1u;
+    if ((address & 3u) != 0u) throw std::runtime_error("Thumb hook target is not 4-byte aligned");
+    env.MemoryWrite16(address + 0u, 0x4B00u); // ldr r3, [pc, #0]
+    env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+    env.MemoryWrite32(address + 4u, destination);
+}
+static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
+    struct Hook { const char* symbol; const char* import; };
+    static constexpr Hook hooks[] = {
+        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm", "__dynarmic_ccfileutils_getFileDataFromZip"},
+        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_", "__dynarmic_ccfileutils_existFileDataFromZip"},
+    };
+    std::size_t installed = 0;
+    for (const Hook& hook : hooks) {
+        const u32 target = FindSymbolAddress(runtime, hook.symbol);
+        if (!target) continue;
+        const u32 destination = EnsureImport(runtime, env, hook.import);
+        InstallThumbAbsoluteImportHook(env, target, destination);
+        ++installed;
+    }
+    return installed;
+}
+
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
@@ -823,6 +1060,25 @@ struct GuestFile {
     bool readable() const { return stream != nullptr || memory != nullptr; }
 };
 
+struct GuestAddrInfoAllocation {
+    std::vector<u32> blocks;
+};
+
+struct GuestPollFd {
+    s32 fd;
+    std::int16_t events;
+    std::int16_t revents;
+};
+static_assert(sizeof(GuestPollFd) == 8);
+
+struct CooperativeWorkerContext {
+    std::array<u32, 16> regs{};
+    std::array<u32, 64> ext_regs{};
+    u32 cpsr = 0x10u;
+    u32 fpscr = 0u;
+    bool valid = false;
+};
+
 enum class HostEventType {
     TouchBegin,
     TouchMove,
@@ -868,7 +1124,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest8Window";
+        const char* class_name = "GeometryDashDynarmicTest9Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -880,7 +1136,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test8",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test9",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -904,6 +1160,12 @@ public:
         if (!format || !SetPixelFormat(device_, format, &pfd)) return Fail("SetPixelFormat failed");
         context_ = wglCreateContext(device_);
         if (!context_ || !wglMakeCurrent(device_, context_)) return Fail("wglCreateContext/wglMakeCurrent failed");
+        const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+        const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        log << "RESULT: DYNARMIC_OPENGL_DEVICE vendor=" << (vendor ? vendor : "<null>")
+            << " renderer=" << (renderer ? renderer : "<null>")
+            << " version=" << (version ? version : "<null>") << '\n';
         opengl_ = LoadLibraryA("opengl32.dll");
         if (!opengl_) return Fail("opengl32.dll could not be loaded");
 
@@ -1170,11 +1432,20 @@ public:
             if (stream.kind == ZStreamKind::Inflate) inflateEnd(&stream.host);
             else if (stream.kind == ZStreamKind::Deflate) deflateEnd(&stream.host);
         }
+        apk_member_cache_.Report();
         if (apk_memory_read_calls_) {
             log_ << "Dynarmic APK memory cache totals: reads=" << apk_memory_read_calls_
                  << " bytes=" << apk_memory_read_bytes_ << '\n';
             log_.flush();
         }
+#ifdef _WIN32
+        for (const auto& [guest_fd, host_socket] : sockets_) {
+            (void)guest_fd;
+            closesocket(host_socket);
+        }
+        sockets_.clear();
+        if (winsock_initialized_) { WSACleanup(); winsock_initialized_ = false; }
+#endif
         if (audio_initialized_) {
             audio_shutdown();
             audio_initialized_ = false;
@@ -1187,8 +1458,17 @@ public:
         apk_path_ = apk_path;
         writable_path_ = writable_path;
         apk_image_ = &apk_image;
+        apk_member_cache_.Initialize(apk_image, writable_path, log_);
 #ifdef _WIN32
         CreateDirectoryA(writable_path_.c_str(), nullptr);
+        WSADATA winsock_data{};
+        if (WSAStartup(MAKEWORD(2, 2), &winsock_data) == 0) {
+            winsock_initialized_ = true;
+            log_ << "RESULT: DYNARMIC_WINSOCK_BRIDGE_READY version="
+                 << LOBYTE(winsock_data.wVersion) << '.' << HIBYTE(winsock_data.wVersion) << '\n';
+        } else {
+            log_ << "WARNING: Winsock initialization failed; online features unavailable\n";
+        }
 #endif
         storage_initialize(writable_path_.c_str());
         const std::filesystem::path executable_directory =
@@ -1540,10 +1820,14 @@ private:
     }
     void LogHostDispatch(const std::string& label, u32 function, const std::string& details) {
         ++host_event_sequence_;
+        const bool noisy_move = label == "nativeTouchesMove";
+        const bool print_event = !noisy_move || host_event_sequence_ <= 32u ||
+                                 (host_event_sequence_ % 120u) == 0u;
         std::ostringstream event;
         event << "host#" << host_event_sequence_ << ':' << label;
         if (!details.empty()) event << ' ' << details;
         RememberEvent(event.str());
+        if (!print_event) return;
         log_ << "Dynarmic host dispatch #" << host_event_sequence_
              << ": " << label << " guest=0x" << std::hex << function
              << " (" << DescribeAddress(function) << ')' << std::dec;
@@ -3174,6 +3458,509 @@ private:
         return 0;
     }
 
+    void SetGuestErrno(int value) {
+        env_.MemoryWrite32(errno_address_, static_cast<u32>(value));
+    }
+#ifdef _WIN32
+    static int GuestAddressFamily(int host_family) {
+        if (host_family == AF_INET6) return 10;
+        if (host_family == AF_INET) return 2;
+        return host_family;
+    }
+    static int HostAddressFamily(int guest_family) {
+        if (guest_family == 10) return AF_INET6;
+        if (guest_family == 2) return AF_INET;
+        return guest_family;
+    }
+    static int MapWsaError(int error) {
+        switch (error) {
+        case WSAEWOULDBLOCK: return 11;
+        case WSAEINPROGRESS: return 115;
+        case WSAEALREADY: return 114;
+        case WSAENOTSOCK: return 88;
+        case WSAEDESTADDRREQ: return 89;
+        case WSAEMSGSIZE: return 90;
+        case WSAEPROTOTYPE: return 91;
+        case WSAENOPROTOOPT: return 92;
+        case WSAEPROTONOSUPPORT: return 93;
+        case WSAESOCKTNOSUPPORT: return 94;
+        case WSAEOPNOTSUPP: return 95;
+        case WSAEAFNOSUPPORT: return 97;
+        case WSAEADDRINUSE: return 98;
+        case WSAEADDRNOTAVAIL: return 99;
+        case WSAENETDOWN: return 100;
+        case WSAENETUNREACH: return 101;
+        case WSAENETRESET: return 102;
+        case WSAECONNABORTED: return 103;
+        case WSAECONNRESET: return 104;
+        case WSAENOBUFS: return 105;
+        case WSAEISCONN: return 106;
+        case WSAENOTCONN: return 107;
+        case WSAETIMEDOUT: return 110;
+        case WSAECONNREFUSED: return 111;
+        case WSAEHOSTUNREACH: return 113;
+        default: return error ? error : 5;
+        }
+    }
+    u32 SocketFailure() {
+        SetGuestErrno(MapWsaError(WSAGetLastError()));
+        return static_cast<u32>(-1);
+    }
+    SOCKET FindHostSocket(u32 guest_fd) const {
+        const auto found = sockets_.find(guest_fd);
+        return found == sockets_.end() ? INVALID_SOCKET : found->second;
+    }
+    bool IsGuestSocket(u32 guest_fd) const { return sockets_.find(guest_fd) != sockets_.end(); }
+    u32 RegisterSocket(SOCKET socket_value) {
+        if (socket_value == INVALID_SOCKET) return SocketFailure();
+        const u32 guest_fd = next_socket_fd_++;
+        sockets_[guest_fd] = socket_value;
+        return guest_fd;
+    }
+    bool ReadGuestSockaddr(u32 address, u32 length, sockaddr_storage& output, int& output_length) {
+        if (!address || length < 2u || length > sizeof(sockaddr_storage)) return false;
+        std::array<u8, sizeof(sockaddr_storage)> bytes{};
+        if (!env_.ReadBytes(address, bytes.data(), length)) return false;
+        u16 family = 0;
+        std::memcpy(&family, bytes.data(), sizeof(family));
+        family = static_cast<u16>(HostAddressFamily(family));
+        std::memcpy(bytes.data(), &family, sizeof(family));
+        std::memcpy(&output, bytes.data(), length);
+        output_length = static_cast<int>(length);
+        return true;
+    }
+    bool WriteGuestSockaddr(u32 address, u32 length_address, const sockaddr* input, int input_length) {
+        if (!length_address) return true;
+        const u32 capacity = env_.MemoryRead32(length_address);
+        env_.MemoryWrite32(length_address, static_cast<u32>(input_length));
+        if (!address || capacity == 0u) return true;
+        const u32 copy_length = std::min<u32>(capacity, static_cast<u32>(input_length));
+        std::array<u8, sizeof(sockaddr_storage)> bytes{};
+        std::memcpy(bytes.data(), input, copy_length);
+        u16 family = 0;
+        std::memcpy(&family, bytes.data(), sizeof(family));
+        family = static_cast<u16>(GuestAddressFamily(family));
+        std::memcpy(bytes.data(), &family, sizeof(family));
+        return env_.WriteBytes(address, bytes.data(), copy_length);
+    }
+    u32 GuestSocket(u32 family, u32 type, u32 protocol) {
+        if (!winsock_initialized_) { SetGuestErrno(100); return static_cast<u32>(-1); }
+        return RegisterSocket(::socket(HostAddressFamily(static_cast<int>(family)),
+                                       static_cast<int>(type), static_cast<int>(protocol)));
+    }
+    u32 GuestConnect(u32 guest_fd, u32 address, u32 length) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        sockaddr_storage host_address{}; int host_length = 0;
+        if (socket_value == INVALID_SOCKET || !ReadGuestSockaddr(address, length, host_address, host_length)) {
+            SetGuestErrno(88); return static_cast<u32>(-1);
+        }
+        const int code = ::connect(socket_value, reinterpret_cast<const sockaddr*>(&host_address), host_length);
+        if (network_log_count_++ < 64u) {
+            char address_text[INET6_ADDRSTRLEN]{};
+            u16 port = 0;
+            if (host_address.ss_family == AF_INET) {
+                const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&host_address);
+                ::inet_ntop(AF_INET, &ipv4->sin_addr, address_text, sizeof(address_text));
+                port = ntohs(ipv4->sin_port);
+            } else if (host_address.ss_family == AF_INET6) {
+                const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&host_address);
+                ::inet_ntop(AF_INET6, &ipv6->sin6_addr, address_text, sizeof(address_text));
+                port = ntohs(ipv6->sin6_port);
+            }
+            log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                 << (address_text[0] ? address_text : "?") << ':' << port
+                 << " result=" << code << (code ? " wsa=" + std::to_string(WSAGetLastError()) : std::string{}) << '\n';
+        }
+        return code == 0 ? 0u : SocketFailure();
+    }
+    u32 GuestBind(u32 guest_fd, u32 address, u32 length) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        sockaddr_storage host_address{}; int host_length = 0;
+        if (socket_value == INVALID_SOCKET || !ReadGuestSockaddr(address, length, host_address, host_length)) return SocketFailure();
+        const int code = ::bind(socket_value, reinterpret_cast<const sockaddr*>(&host_address), host_length);
+        return code == 0 ? 0u : SocketFailure();
+    }
+    u32 GuestAccept(u32 guest_fd, u32 address, u32 length_address) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET) { SetGuestErrno(88); return static_cast<u32>(-1); }
+        sockaddr_storage host_address{}; int host_length = sizeof(host_address);
+        const SOCKET accepted = ::accept(socket_value, reinterpret_cast<sockaddr*>(&host_address), &host_length);
+        if (accepted == INVALID_SOCKET) return SocketFailure();
+        if (!WriteGuestSockaddr(address, length_address, reinterpret_cast<sockaddr*>(&host_address), host_length)) {
+            closesocket(accepted); SetGuestErrno(14); return static_cast<u32>(-1);
+        }
+        return RegisterSocket(accepted);
+    }
+    u32 GuestListen(u32 guest_fd, u32 backlog) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET) { SetGuestErrno(88); return static_cast<u32>(-1); }
+        return ::listen(socket_value, static_cast<int>(backlog)) == 0 ? 0u : SocketFailure();
+    }
+    static int HostMessageFlags(u32 guest_flags) {
+        int host_flags = 0;
+        if (guest_flags & 0x0001u) host_flags |= MSG_OOB;
+        if (guest_flags & 0x0002u) host_flags |= MSG_PEEK;
+        if (guest_flags & 0x0004u) host_flags |= MSG_DONTROUTE;
+#ifdef MSG_WAITALL
+        if (guest_flags & 0x0100u) host_flags |= MSG_WAITALL;
+#endif
+        return host_flags; // Ignore Android MSG_DONTWAIT/MSG_NOSIGNAL; socket mode handles them.
+    }
+    u32 GuestSend(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        const char* data = static_cast<const char*>(env_.HostPointer(buffer, length));
+        if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        const int code = ::send(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
+        return code >= 0 ? static_cast<u32>(code) : SocketFailure();
+    }
+    u32 GuestReceive(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        char* data = static_cast<char*>(env_.HostPointer(buffer, length));
+        if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        const int code = ::recv(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)), HostMessageFlags(flags));
+        return code >= 0 ? static_cast<u32>(code) : SocketFailure();
+    }
+    u32 GuestSendTo(u32 guest_fd, u32 buffer, u32 length, u32 flags, u32 address, u32 address_length) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        const char* data = static_cast<const char*>(env_.HostPointer(buffer, length));
+        sockaddr_storage host_address{}; int host_length = 0;
+        if (socket_value == INVALID_SOCKET || (!data && length) ||
+            !ReadGuestSockaddr(address, address_length, host_address, host_length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        const int code = ::sendto(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)),
+                                  HostMessageFlags(flags), reinterpret_cast<const sockaddr*>(&host_address), host_length);
+        return code >= 0 ? static_cast<u32>(code) : SocketFailure();
+    }
+    u32 GuestReceiveFrom(u32 guest_fd, u32 buffer, u32 length, u32 flags, u32 address, u32 length_address) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        char* data = static_cast<char*>(env_.HostPointer(buffer, length));
+        sockaddr_storage host_address{}; int host_length = sizeof(host_address);
+        if (socket_value == INVALID_SOCKET || (!data && length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        const int code = ::recvfrom(socket_value, data, static_cast<int>(std::min<u32>(length, INT_MAX)),
+                                    HostMessageFlags(flags), reinterpret_cast<sockaddr*>(&host_address), &host_length);
+        if (code < 0) return SocketFailure();
+        WriteGuestSockaddr(address, length_address, reinterpret_cast<sockaddr*>(&host_address), host_length);
+        return static_cast<u32>(code);
+    }
+    u32 GuestSocketName(u32 guest_fd, u32 address, u32 length_address, bool peer) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET) { SetGuestErrno(88); return static_cast<u32>(-1); }
+        sockaddr_storage host_address{}; int host_length = sizeof(host_address);
+        const int code = peer ? ::getpeername(socket_value, reinterpret_cast<sockaddr*>(&host_address), &host_length)
+                              : ::getsockname(socket_value, reinterpret_cast<sockaddr*>(&host_address), &host_length);
+        if (code != 0) return SocketFailure();
+        return WriteGuestSockaddr(address, length_address, reinterpret_cast<sockaddr*>(&host_address), host_length) ? 0u : static_cast<u32>(-1);
+    }
+    static int HostSocketLevel(int guest_level) {
+        if (guest_level == 1) return SOL_SOCKET;
+        if (guest_level == 6) return IPPROTO_TCP;
+        if (guest_level == 0) return IPPROTO_IP;
+        if (guest_level == 41) return IPPROTO_IPV6;
+        return guest_level;
+    }
+    static int HostSocketOption(int guest_level, int guest_option) {
+        if (guest_level == 1) {
+            switch (guest_option) {
+            case 2: return SO_REUSEADDR;
+            case 3: return SO_TYPE;
+            case 4: return SO_ERROR;
+            case 7: return SO_SNDBUF;
+            case 8: return SO_RCVBUF;
+            case 9: return SO_KEEPALIVE;
+            case 13: return SO_LINGER;
+            case 20: return SO_RCVTIMEO;
+            case 21: return SO_SNDTIMEO;
+            default: return guest_option;
+            }
+        }
+        if (guest_level == 6 && guest_option == 1) return TCP_NODELAY;
+        return guest_option;
+    }
+    u32 GuestSetSockOpt(u32 guest_fd, u32 level, u32 option, u32 value_address, u32 value_length) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        const char* value = static_cast<const char*>(env_.HostPointer(value_address, value_length));
+        if (socket_value == INVALID_SOCKET || (!value && value_length)) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        const int host_level = HostSocketLevel(static_cast<int>(level));
+        const int host_option = HostSocketOption(static_cast<int>(level), static_cast<int>(option));
+        DWORD timeout_ms = 0;
+        struct linger host_linger{};
+        if (level == 1u && option == 13u && value_length >= 8u) {
+            host_linger.l_onoff = static_cast<u_short>(env_.MemoryRead32(value_address) != 0u);
+            host_linger.l_linger = static_cast<u_short>(std::min<u32>(env_.MemoryRead32(value_address + 4u), 0xffffu));
+            value = reinterpret_cast<const char*>(&host_linger);
+            value_length = sizeof(host_linger);
+        } else if (level == 1u && (option == 20u || option == 21u) && value_length >= 8u) {
+            const s32 seconds = static_cast<s32>(env_.MemoryRead32(value_address));
+            const s32 micros = static_cast<s32>(env_.MemoryRead32(value_address + 4u));
+            timeout_ms = static_cast<DWORD>(std::max<s64>(0, static_cast<s64>(seconds) * 1000 + micros / 1000));
+            value = reinterpret_cast<const char*>(&timeout_ms);
+            value_length = sizeof(timeout_ms);
+        }
+        const int code = ::setsockopt(socket_value, host_level, host_option, value, static_cast<int>(value_length));
+        if (code == 0) return 0;
+        // Android-only socket options such as SO_NOSIGPIPE are harmless on Windows.
+        if (WSAGetLastError() == WSAENOPROTOOPT || WSAGetLastError() == WSAEINVAL) return 0;
+        return SocketFailure();
+    }
+    u32 GuestGetSockOpt(u32 guest_fd, u32 level, u32 option, u32 value_address, u32 length_address) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET || !length_address) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        u32 capacity = env_.MemoryRead32(length_address);
+        char* value = static_cast<char*>(env_.HostPointer(value_address, capacity));
+        if (!value && capacity) { SetGuestErrno(14); return static_cast<u32>(-1); }
+        int host_length = static_cast<int>(capacity);
+        const int host_level = HostSocketLevel(static_cast<int>(level));
+        const int host_option = HostSocketOption(static_cast<int>(level), static_cast<int>(option));
+        const int code = ::getsockopt(socket_value, host_level, host_option, value, &host_length);
+        if (code != 0) return SocketFailure();
+        env_.MemoryWrite32(length_address, static_cast<u32>(host_length));
+        if (level == 1u && option == 4u && host_length >= static_cast<int>(sizeof(int))) {
+            int host_error = 0; std::memcpy(&host_error, value, sizeof(host_error));
+            const int guest_error = MapWsaError(host_error); std::memcpy(value, &guest_error, sizeof(guest_error));
+        }
+        return 0;
+    }
+    static SHORT HostPollEvents(std::int16_t guest_events) {
+        SHORT host = 0;
+        if (guest_events & 0x0001) host |= POLLRDNORM;
+        if (guest_events & 0x0002) host |= POLLPRI;
+        if (guest_events & 0x0004) host |= POLLWRNORM;
+        return host;
+    }
+    static std::int16_t GuestPollEvents(SHORT host_events) {
+        std::int16_t guest = 0;
+        if (host_events & (POLLRDNORM | POLLRDBAND)) guest |= 0x0001;
+        if (host_events & POLLPRI) guest |= 0x0002;
+        if (host_events & POLLWRNORM) guest |= 0x0004;
+        if (host_events & POLLERR) guest |= 0x0008;
+        if (host_events & POLLHUP) guest |= 0x0010;
+        if (host_events & POLLNVAL) guest |= 0x0020;
+        return guest;
+    }
+    u32 GuestPoll(u32 pollfds_address, u32 count, s32 timeout) {
+        if (count > 4096u) { SetGuestErrno(22); return static_cast<u32>(-1); }
+        std::vector<GuestPollFd> guest(count);
+        if (count && !env_.ReadBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd))) return static_cast<u32>(-1);
+        std::vector<WSAPOLLFD> host(count);
+        for (u32 index = 0; index < count; ++index) {
+            host[index].fd = FindHostSocket(static_cast<u32>(guest[index].fd));
+            host[index].events = HostPollEvents(guest[index].events);
+            host[index].revents = 0;
+        }
+        const int code = WSAPoll(host.data(), static_cast<ULONG>(host.size()), timeout);
+        if (code < 0) return SocketFailure();
+        for (u32 index = 0; index < count; ++index)
+            guest[index].revents = GuestPollEvents(host[index].revents);
+        if (count) env_.WriteBytes(pollfds_address, guest.data(), guest.size() * sizeof(GuestPollFd));
+        return static_cast<u32>(code);
+    }
+    u32 GuestIoctl(u32 guest_fd, u32 request, u32 argument_address) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET) { SetGuestErrno(88); return static_cast<u32>(-1); }
+        if (request == 0x5421u || request == static_cast<u32>(FIONBIO)) {
+            u_long value = argument_address ? env_.MemoryRead32(argument_address) : 0u;
+            const int code = ioctlsocket(socket_value, FIONBIO, &value);
+            if (code == 0) {
+                if (value) nonblocking_sockets_.insert(guest_fd); else nonblocking_sockets_.erase(guest_fd);
+                return 0;
+            }
+            return SocketFailure();
+        }
+        SetGuestErrno(22); return static_cast<u32>(-1);
+    }
+    u32 GuestFcntl(u32 guest_fd, u32 command, u32 argument) {
+        const SOCKET socket_value = FindHostSocket(guest_fd);
+        if (socket_value == INVALID_SOCKET) { SetGuestErrno(88); return static_cast<u32>(-1); }
+        constexpr u32 kFGetFl = 3u, kFSetFl = 4u, kONonBlock = 0x800u;
+        if (command == kFGetFl) return nonblocking_sockets_.count(guest_fd) ? kONonBlock : 0u;
+        if (command == kFSetFl) {
+            u_long value = (argument & kONonBlock) ? 1u : 0u;
+            if (ioctlsocket(socket_value, FIONBIO, &value) != 0) return SocketFailure();
+            if (value) nonblocking_sockets_.insert(guest_fd); else nonblocking_sockets_.erase(guest_fd);
+            return 0;
+        }
+        return 0;
+    }
+    u32 GuestCloseSocket(u32 guest_fd) {
+        const auto found = sockets_.find(guest_fd);
+        if (found == sockets_.end()) return static_cast<u32>(-1);
+        const int code = closesocket(found->second);
+        sockets_.erase(found); nonblocking_sockets_.erase(guest_fd);
+        return code == 0 ? 0u : SocketFailure();
+    }
+    u32 GuestGetAddrInfo(u32 node_address, u32 service_address, u32 hints_address, u32 result_address) {
+        if (!result_address) return static_cast<u32>(EAI_FAIL);
+        env_.MemoryWrite32(result_address, 0u);
+        const std::string node = ReadCString(node_address);
+        const std::string service = ReadCString(service_address);
+        addrinfo host_hints{}; addrinfo* hints = nullptr;
+        if (hints_address) {
+            const u32 guest_flags = env_.MemoryRead32(hints_address + 0u);
+            host_hints.ai_flags = 0;
+            if (guest_flags & 0x001u) host_hints.ai_flags |= AI_PASSIVE;
+            if (guest_flags & 0x002u) host_hints.ai_flags |= AI_CANONNAME;
+            if (guest_flags & 0x004u) host_hints.ai_flags |= AI_NUMERICHOST;
+#ifdef AI_NUMERICSERV
+            if (guest_flags & 0x400u) host_hints.ai_flags |= AI_NUMERICSERV;
+#endif
+            host_hints.ai_family = HostAddressFamily(static_cast<int>(env_.MemoryRead32(hints_address + 4u)));
+            host_hints.ai_socktype = static_cast<int>(env_.MemoryRead32(hints_address + 8u));
+            host_hints.ai_protocol = static_cast<int>(env_.MemoryRead32(hints_address + 12u));
+            hints = &host_hints;
+        }
+        addrinfo* host_results = nullptr;
+        const int code = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
+                                       service.empty() ? nullptr : service.c_str(), hints, &host_results);
+        if (network_log_count_++ < 64u) {
+            log_ << "[host] DNS getaddrinfo node=" << (node.empty() ? "<null>" : node)
+                 << " service=" << (service.empty() ? "<null>" : service)
+                 << " result=" << code << '\n';
+        }
+        if (code != 0) return static_cast<u32>(code);
+        ScopeExit cleanup([&] { if (host_results) ::freeaddrinfo(host_results); });
+        GuestAddrInfoAllocation allocation;
+        u32 first = 0, previous = 0;
+        for (addrinfo* item = host_results; item; item = item->ai_next) {
+            if (item->ai_addrlen > sizeof(sockaddr_storage)) continue;
+            const u32 node_block = Allocate(32u);
+            const u32 address_block = Allocate(static_cast<u32>(item->ai_addrlen));
+            if (!node_block || !address_block) break;
+            allocation.blocks.push_back(node_block); allocation.blocks.push_back(address_block);
+            std::array<u8, sizeof(sockaddr_storage)> address_bytes{};
+            std::memcpy(address_bytes.data(), item->ai_addr, item->ai_addrlen);
+            u16 family = static_cast<u16>(GuestAddressFamily(item->ai_family));
+            std::memcpy(address_bytes.data(), &family, sizeof(family));
+            env_.WriteBytes(address_block, address_bytes.data(), item->ai_addrlen);
+            u32 canonical = 0;
+            if (item->ai_canonname) { canonical = AllocateString(item->ai_canonname); if (canonical) allocation.blocks.push_back(canonical); }
+            env_.MemoryWrite32(node_block + 0u, static_cast<u32>(item->ai_flags));
+            env_.MemoryWrite32(node_block + 4u, static_cast<u32>(GuestAddressFamily(item->ai_family)));
+            env_.MemoryWrite32(node_block + 8u, static_cast<u32>(item->ai_socktype));
+            env_.MemoryWrite32(node_block + 12u, static_cast<u32>(item->ai_protocol));
+            env_.MemoryWrite32(node_block + 16u, static_cast<u32>(item->ai_addrlen));
+            env_.MemoryWrite32(node_block + 20u, canonical);
+            env_.MemoryWrite32(node_block + 24u, address_block);
+            env_.MemoryWrite32(node_block + 28u, 0u);
+            if (!first) first = node_block;
+            if (previous) env_.MemoryWrite32(previous + 28u, node_block);
+            previous = node_block;
+        }
+        if (!first) { for (u32 block : allocation.blocks) Free(block); return static_cast<u32>(EAI_MEMORY); }
+        guest_addrinfo_[first] = std::move(allocation);
+        env_.MemoryWrite32(result_address, first);
+        return 0;
+    }
+    u32 GuestFreeAddrInfo(u32 address) {
+        const auto found = guest_addrinfo_.find(address);
+        if (found == guest_addrinfo_.end()) return 0;
+        for (u32 block : found->second.blocks) Free(block);
+        guest_addrinfo_.erase(found);
+        return 0;
+    }
+    u32 GuestInetPton(u32 family, u32 text_address, u32 output_address) {
+        const std::string text = ReadCString(text_address);
+        const int host_family = HostAddressFamily(static_cast<int>(family));
+        const std::size_t size = host_family == AF_INET ? 4u : host_family == AF_INET6 ? 16u : 0u;
+        void* output = size ? env_.HostPointer(output_address, size) : nullptr;
+        return output ? static_cast<u32>(::inet_pton(host_family, text.c_str(), output)) : 0u;
+    }
+    u32 GuestInetNtop(u32 family, u32 input_address, u32 output_address, u32 output_size) {
+        const int host_family = HostAddressFamily(static_cast<int>(family));
+        const std::size_t input_size = host_family == AF_INET ? 4u : host_family == AF_INET6 ? 16u : 0u;
+        const void* input = input_size ? env_.HostPointer(input_address, input_size) : nullptr;
+        std::array<char, INET6_ADDRSTRLEN> text{};
+        if (!input || !::inet_ntop(host_family, input, text.data(), text.size())) return 0;
+        const std::size_t length = std::strlen(text.data()) + 1u;
+        if (!output_address || output_size < length || !env_.WriteBytes(output_address, text.data(), length)) return 0;
+        return output_address;
+    }
+#else
+    bool IsGuestSocket(u32) const { return false; }
+#endif
+
+    bool InitializeCooperativeWorker(u32 thread_address, u32 start_routine, u32 argument) {
+        if (!start_routine) return false;
+        cooperative_worker_ = {};
+        cooperative_worker_.regs[0] = argument;
+        cooperative_worker_.regs[13] = kStackBase + 0x00100000u - 0x1000u;
+        cooperative_worker_.regs[14] = kReturnStub;
+        cooperative_worker_.regs[15] = start_routine & ~1u;
+        cooperative_worker_.cpsr = 0x10u | ((start_routine & 1u) ? 0x20u : 0u);
+        cooperative_worker_.valid = true;
+        if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
+        log_ << "[host] Cooperative guest worker registered at 0x" << std::hex << start_routine
+             << " arg=0x" << argument << std::dec << '\n';
+        return true;
+    }
+    bool ResumeCooperativeWorker() {
+        if (!cooperative_worker_.valid || running_cooperative_worker_) return true;
+        const auto saved_regs = cpu_.Regs();
+        const auto saved_ext = cpu_.ExtRegs();
+        const u32 saved_cpsr = cpu_.Cpsr();
+        const u32 saved_fpscr = cpu_.Fpscr();
+        ScopeExit restore([&] {
+            cpu_.Regs() = saved_regs; cpu_.ExtRegs() = saved_ext;
+            cpu_.SetCpsr(saved_cpsr); cpu_.SetFpscr(saved_fpscr);
+            running_cooperative_worker_ = false;
+        });
+        cpu_.Regs() = cooperative_worker_.regs;
+        cpu_.ExtRegs() = cooperative_worker_.ext_regs;
+        cpu_.SetCpsr(cooperative_worker_.cpsr);
+        cpu_.SetFpscr(cooperative_worker_.fpscr);
+        running_cooperative_worker_ = true;
+        cooperative_worker_yielded_ = false;
+        cooperative_worker_done_ = false;
+        const auto started = std::chrono::steady_clock::now();
+        while (!cooperative_worker_yielded_ && !cooperative_worker_done_) {
+            if (std::chrono::steady_clock::now() - started > std::chrono::seconds(120))
+                return Fail("cooperative HTTP worker exceeded 120 second guard");
+            env_.ResetStopState(); env_.ticks_left = 5000000u;
+            cpu_.Run(); cpu_.ClearHalt(kCallbackHalt);
+            if (env_.invalid_access) return Fail("cooperative HTTP worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("cooperative HTTP worker interpreter fallback");
+            if (env_.exception_seen) return Fail("cooperative HTTP worker guest exception");
+            if (env_.svc_pending) {
+                if (env_.pending_svc == kSvcReturn) { cooperative_worker_done_ = true; break; }
+                if (!HandleSvc(env_.pending_svc, "CCHttpClient worker")) return false;
+            } else if (env_.ticks_left != 0u) {
+                return Fail("cooperative HTTP worker stopped without a trap");
+            }
+        }
+        cooperative_worker_.regs = cpu_.Regs();
+        cooperative_worker_.ext_regs = cpu_.ExtRegs();
+        cooperative_worker_.cpsr = cpu_.Cpsr();
+        cooperative_worker_.fpscr = cpu_.Fpscr();
+        if (cooperative_worker_done_) cooperative_worker_.valid = false;
+        if (cooperative_worker_yielded_ && network_worker_runs_++ < 32u)
+            log_ << "[host] Cooperative HTTP worker idle after processing queued request(s)\n";
+        return true;
+    }
+
+    u32 HostGetFileDataFromZip(u32 zip_path_address, u32 member_address, u32 size_address) {
+        if (size_address) env_.MemoryWrite32(size_address, 0u);
+        const std::string zip_path = ReadCString(zip_path_address);
+        const std::string member = ReadCString(member_address);
+        if (member.empty()) return 0;
+        if (!zip_path.empty() && TranslatePath(zip_path) != apk_path_ &&
+            zip_path != "game.apk" && !zip_path.ends_with("/game.apk")) return 0;
+        const auto bytes = apk_member_cache_.Load(member);
+        if (!bytes) return 0;
+        const u32 allocation_size = static_cast<u32>(std::max<std::size_t>(bytes->size(), 1u));
+        const u32 output = Allocate(allocation_size);
+        if (!output) return 0;
+        if (!bytes->empty() && !env_.WriteBytes(output, bytes->data(), bytes->size())) {
+            Free(output);
+            return 0;
+        }
+        if (size_address) env_.MemoryWrite32(size_address, static_cast<u32>(bytes->size()));
+        return output;
+    }
+    u32 HostExistFileDataFromZip(u32 zip_path_address, u32 member_address) {
+        const std::string zip_path = ReadCString(zip_path_address);
+        if (!zip_path.empty() && TranslatePath(zip_path) != apk_path_ &&
+            zip_path != "game.apk" && !zip_path.ends_with("/game.apk")) return 0;
+        return apk_member_cache_.Exists(ReadCString(member_address)) ? 1u : 0u;
+    }
+
     bool DispatchImport(ImportRecord& import) {
         const std::string& name = import.name;
         const u32 r0 = cpu_.Regs()[0], r1 = cpu_.Regs()[1], r2 = cpu_.Regs()[2], r3 = cpu_.Regs()[3];
@@ -3189,6 +3976,10 @@ private:
         };
         // These dominate APK/level loading. Keep them ahead of the large generic
         // import chain and avoid temporary allocations on every SVC crossing.
+        if (name == "__dynarmic_ccfileutils_getFileDataFromZip")
+            return finish_hot(HostGetFileDataFromZip(r1, r2, r3));
+        if (name == "__dynarmic_ccfileutils_existFileDataFromZip")
+            return finish_hot(HostExistFileDataFromZip(r1, r2));
         if (name == "fread") return finish_hot(ReadGuestFile(r0, r1, r2, r3));
         if (name == "fseek") return finish_hot(static_cast<u32>(SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2))));
         if (name == "ftell") return finish_hot(static_cast<u32>(TellGuestFile(r0)));
@@ -3359,10 +4150,26 @@ private:
             const u32 mode_address = AllocateString((r1 & 0x400u) ? "ab" : (r1 & 0x201u) ? "wb" : "rb");
             const u32 path_address = AllocateString(path);
             result = OpenGuestFile(path_address, mode_address);
-        } else if (name == "read") result = ReadGuestFile(r1, 1, r2, r0);
-        else if (name == "write") result = WriteGuestFile(r1, 1, r2, r0);
-        else if (name == "lseek") { result = SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2)) == 0 ? static_cast<u32>(TellGuestFile(r0)) : static_cast<u32>(-1); }
-        else if (name == "close") result = CloseGuestFile(r0);
+        } else if (name == "read") {
+#ifdef _WIN32
+            result = IsGuestSocket(r0) ? GuestReceive(r0, r1, r2, 0u) : ReadGuestFile(r1, 1, r2, r0);
+#else
+            result = ReadGuestFile(r1, 1, r2, r0);
+#endif
+        } else if (name == "write") {
+#ifdef _WIN32
+            result = IsGuestSocket(r0) ? GuestSend(r0, r1, r2, 0u) : WriteGuestFile(r1, 1, r2, r0);
+#else
+            result = WriteGuestFile(r1, 1, r2, r0);
+#endif
+        } else if (name == "lseek") { result = SeekGuestFile(r0, static_cast<s32>(r1), static_cast<int>(r2)) == 0 ? static_cast<u32>(TellGuestFile(r0)) : static_cast<u32>(-1); }
+        else if (name == "close") {
+#ifdef _WIN32
+            result = IsGuestSocket(r0) ? GuestCloseSocket(r0) : CloseGuestFile(r0);
+#else
+            result = CloseGuestFile(r0);
+#endif
+        }
         else if (name == "stat" || name == "fstat") { if (r1) { std::array<u8,128> zero{}; env_.WriteBytes(r1, zero.data(), zero.size()); } result = 0; }
         else if (name == "setvbuf") result = 0;
         else if (name == "getcwd") {
@@ -3409,9 +4216,31 @@ private:
         else if (name == "pthread_key_delete") { thread_values_.erase(r0); result = 0; }
         else if (name == "pthread_setspecific") { thread_values_[r0] = r1; result = 0; }
         else if (name == "pthread_getspecific") result = thread_values_[r0];
-        else if (name == "pthread_create") { if (r0) env_.MemoryWrite32(r0, next_thread_id_++); result = 0; }
-        else if (name == "pthread_exit") result = 0;
-        else if (name == "pthread_detach" || name == "pthread_mutex_init" || name == "pthread_mutex_destroy" || name == "pthread_mutex_lock" || name == "pthread_mutex_unlock" || name == "pthread_cond_broadcast" || name == "pthread_cond_wait" || name == "sem_init" || name == "sem_destroy" || name == "sem_post" || name == "sem_wait") result = 0;
+        else if (name == "pthread_create") {
+            result = InitializeCooperativeWorker(r0, r2, r3) ? 0u : static_cast<u32>(-1);
+        } else if (name == "pthread_exit") {
+            if (running_cooperative_worker_) { cooperative_worker_done_ = true; return true; }
+            result = 0;
+        } else if (name == "sem_init") {
+            semaphores_[r0] = r2; result = 0;
+        } else if (name == "sem_destroy") {
+            semaphores_.erase(r0); result = 0;
+        } else if (name == "sem_wait") {
+            u32& count = semaphores_[r0];
+            if (count) { --count; result = 0; }
+            else if (running_cooperative_worker_) {
+                cooperative_worker_yielded_ = true;
+                return true; // Keep PC on sem_wait; resume when sem_post adds work.
+            } else { SetGuestErrno(11); result = static_cast<u32>(-1); }
+        } else if (name == "sem_post") {
+            ++semaphores_[r0];
+            cpu_.Regs()[0] = 0u;
+            ResumeAfterStub(import.address);
+            return running_cooperative_worker_ ? true : ResumeCooperativeWorker();
+        } else if (name == "pthread_detach" || name == "pthread_mutex_init" ||
+                   name == "pthread_mutex_destroy" || name == "pthread_mutex_lock" ||
+                   name == "pthread_mutex_unlock" || name == "pthread_cond_broadcast" ||
+                   name == "pthread_cond_wait") result = 0;
         else if (name == "gettimeofday") {
             const auto now = std::chrono::system_clock::now();
             const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
@@ -3438,7 +4267,8 @@ private:
             std::tm host{}; host.tm_sec=guest.tm_sec; host.tm_min=guest.tm_min; host.tm_hour=guest.tm_hour; host.tm_mday=guest.tm_mday; host.tm_mon=guest.tm_mon; host.tm_year=guest.tm_year; host.tm_wday=guest.tm_wday; host.tm_yday=guest.tm_yday; host.tm_isdst=guest.tm_isdst;
             std::vector<char> output(r1 ? r1 : 1u);
             const std::size_t written = std::strftime(output.data(), output.size(), ReadCString(r2).c_str(), &host);
-            if (r0 && r1) env_.WriteBytes(r0, output.data(), output.size()); result = static_cast<u32>(written);
+            if (r0 && r1) env_.WriteBytes(r0, output.data(), output.size());
+            result = static_cast<u32>(written);
         } else if (name == "wmemcpy" || name == "wmemmove") result = CopyGuest(r0,r1,r2*4u) ? r0 : 0;
         else if (name == "wmemset") { for(u32 i=0;i<r2;++i) env_.MemoryWrite32(r0+i*4u,r1); result=r0; }
         else if (name == "wmemcmp") { result=0; for(u32 i=0;i<r2;++i){const u32 a=env_.MemoryRead32(r0+i*4u),b=env_.MemoryRead32(r1+i*4u);if(a!=b){result=static_cast<u32>(a<b?-1:1);break;}} }
@@ -3466,7 +4296,16 @@ private:
         else if (name == "setlocale") result = c_locale_address_;
         else if (name == "getenv") result = 0;
         else if (name == "geteuid") result = 1000;
-        else if (name == "gethostname") { const char host[]="dynarmic-win64"; if (r0 && r1) { const std::size_t n=std::min<std::size_t>(sizeof(host),r1); env_.WriteBytes(r0,host,n); } result=0; }
+        else if (name == "gethostname") {
+#ifdef _WIN32
+            std::vector<char> host(std::max<u32>(r1, 1u), 0);
+            const int code = ::gethostname(host.data(), static_cast<int>(host.size()));
+            if (code == 0 && r0 && r1) env_.WriteBytes(r0, host.data(), host.size());
+            result = code == 0 ? 0u : SocketFailure();
+#else
+            const char host[]="dynarmic-win64"; if (r0 && r1) { const std::size_t n=std::min<std::size_t>(sizeof(host),r1); env_.WriteBytes(r0,host,n); } result=0;
+#endif
+        }
         else if (name == "getopt") result = static_cast<u32>(-1);
         else if (name == "getpwuid") result = 0;
         else if (name == "strerror" || name == "strerror_r") { const u32 text=AllocateString("host error"); if(name=="strerror_r"&&r1&&r2){const std::string v=ReadCString(text);const std::size_t n=std::min<std::size_t>(v.size(),r2-1u);env_.WriteBytes(r1,v.data(),n);env_.MemoryWrite8(r1+static_cast<u32>(n),0);result=0;}else result=text; }
@@ -3505,7 +4344,121 @@ private:
         else if (name == "dlopen" || name == "dlsym" || name == "dlclose" || name == "dlerror") result=0;
         else if (name == "mmap") result=AllocateAligned(r1, kPageSize);
         else if (name == "munmap") { Free(r0); result=0; }
-        else if (name == "socket" || name == "accept" || name == "bind" || name == "connect" || name == "listen" || name == "recv" || name == "recvfrom" || name == "send" || name == "sendto" || name == "setsockopt" || name == "getsockopt" || name == "getpeername" || name == "getsockname" || name == "poll" || name == "ioctl" || name == "fcntl" || name == "getaddrinfo" || name == "freeaddrinfo" || name == "inet_ntop" || name == "inet_pton" || name == "alarm" || name == "raise" || name == "sigaction") result = name == "freeaddrinfo" ? 0u : static_cast<u32>(-1);
+        else if (name == "socket") {
+#ifdef _WIN32
+            result = GuestSocket(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "connect") {
+#ifdef _WIN32
+            result = GuestConnect(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "bind") {
+#ifdef _WIN32
+            result = GuestBind(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "listen") {
+#ifdef _WIN32
+            result = GuestListen(r0, r1);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "accept") {
+#ifdef _WIN32
+            result = GuestAccept(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "send") {
+#ifdef _WIN32
+            result = GuestSend(r0, r1, r2, r3);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "recv") {
+#ifdef _WIN32
+            result = GuestReceive(r0, r1, r2, r3);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "sendto") {
+#ifdef _WIN32
+            result = GuestSendTo(r0, r1, r2, r3, ArgWord(4), ArgWord(5));
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "recvfrom") {
+#ifdef _WIN32
+            result = GuestReceiveFrom(r0, r1, r2, r3, ArgWord(4), ArgWord(5));
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "setsockopt") {
+#ifdef _WIN32
+            result = GuestSetSockOpt(r0, r1, r2, r3, ArgWord(4));
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "getsockopt") {
+#ifdef _WIN32
+            result = GuestGetSockOpt(r0, r1, r2, r3, ArgWord(4));
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "getpeername" || name == "getsockname") {
+#ifdef _WIN32
+            result = GuestSocketName(r0, r1, r2, name == "getpeername");
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "poll") {
+#ifdef _WIN32
+            result = GuestPoll(r0, r1, static_cast<s32>(r2));
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "ioctl") {
+#ifdef _WIN32
+            result = GuestIoctl(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "fcntl") {
+#ifdef _WIN32
+            result = GuestFcntl(r0, r1, r2);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "getaddrinfo") {
+#ifdef _WIN32
+            result = GuestGetAddrInfo(r0, r1, r2, r3);
+#else
+            result = static_cast<u32>(-1);
+#endif
+        } else if (name == "freeaddrinfo") {
+#ifdef _WIN32
+            result = GuestFreeAddrInfo(r0);
+#else
+            result = 0;
+#endif
+        } else if (name == "inet_ntop") {
+#ifdef _WIN32
+            result = GuestInetNtop(r0, r1, r2, r3);
+#else
+            result = 0;
+#endif
+        } else if (name == "inet_pton") {
+#ifdef _WIN32
+            result = GuestInetPton(r0, r1, r2);
+#else
+            result = 0;
+#endif
+        } else if (name == "alarm" || name == "raise" || name == "sigaction") result = 0;
         else {
             ++permissive_stub_calls_;
             permissive_names_.insert(name);
@@ -3538,6 +4491,12 @@ private:
     u32 next_pthread_key_=1;
     u32 next_thread_id_=1;
     std::unordered_map<u32,u32> thread_values_;
+    std::unordered_map<u32,u32> semaphores_;
+    CooperativeWorkerContext cooperative_worker_;
+    bool running_cooperative_worker_=false;
+    bool cooperative_worker_yielded_=false;
+    bool cooperative_worker_done_=false;
+    u64 network_worker_runs_=0;
     u64 random_state_=1;
     unsigned call_depth_=0;
     u64 permissive_stub_calls_=0;
@@ -3564,7 +4523,16 @@ private:
     u64 zlib_init_logs_=0;
     std::string apk_path_;
     std::string writable_path_;
+#ifdef _WIN32
+    bool winsock_initialized_=false;
+    u32 next_socket_fd_=0x4000u;
+    std::unordered_map<u32, SOCKET> sockets_;
+    std::unordered_set<u32> nonblocking_sockets_;
+    std::unordered_map<u32, GuestAddrInfoAllocation> guest_addrinfo_;
+    u64 network_log_count_=0;
+#endif
     const std::vector<u8>* apk_image_ = nullptr;
+    ApkMemberCache apk_member_cache_;
     u64 apk_memory_open_logs_ = 0;
     u64 file_open_logs_ = 0;
     u64 apk_memory_read_calls_ = 0;
@@ -3649,11 +4617,11 @@ int main(int argc,char** argv) {
     g_runtime_log_stream = &log_file;
     auto emit=[&](const std::string& line){std::cout<<line<<'\n';log_file<<line<<'\n';log_file.flush();};
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest8");
-        emit("Milestone: APK memory acceleration, text-safe Space input, and clean guest shutdown");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest9");
+        emit("Milestone: host-level APK member caching, cooperative HTTP sockets, and high-performance GPU preference");
         emit("Log file: " + log_path);
         emit("Host pointer bits: "+std::to_string(sizeof(void*)*8));
-        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest8 must be compiled as a 64-bit executable");
+        if(sizeof(void*)!=8) throw std::runtime_error("DynarmicTest9 must be compiled as a 64-bit executable");
         RunThumbSmoke();
         emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
 
@@ -3677,6 +4645,8 @@ int main(int argc,char** argv) {
         emit("Extracted lib/armeabi/libgame.so: "+std::to_string(libgame.size())+" bytes");
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
+        const std::size_t zip_hooks = InstallCcFileUtilsZipHooks(runtime, env);
+        if (zip_hooks != 2u) throw std::runtime_error("required cocos2d ZIP hooks were not found");
         {
             std::ostringstream line; line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"<<runtime.image_max<<" entry=0x"<<runtime.entry<<std::dec; emit(line.str());
         }
@@ -3694,6 +4664,7 @@ int main(int argc,char** argv) {
             emit(line.str());
         }
         emit("RESULT: DYNARMIC_RELOCATION_OK");
+        emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=" + std::to_string(zip_hooks));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes=" + std::to_string(apk.size()));
@@ -3711,7 +4682,7 @@ int main(int argc,char** argv) {
         {std::ostringstream line;line<<"Dynarmic JNI_OnLoad returned 0x"<<std::hex<<std::setw(8)<<std::setfill('0')<<result<<std::dec;emit(line.str());}
         if(result!=kJniVersion14) throw std::runtime_error("JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP8_PROBE_ONLY_OK");return 0;}
+        if(probe_only){emit("RESULT: DYNARMIC_BRINGUP9_PROBE_ONLY_OK");return 0;}
 
         const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
         if(!apk_ref||!executor.RunFunction(runtime.native_set_paths,{kEnvObject,0u,apk_ref},&result,"nativeSetPaths")) throw std::runtime_error(executor.LastError());
@@ -3798,7 +4769,7 @@ int main(int argc,char** argv) {
                 emit(line.str());
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test8 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
+                title<<"Geometry Dash ARM - Dynarmic x64 Test9 | "<<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
                 interval_frames=0;
@@ -3815,11 +4786,11 @@ int main(int argc,char** argv) {
         emit("Dynarmic interactive loop ended after frames="+std::to_string(frame_count));
         emit("Permissive runtime import calls: "+std::to_string(executor.PermissiveStubCalls())+" unique="+std::to_string(executor.PermissiveNames().size()));
         if(!executor.PermissiveNames().empty()){std::ostringstream names;names<<"Permissive imports:";for(const auto& name:executor.PermissiveNames())names<<' '<<name;emit(names.str());}
-        emit("RESULT: DYNARMIC_BRINGUP8_OK");
+        emit("RESULT: DYNARMIC_BRINGUP9_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP8_FAILED");
+        emit("RESULT: DYNARMIC_BRINGUP9_FAILED");
         return 1;
     }
 }

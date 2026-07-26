@@ -1,52 +1,52 @@
-# Geometry Dash ARM Wrapper — Dynarmic x64 Test8
+# Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9
 
-Current version: **0.9.4-arm-dynarmictest8**
+DynarmicTest9 runs the ARMv5TE Android build of early Geometry Dash on 64-bit Windows through Dynarmic.
 
-Test8 keeps Test7's smooth gameplay, stable saves and Windows audio, then targets the remaining wrapper overhead: repeated APK ZIP reads during level/menu loading, the guest Exit button not closing the host window, and Space triggering gameplay while a text field is active.
+## Main changes in Test9
+
+- Host-level cocos2d APK member cache instead of millions of guest minizip calls.
+- Memory cache plus persistent validated cache in `save/apk-member-cache`.
+- NVIDIA Optimus and AMD PowerXpress high-performance GPU preference exports.
+- Actual OpenGL vendor/renderer logging.
+- Experimental Winsock bridge for the game’s bundled libcurl.
+- Cooperative execution of the game’s `CCHttpClient` worker.
+- Reduced repetitive touch-move logging.
+- Retains Test6 allocator, Test7 save/audio, and Test8 Exit/Space fixes.
 
 ## Build
 
-Run on 64-bit Windows:
+On 64-bit Windows, run:
 
 ```cmd
 BUILD_DYNARMIC_X64.cmd
 ```
 
-The builder reuses its downloaded tools and build cache, then creates:
+The builder creates:
 
 ```text
-dist-arm-wrapper-dynarmictest8
+dist-arm-wrapper-dynarmictest9
 ```
 
-Launch:
+Launch with:
 
 ```text
-dist-arm-wrapper-dynarmictest8\RUN_DYNARMIC_INTERACTIVE.cmd
+dist-arm-wrapper-dynarmictest9\RUN_DYNARMIC_INTERACTIVE.cmd
 ```
 
-The full source package includes `game.apk`, the complete source/vendor tree, build scripts, patches and licenses.
+The first launch may populate audio and APK-member caches. Later launches reuse them.
 
-## Controls
+## Useful log markers
 
-- Left mouse button: touch begin/end
-- Mouse drag: touch move
-- Space or Up Arrow: gameplay press/release
-- Escape: Android Back
-- Text and Backspace: editor text input
-- Window deactivate/reactivate: Android pause/resume
+```text
+RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=2
+RESULT: DYNARMIC_APK_MEMBER_INDEX_READY entries=...
+RESULT: DYNARMIC_WINSOCK_BRIDGE_READY version=2.2
+RESULT: DYNARMIC_OPENGL_DEVICE vendor=... renderer=...
+Dynarmic guest call timing: nativeTouchesEnd elapsed_ms=...
+```
 
-While the Android IME/text field is open, Space is sent only as text and no gameplay touch is generated.
+For internet testing, open an online menu and keep the complete log. DNS and connection attempts appear as `[host] DNS ...` and `[host] Socket connect ...`.
 
-## Test8 focus
+## Source integrity
 
-- memory-backed read-only `game.apk` handles using the already-loaded APK image
-- direct guest-buffer `fread`/`fwrite` without per-call temporary vectors
-- hot paths for the libc calls dominating ZIP and level parsing
-- sampled import-history logging instead of allocating a diagnostic string for every trap
-- clean host shutdown when the guest calls `terminateProcess`
-- gameplay Space suppression while editor/name/description text input is active
-- retained Test7 mapped stdio, save stability, audio bridge, allocator and fatal diagnostics
-
-Test8 intentionally does **not** cache parsed level/editor objects. Those objects are mutable and caching them across edits could return stale or corrupt data. It accelerates the APK/resource source path instead, which also benefits first-open menus and textures.
-
-See `DYNARMICTEST8-NOTES.md` for technical details.
+`game.apk`, Dynarmic build files, zlib, stb_vorbis, licenses, and all source dependencies are included. No cleanup step removes the APK or required source trees.

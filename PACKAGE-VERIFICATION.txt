@@ -1,43 +1,26 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest8
-Package verification
+Geometry Dash ARM Wrapper 0.9.4-arm-dynarmictest9
 
-Base used:
-  GeometryDashArmWrapper-0.9.4-arm-dynarmictest7-full-source.zip
-  Base source files preserved: 1118/1118
-  New Test8 documentation files: 2
+Base package:
+  GeometryDashArmWrapper-0.9.4-arm-dynarmictest8-full-source.zip
 
-Preservation checks:
-  game.apk: present
-  game.apk bytes: 24704408
+Preservation:
+  Test8 files: 1120
+  Missing Test8 files: 0
+  New Test9 files: 2
+  Final source files: 1122
+  game.apk: byte-identical to Test8
   game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
-  total source-package files before ZIP: 1120
-  missing Test7 files: 0
-  src files: preserved
-  third_party files: preserved
-  tools files: preserved
-  patches files: preserved
-  BUILD_DYNARMIC_X64.cmd: present
-  build-dynarmic-x64.ps1: present
-  dynarmic-x64/CMakeLists.txt: present
-
-Test8 changes:
-  - read-only game.apk opens use the wrapper's existing immutable APK byte vector
-  - per-handle APK memory seek/tell/read position
-  - direct guest-memory fread/fwrite without a temporary vector per call
-  - early hot import paths for ZIP/level parsing libc calls
-  - sampled normal import-history logging, while fatal calls remain fully recorded
-  - slow native guest-call timing lines for callbacks taking at least 250 ms
-  - guest terminateProcess requests clean render-loop and Win32 window shutdown
-  - Android IME state suppresses gameplay Space while preserving typed spaces
-  - Test8 build/version/output naming and documentation
 
 Validation performed:
-  - C++20 syntax check against a minimal Dynarmic A32 API stub
-  - warning-enabled C++ syntax check (only two pre-existing unused OpenGL state fields)
-  - C11 syntax checks for APK audio extraction and embedded-effect stub
-  - Test7-to-Test8 source-file preservation comparison
-  - APK size/hash verification
-  - package path/name audit for current Test8 build markers
+  - C++20 non-Windows syntax validation with warnings treated as errors
+  - cocos2d ZIP hook symbols verified in libgame.so
+  - both hook targets verified to be 4-byte aligned Thumb functions
+  - APK central-directory entries and CRC values checked
+  - source audit confirmed socket imports are no longer blanket failure stubs
+  - CMake audit confirmed ws2_32 linkage
+  - source/package path audit for DynarmicTest9 naming and result markers
+  - final ZIP integrity and SHA-256 verification
 
-A complete Windows/Dynarmic executable was not built in this Linux packaging environment.
-Run BUILD_DYNARMIC_X64.cmd on 64-bit Windows.
+Important limitation:
+  The full Windows Dynarmic executable was not compiled in this Linux packaging environment.
+  The Winsock/CCHttp path is experimental and requires runtime testing on Windows.
