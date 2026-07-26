@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup2"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup3"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder13-v22beta-armv7-bringup2-monitor-dual-apk"
+$BuilderRevision = "dynarmic-x64-builder14-v22beta-armv7-bringup3-exclusive-memory"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -435,18 +435,18 @@ if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK or libcocos2dcpp.so not
 $InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
 $PackagedInputName = if ($InputExtension -eq ".so") { "libcocos2dcpp.so" } else { "game-v22beta-selected.apk" }
 Copy-Item -Force $ResolvedApk (Join-Path $Output $PackagedInputName)
-$RootNewerApk = Join-Path $Root "game-v22beta.apk"
-$RootEarlierApk = Join-Path $Root "game-v22beta1.apk"
-if (Test-Path $RootNewerApk) { Copy-Item -Force $RootNewerApk (Join-Path $Output "game-v22beta.apk") }
-if (Test-Path $RootEarlierApk) { Copy-Item -Force $RootEarlierApk (Join-Path $Output "game-v22beta1.apk") }
+# Source packages intentionally contain no APKs. An APK passed explicitly to
+# BUILD_V22BETA_X64.cmd is copied only into the generated dist directory as
+# game-v22beta-selected.apk. The named newer/earlier launchers remain available
+# for users who manually place those files beside the built executable.
 $RootRawSo = Join-Path $Root "libcocos2dcpp.so"
 if (Test-Path $RootRawSo) { Copy-Item -Force $RootRawSo (Join-Path $Output "libcocos2dcpp.so") }
 $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "V22BETA-BRINGUP2-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP2-NOTES.md") }
+$V22Notes = Join-Path $Root "V22BETA-BRINGUP3-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP3-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
 
 $RawProbeLauncher = @'
@@ -467,6 +467,25 @@ pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_V22_RAW_SO_PROBE.cmd"), $RawProbeLauncher, [Text.Encoding]::ASCII)
+$SelectedLauncher = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist game-v22beta-selected.apk (
+  echo game-v22beta-selected.apk is missing.
+  echo Rebuild with: BUILD_V22BETA_X64.cmd "D:\path\to\beta.apk"
+  pause
+  exit /b 2
+)
+GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --debug-everything --dump-imports=gd-v22beta-selected-imports.txt --log=gd-v22beta-selected.log --profile=gd-v22beta-selected-profile.csv --profile-summary=gd-v22beta-selected-profile-summary.txt
+set "RESULT=%ERRORLEVEL%"
+echo.
+echo Main log: gd-v22beta-selected.log
+echo Imports: gd-v22beta-selected-imports.txt
+pause
+exit /b %RESULT%
+'@
+[IO.File]::WriteAllText((Join-Path $Output "RUN_V22_SELECTED_APK.cmd"), $SelectedLauncher, [Text.Encoding]::ASCII)
 $NewerLauncher = @'
 @echo off
 setlocal
@@ -509,4 +528,4 @@ exit /b %RESULT%
 Write-Host "`nDynarmic x64 2.2 beta ARMv7 bring-up branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Raw .so: RUN_V22_RAW_SO_PROBE.cmd"
-Write-Host "Newer APK: RUN_V22_NEWER_APK.cmd`nEarlier APK: RUN_V22_EARLIER_APK.cmd"
+Write-Host "Selected APK: RUN_V22_SELECTED_APK.cmd`nNewer/earlier named APK launchers are also included."

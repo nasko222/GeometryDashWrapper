@@ -783,6 +783,22 @@ public:
         WriteTyped(vaddr, value);
     }
 
+    bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
     void InterpreterFallback(u32 pc, std::size_t count) override {
         interpreter_fallback = true;
         fallback_pc = pc;
@@ -916,6 +932,21 @@ private:
         }
         std::memcpy(region->data.data() + (address - region->base), &value,
                     sizeof(value));
+    }
+
+    template <typename T>
+    bool CompareExchangeTyped(u32 address, T value, T expected) {
+        MemoryRegion* region = FindMutable(address, sizeof(T));
+        if (!region) {
+            WriteFault(address);
+            return false;
+        }
+        T current{};
+        u8* const bytes = region->data.data() + (address - region->base);
+        std::memcpy(&current, bytes, sizeof(current));
+        if (current != expected) return false;
+        std::memcpy(bytes, &value, sizeof(value));
+        return true;
     }
 
     std::vector<MemoryRegion> regions_;
@@ -1102,17 +1133,17 @@ static void InstallThumbAbsoluteImportHookPreservingArguments(
     ProbeEnvironment& env, const ElfRuntime& runtime, const SymbolRecord& symbol,
     u16 expected_first_halfword, u32 destination) {
     if ((symbol.address & 1u) == 0u)
-        throw std::runtime_error("ZIP hook symbol is not marked as Thumb: " + symbol.name);
+        throw std::runtime_error("hook symbol is not marked as Thumb: " + symbol.name);
     if (symbol.size < 8u)
-        throw std::runtime_error("ZIP hook symbol is too small: " + symbol.name);
+        throw std::runtime_error("hook symbol is too small: " + symbol.name);
     const u32 address = symbol.address & ~1u;
     if ((address & 3u) != 0u || address < runtime.image_min ||
         address > runtime.image_max - 8u)
-        throw std::runtime_error("ZIP hook target is outside the executable image: " + symbol.name);
+        throw std::runtime_error("hook target is outside the executable image: " + symbol.name);
     const u16 original = env.MemoryRead16(address);
     if (original != expected_first_halfword) {
         std::ostringstream error;
-        error << "ZIP hook prologue mismatch for " << symbol.name
+        error << "hook prologue mismatch for " << symbol.name
               << ": expected 0x" << std::hex << expected_first_halfword
               << " got 0x" << original;
         throw std::runtime_error(error.str());
@@ -1155,9 +1186,21 @@ static std::size_t InstallCcApplicationOpenUrlHook(ElfRuntime& runtime, ProbeEnv
     if (!target) return 0u;
     const u32 destination = EnsureImport(runtime, env, "__dynarmic_ccapplication_openURL");
     // CCApplication::openURL(this, url): R0 is `this`, R1 is the URL. The
-    // absolute hook uses R0 as scratch, preserving the URL in R1.
+    // two supplied 2.2 betas use different valid compiler prologues:
+    // newer push {r4,r5,lr} (0xB530), earlier push {r0-r4,lr} (0xB51F).
+    // Validate against those exact known forms, then reuse the common absolute
+    // trampoline, which only needs eight writable bytes at the function entry.
+    const u32 address = target->address & ~1u;
+    const u16 prologue = env.MemoryRead16(address);
+    if (prologue != 0xB530u && prologue != 0xB51Fu) {
+        std::ostringstream error;
+        error << "hook prologue mismatch for " << target->name
+              << ": expected 0xb530 or 0xb51f got 0x" << std::hex
+              << prologue;
+        throw std::runtime_error(error.str());
+    }
     InstallThumbAbsoluteImportHookPreservingArguments(
-        env, runtime, *target, 0xB530u, destination);
+        env, runtime, *target, prologue, destination);
     return 1u;
 }
 
@@ -1488,7 +1531,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup2Window";
+        const char* class_name = "GeometryDashV22BetaBringup3Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1909,6 +1952,7 @@ public:
           cpu_(MakeConfig(env, global_monitor_)) {
         env_.AttachCpu(&cpu_);
         log_ << "RESULT: DYNARMIC_GLOBAL_MONITOR_READY processors=1 processor_id=0\n";
+        log_ << "RESULT: DYNARMIC_EXCLUSIVE_MEMORY_READY widths=8,16,32,64 compare_exchange=1\n";
         InitializeControlTraps();
         heap_cursor_ = kHeapBase + 0x1000u;
         errno_address_ = kObjectBase + kObjectRegionSize - 0x1000u;
@@ -6311,6 +6355,41 @@ static void RunArmv7FeatureSmoke() {
               << " r2=0x" << cpu.Regs()[2] << " r3=0x" << cpu.Regs()[3];
         throw std::runtime_error(error.str());
     }
+
+    // Constructor 1 in both beta families uses this same atomic increment
+    // shape. The previous branch provided a global monitor but omitted the
+    // callbacks which perform the monitored compare-and-write, causing every
+    // STREX to fail forever.
+    static constexpr std::array<u8, 16> exclusive_code = {
+        0x50,0xE8,0x00,0x1F, // ldrex r1, [r0]
+        0x01,0x31,           // adds  r1, #1
+        0x40,0xE8,0x00,0x12, // strex r2, r1, [r0]
+        0x00,0x2A,           // cmp   r2, #0
+        0xFB,0xD1,           // bne   strex
+        0xFE,0xE7            // b     .
+    };
+    constexpr u32 exclusive_pc = kSmokeBase + 0x100u;
+    constexpr u32 exclusive_data = kSmokeBase + 0x200u;
+    if (!env.WriteBytes(exclusive_pc, exclusive_code.data(),
+                        exclusive_code.size()))
+        throw std::runtime_error("could not write ARMv7 exclusive smoke code");
+    env.MemoryWrite32(exclusive_data, 41u);
+    env.ResetStopState();
+    cpu.Regs().fill(0);
+    cpu.Regs()[0] = exclusive_data;
+    cpu.Regs()[15] = exclusive_pc;
+    cpu.SetCpsr(0x30u);
+    env.ticks_left = 32u;
+    cpu.Run();
+    if (env.invalid_access || env.interpreter_fallback || env.exception_seen ||
+        env.MemoryRead32(exclusive_data) != 42u || cpu.Regs()[1] != 42u ||
+        cpu.Regs()[2] != 0u) {
+        std::ostringstream error;
+        error << "Dynarmic ARMv7 exclusive smoke failed value=" << std::dec
+              << env.MemoryRead32(exclusive_data) << " r1=" << cpu.Regs()[1]
+              << " strex_status=" << cpu.Regs()[2];
+        throw std::runtime_error(error.str());
+    }
 }
 
 
@@ -6392,7 +6471,7 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup2");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup3");
         emit("Milestone: ARMv7 global exclusive monitor, dual-beta APK bring-up, FMOD stream-buffer compatibility, and startup music pre-cache");
         emit("Log file: " + log_path);
         if (profile_enabled) {
@@ -6405,15 +6484,15 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup2 must be compiled as a 64-bit executable");
+                "V22BetaBringup3 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
-            emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 guest=v7A host=x86_64");
+            emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
         } else {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP3_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -6867,7 +6946,7 @@ int main(int argc,char** argv) {
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP1_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP3_FAILED");
         return 1;
     }
 }

@@ -1,10 +1,4 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup2
-C++20 syntax check: PASS (portable Dynarmic API stub)
-Dynarmic global monitor wired into ARMv7 smoke and runtime JIT: YES
-Newer APK constructors: 349
-Earlier APK constructors: 327
-Newer APK SHA-256: b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1
-Earlier APK SHA-256: 4380274db86cba17884a1a4c928cf9fc643747d027cf08e99b158dbeb1e43ddf
-Raw SO SHA-256: c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
-Historical changelog pile removed by user request
-Windows compile/runtime test: NOT PERFORMED in Linux
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup3
+Source policy: APK-free
+Primary fixes: A32 exclusive write callbacks; dual openURL prologues
+Input raw library: libcocos2dcpp.so
