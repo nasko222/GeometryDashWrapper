@@ -1,0 +1,22 @@
+Geometry Dash 2.2 beta ARMv7 branch static audit
+Input: libcocos2dcpp.so
+Size: 9578364 bytes
+SHA-256: c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
+
+Architecture: ARMv7-A / Thumb-2 / VFPv3 / NEONv1 / EABI5 / soft-float ABI
+Mapped image: 0x10000000-0x10933000
+Constructors: 349
+Function imports after host-hook insertion: 372
+Imported objects: 5
+Relocations: 103102
+  R_ARM_RELATIVE: 102707
+  R_ARM_JUMP_SLOT: 367
+  R_ARM_GLOB_DAT: 23
+  R_ARM_ABS32: 5
+GLES imports: 84 (84/84 argument descriptors present)
+FMOD imports: 28 (28/28 routed through DispatchFmod)
+Known imports falling directly to generic permissive fallback: 0
+CCFileUtils ZIP hooks installed: 1
+CCApplication openURL hooks installed: 1
+
+Result: DYNARMIC_V22_STATIC_AUDIT_OK

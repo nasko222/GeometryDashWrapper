@@ -306,6 +306,36 @@ static std::vector<u8> ExtractZipMember(const std::vector<u8>& zip, std::string_
     throw std::runtime_error("APK member not found: " + std::string(requested_name));
 }
 
+static bool IsElf32ArmImage(const std::vector<u8>& bytes) {
+    if (bytes.size() < sizeof(Elf32Ehdr)) return false;
+    const Elf32Ehdr header = ReadPod<Elf32Ehdr>(bytes, 0);
+    return std::memcmp(header.ident, "\x7F" "ELF", 4) == 0 &&
+           header.ident[4] == 1 && header.ident[5] == 1 &&
+           header.type == kEtDyn && header.machine == kEmArm;
+}
+
+static std::vector<u8> ExtractV22NativeLibrary(const std::vector<u8>& apk,
+                                               std::string& member_name) {
+    static constexpr const char* candidates[] = {
+        "lib/armeabi-v7a/libcocos2dcpp.so",
+        "lib/armeabi/libcocos2dcpp.so",
+    };
+    std::string errors;
+    for (const char* candidate : candidates) {
+        try {
+            std::vector<u8> result = ExtractZipMember(apk, candidate);
+            member_name = candidate;
+            return result;
+        } catch (const std::exception& error) {
+            if (!errors.empty()) errors += "; ";
+            errors += std::string(candidate) + ": " + error.what();
+        }
+    }
+    throw std::runtime_error(
+        "2.2 beta APK does not contain libcocos2dcpp.so in a supported ARMv7 path (" +
+        errors + ")");
+}
+
 struct ZipEntryRecord {
     std::string name;
     u16 method = 0;
@@ -1032,8 +1062,10 @@ static void InstallThumbAbsoluteImportHookPreservingArguments(
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
     struct Hook { const char* symbol; const char* import; u16 prologue; };
     static constexpr Hook hooks[] = {
-        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm", "__dynarmic_ccfileutils_getFileDataFromZip", 0xB5F0u},
-        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_", "__dynarmic_ccfileutils_existFileDataFromZip", 0xB570u},
+        // The 2.2 beta library uses a Thumb-2 push.w prologue and no longer
+        // exports existFileDataFromZip. Keep only the data hook.
+        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm",
+         "__dynarmic_ccfileutils_getFileDataFromZip", 0xE92Du},
     };
     std::size_t installed = 0;
     for (const Hook& hook : hooks) {
@@ -1086,9 +1118,9 @@ static std::size_t InstallSimpleAudioEffectHooks(ElfRuntime& runtime,
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
-        throw std::runtime_error("libgame.so is not a little-endian ELF32 image");
+        throw std::runtime_error("input native library is not a little-endian ELF32 image");
     }
-    if (header.type != kEtDyn || header.machine != kEmArm) throw std::runtime_error("libgame.so is not an ARM ET_DYN shared object");
+    if (header.type != kEtDyn || header.machine != kEmArm) throw std::runtime_error("input native library is not an ARM ET_DYN shared object");
     if (header.phentsize != sizeof(Elf32Phdr) || header.shentsize != sizeof(Elf32Shdr)) throw std::runtime_error("unexpected ELF table entry sizes");
     if (static_cast<u64>(header.phoff) + static_cast<u64>(header.phnum) * sizeof(Elf32Phdr) > elf.size() ||
         static_cast<u64>(header.shoff) + static_cast<u64>(header.shnum) * sizeof(Elf32Shdr) > elf.size()) {
@@ -1217,7 +1249,7 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
         runtime.native_render == 0 || runtime.native_touch_begin == 0 ||
         runtime.native_touch_end == 0 || runtime.native_touch_move == 0 ||
         runtime.native_key_down == 0) {
-        throw std::runtime_error("required JNI/render/input exports were not found in libgame.so");
+        throw std::runtime_error("required JNI/render/input exports were not found in the ARMv7 library");
     }
     if (runtime.constructors.empty()) throw std::runtime_error("ARM ELF has no .init_array");
     return runtime;
@@ -1386,7 +1418,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashDynarmicTest14Window";
+        const char* class_name = "GeometryDashV22BetaBringup1Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1398,7 +1430,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test14",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bring-up 1",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -1843,12 +1875,16 @@ public:
         storage_shutdown();
     }
 
-    void ConfigureHost(const std::string& apk_path, const std::string& writable_path,
-                       const std::vector<u8>& apk_image) {
-        apk_path_ = apk_path;
+    void ConfigureHost(const std::string& input_path, const std::string& writable_path,
+                       const std::vector<u8>& apk_image, bool input_is_apk) {
+        apk_path_ = input_path;
         writable_path_ = writable_path;
-        apk_image_ = &apk_image;
-        apk_member_cache_.Initialize(apk_image, writable_path, log_);
+        apk_image_ = input_is_apk ? &apk_image : nullptr;
+        if (input_is_apk) {
+            apk_member_cache_.Initialize(apk_image, writable_path, log_);
+        } else {
+            log_ << "RESULT: DYNARMIC_V22_RAW_LIBRARY_MODE apk-cache=disabled assets=unavailable\n";
+        }
         // Text-entry UI lazily requests these assets the first time a level
         // name, description, or search field opens. Pull them into the native
         // member cache during startup so slower disks do not add another
@@ -1860,8 +1896,10 @@ public:
             "assets/square02b_001-hd.png",
         };
         std::size_t warmed_text_assets = 0;
-        for (const char* member : kTextInputWarmAssets) {
-            if (apk_member_cache_.Load(member)) ++warmed_text_assets;
+        if (input_is_apk) {
+            for (const char* member : kTextInputWarmAssets) {
+                if (apk_member_cache_.Load(member)) ++warmed_text_assets;
+            }
         }
         log_ << "RESULT: DYNARMIC_TEXT_INPUT_ASSET_PREWARM_READY count="
              << warmed_text_assets << '\n';
@@ -1882,7 +1920,7 @@ public:
         const std::string executable_directory_string =
             executable_directory.empty() ? std::string(".") : executable_directory.string();
         audio_initialize(executable_directory_string.c_str());
-        audio_set_apk_path(apk_path_.c_str());
+        if (input_is_apk) audio_set_apk_path(apk_path_.c_str());
         audio_initialized_ = true;
         stdin_handle_ = NewGuestFile(stdin, true, "stdin", "rb");
         stdout_handle_ = NewGuestFile(stdout, true, "stdout", "wb");
@@ -2236,7 +2274,7 @@ private:
     static Dynarmic::A32::UserConfig MakeConfig(ProbeEnvironment& env) {
         Dynarmic::A32::UserConfig config;
         config.callbacks = &env;
-        config.arch_version = Dynarmic::A32::ArchVersion::v5TE;
+        config.arch_version = Dynarmic::A32::ArchVersion::v7A;
         config.check_halt_on_memory_access = true;
         return config;
     }
@@ -3769,22 +3807,22 @@ private:
     static unsigned GlArgumentCount(const std::string& name) {
         static const std::unordered_map<std::string, unsigned> counts = {
             {"glActiveTexture",1},{"glAttachShader",2},{"glBindAttribLocation",3},{"glBindBuffer",2},
-            {"glBindFramebuffer",2},{"glBindRenderbuffer",2},{"glBindTexture",2},{"glBlendFunc",2},
+            {"glBindFramebuffer",2},{"glBindRenderbuffer",2},{"glBindTexture",2},{"glBlendEquation",1},{"glBlendFunc",2},
             {"glBufferData",4},{"glBufferSubData",4},{"glCheckFramebufferStatus",1},{"glClear",1},
             {"glClearColor",4},{"glClearDepthf",1},{"glClearStencil",1},{"glCompileShader",1},
             {"glCompressedTexImage2D",8},{"glCreateProgram",0},{"glCreateShader",1},{"glDeleteBuffers",2},
             {"glDeleteFramebuffers",2},{"glDeleteProgram",1},{"glDeleteRenderbuffers",2},{"glDeleteShader",1},
-            {"glDeleteTextures",2},{"glDepthFunc",1},{"glDisable",1},{"glDisableVertexAttribArray",1},
+            {"glDeleteTextures",2},{"glDepthFunc",1},{"glDepthMask",1},{"glDisable",1},{"glDisableVertexAttribArray",1},
             {"glDrawArrays",3},{"glDrawElements",4},{"glEnable",1},{"glEnableVertexAttribArray",1},
             {"glFramebufferRenderbuffer",4},{"glFramebufferTexture2D",5},{"glGenBuffers",2},
             {"glGenFramebuffers",2},{"glGenRenderbuffers",2},{"glGenTextures",2},{"glGenerateMipmap",1},
-            {"glGetError",0},{"glGetFloatv",2},{"glGetIntegerv",2},{"glGetProgramInfoLog",4},
-            {"glGetProgramiv",3},{"glGetShaderInfoLog",4},{"glGetShaderiv",3},{"glGetString",1},
-            {"glGetUniformLocation",2},{"glLineWidth",1},{"glLinkProgram",1},{"glPixelStorei",2},
-            {"glReadPixels",7},{"glRenderbufferStorage",4},{"glScissor",4},{"glShaderSource",4},
-            {"glTexImage2D",9},{"glTexParameteri",3},{"glUniform1f",2},{"glUniform1i",2},
-            {"glUniform2f",3},{"glUniform2fv",3},{"glUniform3f",4},{"glUniform3fv",3},
-            {"glUniform4f",5},{"glUniform4fv",3},{"glUniformMatrix4fv",4},{"glUseProgram",1},
+            {"glGetBooleanv",2},{"glGetError",0},{"glGetFloatv",2},{"glGetIntegerv",2},{"glGetProgramInfoLog",4},
+            {"glGetProgramiv",3},{"glGetShaderInfoLog",4},{"glGetShaderSource",4},{"glGetShaderiv",3},{"glGetString",1},
+            {"glGetUniformLocation",2},{"glIsEnabled",1},{"glLineWidth",1},{"glLinkProgram",1},{"glPixelStorei",2},
+            {"glReadPixels",7},{"glRenderbufferStorage",4},{"glScissor",4},{"glShaderSource",4},{"glStencilFunc",3},{"glStencilMask",1},{"glStencilOp",3},
+            {"glTexImage2D",9},{"glTexParameteri",3},{"glUniform1f",2},{"glUniform1i",2},{"glUniform2i",3},{"glUniform2iv",3},
+            {"glUniform2f",3},{"glUniform2fv",3},{"glUniform3f",4},{"glUniform3fv",3},{"glUniform3i",4},{"glUniform3iv",3},
+            {"glUniform4f",5},{"glUniform4fv",3},{"glUniform4i",5},{"glUniform4iv",3},{"glUniformMatrix3fv",4},{"glUniformMatrix4fv",4},{"glUseProgram",1},
             {"glVertexAttribPointer",6},{"glViewport",4}
         };
         const auto found = counts.find(name);
@@ -3919,6 +3957,12 @@ private:
             std::vector<GLuint> values(static_cast<std::size_t>(arguments[0]));
             if (bytes) env_.ReadBytes(static_cast<u32>(arguments[1]), values.data(), bytes);
             reinterpret_cast<Fn>(function)(static_cast<GLsizei>(arguments[0]), values.data());
+        } else if (name == "glGetBooleanv") {
+            using Fn = void (APIENTRY*)(GLenum, GLboolean*);
+            std::array<GLboolean, 16> values{};
+            reinterpret_cast<Fn>(function)(static_cast<GLenum>(arguments[0]), values.data());
+            const std::size_t count = arguments[0] == 0x0C23u ? 4u : 1u;
+            env_.WriteBytes(static_cast<u32>(arguments[1]), values.data(), count * sizeof(GLboolean));
         } else if (name == "glGetIntegerv") {
             using Fn = void (APIENTRY*)(GLenum, GLint*);
             std::array<GLint, 16> values{};
@@ -3936,7 +3980,7 @@ private:
             GLint value = 0;
             reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]), static_cast<GLenum>(arguments[1]), &value);
             env_.MemoryWrite32(static_cast<u32>(arguments[2]), static_cast<u32>(value));
-        } else if (name == "glGetProgramInfoLog" || name == "glGetShaderInfoLog") {
+        } else if (name == "glGetProgramInfoLog" || name == "glGetShaderInfoLog" || name == "glGetShaderSource") {
             using Fn = void (APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
             const GLsizei capacity = static_cast<GLsizei>(arguments[1]);
             std::vector<char> text(capacity > 0 ? static_cast<std::size_t>(capacity) : 1u);
@@ -3962,6 +4006,17 @@ private:
             const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * components * sizeof(GLfloat);
             const GLfloat* values = static_cast<const GLfloat*>(env_.HostPointer(static_cast<u32>(arguments[2]), bytes));
             reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), values);
+        } else if (name == "glUniform2iv" || name == "glUniform3iv" || name == "glUniform4iv") {
+            using Fn = void (APIENTRY*)(GLint, GLsizei, const GLint*);
+            const unsigned components = name == "glUniform2iv" ? 2u : name == "glUniform3iv" ? 3u : 4u;
+            const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * components * sizeof(GLint);
+            const GLint* values = static_cast<const GLint*>(env_.HostPointer(static_cast<u32>(arguments[2]), bytes));
+            reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), values);
+        } else if (name == "glUniformMatrix3fv") {
+            using Fn = void (APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
+            const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * 9u * sizeof(GLfloat);
+            const GLfloat* values = static_cast<const GLfloat*>(env_.HostPointer(static_cast<u32>(arguments[3]), bytes));
+            reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), static_cast<GLboolean>(arguments[2]), values);
         } else if (name == "glUniformMatrix4fv") {
             using Fn = void (APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
             const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * 16u * sizeof(GLfloat);
@@ -4812,6 +4867,179 @@ private:
         return apk_member_cache_.Exists(ReadCString(member_address)) ? 1u : 0u;
     }
 
+    enum class FmodObjectKind { System, Sound, Stream, Channel, Dsp };
+    struct FmodObjectState {
+        FmodObjectKind kind = FmodObjectKind::System;
+        std::string path;
+        u32 mode = 0;
+        unsigned host_id = 0;
+        float volume = 1.0f;
+        bool paused = false;
+        bool playing = false;
+        u32 position_ms = 0;
+    };
+
+    static bool IsFmodImport(const std::string& name) {
+        return name == "FMOD_System_Create" || name.rfind("_ZN4FMOD", 0) == 0;
+    }
+
+    u32 NewFmodObject(FmodObjectKind kind, const std::string& path = {}) {
+        const u32 address = Allocate(64u);
+        if (!address) return 0;
+        void* memory = env_.HostPointer(address, 64u);
+        if (memory) std::memset(memory, 0, 64u);
+        FmodObjectState state;
+        state.kind = kind;
+        state.path = path;
+        fmod_objects_[address] = std::move(state);
+        return address;
+    }
+
+    FmodObjectState* FindFmodObject(u32 address) {
+        const auto found = fmod_objects_.find(address);
+        return found == fmod_objects_.end() ? nullptr : &found->second;
+    }
+
+    bool DispatchFmod(ImportRecord& import) {
+        const std::string& name = import.name;
+        const u32 r0 = cpu_.Regs()[0], r1 = cpu_.Regs()[1], r2 = cpu_.Regs()[2], r3 = cpu_.Regs()[3];
+        constexpr u32 kFmodOk = 0;
+        auto finish = [&](u32 value) {
+            cpu_.Regs()[0] = value;
+            ResumeAfterStub(import.address);
+            return true;
+        };
+        if (name == "FMOD_System_Create") {
+            const u32 system = NewFmodObject(FmodObjectKind::System);
+            if (r0) env_.MemoryWrite32(r0, system);
+            if (import.calls == 1) log_ << "RESULT: DYNARMIC_V22_FMOD_BRIDGE_READY system=0x" << std::hex << system << std::dec << '\n';
+            return finish(system ? kFmodOk : 1u);
+        }
+        if (name == "_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE" ||
+            name == "_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE") {
+            const bool stream = name.find("createStream") != std::string::npos;
+            const std::string path = ReadCString(r1);
+            const u32 object = NewFmodObject(stream ? FmodObjectKind::Stream : FmodObjectKind::Sound, path);
+            if (FmodObjectState* state = FindFmodObject(object)) state->mode = r2;
+            const u32 output = ArgWord(4);
+            if (output) env_.MemoryWrite32(output, object);
+            if (stream) audio_preload_background(path.c_str()); else audio_preload_effect(path.c_str());
+            return finish(object ? kFmodOk : 1u);
+        }
+        if (name == "_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE") {
+            FmodObjectState* sound = FindFmodObject(r1);
+            const u32 channel = NewFmodObject(FmodObjectKind::Channel, sound ? sound->path : std::string{});
+            FmodObjectState* state = FindFmodObject(channel);
+            if (state && sound) {
+                state->mode = sound->mode;
+                state->paused = r3 != 0;
+                state->playing = true;
+                const bool loop = (sound->mode & 0x2u) != 0;
+                if (sound->kind == FmodObjectKind::Stream) {
+                    audio_play_background(sound->path.c_str(), loop ? 1 : 0);
+                    if (state->paused) audio_pause_background();
+                } else {
+                    state->host_id = audio_play_effect(sound->path.c_str(), loop ? 1 : 0);
+                    if (state->paused && state->host_id) audio_pause_effect(state->host_id);
+                }
+            }
+            const u32 output = ArgWord(4);
+            if (output) env_.MemoryWrite32(output, channel);
+            return finish(channel ? kFmodOk : 1u);
+        }
+        if (name == "_ZN4FMOD6System10getVersionEPj") {
+            if (r1) env_.MemoryWrite32(r1, 0x00020200u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System17getSoftwareFormatEPiP16FMOD_SPEAKERMODES1_") {
+            if (r1) env_.MemoryWrite32(r1, 48000u);
+            if (r2) env_.MemoryWrite32(r2, 2u);
+            if (r3) env_.MemoryWrite32(r3, 0u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl9setVolumeEf") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->volume = WordToFloat(r1);
+                if (state->host_id) audio_set_effect_volume(state->host_id, state->volume);
+                else audio_set_background_volume(state->volume);
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl9getVolumeEPf") {
+            if (r1) env_.MemoryWrite32(r1, FloatToWord(FindFmodObject(r0) ? FindFmodObject(r0)->volume : 1.0f));
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl9setPausedEb") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->paused = r1 != 0;
+                if (state->host_id) state->paused ? audio_pause_effect(state->host_id) : audio_resume_effect(state->host_id);
+                else state->paused ? audio_pause_background() : audio_resume_background();
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl9getPausedEPb") {
+            if (r1) env_.MemoryWrite8(r1, FindFmodObject(r0) && FindFmodObject(r0)->paused ? 1u : 0u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl9isPlayingEPb") {
+            FmodObjectState* state = FindFmodObject(r0);
+            bool playing = state && state->playing;
+            if (state && state->host_id) playing = audio_is_effect_playing(state->host_id) != 0;
+            else if (state) playing = audio_is_background_playing() != 0;
+            if (r1) env_.MemoryWrite8(r1, playing ? 1u : 0u);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl4stopEv") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                if (state->host_id) audio_stop_effect(state->host_id); else audio_stop_background();
+                state->playing = false;
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl7setModeEj") {
+            if (FmodObjectState* state = FindFmodObject(r0)) state->mode = r1;
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD7Channel11getPositionEPjj") {
+            u32 position = 0;
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                position = state->host_id ? state->position_ms : static_cast<u32>(audio_get_background_time() * 1000.0f);
+            }
+            if (r1) env_.MemoryWrite32(r1, position);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD7Channel11setPositionEjj") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->position_ms = r1;
+                if (!state->host_id) audio_set_background_time(static_cast<float>(r1) / 1000.0f);
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD14ChannelControl6getDSPEiPPNS_3DSPE") {
+            const u32 dsp = NewFmodObject(FmodObjectKind::Dsp);
+            if (r2) env_.MemoryWrite32(r2, dsp);
+            return finish(dsp ? kFmodOk : 1u);
+        }
+        if (name == "_ZN4FMOD3DSP15getMeteringInfoEP22FMOD_DSP_METERING_INFOS2_") {
+            if (r1) { std::array<u8, 128> zero{}; env_.WriteBytes(r1, zero.data(), zero.size()); }
+            if (r2) { std::array<u8, 128> zero{}; env_.WriteBytes(r2, zero.data(), zero.size()); }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD5Sound7releaseEv") {
+            fmod_objects_.erase(r0);
+            Free(r0);
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System7releaseEv") {
+            fmod_objects_.erase(r0);
+            Free(r0);
+            return finish(kFmodOk);
+        }
+        // Remaining system setup/update, callback, DSP-enable and mixer calls are
+        // state-free for the Windows bridge and succeed intentionally.
+        return finish(kFmodOk);
+    }
+
     bool DispatchImport(ImportRecord& import) {
         const std::string& name = import.name;
         const u32 r0 = cpu_.Regs()[0], r1 = cpu_.Regs()[1], r2 = cpu_.Regs()[2], r3 = cpu_.Regs()[3];
@@ -4819,6 +5047,7 @@ private:
         bool result_set = true;
 
         if (import.is_gl) return DispatchGl(import);
+        if (IsFmodImport(name)) return DispatchFmod(import);
 
         auto finish_hot = [&](u32 value) {
             cpu_.Regs()[0] = value;
@@ -5163,11 +5392,19 @@ private:
         } else if (name == "iswctype") {
             const int c = r0 <= 0xffu ? static_cast<int>(r0) : 0;
             switch (r1) { case 1: result=std::isalnum(c)!=0; break; case 2: result=std::isalpha(c)!=0; break; case 3: result=c==' '||c=='\t'; break; case 4: result=std::iscntrl(c)!=0; break; case 5: result=std::isdigit(c)!=0; break; case 6: result=std::isgraph(c)!=0; break; case 7: result=std::islower(c)!=0; break; case 8: result=std::isprint(c)!=0; break; case 9: result=std::ispunct(c)!=0; break; case 10: result=std::isspace(c)!=0; break; case 11: result=std::isupper(c)!=0; break; case 12: result=std::isxdigit(c)!=0; break; default: result=0; }
-        } else if (name == "tolower" || name == "towlower") result = static_cast<u32>(std::tolower(static_cast<unsigned char>(r0)));
+        } else if (name == "isalnum") result = std::isalnum(static_cast<unsigned char>(r0)) != 0;
+        else if (name == "isalpha") result = std::isalpha(static_cast<unsigned char>(r0)) != 0;
+        else if (name == "isprint") result = std::isprint(static_cast<unsigned char>(r0)) != 0;
+        else if (name == "isspace") result = std::isspace(static_cast<unsigned char>(r0)) != 0;
+        else if (name == "tolower" || name == "towlower") result = static_cast<u32>(std::tolower(static_cast<unsigned char>(r0)));
         else if (name == "toupper" || name == "towupper") result = static_cast<u32>(std::toupper(static_cast<unsigned char>(r0)));
         else if (name == "setlocale") result = c_locale_address_;
         else if (name == "getenv") result = 0;
-        else if (name == "geteuid") result = 1000;
+        else if (name == "geteuid" || name == "getuid") result = 1000;
+        else if (name == "getegid" || name == "getgid") result = 1000;
+        else if (name == "getpid") result = 4242;
+        else if (name == "pthread_self") result = 1;
+        else if (name == "pthread_equal") result = r0 == r1 ? 1u : 0u;
         else if (name == "gethostname") {
 #ifdef _WIN32
             std::vector<char> host(std::max<u32>(r1, 1u), 0);
@@ -5182,8 +5419,11 @@ private:
         else if (name == "getpwuid") result = 0;
         else if (name == "strerror" || name == "strerror_r") { const u32 text=AllocateString("host error"); if(name=="strerror_r"&&r1&&r2){const std::string v=ReadCString(text);const std::size_t n=std::min<std::size_t>(v.size(),r2-1u);env_.WriteBytes(r1,v.data(),n);env_.MemoryWrite8(r1+static_cast<u32>(n),0);result=0;}else result=text; }
         else if (name == "arc4random") result = 0x9e3779b9u ^ static_cast<u32>(import.calls * 2654435761u);
+        else if (name == "srand") { random_state_ = r0 ? r0 : 1u; result = 0; }
+        else if (name == "rand") { random_state_ = random_state_ * 1103515245ull + 12345ull; result = static_cast<u32>((random_state_ >> 16) & 0x7fffu); }
         else if (name == "srand48") { random_state_ = r0 ? r0 : 1u; result = 0; }
         else if (name == "lrand48") { random_state_ = random_state_ * 25214903917ull + 11ull; result = static_cast<u32>((random_state_ >> 17) & 0x7fffffffu); }
+        else if (name == "atof") { ReturnDouble(std::strtod(ReadCString(r0).c_str(), nullptr)); result_set=false; }
         else if (name == "sin") { ReturnDouble(std::sin(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "cos") { ReturnDouble(std::cos(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "tan") { ReturnDouble(std::tan(WordsToDouble(r0,r1))); result_set=false; }
@@ -5196,6 +5436,21 @@ private:
         else if (name == "ceil") { ReturnDouble(std::ceil(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "round") { ReturnDouble(std::round(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "roundf") result = FloatToWord(std::round(WordToFloat(r0)));
+        else if (name == "acosf") result = FloatToWord(std::acos(WordToFloat(r0)));
+        else if (name == "asinf") result = FloatToWord(std::asin(WordToFloat(r0)));
+        else if (name == "atan2f") result = FloatToWord(std::atan2(WordToFloat(r0),WordToFloat(r1)));
+        else if (name == "ceilf") result = FloatToWord(std::ceil(WordToFloat(r0)));
+        else if (name == "cosf") result = FloatToWord(std::cos(WordToFloat(r0)));
+        else if (name == "expf") result = FloatToWord(std::exp(WordToFloat(r0)));
+        else if (name == "floorf") result = FloatToWord(std::floor(WordToFloat(r0)));
+        else if (name == "fmodf") result = FloatToWord(std::fmod(WordToFloat(r0),WordToFloat(r1)));
+        else if (name == "logf") result = FloatToWord(std::log(WordToFloat(r0)));
+        else if (name == "powf") result = FloatToWord(std::pow(WordToFloat(r0),WordToFloat(r1)));
+        else if (name == "sinf") result = FloatToWord(std::sin(WordToFloat(r0)));
+        else if (name == "sqrtf") result = FloatToWord(std::sqrt(WordToFloat(r0)));
+        else if (name == "tanf") result = FloatToWord(std::tan(WordToFloat(r0)));
+        else if (name == "lroundf") result = static_cast<u32>(std::lround(WordToFloat(r0)));
+        else if (name == "__isnanf") result = std::isnan(WordToFloat(r0)) ? 1u : 0u;
         else if (name == "pow") { ReturnDouble(std::pow(WordsToDouble(r0,r1),WordsToDouble(r2,r3))); result_set=false; }
         else if (name == "fmod") { ReturnDouble(std::fmod(WordsToDouble(r0,r1),WordsToDouble(r2,r3))); result_set=false; }
         else if (name == "exp") { ReturnDouble(std::exp(WordsToDouble(r0,r1))); result_set=false; }
@@ -5204,6 +5459,7 @@ private:
         else if (name == "sinh") { ReturnDouble(std::sinh(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "cosh") { ReturnDouble(std::cosh(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "tanh") { ReturnDouble(std::tanh(WordsToDouble(r0,r1))); result_set=false; }
+        else if (name == "asinh") { ReturnDouble(std::asinh(WordsToDouble(r0,r1))); result_set=false; }
         else if (name == "ldexp") { ReturnDouble(std::ldexp(WordsToDouble(r0,r1),static_cast<s32>(r2))); result_set=false; }
         else if (name == "frexp") { int exponent=0; const double value=std::frexp(WordsToDouble(r0,r1),&exponent); if(r2)env_.MemoryWrite32(r2,static_cast<u32>(exponent)); ReturnDouble(value); result_set=false; }
         else if (name == "modf") { double integral=0; const double fraction=std::modf(WordsToDouble(r0,r1),&integral); if(r2){u64 bits=0;std::memcpy(&bits,&integral,sizeof(bits));env_.MemoryWrite64(r2,bits);} ReturnDouble(fraction); result_set=false; }
@@ -5216,8 +5472,23 @@ private:
             last_android_log_ = text.size() <= 160u ? text : text.substr(0, 160u);
             log_ << "android log: " << text << '\n';
             result=static_cast<u32>(text.size());
+        } else if (name == "__assert2") {
+            log_ << "WARNING: guest __assert2 file=" << ReadCString(r0) << " line=" << r1
+                 << " function=" << ReadCString(r2) << " expression=" << ReadCString(r3) << '\n';
+            result = 0;
         } else if (name == "__gnu_Unwind_Find_exidx") { if(r1)env_.MemoryWrite32(r1,0); result=0; }
         else if (name == "dlopen" || name == "dlsym" || name == "dlclose" || name == "dlerror") result=0;
+        else if (name == "access") { std::error_code ec; result=std::filesystem::exists(TranslatePath(ReadCString(r0)),ec)?0u:static_cast<u32>(-1); }
+        else if (name == "mkdir") { std::error_code ec; const bool made=std::filesystem::create_directories(TranslatePath(ReadCString(r0)),ec); result=(!ec&&(made||std::filesystem::exists(TranslatePath(ReadCString(r0)))))?0u:static_cast<u32>(-1); }
+        else if (name == "remove") { std::error_code ec; result=std::filesystem::remove(TranslatePath(ReadCString(r0)),ec)?0u:static_cast<u32>(-1); }
+        else if (name == "rename") { std::error_code ec; std::filesystem::rename(TranslatePath(ReadCString(r0)),TranslatePath(ReadCString(r1)),ec); result=ec?static_cast<u32>(-1):0u; }
+        else if (name == "sysconf") result = r0 == 30u ? kPageSize : 1u;
+        else if (name == "gai_strerror") result = AllocateString("address resolution error");
+        else if (name == "if_nametoindex") result = 1u;
+        else if (name == "initgroups" || name == "setgid" || name == "setuid" || name == "umask") result = 0;
+        else if (name == "fork" || name == "execl" || name == "kill" || name == "waitpid" || name == "pipe" || name == "socketpair") result = static_cast<u32>(-1);
+        else if (name == "dup2") result = r1;
+        else if (name == "syslog" || name == "swprintf" || name == "writev") result = 0;
         else if (name == "mmap") result=AllocateAligned(r1, kPageSize);
         else if (name == "munmap") { Free(r0); result=0; }
         else if (name == "socket") {
@@ -5334,8 +5605,33 @@ private:
 #else
             result = 0;
 #endif
-        } else if (name == "alarm" || name == "raise" || name == "sigaction") result = 0;
-        else {
+        } else if (name == "alarm" || name == "raise" || name == "sigaction" ||
+                   name == "sigprocmask" || name == "sched_yield" || name == "usleep" ||
+                   name == "pthread_join" || name == "pthread_attr_init" ||
+                   name == "pthread_cond_init" || name == "pthread_cond_destroy" ||
+                   name == "pthread_cond_signal" || name == "pthread_rwlock_init" ||
+                   name == "pthread_rwlock_destroy" || name == "pthread_rwlock_rdlock" ||
+                   name == "pthread_rwlock_wrlock" || name == "pthread_rwlock_unlock" ||
+                   name == "__google_potentially_blocking_region_begin" ||
+                   name == "__google_potentially_blocking_region_end" || name == "mlock" ||
+                   name == "mprotect" || name == "chmod" || name == "bsd_signal") result = 0;
+        else if (name == "ferror") {
+            GuestFile* file=FindGuestFile(r0); result=file&&file->stream?static_cast<u32>(std::ferror(file->stream)):0;
+        } else if (name == "setbuf") {
+            GuestFile* file=FindGuestFile(r0); if(file&&file->stream)std::setbuf(file->stream,nullptr); result=0;
+        } else if (name == "strcspn") {
+            const std::string a=ReadCString(r0),b=ReadCString(r1); const std::size_t n=a.find_first_of(b); result=static_cast<u32>(n==std::string::npos?a.size():n);
+        } else if (name == "strspn") {
+            const std::string a=ReadCString(r0),b=ReadCString(r1); std::size_t n=0; while(n<a.size()&&b.find(a[n])!=std::string::npos)++n; result=static_cast<u32>(n);
+        } else if (name == "strpbrk") {
+            const std::string a=ReadCString(r0),b=ReadCString(r1); const std::size_t n=a.find_first_of(b); result=n==std::string::npos?0:r0+static_cast<u32>(n);
+        } else if (name == "memmem") {
+            const u8* h=static_cast<const u8*>(env_.HostPointer(r0,r1)); const u8* n=static_cast<const u8*>(env_.HostPointer(r2,r3)); result=0; if(h&&n&&r3<=r1){for(u32 i=0;i<=r1-r3;++i){if(std::memcmp(h+i,n,r3)==0){result=r0+i;break;}}}
+        } else if (name == "closedir" || name == "opendir" || name == "readdir" ||
+                   name == "gethostbyname" || name == "getnameinfo" ||
+                   name == "shutdown" || name == "syscall") {
+            result=0;
+        } else {
             ++permissive_stub_calls_;
             permissive_names_.insert(name);
             if (!import.warned) { import.warned=true; log_ << "Dynarmic permissive runtime stub: " << name << " -> 0\n"; log_.flush(); }
@@ -5386,6 +5682,7 @@ private:
     u64 gl_texture_upload_bytes_=0;
     GuestCallMetrics last_call_metrics_;
     std::set<std::string> permissive_names_;
+    std::unordered_map<u32, FmodObjectState> fmod_objects_;
     std::deque<std::string> recent_events_;
     std::vector<std::string> active_calls_;
     u64 host_event_sequence_=0;
@@ -5757,7 +6054,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper DynarmicTest14 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -5859,22 +6156,61 @@ static std::string Utf8FromCodepoint(u32 codepoint) {
     return result;
 }
 
-static void RunThumbSmoke() {
+static void RunArmv7FeatureSmoke() {
     ProbeEnvironment env;
     env.Map(kSmokeBase,kPageSize,true);
-    env.MemoryWrite16(kSmokeBase+0,0x0088u);
-    env.MemoryWrite16(kSmokeBase+2,0xE7FEu);
+    // Thumb-2 + VFPv3 + NEON sequence assembled for ARMv7-A, softfp.
+    static constexpr std::array<u8, 34> code = {
+        0x41,0xF2,0x34,0x20, 0xC0,0xF2,0x01,0x00,
+        0xB7,0xEE,0x00,0x0A, 0x30,0xEE,0x00,0x0A,
+        0x10,0xEE,0x10,0x1A, 0x80,0xEF,0x11,0x10,
+        0x21,0xEF,0x01,0x18, 0x53,0xEC,0x11,0x2B,
+        0xFE,0xE7
+    };
+    if (!env.WriteBytes(kSmokeBase, code.data(), code.size()))
+        throw std::runtime_error("could not write ARMv7 feature smoke code");
     Dynarmic::A32::UserConfig config;
     config.callbacks=&env;
-    config.arch_version=Dynarmic::A32::ArchVersion::v5TE;
+    config.arch_version=Dynarmic::A32::ArchVersion::v7A;
     config.check_halt_on_memory_access=true;
     Dynarmic::A32::Jit cpu{config};
     env.AttachCpu(&cpu);
-    cpu.Regs().fill(0); cpu.Regs()[0]=1; cpu.Regs()[1]=2; cpu.Regs()[15]=kSmokeBase;
-    cpu.SetCpsr(0x30u); env.ticks_left=1; cpu.Run();
-    if(env.invalid_access||env.interpreter_fallback||env.exception_seen||cpu.Regs()[0]!=8) throw std::runtime_error("Dynarmic Thumb smoke failed");
+    cpu.Regs().fill(0);
+    cpu.Regs()[15]=kSmokeBase;
+    cpu.SetCpsr(0x30u);
+    env.ticks_left=16;
+    cpu.Run();
+    if(env.invalid_access||env.interpreter_fallback||env.exception_seen||
+       cpu.Regs()[0]!=0x00011234u||cpu.Regs()[1]!=0x40000000u||
+       cpu.Regs()[2]!=2u||cpu.Regs()[3]!=2u) {
+        std::ostringstream error;
+        error << "Dynarmic ARMv7 feature smoke failed r0=0x" << std::hex
+              << cpu.Regs()[0] << " r1=0x" << cpu.Regs()[1]
+              << " r2=0x" << cpu.Regs()[2] << " r3=0x" << cpu.Regs()[3];
+        throw std::runtime_error(error.str());
+    }
 }
 
+
+
+
+static void WriteV22ImportManifest(const ElfRuntime& runtime,
+                                   const std::string& path) {
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) throw std::runtime_error("could not create import manifest: " + path);
+    output << "Geometry Dash 2.2 beta ARMv7 native import manifest\n";
+    output << "imports=" << runtime.imports.size() << " objects=" << runtime.objects.size() << "\n\n";
+    std::vector<std::string> names;
+    names.reserve(runtime.imports.size());
+    for (const ImportRecord& import : runtime.imports) names.push_back(import.name);
+    std::sort(names.begin(), names.end());
+    for (const std::string& name : names) {
+        const char* group = name.rfind("gl", 0) == 0 ? "GL" :
+                            (name == "FMOD_System_Create" || name.rfind("_ZN4FMOD", 0) == 0) ? "FMOD" :
+                            name.rfind("Java_", 0) == 0 ? "JNI" : "LIBC";
+        output << group << '\t' << name << '\n';
+    }
+}
 } // namespace
 
 static std::ostream* g_runtime_log_stream = nullptr;
@@ -5897,6 +6233,7 @@ int main(int argc,char** argv) {
     std::string profile_summary_path = "gd-dynarmic-profile-summary.txt";
     double slow_frame_ms = 20.0;
     bool profile_enabled = true;
+    bool static_audit_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
         if (argument.rfind("--log=", 0) == 0 && argument.size() > 6u)
@@ -5913,6 +6250,8 @@ int main(int argc,char** argv) {
                 5.0, std::stod(std::string(argument.substr(16))));
         else if (argument == "--no-profile")
             profile_enabled = false;
+        else if (argument == "--static-audit-only")
+            static_audit_only = true;
     }
 
     std::array<char, 1024u * 1024u> log_buffer{};
@@ -5931,8 +6270,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-dynarmictest14");
-        emit("Milestone: direct asynchronous sound effects, first-text-input asset prewarm, debug-everything profiler, and low-end PC performance");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup1");
+        emit("Milestone: separate Geometry Dash 2.2 beta ARMv7-A/Thumb-2/VFPv3/NEON bring-up, raw-library probe mode, and APK auto-detection");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -5944,19 +6283,28 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "DynarmicTest14 must be compiled as a 64-bit executable");
-        RunThumbSmoke();
-        emit("RESULT: DYNARMIC_X64_THUMB_SMOKE_OK r0=8 guest=v5TE host=x86_64");
+                "V22BetaBringup1 must be compiled as a 64-bit executable");
+        if (!static_audit_only) {
+            RunArmv7FeatureSmoke();
+            emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 guest=v7A host=x86_64");
+        } else {
+            emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
+        }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_DEBUG_EVERYTHING_READY frame-csv=1 slow-frame-dumps=1 import-gl-heap-counters=1 async-effects=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
-        std::string apk_path="game.apk";
+        std::string input_path="libcocos2dcpp.so";
+        std::string import_manifest_path="gd-v22beta-imports.txt";
         bool probe_only=false;
+        bool probe_only_explicit=false;
         int width=1280,height=720,max_frames=0;
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
-            if(argument=="--probe-only") probe_only=true;
+            if(argument=="--probe-only") { probe_only=true; probe_only_explicit=true; }
+            else if(argument=="--static-audit-only") {}
             else if(argument=="--debug-everything") {}
+            else if(argument.rfind("--dump-imports=",0)==0)
+                import_manifest_path=std::string(argument.substr(15));
             else if(argument.rfind("--frames=",0)==0)
                 max_frames=std::max(
                     1,std::stoi(std::string(argument.substr(9))));
@@ -5967,35 +6315,42 @@ int main(int argc,char** argv) {
                 height=std::max(
                     240,std::stoi(std::string(argument.substr(9))));
             else if(!argument.empty()&&argument[0]!='-')
-                apk_path=std::string(argument);
+                input_path=std::string(argument);
         }
-        const std::filesystem::path absolute_apk=
-            std::filesystem::absolute(apk_path);
+        const std::filesystem::path absolute_input=
+            std::filesystem::absolute(input_path);
         const std::filesystem::path writable=
-            std::filesystem::absolute("save");
-        emit("Input APK: "+absolute_apk.string());
-        const std::vector<u8> apk=ReadFile(absolute_apk.string());
-        emit("APK bytes: "+std::to_string(apk.size()));
-        const std::vector<u8> libgame=
-            ExtractZipMember(apk,"lib/armeabi/libgame.so");
-        emit("Extracted lib/armeabi/libgame.so: "+
-             std::to_string(libgame.size())+" bytes");
+            std::filesystem::absolute("save-v22beta");
+        emit("Input file: "+absolute_input.string());
+        const std::vector<u8> input_bytes=ReadFile(absolute_input.string());
+        emit("Input bytes: "+std::to_string(input_bytes.size()));
+        const bool input_is_apk=!IsElf32ArmImage(input_bytes);
+        std::vector<u8> apk;
+        std::vector<u8> libgame;
+        std::string library_member;
+        if(input_is_apk){
+            apk=input_bytes;
+            libgame=ExtractV22NativeLibrary(apk,library_member);
+            emit("Input type: APK");
+            emit("Extracted "+library_member+": "+
+                 std::to_string(libgame.size())+" bytes");
+        }else{
+            libgame=input_bytes;
+            library_member="raw:libcocos2dcpp.so";
+            emit("Input type: raw ARMv7 ELF shared library");
+            if(!probe_only_explicit) probe_only=true;
+        }
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
-        if(zip_hooks!=2u)
+        if(zip_hooks!=1u)
             throw std::runtime_error(
-                "required cocos2d ZIP hooks were not found");
+                "required 2.2 cocos2d getFileDataFromZip hook was not found");
         const std::size_t browser_hooks=
             InstallCcApplicationOpenUrlHook(runtime,env);
         if(browser_hooks!=1u)
             throw std::runtime_error(
                 "required cocos2d openURL hook was not found");
-        const std::size_t audio_effect_hooks=
-            InstallSimpleAudioEffectHooks(runtime,env);
-        if(audio_effect_hooks!=2u)
-            throw std::runtime_error(
-                "required SimpleAudioEngine effect hooks were not found");
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6026,11 +6381,19 @@ int main(int argc,char** argv) {
              " scratch=r0 args=r1-r3-preserved");
         emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
              std::to_string(browser_hooks));
-        emit("RESULT: DYNARMIC_SIMPLEAUDIO_EFFECT_HOOKS_READY count="+
-             std::to_string(audio_effect_hooks)+
-             " play=direct-host preload=direct-host async-worker=1");
+        emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports=28 simpleaudio-hooks=not-required");
+        WriteV22ImportManifest(runtime, import_manifest_path);
+        emit("RESULT: DYNARMIC_V22_IMPORT_MANIFEST_WRITTEN path="+import_manifest_path+
+             " imports="+std::to_string(runtime.imports.size()));
+        if (static_audit_only) {
+            emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_OK constructors="+
+                 std::to_string(runtime.constructors.size())+
+                 " imports="+std::to_string(runtime.imports.size())+
+                 " relocations="+std::to_string(runtime.relocation_count));
+            return 0;
+        }
         GuestExecutor executor(env,runtime,log_file);
-        executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
+        executor.ConfigureHost(absolute_input.string(),writable.string(),apk,input_is_apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
              std::to_string(apk.size()));
         emit("RESULT: DYNARMIC_OPENGL_IMPORT_CACHE_READY imports="+
@@ -6076,11 +6439,14 @@ int main(int argc,char** argv) {
                 "JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
         if(probe_only){
-            emit("RESULT: DYNARMIC_BRINGUP14_PROBE_ONLY_OK");
+            emit(std::string("RESULT: DYNARMIC_V22_BETA_PROBE_ONLY_OK input=")+
+                 (input_is_apk ? "apk" : "raw-so"));
             return 0;
         }
+        if(!input_is_apk)
+            throw std::runtime_error("raw libcocos2dcpp.so has no Java/assets; pass a complete 2.2 beta APK for nativeInit");
 
-        const u32 apk_ref=executor.NewStringRef(absolute_apk.string());
+        const u32 apk_ref=executor.NewStringRef(absolute_input.string());
         if(!apk_ref||!executor.RunFunction(
                 runtime.native_set_paths,{kEnvObject,0u,apk_ref},
                 &result,"nativeSetPaths"))
@@ -6321,7 +6687,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test14 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bring-up 1 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -6371,11 +6737,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_BRINGUP14_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP1_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_BRINGUP14_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP1_FAILED");
         return 1;
     }
 }

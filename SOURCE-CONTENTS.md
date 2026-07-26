@@ -1,17 +1,21 @@
-# Source contents — DynarmicTest14
+# Source contents — v22beta-bringup1
 
-This is the complete DynarmicTest13 source plus the Test14 direct asynchronous effect and text-input-prewarm changes. No APK, dependency, tool, prior changelog, prior notes, or build material was removed.
+This full-source package preserves all 1,134 files from DynarmicTest14 and adds the separate ARMv7 beta branch files:
 
-Test14-specific files:
+- `libcocos2dcpp.so` — supplied ARMv7 beta native library.
+- `V22BETA-BRINGUP1-NOTES.md` — usage and technical status.
+- `CHANGELOG-0.9.4-arm-v22beta-bringup1.md`.
+- `V22BETA-STATIC-AUDIT.txt`.
+- `V22BETA-IMPORT-MANIFEST.txt`.
+- `BUILD_V22BETA_X64.cmd`.
 
-- `CHANGELOG-0.9.4-arm-dynarmictest14.md`
-- `DYNARMICTEST14-NOTES.md`
+Modified branch files:
 
-Primary changed files:
+- `src/dynarmic_probe.cpp`.
+- `build-dynarmic-x64.ps1`.
+- `dynarmic-x64/CMakeLists.txt`.
+- `README.md`.
+- `VERSION.txt`.
+- `PACKAGE-VERIFICATION.txt`.
 
-- `src/audio_win.c` — ordered asynchronous effect command worker and cached decoder-slot operations.
-- `src/audio_win.h` — parameter-preserving `audio_play_effect_ex` interface.
-- `src/dynarmic_probe.cpp` — direct ARM effect hooks, stack-argument decoding, text-input asset prewarm, and Test14 markers.
-- `dynarmic-x64/CMakeLists.txt` — Test14 project name.
-- `build-dynarmic-x64.ps1` — Test14 output folder, builder revision, notes, and messages.
-- `README.md`, `VERSION.txt`, and `PACKAGE-VERIFICATION.txt` — Test14 metadata.
+The original Test14 `game.apk`, history, third-party sources, build helpers and earlier notes remain preserved. The v22 builder defaults to `libcocos2dcpp.so`, so the retained old APK is not accidentally used for this branch.
