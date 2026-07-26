@@ -52,6 +52,7 @@
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 extern "C" {
 #include "zlib.h"
@@ -84,6 +85,18 @@ private:
 };
 
 namespace {
+
+template <typename ArchVersion>
+constexpr ArchVersion DynarmicArmv7ArchVersion() {
+    if constexpr (requires { ArchVersion::v7A; }) {
+        return ArchVersion::v7A;
+    } else if constexpr (requires { ArchVersion::v7; }) {
+        return ArchVersion::v7;
+    } else {
+        static_assert(!sizeof(ArchVersion),
+                      "This Dynarmic revision has no recognized ARMv7 architecture enum");
+    }
+}
 
 constexpr u32 kGameBase = 0x10000000u;
 constexpr u32 kSmokeBase = 0x0F000000u;
@@ -392,6 +405,63 @@ public:
                   << ": " << entry->name << " bytes=" << bytes->size() << '\n';
         }
         return bytes;
+    }
+
+    std::pair<std::size_t, u64> PrecacheBackgroundMusic(
+        const std::filesystem::path& writable_path) {
+        std::vector<std::string> music_names;
+        for (const auto& [name, entry] : entries_) {
+            (void)entry;
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char value) {
+                               return static_cast<char>(std::tolower(value));
+                           });
+            if (lower.starts_with("assets/") && lower.ends_with(".mp3"))
+                music_names.push_back(name);
+        }
+        std::sort(music_names.begin(), music_names.end());
+        const std::filesystem::path output_directory =
+            writable_path / "audio-cache";
+        std::error_code error;
+        std::filesystem::create_directories(output_directory, error);
+        std::size_t ready = 0;
+        u64 bytes_ready = 0;
+        for (const std::string& name : music_names) {
+            const std::shared_ptr<const std::vector<u8>> bytes = Load(name);
+            if (!bytes) continue;
+            const std::filesystem::path destination =
+                output_directory / std::filesystem::path(name).filename();
+            error.clear();
+            if (std::filesystem::is_regular_file(destination, error) &&
+                std::filesystem::file_size(destination, error) == bytes->size()) {
+                ++ready;
+                bytes_ready += bytes->size();
+                continue;
+            }
+            const std::filesystem::path temporary =
+                destination.string() + ".wrapper.tmp";
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) continue;
+            if (!bytes->empty())
+                output.write(reinterpret_cast<const char*>(bytes->data()),
+                             static_cast<std::streamsize>(bytes->size()));
+            output.close();
+            if (!output) {
+                std::filesystem::remove(temporary, error);
+                continue;
+            }
+            std::filesystem::remove(destination, error);
+            error.clear();
+            std::filesystem::rename(temporary, destination, error);
+            if (error) {
+                std::filesystem::remove(temporary, error);
+                continue;
+            }
+            ++ready;
+            bytes_ready += bytes->size();
+        }
+        return {ready, bytes_ready};
     }
 
     void Report() const {
@@ -1418,7 +1488,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup1Window";
+        const char* class_name = "GeometryDashV22BetaBringup2Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1831,9 +1901,14 @@ public:
 
 class GuestExecutor {
 public:
+    static bool IsFmodImportName(const std::string& name) {
+        return name == "FMOD_System_Create" || name.rfind("_ZN4FMOD", 0) == 0;
+    }
     GuestExecutor(ProbeEnvironment& env, ElfRuntime& runtime, std::ostream& log)
-        : env_(env), runtime_(runtime), log_(log), cpu_(MakeConfig(env)) {
+        : env_(env), runtime_(runtime), log_(log), global_monitor_(1),
+          cpu_(MakeConfig(env, global_monitor_)) {
         env_.AttachCpu(&cpu_);
+        log_ << "RESULT: DYNARMIC_GLOBAL_MONITOR_READY processors=1 processor_id=0\n";
         InitializeControlTraps();
         heap_cursor_ = kHeapBase + 0x1000u;
         errno_address_ = kObjectBase + kObjectRegionSize - 0x1000u;
@@ -1892,8 +1967,18 @@ public:
         static constexpr const char* kTextInputWarmAssets[] = {
             "assets/chatFont-hd.fnt",
             "assets/chatFont-hd.png",
+            "assets/chatFont.fnt",
+            "assets/chatFont.png",
+            "assets/bigFont-hd.fnt",
+            "assets/bigFont-hd.png",
+            "assets/bigFont.fnt",
+            "assets/bigFont.png",
+            "assets/goldFont-hd.fnt",
+            "assets/goldFont-hd.png",
             "assets/loadingCircle-hd.png",
+            "assets/loadingCircle.png",
             "assets/square02b_001-hd.png",
+            "assets/square02b_001.png",
         };
         std::size_t warmed_text_assets = 0;
         if (input_is_apk) {
@@ -1903,6 +1988,20 @@ public:
         }
         log_ << "RESULT: DYNARMIC_TEXT_INPUT_ASSET_PREWARM_READY count="
              << warmed_text_assets << '\n';
+        if (input_is_apk) {
+            const auto music_cache_begin = std::chrono::steady_clock::now();
+            const auto [music_cache_count, music_cache_bytes] =
+                apk_member_cache_.PrecacheBackgroundMusic(
+                    std::filesystem::path(writable_path_));
+            const double music_cache_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - music_cache_begin).count();
+            log_ << "RESULT: DYNARMIC_BACKGROUND_MUSIC_PRECACHE_READY count="
+                 << music_cache_count << " bytes=" << music_cache_bytes
+                 << " elapsed_ms=" << std::fixed << std::setprecision(1)
+                 << music_cache_ms << '\n';
+        } else {
+            log_ << "RESULT: DYNARMIC_BACKGROUND_MUSIC_PRECACHE_SKIPPED raw-so=1\n";
+        }
 #ifdef _WIN32
         CreateDirectoryA(writable_path_.c_str(), nullptr);
         WSADATA winsock_data{};
@@ -1920,6 +2019,7 @@ public:
         const std::string executable_directory_string =
             executable_directory.empty() ? std::string(".") : executable_directory.string();
         audio_initialize(executable_directory_string.c_str());
+        audio_set_writable_directory(writable_path_.c_str());
         if (input_is_apk) audio_set_apk_path(apk_path_.c_str());
         audio_initialized_ = true;
         stdin_handle_ = NewGuestFile(stdin, true, "stdin", "rb");
@@ -2271,10 +2371,13 @@ public:
     }
 
 private:
-    static Dynarmic::A32::UserConfig MakeConfig(ProbeEnvironment& env) {
+    static Dynarmic::A32::UserConfig MakeConfig(
+        ProbeEnvironment& env, Dynarmic::ExclusiveMonitor& global_monitor) {
         Dynarmic::A32::UserConfig config;
         config.callbacks = &env;
-        config.arch_version = Dynarmic::A32::ArchVersion::v7A;
+        config.arch_version = DynarmicArmv7ArchVersion<Dynarmic::A32::ArchVersion>();
+        config.global_monitor = &global_monitor;
+        config.processor_id = 0;
         config.check_halt_on_memory_access = true;
         return config;
     }
@@ -4877,10 +4980,12 @@ private:
         bool paused = false;
         bool playing = false;
         u32 position_ms = 0;
+        u32 stream_buffer_size = 16384;
+        u32 stream_buffer_type = 0;
     };
 
     static bool IsFmodImport(const std::string& name) {
-        return name == "FMOD_System_Create" || name.rfind("_ZN4FMOD", 0) == 0;
+        return IsFmodImportName(name);
     }
 
     u32 NewFmodObject(FmodObjectKind kind, const std::string& path = {}) {
@@ -4946,6 +5051,19 @@ private:
             const u32 output = ArgWord(4);
             if (output) env_.MemoryWrite32(output, channel);
             return finish(channel ? kFmodOk : 1u);
+        }
+        if (name == "_ZN4FMOD6System19setStreamBufferSizeEjj") {
+            if (FmodObjectState* state = FindFmodObject(r0)) {
+                state->stream_buffer_size = r1;
+                state->stream_buffer_type = r2;
+            }
+            return finish(kFmodOk);
+        }
+        if (name == "_ZN4FMOD6System19getStreamBufferSizeEPjS1_") {
+            FmodObjectState* state = FindFmodObject(r0);
+            if (r1) env_.MemoryWrite32(r1, state ? state->stream_buffer_size : 16384u);
+            if (r2) env_.MemoryWrite32(r2, state ? state->stream_buffer_type : 0u);
+            return finish(kFmodOk);
         }
         if (name == "_ZN4FMOD6System10getVersionEPj") {
             if (r1) env_.MemoryWrite32(r1, 0x00020200u);
@@ -5645,6 +5763,7 @@ private:
     ProbeEnvironment& env_;
     ElfRuntime& runtime_;
     std::ostream& log_;
+    Dynarmic::ExclusiveMonitor global_monitor_;
     Dynarmic::A32::Jit cpu_;
     u32 heap_cursor_=0;
     std::map<u32,u32> allocations_;
@@ -6054,7 +6173,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup1-fix1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6171,7 +6290,10 @@ static void RunArmv7FeatureSmoke() {
         throw std::runtime_error("could not write ARMv7 feature smoke code");
     Dynarmic::A32::UserConfig config;
     config.callbacks=&env;
-    config.arch_version=Dynarmic::A32::ArchVersion::v7A;
+    config.arch_version=DynarmicArmv7ArchVersion<Dynarmic::A32::ArchVersion>();
+    Dynarmic::ExclusiveMonitor global_monitor{1};
+    config.global_monitor=&global_monitor;
+    config.processor_id=0;
     config.check_halt_on_memory_access=true;
     Dynarmic::A32::Jit cpu{config};
     env.AttachCpu(&cpu);
@@ -6270,8 +6392,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup1");
-        emit("Milestone: separate Geometry Dash 2.2 beta ARMv7-A/Thumb-2/VFPv3/NEON bring-up, raw-library probe mode, and APK auto-detection");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup2");
+        emit("Milestone: ARMv7 global exclusive monitor, dual-beta APK bring-up, FMOD stream-buffer compatibility, and startup music pre-cache");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -6283,7 +6405,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup1 must be compiled as a 64-bit executable");
+                "V22BetaBringup2 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 guest=v7A host=x86_64");
@@ -6381,7 +6503,11 @@ int main(int argc,char** argv) {
              " scratch=r0 args=r1-r3-preserved");
         emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
              std::to_string(browser_hooks));
-        emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports=28 simpleaudio-hooks=not-required");
+        emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports="+
+             std::to_string(std::count_if(
+                 runtime.imports.begin(),runtime.imports.end(),
+                 [](const ImportRecord& import){return GuestExecutor::IsFmodImportName(import.name);})) +
+             " simpleaudio-hooks=not-required");
         WriteV22ImportManifest(runtime, import_manifest_path);
         emit("RESULT: DYNARMIC_V22_IMPORT_MANIFEST_WRITTEN path="+import_manifest_path+
              " imports="+std::to_string(runtime.imports.size()));

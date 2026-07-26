@@ -1,0 +1,26 @@
+Geometry Dash 2.2 beta ARMv7 bringup2 static audit
+
+NEWER APK
+apk_bytes=144490721
+apk_sha=b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1
+zip_entries=4862
+assets=4151
+so_bytes=9578364
+so_sha=c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
+constructors=349
+undefined_funcs=368
+relocs={'R_ARM_RELATIVE': 102707, 'R_ARM_GLOB_DAT': 23, 'R_ARM_ABS32': 5, 'R_ARM_JUMP_SLOT': 367}
+
+EARLIER APK
+apk_bytes=97681244
+apk_sha=4380274db86cba17884a1a4c928cf9fc643747d027cf08e99b158dbeb1e43ddf
+zip_entries=744
+assets=480
+so_bytes=9144004
+so_sha=ec047ac9d5630d9c1fed629cda1d63d09f7912b8673984aed2167c59e316e286
+constructors=327
+undefined_funcs=360
+relocs={'R_ARM_RELATIVE': 91056, 'R_ARM_GLOB_DAT': 19, 'R_ARM_ABS32': 5, 'R_ARM_JUMP_SLOT': 357}
+
+Both main libraries are ARM ELF32/ARMv7-A soft-float inputs.
+The runtime still requires Windows execution to discover the next dynamic boundary.

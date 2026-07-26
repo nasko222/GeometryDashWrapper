@@ -1,69 +1,10 @@
-Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup1
-
-Branch status
--------------
-This is a separate experimental ARMv7 branch forked from DynarmicTest14.
-It does not replace or modify the stable 1.0-1.4 build line.
-
-Preservation audit
-------------------
-Base package: 0.9.4-arm-dynarmictest14
-Base files preserved: 1134 of 1134
-Missing base files: 0
-New v22beta files: 6
-Total files: 1140
-
-New files:
-  - BUILD_V22BETA_X64.cmd
-  - CHANGELOG-0.9.4-arm-v22beta-bringup1.md
-  - V22BETA-BRINGUP1-NOTES.md
-  - V22BETA-IMPORT-MANIFEST.txt
-  - V22BETA-STATIC-AUDIT.txt
-  - libcocos2dcpp.so
-
-Changed existing files:
-  - README.md
-  - SOURCE-CONTENTS.md
-  - VERSION.txt
-  - PACKAGE-VERIFICATION.txt
-  - build-dynarmic-x64.ps1
-  - dynarmic-x64/CMakeLists.txt
-  - src/dynarmic_probe.cpp
-
-Supplied ARMv7 library
-----------------------
-libcocos2dcpp.so bytes: 9578364
-libcocos2dcpp.so SHA-256: c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
-Byte-identical to the user-supplied file: yes
-Architecture: ARM EABI5, ARMv7-A, Thumb-2, VFPv3, NEONv1, soft-float ABI
-
-Retained legacy APK
--------------------
-game.apk bytes: 24704408
-game.apk SHA-256: 490c4644b1b52f5cfa304bfd110e68f18c5fff87c487a49a6e9cb27bac93f085
-Byte-identical to the Test14 source APK: yes
-The v22 builder defaults to libcocos2dcpp.so, not this retained legacy APK.
-
-Static branch validation
-------------------------
-- Portable C++20 syntax validation passed with -Wall -Wextra -Werror.
-- Portable C11 helper validation passed with -Wall -Wextra -Werror.
-- The branch loader parsed, mapped, and relocated the supplied library in static-audit mode.
-- Mapped image: 0x10000000-0x10933000.
-- Constructors: 349.
-- Function imports after host-hook insertion: 372.
-- Imported objects: 5.
-- Relocations: 103102.
-- Required ZIP hook installed: 1.
-- Required openURL hook installed: 1.
-- GLES imports: 84; all 84 have argument descriptors.
-- FMOD imports: 28; all 28 route through the initial FMOD bridge.
-- Static audit marker: DYNARMIC_V22_STATIC_AUDIT_OK.
-
-Runtime limitation
-------------------
-The real Windows x64 executable was not compiled or run in this Linux packaging
-environment. The raw library has therefore not yet executed its constructors or
-JNI_OnLoad through the real Dynarmic JIT. A complete 2.2 beta APK was not supplied,
-so nativeSetApkPath, nativeInit, Java/JNI behavior, assets, rendering, input, audio,
-and gameplay remain bring-up targets rather than confirmed working features.
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup2
+C++20 syntax check: PASS (portable Dynarmic API stub)
+Dynarmic global monitor wired into ARMv7 smoke and runtime JIT: YES
+Newer APK constructors: 349
+Earlier APK constructors: 327
+Newer APK SHA-256: b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1
+Earlier APK SHA-256: 4380274db86cba17884a1a4c928cf9fc643747d027cf08e99b158dbeb1e43ddf
+Raw SO SHA-256: c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
+Historical changelog pile removed by user request
+Windows compile/runtime test: NOT PERFORMED in Linux

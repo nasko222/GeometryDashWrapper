@@ -1,23 +1,21 @@
-# Geometry Dash ARM Wrapper — 2.2 Beta ARMv7 Bring-up 1
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 bringup2
 
-This directory is an experimental branch for an ARMv7 Geometry Dash 2.2 beta native library. The stable 1.0–1.4/Test14 source history is retained inside this package, but this branch builds to its own `dist-arm-wrapper-v22beta-bringup1` directory.
+Separate experimental ARMv7-A/Thumb-2/VFPv3/NEON branch. The stable ARMv5 line is not replaced.
 
-## Build the supplied raw library probe
+## Build
 
 ```bat
 BUILD_V22BETA_X64.cmd
 ```
 
-After building, run `RUN_V22_RAW_SO_PROBE.cmd`. It attempts the 349 constructors and `JNI_OnLoad`, then writes a detailed log and import manifest.
+By default the build packages both included beta APKs and the raw `libcocos2dcpp.so`. It creates separate launchers and output logs for the earlier and newer betas.
 
-## Build with the complete APK
+## Bringup2 changes
 
-```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\2.2-beta.apk"
-```
+- Adds the required Dynarmic global exclusive monitor.
+- Supports the earlier beta's FMOD stream-buffer getters/setters.
+- Pre-caches all APK music before native initialization.
+- Keeps raw-library probe mode.
+- Removes inherited changelog/note clutter from unrelated versions.
 
-After building, run `RUN_V22_APK_INTERACTIVE.cmd`.
-
-The complete APK is required to reach real `nativeInit`, because the uploaded file contained only `libcocos2dcpp.so`; Java classes, manifest data, assets and any additional APK libraries are not available in raw-library mode.
-
-See `V22BETA-BRINGUP1-NOTES.md` and `V22BETA-STATIC-AUDIT.txt` for the implemented compatibility work and current limitations.
+Future direction: one unified x86/ARMv5/ARMv7 launcher should auto-select x86 first, with a later configuration override to prefer ARM. That merge is intentionally not implemented here.

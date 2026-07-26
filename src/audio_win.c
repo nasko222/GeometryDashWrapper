@@ -898,6 +898,18 @@ void audio_initialize(const char *executable_directory) {
                 g_audio_cache_directory);
 }
 
+void audio_set_writable_directory(const char *writable_directory) {
+    if (!writable_directory || !writable_directory[0]) return;
+    snprintf(g_save_directory, sizeof(g_save_directory), "%s",
+             writable_directory);
+    snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
+             "%s\\audio-cache", writable_directory);
+    CreateDirectoryA(g_save_directory, NULL);
+    CreateDirectoryA(g_audio_cache_directory, NULL);
+    runtime_log("Audio writable cache directory: %s",
+                g_audio_cache_directory);
+}
+
 void audio_set_apk_path(const char *apk_path) {
     if (apk_path && apk_path[0]) {
         if (_stricmp(g_apk_path, apk_path) != 0) {

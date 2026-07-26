@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup1"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup2"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder11-v22beta-armv7-bringup1"
+$BuilderRevision = "dynarmic-x64-builder13-v22beta-armv7-bringup2-monitor-dual-apk"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -424,17 +424,29 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Copy-Item -Force $ProbeExe (Join-Path $Output "GeometryDashDynarmicProbe.exe")
 
 $ResolvedApk = $Apk
-if ([string]::IsNullOrWhiteSpace($ResolvedApk)) { $ResolvedApk = Join-Path $Root "libcocos2dcpp.so" }
+if ([string]::IsNullOrWhiteSpace($ResolvedApk)) {
+    $DefaultNewer = Join-Path $Root "game-v22beta.apk"
+    $DefaultEarlier = Join-Path $Root "game-v22beta1.apk"
+    if (Test-Path $DefaultNewer) { $ResolvedApk = $DefaultNewer }
+    elseif (Test-Path $DefaultEarlier) { $ResolvedApk = $DefaultEarlier }
+    else { $ResolvedApk = Join-Path $Root "libcocos2dcpp.so" }
+}
 if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK or libcocos2dcpp.so not found: $ResolvedApk" }
 $InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
-$PackagedInputName = if ($InputExtension -eq ".so") { "libcocos2dcpp.so" } else { "game-v22beta.apk" }
+$PackagedInputName = if ($InputExtension -eq ".so") { "libcocos2dcpp.so" } else { "game-v22beta-selected.apk" }
 Copy-Item -Force $ResolvedApk (Join-Path $Output $PackagedInputName)
+$RootNewerApk = Join-Path $Root "game-v22beta.apk"
+$RootEarlierApk = Join-Path $Root "game-v22beta1.apk"
+if (Test-Path $RootNewerApk) { Copy-Item -Force $RootNewerApk (Join-Path $Output "game-v22beta.apk") }
+if (Test-Path $RootEarlierApk) { Copy-Item -Force $RootEarlierApk (Join-Path $Output "game-v22beta1.apk") }
+$RootRawSo = Join-Path $Root "libcocos2dcpp.so"
+if (Test-Path $RootRawSo) { Copy-Item -Force $RootRawSo (Join-Path $Output "libcocos2dcpp.so") }
 $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "V22BETA-BRINGUP1-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP1-NOTES.md") }
+$V22Notes = Join-Path $Root "V22BETA-BRINGUP2-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP2-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
 
 $RawProbeLauncher = @'
@@ -442,41 +454,59 @@ $RawProbeLauncher = @'
 setlocal
 cd /d "%~dp0"
 if not exist libcocos2dcpp.so (
-  echo libcocos2dcpp.so was not packaged. Build with the raw .so or use the APK launcher.
+  echo libcocos2dcpp.so was not packaged.
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe libcocos2dcpp.so --probe-only --dump-imports=gd-v22beta-imports.txt --log=gd-v22beta-raw-probe.log
+GeometryDashDynarmicProbe.exe libcocos2dcpp.so --probe-only --dump-imports=gd-v22beta-raw-imports.txt --log=gd-v22beta-raw-probe.log
 set "RESULT=%ERRORLEVEL%"
 echo.
 echo Log: gd-v22beta-raw-probe.log
-echo Imports: gd-v22beta-imports.txt
+echo Imports: gd-v22beta-raw-imports.txt
 pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_V22_RAW_SO_PROBE.cmd"), $RawProbeLauncher, [Text.Encoding]::ASCII)
-$ApkLauncher = @'
+$NewerLauncher = @'
 @echo off
 setlocal
 cd /d "%~dp0"
 if not exist game-v22beta.apk (
-  echo game-v22beta.apk is missing. Rebuild and pass the complete 2.2 beta APK.
+  echo game-v22beta.apk is missing.
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta.apk --debug-everything --dump-imports=gd-v22beta-imports.txt --log=gd-v22beta-interactive.log --profile=gd-v22beta-profile.csv --profile-summary=gd-v22beta-profile-summary.txt
+GeometryDashDynarmicProbe.exe game-v22beta.apk --debug-everything --dump-imports=gd-v22beta-newer-imports.txt --log=gd-v22beta-newer.log --profile=gd-v22beta-newer-profile.csv --profile-summary=gd-v22beta-newer-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
-echo Main log: gd-v22beta-interactive.log
-echo Imports: gd-v22beta-imports.txt
+echo Main log: gd-v22beta-newer.log
+echo Imports: gd-v22beta-newer-imports.txt
 pause
 exit /b %RESULT%
 '@
-[IO.File]::WriteAllText((Join-Path $Output "RUN_V22_APK_INTERACTIVE.cmd"), $ApkLauncher, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "RUN_V22_NEWER_APK.cmd"), $NewerLauncher, [Text.Encoding]::ASCII)
+$EarlierLauncher = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist game-v22beta1.apk (
+  echo game-v22beta1.apk is missing.
+  pause
+  exit /b 2
+)
+GeometryDashDynarmicProbe.exe game-v22beta1.apk --debug-everything --dump-imports=gd-v22beta-earlier-imports.txt --log=gd-v22beta-earlier.log --profile=gd-v22beta-earlier-profile.csv --profile-summary=gd-v22beta-earlier-profile-summary.txt
+set "RESULT=%ERRORLEVEL%"
+echo.
+echo Main log: gd-v22beta-earlier.log
+echo Imports: gd-v22beta-earlier-imports.txt
+pause
+exit /b %RESULT%
+'@
+[IO.File]::WriteAllText((Join-Path $Output "RUN_V22_EARLIER_APK.cmd"), $EarlierLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`n", [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
 Write-Host "`nDynarmic x64 2.2 beta ARMv7 bring-up branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Raw .so: RUN_V22_RAW_SO_PROBE.cmd"
-Write-Host "Complete APK: RUN_V22_APK_INTERACTIVE.cmd"
+Write-Host "Newer APK: RUN_V22_NEWER_APK.cmd`nEarlier APK: RUN_V22_EARLIER_APK.cmd"
