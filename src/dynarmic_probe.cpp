@@ -100,6 +100,7 @@ constexpr ArchVersion DynarmicArmv7ArchVersion() {
 
 constexpr u32 kGameBase = 0x10000000u;
 constexpr u32 kSmokeBase = 0x0F000000u;
+constexpr u32 kV22ThunkBase = 0x10F00000u;
 constexpr u32 kObjectBase = 0x20000000u;
 constexpr u32 kObjectRegionSize = 0x00100000u;
 constexpr u32 kImportBase = 0x21000000u;
@@ -1025,6 +1026,20 @@ struct ElfRuntime {
     u32 native_delete_backward = 0;
     u32 native_pause = 0;
     u32 native_resume = 0;
+    u32 v22_string_append_bytes = 0;
+    u32 v22_empty_string_data = 0;
+    u32 v22_prepare_setup_address = 0;
+    u32 v22_level_editor_create = 0;
+    u32 v22_scene_create = 0;
+    u32 v22_node_add_child = 0;
+    u32 v22_director_shared = 0;
+    u32 v22_director_replace_scene = 0;
+    u32 v22_transition_fade_create = 0;
+    u32 v22_edit_close_text_inputs = 0;
+    u32 v22_edit_verify_level_name = 0;
+    u32 v22_game_manager_shared = 0;
+    u32 v22_game_manager_editor_state_offset = 0;
+    u32 v22_edit_level_pointer_offset = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -1184,6 +1199,239 @@ static void InstallThumbLiteralPcHookPreservingAllArguments(
     env.MemoryWrite16(address + 0u, 0xF8DFu);
     env.MemoryWrite16(address + 2u, 0xF000u);
     env.MemoryWrite32(address + 4u, destination);
+}
+
+
+static std::optional<u32> DecodeThumbBlTarget(u32 instruction_address,
+                                              u16 first, u16 second) {
+    if ((first & 0xF800u) != 0xF000u ||
+        (second & 0xD000u) != 0xD000u)
+        return std::nullopt;
+    const u32 sign = (first >> 10u) & 1u;
+    const u32 imm10 = first & 0x03FFu;
+    const u32 j1 = (second >> 13u) & 1u;
+    const u32 j2 = (second >> 11u) & 1u;
+    const u32 i1 = (~(j1 ^ sign)) & 1u;
+    const u32 i2 = (~(j2 ^ sign)) & 1u;
+    const u32 imm11 = second & 0x07FFu;
+    const u32 encoded = (sign << 24u) | (i1 << 23u) |
+                        (i2 << 22u) | (imm10 << 12u) |
+                        (imm11 << 1u);
+    const s32 displacement = static_cast<s32>(encoded << 7u) >> 7u;
+    return static_cast<u32>(instruction_address + 4u + displacement);
+}
+
+static void WriteThumbBl(ProbeEnvironment& env, u32 instruction_address,
+                         u32 target_address) {
+    const s64 displacement = static_cast<s64>(target_address & ~1u) -
+                             static_cast<s64>(instruction_address + 4u);
+    if ((displacement & 1ll) != 0ll || displacement < -0x01000000ll ||
+        displacement > 0x00FFFFFEll)
+        throw std::runtime_error("Thumb BL target is out of range");
+    const u32 encoded = static_cast<u32>(static_cast<s32>(displacement)) &
+                        0x01FFFFFFu;
+    const u32 sign = (encoded >> 24u) & 1u;
+    const u32 i1 = (encoded >> 23u) & 1u;
+    const u32 i2 = (encoded >> 22u) & 1u;
+    const u32 imm10 = (encoded >> 12u) & 0x03FFu;
+    const u32 imm11 = (encoded >> 1u) & 0x07FFu;
+    const u32 j1 = (~(i1 ^ sign)) & 1u;
+    const u32 j2 = (~(i2 ^ sign)) & 1u;
+    env.MemoryWrite16(instruction_address,
+                      static_cast<u16>(0xF000u | (sign << 10u) | imm10));
+    env.MemoryWrite16(instruction_address + 2u,
+                      static_cast<u16>(0xD000u | (j1 << 13u) |
+                                       (j2 << 11u) | imm11));
+}
+
+static void EnsureV22ThunkPage(ProbeEnvironment& env) {
+    if (!env.IsMapped(kV22ThunkBase, 1u))
+        env.Map(kV22ThunkBase, kPageSize, true);
+}
+
+static void WriteV22ThumbImportThunk(ProbeEnvironment& env, u32 address,
+                                     u32 destination) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 thunk address is not aligned");
+    env.MemoryWrite16(address + 0u, 0xF8DFu); // ldr.w pc,[pc,#0]
+    env.MemoryWrite16(address + 2u, 0xF000u);
+    env.MemoryWrite32(address + 4u, destination);
+}
+
+static std::vector<u32> FindThumbBlCallSites(const ElfRuntime& runtime,
+                                             ProbeEnvironment& env,
+                                             u32 target_address) {
+    std::vector<u32> result;
+    const u32 target = target_address & ~1u;
+    for (u32 address = runtime.image_min;
+         address <= runtime.image_max - 4u; address += 2u) {
+        const auto decoded = DecodeThumbBlTarget(
+            address, env.MemoryRead16(address), env.MemoryRead16(address + 2u));
+        if (decoded && (*decoded & ~1u) == target) result.push_back(address);
+    }
+    return result;
+}
+
+static bool DiscoverV22GuestStringBuilder(ElfRuntime& runtime,
+                                          ProbeEnvironment& env,
+                                          const SymbolRecord& function) {
+    const u32 begin = function.address & ~1u;
+    if (function.size < 32u || begin < runtime.image_min ||
+        begin > runtime.image_max - function.size)
+        return false;
+
+    u32 builder = 0;
+    u32 empty_data = 0;
+    for (u32 offset = 0; offset + 6u <= function.size; offset += 2u) {
+        const u32 address = begin + offset;
+        if (env.MemoryRead16(address) != 0x4620u) continue; // mov r0,r4
+        const auto target = DecodeThumbBlTarget(
+            address + 2u, env.MemoryRead16(address + 2u),
+            env.MemoryRead16(address + 4u));
+        if (!target || *target < runtime.image_min ||
+            *target >= runtime.image_max)
+            continue;
+        builder = *target | 1u;
+        break;
+    }
+
+    for (u32 offset = 0; offset + 12u <= function.size; offset += 2u) {
+        const u32 address = begin + offset;
+        const u16 literal_load = env.MemoryRead16(address);
+        if ((literal_load & 0xFF00u) != 0x4B00u) continue;
+        u32 add_address = 0;
+        for (u32 delta = 2u; delta <= 8u &&
+             offset + delta + 6u <= function.size; delta += 2u) {
+            if (env.MemoryRead16(address + delta) == 0x447Bu &&
+                env.MemoryRead16(address + delta + 2u) == 0x681Bu &&
+                env.MemoryRead16(address + delta + 4u) == 0x330Cu) {
+                add_address = address + delta;
+                break;
+            }
+        }
+        if (!add_address) continue;
+        const u32 literal_address = ((address + 4u) & ~3u) +
+            static_cast<u32>(literal_load & 0x00FFu) * 4u;
+        if (!env.IsMapped(literal_address, 4u)) continue;
+        const s32 relative = static_cast<s32>(env.MemoryRead32(literal_address));
+        const u32 got_slot = static_cast<u32>(add_address + 4u + relative);
+        if (!env.IsMapped(got_slot, 4u)) continue;
+        const u32 representation = env.MemoryRead32(got_slot);
+        const u32 candidate = representation + 12u;
+        if (!env.IsMapped(candidate - 12u, 13u)) continue;
+        if (env.MemoryRead32(candidate - 12u) != 0u ||
+            env.MemoryRead32(candidate - 8u) != 0u)
+            continue;
+        empty_data = candidate;
+        break;
+    }
+
+    if (!builder || !empty_data) return false;
+    runtime.v22_string_append_bytes = builder;
+    runtime.v22_empty_string_data = empty_data;
+    return true;
+}
+
+static std::size_t InstallV22PrepareLevelBridge(ElfRuntime& runtime,
+                                                ProbeEnvironment& env) {
+    static constexpr const char* kPrepare =
+        "_ZN9PlayLayer29prepareCreateObjectsFromSetupESs";
+    static constexpr const char* kDecompress =
+        "_ZN7cocos2d8ZipUtils16decompressStringESsbi";
+    const SymbolRecord* prepare = FindSymbol(runtime, kPrepare);
+    const SymbolRecord* decompress = FindSymbol(runtime, kDecompress);
+    if (!prepare || !decompress) return 0u;
+    if (!DiscoverV22GuestStringBuilder(runtime, env, *decompress))
+        throw std::runtime_error(
+            "could not discover the beta guest std::string builder");
+    const std::vector<u32> call_sites =
+        FindThumbBlCallSites(runtime, env, prepare->address);
+    if (call_sites.size() != 1u) {
+        std::ostringstream error;
+        error << "expected one PlayLayer setup callsite, found "
+              << call_sites.size();
+        throw std::runtime_error(error.str());
+    }
+    EnsureV22ThunkPage(env);
+    const u32 destination = EnsureImport(
+        runtime, env, "__dynarmic_v22_prepare_level_setup");
+    const u32 thunk = kV22ThunkBase + 0x00u;
+    WriteV22ThumbImportThunk(env, thunk, destination);
+    WriteThumbBl(env, call_sites.front(), thunk);
+    runtime.v22_prepare_setup_address = prepare->address;
+    return call_sites.size();
+}
+
+static bool LooksLikeGuestObject(const ElfRuntime& runtime,
+                                 ProbeEnvironment& env,
+                                 u32 object_address) {
+    if (!object_address || !env.IsMapped(object_address, 4u)) return false;
+    const u32 vtable = env.MemoryRead32(object_address);
+    return vtable >= runtime.image_min && vtable < runtime.image_max &&
+           env.IsMapped(vtable, 4u);
+}
+
+static std::size_t InstallV22EditButtonBridge(ElfRuntime& runtime,
+                                              ProbeEnvironment& env) {
+    static constexpr const char* kOnEdit =
+        "_ZN14EditLevelLayer6onEditEPN7cocos2d8CCObjectE";
+    const SymbolRecord* on_edit = FindSymbol(runtime, kOnEdit);
+    const SymbolRecord* editor_create = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer6createEP11GJGameLevelb");
+    bool editor_has_bool = true;
+    if (!editor_create) {
+        editor_create = FindSymbol(
+            runtime, "_ZN16LevelEditorLayer6createEP11GJGameLevel");
+        editor_has_bool = false;
+    }
+    const SymbolRecord* scene_create = FindSymbol(
+        runtime, "_ZN7cocos2d7CCScene6createEv");
+    const SymbolRecord* add_child = FindSymbol(
+        runtime, "_ZN7cocos2d6CCNode8addChildEPS0_");
+    const SymbolRecord* director_shared = FindSymbol(
+        runtime, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
+    const SymbolRecord* replace_scene = FindSymbol(
+        runtime, "_ZN7cocos2d10CCDirector12replaceSceneEPNS_7CCSceneE");
+    const SymbolRecord* transition = FindSymbol(
+        runtime, "_ZN7cocos2d16CCTransitionFade6createEfPNS_7CCSceneE");
+    const SymbolRecord* close_text = FindSymbol(
+        runtime, "_ZN14EditLevelLayer15closeTextInputsEv");
+    const SymbolRecord* verify_name = FindSymbol(
+        runtime, "_ZN14EditLevelLayer15verifyLevelNameEv");
+    const SymbolRecord* game_manager = FindSymbol(
+        runtime, "_ZN11GameManager11sharedStateEv");
+    if (!on_edit || !editor_create || !scene_create || !add_child ||
+        !director_shared || !replace_scene || !transition || !close_text ||
+        !verify_name || !game_manager)
+        return 0u;
+
+    EnsureV22ThunkPage(env);
+    const u32 destination = EnsureImport(
+        runtime, env, "__dynarmic_v22_edit_level_onEdit");
+    const u32 thunk = kV22ThunkBase + 0x10u;
+    WriteV22ThumbImportThunk(env, thunk, destination);
+
+    std::size_t patched = 0;
+    for (u32 address = (runtime.image_min + 3u) & ~3u;
+         address <= runtime.image_max - 4u; address += 4u) {
+        if (env.MemoryRead32(address) != on_edit->address) continue;
+        env.MemoryWrite32(address, thunk | 1u);
+        ++patched;
+    }
+    if (patched == 0u) return 0u;
+
+    runtime.v22_level_editor_create = editor_create->address;
+    runtime.v22_scene_create = scene_create->address;
+    runtime.v22_node_add_child = add_child->address;
+    runtime.v22_director_shared = director_shared->address;
+    runtime.v22_director_replace_scene = replace_scene->address;
+    runtime.v22_transition_fade_create = transition->address;
+    runtime.v22_edit_close_text_inputs = close_text->address;
+    runtime.v22_edit_verify_level_name = verify_name->address;
+    runtime.v22_game_manager_shared = game_manager->address;
+    runtime.v22_game_manager_editor_state_offset = editor_has_bool ? 0x1BCu : 0u;
+    runtime.v22_edit_level_pointer_offset = editor_has_bool ? 0x150u : 0x140u;
+    return patched;
 }
 
 static std::size_t InstallV22InflateMemoryHook(ElfRuntime& runtime,
@@ -1612,7 +1860,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup7Window";
+        const char* class_name = "GeometryDashV22BetaBringup8Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1930,10 +2178,6 @@ private:
             }
             return 0;
         case WM_KEYDOWN:
-            if (wparam == VK_F2) {
-                self->Queue(HostEvent{HostEventType::OpenEditor});
-                return 0;
-            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -3510,6 +3754,201 @@ private:
         return true;
     }
 
+
+    bool ReadGuestCowStringObject(u32 object_address, std::string& value,
+                                  std::size_t maximum = 64u * 1024u * 1024u) const {
+        value.clear();
+        if (!object_address || !env_.IsMapped(object_address, 4u)) return false;
+        const u32 data_address = env_.MemoryRead32(object_address);
+        if (!data_address || data_address < 12u ||
+            !env_.IsMapped(data_address - 12u, 12u))
+            return false;
+        const u32 length = env_.MemoryRead32(data_address - 12u);
+        if (length > maximum) return false;
+        const void* bytes = env_.HostPointer(data_address, length);
+        if (!bytes && length) return false;
+        value.assign(static_cast<const char*>(bytes), length);
+        return true;
+    }
+
+    bool BuildGuestStringFromBytes(u32 object_address,
+                                   const std::string& value) {
+        if (!object_address || !runtime_.v22_string_append_bytes ||
+            !runtime_.v22_empty_string_data ||
+            value.size() > 64u * 1024u * 1024u ||
+            value.size() > std::numeric_limits<u32>::max() - 1u)
+            return false;
+        const u32 length = static_cast<u32>(value.size());
+        const u32 source = Allocate(length + 1u);
+        if (!source) return false;
+        const bool copied = value.empty() ||
+            env_.WriteBytes(source, value.data(), value.size());
+        env_.MemoryWrite8(source + length, 0u);
+        if (!copied) {
+            Free(source);
+            return false;
+        }
+        env_.MemoryWrite32(object_address, runtime_.v22_empty_string_data);
+        const auto saved_regs = cpu_.Regs();
+        const auto saved_ext = cpu_.ExtRegs();
+        const u32 saved_cpsr = cpu_.Cpsr();
+        const u32 saved_fpscr = cpu_.Fpscr();
+        u32 ignored = 0;
+        const bool ok = RunFunction(
+            runtime_.v22_string_append_bytes,
+            {object_address, source, length}, &ignored,
+            "V22 guest std::string byte builder", 100000000u,
+            std::chrono::milliseconds(15000));
+        cpu_.Regs() = saved_regs;
+        cpu_.ExtRegs() = saved_ext;
+        cpu_.SetCpsr(saved_cpsr);
+        cpu_.SetFpscr(saved_fpscr);
+        Free(source);
+        if (!ok) return false;
+        std::string validation;
+        if (!ReadGuestCowStringObject(object_address, validation) ||
+            validation != value) {
+            log_ << "ERROR: V22 repaired std::string validation failed expected="
+                 << value.size() << " actual=" << validation.size()
+                 << " object=0x" << std::hex << object_address
+                 << " builder=0x" << runtime_.v22_string_append_bytes
+                 << std::dec << '\n';
+            log_.flush();
+            return false;
+        }
+        return true;
+    }
+
+    bool RunNestedPreservingState(u32 address,
+                                  const std::vector<u32>& arguments,
+                                  u32& result, const std::string& label,
+                                  u64 tick_budget = 500000000u) {
+        const auto saved_regs = cpu_.Regs();
+        const auto saved_ext = cpu_.ExtRegs();
+        const u32 saved_cpsr = cpu_.Cpsr();
+        const u32 saved_fpscr = cpu_.Fpscr();
+        const bool ok = RunFunction(address, arguments, &result, label,
+                                    tick_budget,
+                                    std::chrono::milliseconds(30000));
+        cpu_.Regs() = saved_regs;
+        cpu_.ExtRegs() = saved_ext;
+        cpu_.SetCpsr(saved_cpsr);
+        cpu_.SetFpscr(saved_fpscr);
+        return ok;
+    }
+
+    bool HostV22PrepareLevelSetup() {
+        if (!runtime_.v22_prepare_setup_address)
+            return Fail("V22 PlayLayer setup target is unavailable");
+        // The old ARM libstdc++ ABI passes this by-value std::string as a
+        // pointer to the caller-owned four-byte COW object (r5 in PlayLayer::init),
+        // not as the character-data pointer itself. Repair that exact temporary
+        // in place so the caller's existing destructor owns the new value.
+        const u32 string_object = cpu_.Regs()[1];
+        if (!string_object || !env_.IsMapped(string_object, 4u))
+            return Fail("V22 PlayLayer setup std::string object is invalid");
+        u32 string_data = env_.MemoryRead32(string_object);
+        bool empty = string_data == 0u ||
+                     string_data == runtime_.v22_empty_string_data;
+        if (!empty && string_data >= 12u &&
+            env_.IsMapped(string_data - 12u, 12u))
+            empty = env_.MemoryRead32(string_data - 12u) == 0u;
+        if (empty) {
+            if (v22_last_level_setup_.empty())
+                return Fail("V22 level setup argument is empty and no decoded level payload is cached");
+            if (!BuildGuestStringFromBytes(string_object, v22_last_level_setup_))
+                return Fail("V22 failed to rebuild the level setup std::string argument");
+            string_data = env_.MemoryRead32(string_object);
+            if (!string_data) return Fail("V22 rebuilt level string has a null data pointer");
+            ++v22_level_setup_repairs_;
+            log_ << "[host] V22 PlayLayer setup repaired bytes="
+                 << v22_last_level_setup_.size() << " object=0x" << std::hex
+                 << string_object << " data=0x" << string_data << std::dec
+                 << " repair=" << v22_level_setup_repairs_ << '\n';
+            log_.flush();
+        }
+        cpu_.Regs()[15] = runtime_.v22_prepare_setup_address & ~1u;
+        cpu_.SetCpsr((cpu_.Cpsr() & ~0x20u) |
+                     ((runtime_.v22_prepare_setup_address & 1u) ? 0x20u : 0u));
+        return true;
+    }
+
+    bool HostV22EditLevelButton() {
+        const u32 edit_layer = cpu_.Regs()[0];
+        if (!edit_layer || !env_.IsMapped(
+                edit_layer, runtime_.v22_edit_level_pointer_offset + 4u))
+            return Fail("V22 EditLevelLayer pointer is invalid");
+        const u32 level = env_.MemoryRead32(
+            edit_layer + runtime_.v22_edit_level_pointer_offset);
+        if (!LooksLikeGuestObject(runtime_, env_, level)) {
+            std::ostringstream error;
+            error << "V22 editor button has invalid GJGameLevel pointer 0x"
+                  << std::hex << level << " at EditLevelLayer+0x"
+                  << runtime_.v22_edit_level_pointer_offset;
+            return Fail(error.str());
+        }
+
+        log_ << "[host] V22 wrench-and-hammer editor button editLayer=0x"
+             << std::hex << edit_layer << " level=0x" << level
+             << std::dec << '\n';
+        log_.flush();
+
+        u32 director = 0, editor = 0, scene = 0, transition = 0, ignored = 0;
+        if (!RunNestedPreservingState(runtime_.v22_edit_close_text_inputs,
+                                      {edit_layer}, ignored,
+                                      "V22 EditLevelLayer::closeTextInputs"))
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_edit_verify_level_name,
+                                      {edit_layer}, ignored,
+                                      "V22 EditLevelLayer::verifyLevelName"))
+            return false;
+        if (runtime_.v22_game_manager_editor_state_offset) {
+            u32 game_manager = 0;
+            if (!RunNestedPreservingState(runtime_.v22_game_manager_shared, {},
+                                          game_manager,
+                                          "V22 GameManager::sharedState") ||
+                !game_manager || !env_.IsMapped(
+                    game_manager + runtime_.v22_game_manager_editor_state_offset,
+                    4u))
+                return Fail("V22 GameManager editor-state field is unavailable");
+            env_.MemoryWrite32(
+                game_manager + runtime_.v22_game_manager_editor_state_offset,
+                3u);
+        }
+        if (!RunNestedPreservingState(runtime_.v22_director_shared, {},
+                                      director, "V22 CCDirector::sharedDirector") ||
+            !director)
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_level_editor_create,
+                                      {level, 1u}, editor,
+                                      "V22 LevelEditorLayer::create") ||
+            !editor)
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_scene_create, {}, scene,
+                                      "V22 CCScene::create") || !scene)
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_node_add_child,
+                                      {scene, editor}, ignored,
+                                      "V22 CCNode::addChild"))
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_transition_fade_create,
+                                      {0x3F000000u, scene}, transition,
+                                      "V22 CCTransitionFade::create") ||
+            !transition)
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_director_replace_scene,
+                                      {director, transition}, ignored,
+                                      "V22 CCDirector::replaceScene"))
+            return false;
+
+        ++v22_editor_entries_;
+        log_ << "RESULT: DYNARMIC_V22_LEVEL_EDITOR_ENTERED source=wrench-hammer count="
+             << v22_editor_entries_ << '\n';
+        log_.flush();
+        cpu_.Regs()[0] = 0u;
+        return true;
+    }
+
     static bool InflateV22PayloadWithWindow(const std::vector<u8>& compressed,
                                             int window_bits,
                                             std::string& output) {
@@ -3594,6 +4033,12 @@ private:
         env_.MemoryWrite8(guest_output + output_size, 0u);
         env_.MemoryWrite32(output_pointer, guest_output);
         result = output_size;
+        if (decompressed.size() >= 1024u &&
+            decompressed.size() >= 2u && decompressed[0] == 'k' &&
+            decompressed[1] == 'S') {
+            v22_last_level_setup_ = decompressed;
+            ++v22_level_payload_caches_;
+        }
         ++v22_decompress_successes_;
         if (v22_decompress_log_count_ < 16u) {
             ++v22_decompress_log_count_;
@@ -5643,6 +6088,13 @@ private:
         };
         // These dominate APK/level loading. Keep them ahead of the large generic
         // import chain and avoid temporary allocations on every SVC crossing.
+        if (name == "__dynarmic_v22_prepare_level_setup")
+            return HostV22PrepareLevelSetup();
+        if (name == "__dynarmic_v22_edit_level_onEdit") {
+            const bool ok = HostV22EditLevelButton();
+            if (!ok) return false;
+            return finish_hot(cpu_.Regs()[0]);
+        }
         if (name == "__dynarmic_v22_creator_editor_unlock") {
             if (!v22_editor_callback_address_)
                 return Fail("CreatorLayer editor callback address is unavailable");
@@ -6293,6 +6745,10 @@ private:
     u64 v22_decompress_successes_=0;
     u64 v22_decompress_failures_=0;
     u64 v22_decompress_log_count_=0;
+    u64 v22_level_payload_caches_=0;
+    u64 v22_level_setup_repairs_=0;
+    u64 v22_editor_entries_=0;
+    std::string v22_last_level_setup_;
     u32 v22_editor_callback_address_=0;
     u64 v22_editor_unlock_calls_=0;
     bool refresh_rate_bridge_logged_=false;
@@ -6667,7 +7123,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup7 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup8 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6921,8 +7377,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup7");
-        emit("Milestone: guest-original C++ level decompression via low-level inflate bridge and F2 direct editor entry");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup8");
+        emit("Milestone: PlayLayer level-string handoff repair and real wrench-and-hammer EditLevelLayer editor entry");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -6934,7 +7390,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup7 must be compiled as a 64-bit executable");
+                "V22BetaBringup8 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -6942,7 +7398,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -7037,12 +7493,16 @@ int main(int argc,char** argv) {
                 "required CreatorLayer::canPlayOnlineLevels symbol was not found");
         const std::size_t editor_redirects =
             InstallV22CreatorEditorUnlock(runtime, env);
-        const SymbolRecord* direct_editor_symbol = FindSymbol(
-            runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
-        if (!direct_editor_symbol)
+        const std::size_t prepare_bridges =
+            InstallV22PrepareLevelBridge(runtime, env);
+        if (prepare_bridges != 1u)
             throw std::runtime_error(
-                "required CreatorLayer::onMyLevels direct editor entry was not found");
-        const u32 direct_editor_address = direct_editor_symbol->address;
+                "required PlayLayer level setup bridge was not installed");
+        const std::size_t edit_button_pointers =
+            InstallV22EditButtonBridge(runtime, env);
+        if (edit_button_pointers == 0u)
+            throw std::runtime_error(
+                "required EditLevelLayer::onEdit callback pointer was not found");
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -7082,13 +7542,12 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_CREATOR_EDITOR_REDIRECT_FALLBACK count="+
              std::to_string(editor_redirects)+
              " redirect=onOnlyFullVersion->onMyLevels");
-        {
-            std::ostringstream line;
-            line << "RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target=0x"
-                 << std::hex << direct_editor_address << std::dec
-                 << " bypass=broken-beta-button";
-            emit(line.str());
-        }
+        emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
+             std::to_string(prepare_bridges)+
+             " fallback=last-verified-kS-payload guest-string-builder=1");
+        emit("RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_READY pointers="+
+             std::to_string(edit_button_pointers)+
+             " source=EditLevelLayer::onEdit target=LevelEditorLayer::create");
         emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports="+
              std::to_string(std::count_if(
                  runtime.imports.begin(),runtime.imports.end(),
@@ -7242,15 +7701,9 @@ int main(int argc,char** argv) {
                             runtime.native_delete_backward);
                     break;
                 case HostEventType::OpenEditor:
-                    if(!native_paused){
-                        emit("[host] V22 F2 direct editor entry requested");
-                        u32 ignored=0;
-                        ok=executor.RunFunction(
-                            direct_editor_address,{0u,0u},&ignored,
-                            "V22 direct My Levels editor entry",
-                            500000000u,std::chrono::milliseconds(30000));
-                        if(ok) emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_ENTERED source=F2");
-                    }
+                    // Bringup8 incorrectly mapped F2 to My Levels. Bringup8
+                    // intentionally leaves F2 unused; the real wrench-and-
+                    // hammer EditLevelLayer callback is patched instead.
                     break;
                 case HostEventType::Pause:
                     if(!native_paused){
@@ -7460,11 +7913,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_FAILED");
         return 1;
     }
 }

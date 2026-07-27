@@ -1,15 +1,17 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup7
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup8
 
 Package policy:
-- complete source tree retained
+- complete source and pinned dependency tree retained
 - no APK files included
 - no historical wrapper changelog files included
 - raw libcocos2dcpp.so probe retained
 
-Bringup7 validation:
-- portable C++20 syntax passed with Dynarmic interface stubs
-- newer and earlier ccInflateMemory wrappers are 8-byte Thumb-2 functions beginning with 0xf44f
-- high-level C++ decompressString hook removed
-- both beta onMyLevels entries ignore incoming this/sender before creating the My Levels scene
-- F2 event and direct editor call compiled into the interactive loop
+Bringup8 validation:
+- portable C++20 syntax passed with Dynarmic interface stubs and -Wall -Wextra -Werror
+- a Linux static-audit executable built from the exact source
+- newer beta: one PlayLayer setup BL callsite and one EditLevelLayer::onEdit callback pointer patched
+- earlier beta: one PlayLayer setup BL callsite and one EditLevelLayer::onEdit callback pointer patched
+- both beta string builders and empty-string singletons discovered after relocation
+- both beta editor creation, scene, transition, and director symbols resolved
+- APK count in source tree: zero
 - ZIP integrity and SHA-256 verified after packaging
