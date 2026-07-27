@@ -1,6 +1,8 @@
-# Source contents — v22beta NetworkTest6
+# Source contents — v22beta NetworkTest7
 
-This archive contains the complete buildable wrapper source for
-`0.9.4-arm-v22beta-networktest6-safe-async-worker`, excluding proprietary APK files.
-It includes the Dynarmic builder integration, host runtime, local storage/audio,
-condition-variable cooperative networking, notes, and license texts.
+Version: `0.9.4-arm-v22beta-networktest7-native-winhttp-bridge`
+
+The source archive excludes proprietary APK files, generated executables,
+build directories, and tool caches. It retains the complete wrapper source,
+Dynarmic build scripts, third-party source already present in NetworkTest6,
+and the NetworkTest2–NetworkTest7 diagnostic history.

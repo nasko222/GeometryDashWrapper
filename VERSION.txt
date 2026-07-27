@@ -1,1 +1,1 @@
-0.9.4-arm-v22beta-networktest6-safe-async-worker
+0.9.4-arm-v22beta-networktest7-native-winhttp-bridge

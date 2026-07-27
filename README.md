@@ -1,41 +1,51 @@
-# Geometry Dash ARM Wrapper — NetworkTest6
+# Geometry Dash ARM Wrapper — NetworkTest7
 
-`networktest6-safe-async-worker` keeps the complete v22 beta NetworkTest3
-baseline and changes only the network-worker execution path plus diagnostics.
+`networktest7-native-winhttp-bridge` replaces the entire emulated Cocos2d-x
+HTTP worker path with a native Windows transport bridge.
 
-The key fix restores DynarmicTest14's immediate worker wake from `sem_post`.
-NetworkTest2/3 deferred that wake to the next frame, which changed the ordering
-of CCHttpClient's foreground/worker synchronization. NetworkTest6 also wakes
-immediately on condition signals while retaining asynchronous DNS, nonblocking
-sockets, frame slicing, and the hard worker watchdog.
+The supplied 2.2 beta normally sends requests through an emulated ARM pthread,
+libcurl, OpenSSL, DNS, and socket stack. NetworkTest2 through NetworkTest6 tried
+to preserve that stack while changing its scheduling. The NetworkTest6 trace
+shows the worker progressing past the earlier synthetic-import resume problem,
+then stopping in OpenSSL `CRYPTO_THREAD_run_once` before DNS or socket creation.
 
-The branch is intentionally verbose. The log now shows request creation,
-`pthread_create`, semaphores/conditions, DNS, sockets, send/receive/poll, caller
-addresses, a 512-call rolling import history, and 250 ms heartbeats during long
-guest calls.
+NetworkTest7 therefore hooks only:
+
+- `cocos2d::extension::CCHttpClient::send(CCHttpRequest*)`
+
+At that boundary it:
+
+1. Copies the request method, URL, body, and headers from guest memory.
+2. Retains the original guest `CCHttpRequest`.
+3. Returns immediately so the button animation and render loop continue.
+4. Performs HTTP/HTTPS through WinHTTP on a real Windows host thread.
+5. Builds an ABI-compatible guest `CCHttpResponse` on the main frame thread.
+6. Invokes the request's original Cocos2d member callback.
+7. Releases the response through the guest `CCObject` destructor path, which
+   releases the retained request exactly once.
+
+The guest CCHttpClient pthread, libcurl, OpenSSL, DNS, and socket code is not
+entered for these requests. All editor, save, audio, platformer, APK-cache,
+inflate, keyboard, lifecycle, and companion-library behavior remains based on
+NetworkTest6.
 
 ## Build
-
-Place the selected APK beside the built executable as
-`game-v22beta-selected.apk`, then run on the Windows build machine:
 
 ```bat
 BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 ```
 
-Output:
+Expected output directory:
 
 ```text
-dist-arm-wrapper-v22beta-networktest6-safe-async-worker\
+dist-arm-wrapper-v22beta-networktest7-native-winhttp-bridge\
 ```
 
 Primary diagnostics:
 
 ```text
-gd-networktest6.log
-gd-networktest6-imports.txt
-gd-networktest6-profile.csv
-gd-networktest6-profile-summary.txt
+gd-networktest7.log
+gd-networktest7-imports.txt
+gd-networktest7-profile.csv
+gd-networktest7-profile-summary.txt
 ```
-
-The source archive intentionally excludes APK files.

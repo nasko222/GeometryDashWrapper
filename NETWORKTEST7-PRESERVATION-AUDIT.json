@@ -1,0 +1,44 @@
+{
+  "baseline": "NetworkTest6 safe async worker",
+  "target": "NetworkTest7 native WinHTTP bridge",
+  "baseline_files": 1140,
+  "target_files": 1155,
+  "common_files": 1140,
+  "byte_identical_common_files": 1131,
+  "changed_common_files": 9,
+  "new_files": 15,
+  "removed_files": [],
+  "changed_files": [
+    "BRANCH.txt",
+    "BUILDING-ARM.md",
+    "DYNARMICTEST14-NETWORK-REFERENCE.md",
+    "README.md",
+    "SOURCE-CONTENTS.md",
+    "VERSION.txt",
+    "build-dynarmic-x64.ps1",
+    "dynarmic-x64/CMakeLists.txt",
+    "src/dynarmic_probe.cpp"
+  ],
+  "added_files": [
+    "NETWORKTEST6-TRACE-EVIDENCE.txt",
+    "NETWORKTEST7-ABI-DISASSEMBLY.txt",
+    "NETWORKTEST7-BRIDGE-HARNESS.txt",
+    "NETWORKTEST7-BUILD-STATUS.txt",
+    "NETWORKTEST7-NOTES.md",
+    "NETWORKTEST7-PATCH-APPLICATION.txt",
+    "NETWORKTEST7-PRESERVATION-AUDIT.json",
+    "NETWORKTEST7-PRESERVATION-AUDIT.txt",
+    "NETWORKTEST7-PRESERVATION-MANIFEST.sha256",
+    "NETWORKTEST7-ROOT-CAUSE.txt",
+    "NETWORKTEST7-STATIC-AUDIT.txt",
+    "NETWORKTEST7-SYNTAX-CHECK.txt",
+    "NETWORKTEST7-SYNTAX-DIAGNOSTICS.txt",
+    "tools/networktest7_bridge_harness.cpp",
+    "tools/networktest7_static_audit.py"
+  ],
+  "runtime_src_files": 21,
+  "runtime_src_changed": [
+    "src/dynarmic_probe.cpp"
+  ],
+  "runtime_src_identical": 20
+}

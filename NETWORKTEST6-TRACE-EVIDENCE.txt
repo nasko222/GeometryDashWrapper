@@ -1,0 +1,21 @@
+NETWORKTEST6 TRACE EVIDENCE USED FOR NETWORKTEST7
+================================================
+
+The final NetworkTest6 worker path completed the previously problematic
+synthetic malloc/memset/memcpy returns and advanced through:
+
+- CRYPTO_zalloc
+- CRYPTO_strdup
+- OPENSSL_sk_insert
+- CRYPTO_THREAD_run_once (twice)
+
+The log then ended without getaddrinfo, socket, connect, send, recv, or an HTTP
+response callback. This made further guest-worker scheduling changes a poor
+engineering direction. NetworkTest7 hooks CCHttpClient::send before the guest
+pthread/OpenSSL path begins and uses WinHTTP on a host thread instead.
+
+Final relevant log sequence:
+  completed pending stub return ... OPENSSL_sk_insert+0xc8
+  completed pending stub return ... CRYPTO_THREAD_run_once+0x8
+  completed pending stub return ... CRYPTO_THREAD_run_once+0x8
+  <end of log>

@@ -1,0 +1,9 @@
+PASS selected-beta ELF32 little-endian
+PASS CCHttpClient::send address=0x00464eb1 size=72 prologue=0xb570
+PASS CCObject ctor=0x00479f81 retain=0x00479fe1 release=0x00479fd1
+PASS CCHttpResponse dtor=0x004650d9 vtable=0x008fcef8 vtable-size=48 installed-vptr=+8
+PASS hook-boundary=CCHttpClient::send synthetic-import=__dynarmic_v22_native_http_send
+PASS transport=WinHTTP host-thread APIs present
+PASS frame-pump=native-response-callbacks-only guest-worker-slicing=absent
+PASS response-layout=request+0x30 success+0x34 body+0x38 headers+0x44 status+0x50 error+0x54
+PASS CMake-link=winhttp

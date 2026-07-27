@@ -1,16 +1,22 @@
 # DynarmicTest14 network reference
 
-The important working behavior copied from DynarmicTest14 is not a wholesale
-replacement of the v22 runtime. It is the ordering of the worker wake:
+DynarmicTest14 remains the behavioral proof that the APK/GDPS request data and
+server endpoints can work through this wrapper family. NetworkTest2 through
+NetworkTest6 attempted to reproduce its guest pthread/libcurl execution model,
+but the selected 2.2 beta repeatedly stopped during guest OpenSSL initialization
+before reaching DNS or a socket.
 
-1. increment the semaphore;
-2. set the foreground import result;
-3. advance the foreground PC past the import stub;
-4. immediately run/resume the registered guest HTTP worker;
-5. restore the foreground guest state after the worker yields.
+NetworkTest7 therefore does **not** copy DynarmicTest14's worker scheduler. It
+uses DynarmicTest14 only as the known-working functional reference and replaces
+the transport boundary completely:
 
-NetworkTest2 and NetworkTest3 changed step 4 into a next-frame wake. NetworkTest6
-restores immediate wake ordering but uses the newer bounded worker slices,
-nonblocking WinSock implementation, asynchronous DNS, and 4 ms hard watchdog.
-All editor, save, audio, platformer, APK cache, lifecycle, and companion-library
-fixes remain from the v22 baseline.
+1. hook `CCHttpClient::send(CCHttpRequest*)` before guest worker creation;
+2. copy the guest URL, method, body, and headers;
+3. perform HTTP/HTTPS with WinHTTP on a real Windows host thread;
+4. construct the beta's real `CCHttpResponse` ABI in guest memory;
+5. invoke the original member callback on the main frame thread;
+6. release the response through the guest `CCObject` lifecycle.
+
+No guest CCHttpClient pthread, libcurl, OpenSSL, DNS, or socket code is executed
+for hooked requests. All unrelated v22 editor, save, audio, input, APK-cache,
+lifecycle, and companion-library fixes remain inherited from NetworkTest6.

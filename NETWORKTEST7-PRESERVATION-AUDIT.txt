@@ -1,0 +1,48 @@
+NETWORKTEST7 PRESERVATION AUDIT
+===============================
+
+Baseline: NetworkTest6 safe async worker
+Target: NetworkTest7 native WinHTTP bridge
+
+Baseline files: 1140
+Target files: 1155
+Common files: 1140
+Byte-identical common files: 1131
+Changed common files: 9
+New files: 15
+Removed files: 0
+
+Runtime src files: 21
+Runtime src files byte-identical: 20
+Runtime src files changed: src/dynarmic_probe.cpp
+
+Changed existing files:
+- BRANCH.txt
+- BUILDING-ARM.md
+- DYNARMICTEST14-NETWORK-REFERENCE.md
+- README.md
+- SOURCE-CONTENTS.md
+- VERSION.txt
+- build-dynarmic-x64.ps1
+- dynarmic-x64/CMakeLists.txt
+- src/dynarmic_probe.cpp
+
+New files:
+- NETWORKTEST6-TRACE-EVIDENCE.txt
+- NETWORKTEST7-ABI-DISASSEMBLY.txt
+- NETWORKTEST7-BRIDGE-HARNESS.txt
+- NETWORKTEST7-BUILD-STATUS.txt
+- NETWORKTEST7-NOTES.md
+- NETWORKTEST7-PATCH-APPLICATION.txt
+- NETWORKTEST7-PRESERVATION-AUDIT.json
+- NETWORKTEST7-PRESERVATION-AUDIT.txt
+- NETWORKTEST7-PRESERVATION-MANIFEST.sha256
+- NETWORKTEST7-ROOT-CAUSE.txt
+- NETWORKTEST7-STATIC-AUDIT.txt
+- NETWORKTEST7-SYNTAX-CHECK.txt
+- NETWORKTEST7-SYNTAX-DIAGNOSTICS.txt
+- tools/networktest7_bridge_harness.cpp
+- tools/networktest7_static_audit.py
+
+Removed files:
+- none

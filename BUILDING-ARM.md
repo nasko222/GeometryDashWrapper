@@ -1,18 +1,16 @@
-# Geometry Dash ARM Wrapper build notes
+# Building NetworkTest7
 
-## NetworkTest6 v22 beta build
+Run on the existing Windows x64 build workspace:
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
+BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 ```
-
-The APK is copied to the output as `game-v22beta-selected.apk`. There is no
-hard-coded APK size/hash allowlist and no donor-library argument.
 
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-networktest6-safe-async-worker\
+dist-arm-wrapper-v22beta-networktest7-native-winhttp-bridge\
 ```
 
-Run `RUN_NETWORKTEST4.cmd` from that output folder.
+NetworkTest7 adds the Windows system library `winhttp` to the existing link.
+No additional third-party networking dependency is required.
