@@ -1,0 +1,65 @@
+Geometry Dash ARM Wrapper Bringup18 static audit
+Branch: v22beta-bringup18-runtime-hooks
+Version: 0.9.4-arm-v22beta-bringup18-runtime-hooks
+
+Observed Bringup17 failure
+--------------------------
+- End screen failed in cocos2d::CCString::floatValue with R0=0.
+- Fault address: 0xfffffff4.
+- The same fault repeated before the wrapper reported FAILED.
+- Bringup18 adds a narrow recovery only for null/underflow faults while PC or LR
+  is inside CCString::floatValue; unrelated guest faults remain fatal.
+
+Companion feature audit
+-----------------------
+Selected late beta libgame.so:
+- ARM ELF32 size: 636,668 bytes
+- SHA-256: f72c7ed18d0db17ff4a6a1d7284eadae7549fe7e52ba268cbc63b815c7be4917
+- .init_array entries: 28
+- LevelEditorLayerExt::initH: present
+- loader(): present but never called by Bringup18
+- Named ApplyHooks found:
+  MenuLayer, Options, EditLevelLayer, LevelEditorLayer, EditorPauseLayer,
+  CollisionFix, ShaderFix, SpeedrunTimer, MoreSearchLayer, SwingIconFix,
+  AbbreviatedLabels, Emojis, AdvancedLevelInfo, DPAD, GDPSManager, Servers,
+  Hacks, DevDebugHooks.
+
+Hook execution policy
+---------------------
+- libgame.so is mapped and relocated.
+- Its constructors are run before nativeInit.
+- The wrapper calls only named ApplyHooks groups selected by safe/all profile.
+- HookManager::do_hook is handled by the host wrapper and redirects references
+  in the primary ARM image.
+- libhooking.so and libdobby.so are inventoried but not executed.
+- loader() is not called, preventing an uncontrolled duplicate all-hook pass.
+- Dynarmic guest code cache is cleared after hook installation.
+
+Cross-APK compatibility
+-----------------------
+Primary libcocos2dcpp.so hashes:
+- Selected 144 MB beta: c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c
+- Stock SubZero:        f45412b454131ebea5de85272d3c1b36dc2307413e55659104ef01ac437cb90f
+- Early 95 MB beta:     ec047ac9d5630d9c1fed629cda1d63d09f7912b8673984aed2167c59e316e286
+
+Selected vs stock SubZero dynamic symbol layout:
+- selected symbols: 24,464
+- stock symbols:    24,464
+- common symbols:   24,464
+- same address/size/type: 24,464 (100%)
+
+Selected vs early beta:
+- common symbols: 20,760
+- same address/size/type: 115 (0.554%)
+
+Conclusion:
+- The selected libgame.so may be used as a donor for stock SubZero's matching
+  late primary layout.
+- It must not be injected into the early beta. libgdkit.so does not provide the
+  missing compatible full editor implementation.
+
+Validation
+----------
+- C++20 syntax-only check: PASS (3 pre-existing unused-field warnings).
+- Source archive proprietary payload check: no APK and no extracted .so files.
+- Windows cross-link/runtime test: not available in this Linux environment.

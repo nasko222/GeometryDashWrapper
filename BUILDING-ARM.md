@@ -1,3 +1,23 @@
+# Building the ARM wrapper
+
+## Bringup18 quick build
+
+Selected beta:
+
+```bat
+BUILD_V22BETA_X64.cmd "D:\\APKs\\selected-beta.apk"
+```
+
+Stock SubZero using the selected beta as the compatible editor/feature donor:
+
+```bat
+BUILD_V22BETA_X64.cmd "D:\\APKs\\SubZero.apk" "D:\\APKs\\selected-beta.apk"
+```
+
+The optional second argument may also be a raw ARMv7 `libgame.so`.
+
+---
+
 # Building Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup17
 
 Use a fresh extracted source directory on 64-bit Windows:

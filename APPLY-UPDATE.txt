@@ -1,0 +1,5 @@
+Copy this folder over a clean Bringup17 source tree, preserving subfolders and
+replacing existing files. Then remove the files listed in
+DELETE-FROM-BRINGUP17.txt.
+
+For a Git checkout, prefer the included .patch artifact instead.

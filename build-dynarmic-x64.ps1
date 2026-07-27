@@ -1,6 +1,8 @@
 param(
     [Parameter(Position = 0)]
     [string]$Apk = "",
+    [Parameter(Position = 1)]
+    [string]$Companion = "",
     [switch]$Clean,
     [switch]$RefreshDynarmic
 )
@@ -14,7 +16,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup17"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup18-runtime-hooks"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +35,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder28-v22beta-armv7-bringup17-local-saves-pause-editor"
+$BuilderRevision = "dynarmic-x64-builder29-v22beta-armv7-bringup18-runtime-hooks"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -435,6 +437,33 @@ if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK or libcocos2dcpp.so not
 $InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
 $PackagedInputName = if ($InputExtension -eq ".so") { "libcocos2dcpp.so" } else { "game-v22beta-selected.apk" }
 Copy-Item -Force $ResolvedApk (Join-Path $Output $PackagedInputName)
+
+$PackagedCompanionSource = ""
+if (-not [string]::IsNullOrWhiteSpace($Companion)) {
+    $ResolvedCompanion = (Resolve-Path -LiteralPath $Companion).Path
+    $CompanionExtension = [IO.Path]::GetExtension($ResolvedCompanion).ToLowerInvariant()
+    $CompanionOutput = Join-Path $Output "libgame.so"
+    if ($CompanionExtension -eq ".so") {
+        Copy-Item -Force $ResolvedCompanion $CompanionOutput
+    } elseif ($CompanionExtension -eq ".apk" -or $CompanionExtension -eq ".zip") {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $ArchiveHandle = [IO.Compression.ZipFile]::OpenRead($ResolvedCompanion)
+        try {
+            $Entry = $ArchiveHandle.GetEntry("lib/armeabi-v7a/libgame.so")
+            if (-not $Entry) {
+                throw "Companion APK has no lib/armeabi-v7a/libgame.so: $ResolvedCompanion"
+            }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $CompanionOutput, $true)
+        } finally {
+            $ArchiveHandle.Dispose()
+        }
+    } else {
+        throw "Companion must be an APK/ZIP containing ARMv7 libgame.so, or a raw libgame.so: $ResolvedCompanion"
+    }
+    $PackagedCompanionSource = $ResolvedCompanion
+    Write-Host "Packaged companion libgame.so from: $ResolvedCompanion"
+}
+
 # Source packages intentionally contain no APKs. An APK passed explicitly to
 # BUILD_V22BETA_X64.cmd is copied only into the generated dist directory as
 # game-v22beta-selected.apk. The named newer/earlier launchers remain available
@@ -445,10 +474,10 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "V22BETA-BRINGUP17-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP17-NOTES.md") }
-$V22Changelog = Join-Path $Root "CHANGELOG-0.9.4-arm-v22beta-bringup17.md"
-if (Test-Path $V22Changelog) { Copy-Item -Force $V22Changelog (Join-Path $Output "CHANGELOG-0.9.4-arm-v22beta-bringup17.md") }
+$V22Notes = Join-Path $Root "V22BETA-BRINGUP18-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP18-NOTES.md") }
+$V22Changelog = Join-Path $Root "CHANGELOG-0.9.4-arm-v22beta-bringup18-runtime-hooks.md"
+if (Test-Path $V22Changelog) { Copy-Item -Force $V22Changelog (Join-Path $Output "CHANGELOG-0.9.4-arm-v22beta-bringup18-runtime-hooks.md") }
 $SaveRecoveryPs1 = Join-Path $Root "RECOVER_V22_SAVES.ps1"
 $SaveRecoveryCmd = Join-Path $Root "RECOVER_V22_SAVES.cmd"
 if (Test-Path $SaveRecoveryPs1) { Copy-Item -Force $SaveRecoveryPs1 (Join-Path $Output "RECOVER_V22_SAVES.ps1") }
@@ -483,7 +512,9 @@ if not exist game-v22beta-selected.apk (
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --debug-everything --dump-imports=gd-v22beta-selected-imports.txt --log=gd-v22beta-selected.log --profile=gd-v22beta-selected-profile.csv --profile-summary=gd-v22beta-selected-profile-summary.txt
+set "COMPANION="
+if exist libgame.so set "COMPANION=--companion-libgame=libgame.so"
+GeometryDashDynarmicProbe.exe game-v22beta-selected.apk %COMPANION% --companion-hooks=safe --debug-everything --dump-imports=gd-v22beta-selected-imports.txt --log=gd-v22beta-selected.log --profile=gd-v22beta-selected-profile.csv --profile-summary=gd-v22beta-selected-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
 echo Main log: gd-v22beta-selected.log
@@ -492,6 +523,26 @@ pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_V22_SELECTED_APK.cmd"), $SelectedLauncher, [Text.Encoding]::ASCII)
+$AllHooksLauncher = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist game-v22beta-selected.apk (
+  echo game-v22beta-selected.apk is missing.
+  pause
+  exit /b 2
+)
+set "COMPANION="
+if exist libgame.so set "COMPANION=--companion-libgame=libgame.so"
+echo EXPERIMENTAL: enabling every discovered companion feature group.
+GeometryDashDynarmicProbe.exe game-v22beta-selected.apk %COMPANION% --companion-hooks=all --debug-everything --dump-imports=gd-v22beta-selected-all-imports.txt --log=gd-v22beta-selected-all.log --profile=gd-v22beta-selected-all-profile.csv --profile-summary=gd-v22beta-selected-all-profile-summary.txt
+set "RESULT=%ERRORLEVEL%"
+echo.
+echo Main log: gd-v22beta-selected-all.log
+pause
+exit /b %RESULT%
+'@
+[IO.File]::WriteAllText((Join-Path $Output "RUN_V22_SELECTED_APK_ALL_HOOKS.cmd"), $AllHooksLauncher, [Text.Encoding]::ASCII)
 $NewerLauncher = @'
 @echo off
 setlocal
@@ -501,7 +552,9 @@ if not exist game-v22beta.apk (
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta.apk --debug-everything --dump-imports=gd-v22beta-newer-imports.txt --log=gd-v22beta-newer.log --profile=gd-v22beta-newer-profile.csv --profile-summary=gd-v22beta-newer-profile-summary.txt
+set "COMPANION="
+if exist libgame.so set "COMPANION=--companion-libgame=libgame.so"
+GeometryDashDynarmicProbe.exe game-v22beta.apk %COMPANION% --companion-hooks=safe --debug-everything --dump-imports=gd-v22beta-newer-imports.txt --log=gd-v22beta-newer.log --profile=gd-v22beta-newer-profile.csv --profile-summary=gd-v22beta-newer-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
 echo Main log: gd-v22beta-newer.log
@@ -519,7 +572,9 @@ if not exist game-v22beta1.apk (
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta1.apk --debug-everything --dump-imports=gd-v22beta-earlier-imports.txt --log=gd-v22beta-earlier.log --profile=gd-v22beta-earlier-profile.csv --profile-summary=gd-v22beta-earlier-profile-summary.txt
+set "COMPANION="
+if exist libgame.so set "COMPANION=--companion-libgame=libgame.so"
+GeometryDashDynarmicProbe.exe game-v22beta1.apk %COMPANION% --companion-hooks=safe --debug-everything --dump-imports=gd-v22beta-earlier-imports.txt --log=gd-v22beta-earlier.log --profile=gd-v22beta-earlier-profile.csv --profile-summary=gd-v22beta-earlier-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
 echo Main log: gd-v22beta-earlier.log
@@ -528,10 +583,14 @@ pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_V22_EARLIER_APK.cmd"), $EarlierLauncher, [Text.Encoding]::ASCII)
-[IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`n", [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`ncompanion=$PackagedCompanionSource`r`n", [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 2.2 beta ARMv7 bring-up branch ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 2.2 beta ARMv7 Bringup18 branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Raw .so: RUN_V22_RAW_SO_PROBE.cmd"
-Write-Host "Selected APK: RUN_V22_SELECTED_APK.cmd`nNewer/earlier named APK launchers are also included."
+Write-Host "Selected APK (safe features): RUN_V22_SELECTED_APK.cmd"
+Write-Host "Selected APK (all experimental features): RUN_V22_SELECTED_APK_ALL_HOOKS.cmd"
+Write-Host "For stock SubZero with the selected-beta editor/features donor:"
+Write-Host '  BUILD_V22BETA_X64.cmd "D:\path\SubZero.apk" "D:\path\selected-beta.apk"'
+Write-Host "Newer/earlier named APK launchers are also included."

@@ -1,16 +1,10 @@
-# Source contents — v22beta Bringup17
+# Source contents — v22beta Bringup18
 
-Included:
+This archive contains the complete source/build scripts for
+`0.9.4-arm-v22beta-bringup18-runtime-hooks`.
 
-- Dynarmic ARMv7 wrapper and Win32 host bridges.
-- Legacy x86 and Unicorn source retained for the future unified launcher.
-- Windows build scripts, standalone save-recovery helper, and pinned dependency acquisition.
-- Vendored zlib, stb_vorbis, and existing third-party license files.
-- Bringup17 technical notes, static audit, syntax-check report, and verification report.
+Included: Dynarmic wrapper source, portable Windows builder, save recovery,
+Bringup18 notes/changelog, static audit, and syntax report.
 
-Excluded from the downloadable source archive:
-
-- APK files.
-- Extracted game or companion native libraries.
-- Generated build caches and distribution directories.
-- Superseded bringup notes and audits.
+Not included: APKs, `libcocos2dcpp.so`, `libgame.so`, `libhooking.so`, Dobby,
+FMOD binaries, build caches, or generated dist folders.

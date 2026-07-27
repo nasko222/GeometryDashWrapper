@@ -1,0 +1,19 @@
+Bringup18 C++20 syntax-only validation
+
+Command: clang++ -std=c++20 -fsyntax-only with a minimal Dynarmic A32 API stub.
+Result: PASS
+
+Warnings (pre-existing unused private fields):
+/mnt/data/GeometryDashWrapper-0.9.4-arm-v22beta-bringup18-runtime-hooks-full-source-no-apk/src/dynarmic_probe.cpp:8612:9: warning: private field 'network_poll_log_count_' is not used [-Wunused-private-field]
+ 8612 |     u64 network_poll_log_count_=0;
+      |         ^
+/mnt/data/GeometryDashWrapper-0.9.4-arm-v22beta-bringup18-runtime-hooks-full-source-no-apk/src/dynarmic_probe.cpp:8701:9: warning: private field 'gl_array_buffer_binding_' is not used [-Wunused-private-field]
+ 8701 |     u32 gl_array_buffer_binding_=0;
+      |         ^
+/mnt/data/GeometryDashWrapper-0.9.4-arm-v22beta-bringup18-runtime-hooks-full-source-no-apk/src/dynarmic_probe.cpp:8702:9: warning: private field 'gl_element_buffer_binding_' is not used [-Wunused-private-field]
+ 8702 |     u32 gl_element_buffer_binding_=0;
+      |         ^
+3 warnings generated.
+
+This validates C++ syntax and the used Dynarmic Jit::ClearCache API shape. It is
+not a Windows link or runtime execution test.

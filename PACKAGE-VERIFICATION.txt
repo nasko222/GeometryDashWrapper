@@ -1,39 +1,17 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup17
-Branch: v22beta-bringup17-safe-companions
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup18-runtime-hooks
+Branch: v22beta-bringup18-runtime-hooks
 
-Scope
-- Starts from the Bringup16 stable 2.2-beta runtime.
-- Fixes package-agnostic portable saves and targeted gameplay Edit entry.
-- Inventories all APK ARM libraries without blindly running all constructors.
-- Stable Dynarmic Test14-fix1 for Geometry Dash 1.0-1.4 is untouched.
-- Source archive contains no APK or extracted proprietary native library.
+Package policy: complete source, no APK, no extracted proprietary .so.
+Build output: dist-arm-wrapper-v22beta-bringup18-runtime-hooks
+Builder revision: dynarmic-x64-builder29-v22beta-armv7-bringup18-runtime-hooks
 
-Implemented
-- `/data/data/<any-package>/...` -> local `save-v22beta` translation.
-- Copy-only recovery of misplaced drive-root CCGameManager/CCLocalLevels files.
-- Standalone RECOVER_V22_SAVES helper for pre-build listing/recovery.
-- PauseLayer and EndLevelLayer Edit callback bridges to validated editor entry.
-- Existing wrench/hammer targeted companion `initH` entry retained.
-- Native `.so` inventory with explicit primary/companion/audit-only policy.
-- Broad libgame/libhooking/Dobby/libgdkit constructors and ApplyHooks disabled.
+Validation performed:
+- C++20 syntax-only check: PASS
+- selected/stock symbol-layout comparison: 24,464/24,464 exact
+- early-beta layout rejection verified by symbol comparison
+- safe/all companion feature symbols present in selected libgame.so
+- end-screen crash signature matched to null CCString::floatValue
 
-Static evidence
-- Selected APK libraries: libcocos2dcpp, libfmod, libgame, libhooking, libdobby.
-- Selected primary PauseLayer::onEdit and EndLevelLayer::onEdit are size-2 stubs.
-- Both stub addresses have aligned pointer references in the selected ELF.
-- Selected companion provides compatible LevelEditorLayerExt::initH.
-- Stock SubZero has no companion libgame and only a base editor initializer.
-- Legacy libgdkit is a hook framework, not a stock editor implementation.
-
-Validation performed in this handoff
-- C++20 syntax check: PASS (three pre-existing unused-field warnings).
-- Source/version/branch consistency audit: PASS.
-- APK inclusion audit: PASS; no APK files in source package.
-- Windows x64 cross-build/link: NOT RUN in this Linux environment.
-- Live gameplay/editor/save migration: requires Windows test build.
-
-Build identity
-- Output: dist-arm-wrapper-v22beta-bringup17
-- Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
-- Builder revision:
-  dynarmic-x64-builder28-v22beta-armv7-bringup17-local-saves-pause-editor
+Not performed here:
+- Windows link
+- live ARM runtime test

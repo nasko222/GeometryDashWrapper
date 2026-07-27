@@ -1065,6 +1065,48 @@ struct SymbolRecord {
     u32 address = 0;
     u32 size = 0;
 };
+enum class V22CompanionHookMode {
+    Off,
+    Safe,
+    All,
+};
+
+static const char* V22CompanionHookModeName(V22CompanionHookMode mode) {
+    switch (mode) {
+    case V22CompanionHookMode::Off: return "off";
+    case V22CompanionHookMode::Safe: return "safe";
+    case V22CompanionHookMode::All: return "all";
+    }
+    return "off";
+}
+
+struct V22CompanionFeatureSpec {
+    const char* label;
+    const char* symbol;
+    bool safe;
+};
+
+static constexpr V22CompanionFeatureSpec kV22CompanionFeatures[] = {
+    {"MenuLayer", "_ZN12MenuLayerExt10ApplyHooksEv", true},
+    {"Options", "_ZN7Options10ApplyHooksEv", true},
+    {"EditLevelLayer", "_ZN17EditLevelLayerExt10ApplyHooksEv", true},
+    {"LevelEditorLayer", "_ZN19LevelEditorLayerExt10ApplyHooksEv", true},
+    {"EditorPauseLayer", "_ZN19EditorPauseLayerExt10ApplyHooksEv", true},
+    {"CollisionFix", "_ZN12CollisionFix10ApplyHooksEv", true},
+    {"ShaderFix", "_ZN9ShaderFix10ApplyHooksEv", true},
+    {"SpeedrunTimer", "_ZN13SpeedrunTimer10ApplyHooksEv", true},
+    {"MoreSearch", "_ZN18MoreSearchLayerExt10ApplyHooksEv", true},
+    {"SwingIconFix", "_ZN12SwingIconFix10ApplyHooksEv", true},
+    {"AbbreviatedLabels", "_ZN17AbbreviatedLabels10ApplyHooksEv", true},
+    {"Emojis", "_ZN6Emojis10ApplyHooksEv", true},
+    {"AdvancedLevelInfo", "_ZN17AdvancedLevelInfo10ApplyHooksEv", true},
+    {"DPAD", "_ZN9DPADHooks10ApplyHooksEv", false},
+    {"GDPSManager", "_ZN11GDPSManager10ApplyHooksEv", false},
+    {"Servers", "_ZN7Servers10ApplyHooksEv", false},
+    {"Hacks", "_ZN5Hacks10ApplyHooksEv", false},
+    {"DevDebug", "_ZN13DevDebugHooks10ApplyHooksEv", false},
+};
+
 struct ElfRuntime {
     u32 image_min = 0;
     u32 image_max = 0;
@@ -2483,7 +2525,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup17Window";
+        const char* class_name = "GeometryDashV22BetaBringup18Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2495,7 +2537,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup17",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup18",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2973,6 +3015,12 @@ public:
         if (const SymbolRecord* editor = FindSymbol(
                 runtime_, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"))
             v22_editor_callback_address_ = editor->address;
+        if (const SymbolRecord* float_value = FindSymbol(
+                runtime_, "_ZNK7cocos2d8CCString10floatValueEv")) {
+            v22_ccstring_float_value_ = float_value->address & ~1u;
+            v22_ccstring_float_value_size_ =
+                std::max<u32>(float_value->size, 0x28u);
+        }
     }
 
     ~GuestExecutor() {
@@ -3144,6 +3192,14 @@ public:
     void FlushDiagnostics() { log_.flush(); }
     const GuestCallMetrics& LastCallMetrics() const { return last_call_metrics_; }
     const std::string& LastAndroidLog() const { return last_android_log_; }
+    u64 CompanionHooksInstalled() const { return v22_companion_hooks_installed_; }
+    u64 CompanionHooksSkipped() const { return v22_companion_hooks_skipped_; }
+    void ClearGuestCodeCache(const char* reason) {
+        cpu_.ClearCache();
+        log_ << "RESULT: DYNARMIC_GUEST_CODE_CACHE_CLEARED reason="
+             << (reason ? reason : "unspecified") << '\n';
+        log_.flush();
+    }
 
     ProfilerCounters CaptureProfilerCounters() const {
         ProfilerCounters counters;
@@ -3535,6 +3591,12 @@ public:
             cpu_.ClearHalt(kCallbackHalt);
 
             if (env_.invalid_access) {
+                if (RecoverV22NullCcStringFloatValue(label)) {
+                    estimated_ticks += 1024u;
+                    if (!unlimited_ticks)
+                        budget = budget > 1024u ? budget - 1024u : 0u;
+                    continue;
+                }
                 std::ostringstream error;
                 error << label << " invalid guest memory at 0x" << std::hex << env_.fault_address
                       << " PC=0x" << cpu_.Regs()[15] << " (" << DescribeAddress(cpu_.Regs()[15]) << ')'
@@ -3626,6 +3688,41 @@ private:
         config.check_halt_on_memory_access = true;
         return config;
     }
+    bool RecoverV22NullCcStringFloatValue(const std::string& label) {
+        if (!v22_ccstring_float_value_ || cpu_.Regs()[0] != 0u) return false;
+        const u32 pc = cpu_.Regs()[15] & ~1u;
+        const u32 lr = cpu_.Regs()[14];
+        const u32 lr_address = lr & ~1u;
+        const u32 begin = v22_ccstring_float_value_;
+        const u32 end = begin + v22_ccstring_float_value_size_;
+        const bool inside_float_value =
+            (pc >= begin && pc < end) ||
+            (lr_address >= begin && lr_address < end);
+        const bool null_underflow =
+            env_.fault_address == 0x30u || env_.fault_address >= 0xFFFFF000u;
+        if (!inside_float_value || !null_underflow || !lr) return false;
+
+        // CCString::floatValue calls CCString::length first. A malformed beta
+        // level can pass a null CCString pointer on the end screen. Resume as
+        // though length() returned zero; floatValue then follows its own
+        // normal empty-string path and returns 0.0f.
+        cpu_.Regs()[0] = 0u;
+        cpu_.Regs()[15] = lr_address;
+        u32 cpsr = cpu_.Cpsr();
+        if (lr & 1u) cpsr |= 0x20u;
+        else cpsr &= ~0x20u;
+        cpu_.SetCpsr(cpsr);
+        const u32 fault = env_.fault_address;
+        env_.ResetStopState();
+        ++v22_null_ccstring_float_recoveries_;
+        log_ << "RESULT: DYNARMIC_V22_NULL_CCSTRING_FLOAT_RECOVERED call="
+             << v22_null_ccstring_float_recoveries_
+             << " label=" << label << " fault=0x" << std::hex << fault
+             << " resume=0x" << lr_address << std::dec << '\n';
+        log_.flush();
+        return true;
+    }
+
     bool Fail(const std::string& message) {
         last_error_ = message;
         log_ << "ERROR: " << message << '\n';
@@ -4989,9 +5086,16 @@ private:
                 break;
             }
         }
-        if (!target)
-            return Fail("V22 companion hook target is unavailable: " +
-                        target_name);
+        if (!target) {
+            if (original_storage && env_.IsMapped(original_storage, 4u))
+                env_.MemoryWrite32(original_storage, 0u);
+            ++v22_companion_hooks_skipped_;
+            log_ << "RESULT: DYNARMIC_V22_COMPANION_HOOK_SKIPPED target="
+                 << target_name << " reason=primary-symbol-unavailable skip="
+                 << v22_companion_hooks_skipped_ << '\n';
+            log_.flush();
+            return true;
+        }
         if (!replacement ||
             (replacement & ~1u) < runtime_.v22_companion_executable_min ||
             (replacement & ~1u) >= runtime_.v22_companion_executable_max)
@@ -8538,6 +8642,10 @@ private:
     bool v22_mouse_platformer_jump_down_=false;
     u32 v22_mouse_platformer_touch_ui_=0;
     u64 v22_companion_hooks_installed_=0;
+    u64 v22_companion_hooks_skipped_=0;
+    u64 v22_null_ccstring_float_recoveries_=0;
+    u32 v22_ccstring_float_value_=0;
+    u32 v22_ccstring_float_value_size_=0;
     u64 v22_level_catalog_decodes_=0;
     u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x100u;
     std::optional<std::string> v22_pending_level_setup_;
@@ -8918,7 +9026,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup17 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup18-runtime-hooks debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -9172,9 +9280,9 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup17");
-        emit("Bringup17: local save redirect/migration, pause/end editor bridge, "
-             "native-library inventory, and ABI-gated companions");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup18-runtime-hooks");
+        emit("Bringup18: end-screen CCString recovery, companion runtime hooks, "
+             "sidecar libgame support, and local saves");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -9186,7 +9294,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup17 must be compiled as a 64-bit executable");
+                "V22BetaBringup18 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -9194,10 +9302,12 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP18_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
+        std::string companion_libgame_path;
+        V22CompanionHookMode companion_hook_mode = V22CompanionHookMode::Safe;
         bool probe_only=false;
         bool probe_only_explicit=false;
         int width=1280,height=720,max_frames=0;
@@ -9217,6 +9327,16 @@ int main(int argc,char** argv) {
             else if(argument.rfind("--height=",0)==0)
                 height=std::max(
                     240,std::stoi(std::string(argument.substr(9))));
+            else if(argument.rfind("--companion-libgame=",0)==0)
+                companion_libgame_path=std::string(argument.substr(20));
+            else if(argument.rfind("--companion-hooks=",0)==0) {
+                const std::string mode(argument.substr(18));
+                if (mode == "off") companion_hook_mode = V22CompanionHookMode::Off;
+                else if (mode == "safe") companion_hook_mode = V22CompanionHookMode::Safe;
+                else if (mode == "all") companion_hook_mode = V22CompanionHookMode::All;
+                else throw std::runtime_error(
+                    "--companion-hooks must be off, safe, or all");
+            }
             else if(!argument.empty()&&argument[0]!='-')
                 input_path=std::string(argument);
         }
@@ -9231,6 +9351,7 @@ int main(int argc,char** argv) {
         std::vector<u8> apk;
         std::vector<u8> libgame;
         std::vector<u8> companion_libgame;
+        std::string companion_libgame_source;
         u32 companion_crc = 0u;
         bool companion_hooking_present = false;
         bool companion_dobby_present = false;
@@ -9262,6 +9383,8 @@ int main(int argc,char** argv) {
             try {
                 companion_libgame = ExtractZipMember(
                     apk, "lib/armeabi-v7a/libgame.so");
+                if (!companion_libgame.empty())
+                    companion_libgame_source = "input-apk";
             } catch (const std::exception&) {
                 companion_libgame.clear();
             }
@@ -9279,6 +9402,29 @@ int main(int argc,char** argv) {
                 "lib/armeabi-v7a/libdobby.so");
             legacy_gdkit_present = has_apk_member(
                 "lib/armeabi-v7a/libgdkit.so");
+            if (companion_libgame.empty()) {
+                std::filesystem::path sidecar;
+                if (!companion_libgame_path.empty())
+                    sidecar = std::filesystem::absolute(companion_libgame_path);
+                else {
+                    const std::filesystem::path beside_input =
+                        absolute_input.parent_path() / "libgame.so";
+                    const std::filesystem::path beside_executable =
+                        std::filesystem::absolute("libgame.so");
+                    if (std::filesystem::exists(beside_input))
+                        sidecar = beside_input;
+                    else if (std::filesystem::exists(beside_executable))
+                        sidecar = beside_executable;
+                }
+                if (!sidecar.empty()) {
+                    companion_libgame = ReadFile(sidecar.string());
+                    if (!IsElf32ArmImage(companion_libgame))
+                        throw std::runtime_error(
+                            "external companion libgame.so is not ARM ELF32: " +
+                            sidecar.string());
+                    companion_libgame_source = sidecar.string();
+                }
+            }
             if (!companion_libgame.empty()) {
                 companion_crc = static_cast<u32>(crc32(
                     0, reinterpret_cast<const Bytef*>(
@@ -9288,9 +9434,9 @@ int main(int argc,char** argv) {
                 line << "RESULT: DYNARMIC_V22_COMPANION_LIBGAME_DETECTED bytes="
                      << companion_libgame.size() << " crc32=0x" << std::hex
                      << std::setw(8) << std::setfill('0') << companion_crc
-                     << std::dec
-                     << " role=optional-editor-extension "
-                        "execution=capability-gated";
+                     << std::dec << " source=" << companion_libgame_source
+                     << " role=editor-and-feature-extension "
+                        "hook-engine=host-redirection execution=runtime-profile";
                 emit(line.str());
             } else {
                 emit("RESULT: DYNARMIC_V22_COMPANION_LIBGAME_ABSENT "
@@ -9314,7 +9460,7 @@ int main(int argc,char** argv) {
                         : legacy_gdkit_present
                             ? "legacy-touch,update,menu,unlock"
                             : "none") +
-                " execution=capability-gated-no-global-loader");
+                " execution=constructors+selected-ApplyHooks-no-dobby-loader");
         }else{
             libgame=input_bytes;
             library_member="raw:libcocos2dcpp.so";
@@ -9450,9 +9596,12 @@ int main(int argc,char** argv) {
                  << runtime.v22_companion_executable_min << "-0x"
                  << runtime.v22_companion_executable_max << " initH=0x"
                  << runtime.v22_companion_editor_init << std::dec
-                 << " constructors=not-run initH-enabled="
+                 << " constructors=" << companion_runtime.constructors.size()
+                 << " initH-enabled="
                  << (runtime.v22_companion_editor_init_enabled ? 1 : 0)
-                 << " mode=capability-gated ApplyHooks=disabled";
+                 << " hook-profile="
+                 << V22CompanionHookModeName(companion_hook_mode)
+                 << " source=" << companion_libgame_source;
             emit(line.str());
             if (runtime.v22_companion_editor_init_enabled) {
                 emit(
@@ -9529,10 +9678,13 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target="+
              std::to_string(direct_editor_address != 0u)+
              " action=MyLevels");
-        emit("RESULT: DYNARMIC_V22_COMPANION_GAMEPLAY_HOOKS_DISABLED "
-             "sets=DPAD,CollisionFix,ShaderFix,SpeedrunTimer,GDPSManager "
-             "reason=constructors-and-global-hooks-regress-stable-gameplay "
-             "targeted-editor-init=capability-gated");
+        emit("RESULT: DYNARMIC_V22_COMPANION_HOOK_POLICY mode=" +
+             std::string(V22CompanionHookModeName(companion_hook_mode)) +
+             " safe=MenuLayer,Options,EditLevelLayer,LevelEditorLayer,"
+             "EditorPauseLayer,CollisionFix,ShaderFix,SpeedrunTimer,"
+             "MoreSearch,SwingIconFix,AbbreviatedLabels,Emojis,"
+             "AdvancedLevelInfo all-adds=DPAD,GDPSManager,Servers,Hacks,DevDebug "
+             "loader=disabled libhooking=host-implemented libdobby=not-run");
         emit("RESULT: DYNARMIC_V22_PLATFORMER_WINDOWS_INPUT_READY "
              "mouse=native-touch-id-ownership+host-jump "
              "keyboard=Space,Up,A,D,Left,Right "
@@ -9618,6 +9770,103 @@ int main(int argc,char** argv) {
                 &result,"nativeSetPaths"))
             throw std::runtime_error(executor.LastError());
         emit("RESULT: DYNARMIC_PATHS_SET");
+
+        bool companion_runtime_initialized = false;
+        if (!companion_libgame.empty() && late_beta_layout &&
+            companion_hook_mode != V22CompanionHookMode::Off) {
+            companion_runtime_initialized = true;
+            emit("Running " +
+                 std::to_string(companion_runtime.constructors.size()) +
+                 " companion libgame.so constructors through Dynarmic");
+            for (std::size_t index = 0;
+                 index < companion_runtime.constructors.size(); ++index) {
+                const u32 entry = companion_runtime.constructors[index];
+                if (entry == 0u || entry == std::numeric_limits<u32>::max())
+                    continue;
+                u32 ignored = 0u;
+                if (!executor.RunFunction(
+                        entry, {}, &ignored,
+                        "companion constructor " +
+                            std::to_string(index + 1u),
+                        0u, std::chrono::milliseconds(30000))) {
+                    emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTOR_FAILED index=" +
+                         std::to_string(index + 1u) +
+                         " action=disable-companion-hooks");
+                    companion_runtime_initialized = false;
+                    break;
+                }
+            }
+            if (companion_runtime_initialized) {
+                emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_OK count=" +
+                     std::to_string(companion_runtime.constructors.size()));
+                std::size_t features_ok = 0u;
+                std::size_t features_failed = 0u;
+                std::size_t features_absent = 0u;
+                for (const V22CompanionFeatureSpec& feature :
+                     kV22CompanionFeatures) {
+                    if (companion_hook_mode == V22CompanionHookMode::Safe &&
+                        !feature.safe)
+                        continue;
+                    const SymbolRecord* apply =
+                        FindSymbol(runtime, feature.symbol);
+                    if (!apply ||
+                        apply->address < runtime.v22_companion_executable_min ||
+                        apply->address >= runtime.v22_companion_executable_max) {
+                        ++features_absent;
+                        emit(std::string(
+                                 "RESULT: DYNARMIC_V22_COMPANION_FEATURE_ABSENT name=") +
+                             feature.label);
+                        continue;
+                    }
+                    const u64 hooks_before =
+                        executor.CompanionHooksInstalled();
+                    const u64 skipped_before =
+                        executor.CompanionHooksSkipped();
+                    u32 ignored = 0u;
+                    const bool ok = executor.RunFunction(
+                        apply->address, {}, &ignored,
+                        std::string("companion ") + feature.label +
+                            "::ApplyHooks",
+                        0u, std::chrono::milliseconds(30000));
+                    if (ok) {
+                        ++features_ok;
+                        emit(std::string(
+                                 "RESULT: DYNARMIC_V22_COMPANION_FEATURE_ENABLED name=") +
+                             feature.label + " hooks=" +
+                             std::to_string(
+                                 executor.CompanionHooksInstalled() -
+                                 hooks_before) +
+                             " skipped=" +
+                             std::to_string(
+                                 executor.CompanionHooksSkipped() -
+                                 skipped_before));
+                    } else {
+                        ++features_failed;
+                        emit(std::string(
+                                 "RESULT: DYNARMIC_V22_COMPANION_FEATURE_FAILED name=") +
+                             feature.label + " action=continue-primary-game");
+                    }
+                }
+                executor.ClearGuestCodeCache("companion-hooks-installed");
+                emit("RESULT: DYNARMIC_V22_COMPANION_FEATURE_TOTALS mode=" +
+                     std::string(V22CompanionHookModeName(
+                         companion_hook_mode)) +
+                     " enabled=" + std::to_string(features_ok) +
+                     " failed=" + std::to_string(features_failed) +
+                     " absent=" + std::to_string(features_absent) +
+                     " hooks=" +
+                     std::to_string(executor.CompanionHooksInstalled()) +
+                     " skipped=" +
+                     std::to_string(executor.CompanionHooksSkipped()));
+            }
+        } else if (!companion_libgame.empty() && !late_beta_layout) {
+            emit("RESULT: DYNARMIC_V22_COMPANION_RUNTIME_SKIPPED "
+                 "reason=primary-layout-not-late-beta action=preserve-game");
+        } else if (companion_hook_mode == V22CompanionHookMode::Off) {
+            emit("RESULT: DYNARMIC_V22_COMPANION_RUNTIME_SKIPPED "
+                 "reason=hook-profile-off");
+        }
+
         if(!executor.CreateOpenGlWindow(width,height))
             throw std::runtime_error(
                 "could not create Win32 OpenGL host window");
@@ -9880,7 +10129,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup17 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup18 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -9930,11 +10179,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP18_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP18_FAILED");
         return 1;
     }
 }
