@@ -1,47 +1,52 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup13
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup14
 
 Scope
-- Separate Dynarmic ARMv7 branch for the supplied Geometry Dash 2.2 betas.
-- Stable Dynarmic Test14-fix1 source for Geometry Dash 1.0-1.4 was not modified.
+- Separate Dynarmic ARMv7 line for the supplied Geometry Dash 2.2 betas.
+- Stable Dynarmic Test14-fix1 for Geometry Dash 1.0-1.4 was not modified.
 - Release and source archives contain no APK or extracted game native library.
 
-Runtime changes
-- Guest C-string operations now have a mapped-memory-bounded 64 MiB ceiling.
-  The former 1 MiB ceiling truncated Press Start (1,241,094 decoded bytes) and
-  Knock Em Out (1,091,308 decoded bytes).
-- LevelEditorLayer and PlayLayer each receive only their companion
-  updateVisibility helper. Complete ApplyHooks groups remain disabled.
-- Space/Up queue button 1 directly; left/right retain buttons 2/3.
-- WAV effects use a 48-slot waveOut backend. Music remains on MCI.
-- Valid non-empty level setups and the targeted editor initH path are preserved.
+Evidence and changes
+- Log 17 stopped after editor entry because the companion visibility helper
+  scanned all 10,000 editor sections in emulated ARM every frame.
+- Log 18 inflated the test platformer successfully, then crashed in companion
+  GDPSManager::detectEmulators through __stack_chk_fail.
+- Editor visibility now uses a bounded native CCArray scan and primary game
+  object functions, with at most 32 new activations per frame.
+- PlayLayer runs its untouched primary visibility implementation first; a
+  native post-pass sets only platformer-control opacity.
+- Companion GDPSManager, full ApplyHooks, constructors, DPAD touch hooks,
+  collision hooks, and broad gameplay hooks remain disabled.
+- Bringup13 level decoding/recovery, large strings, input, music, and waveOut
+  sound effects are preserved.
 
 Validation performed
-- C++20 syntax check: -Wall -Wextra -Werror, passed.
-- Windows audio C compile: -Wall -Wextra -Werror, passed.
-- Windows cross-compile: Zig 0.14.1, PE32+ x86-64, passed.
+- Linux C++20 syntax/compile: -Wall -Wextra -Werror, passed.
+- Windows x64 C++20 cross-compile: Zig 0.14.1,
+  -Wall -Wextra -Werror, passed.
+- Windows artifact: PE32+ x86-64 console executable, passed.
+- Required PE imports include OPENGL32.dll, USER32.dll, GDI32.dll,
+  WINMM.dll, ole32.dll, WS2_32.dll, and SHELL32.dll.
 - Windows executable SHA-256:
-  6ad0532d072c986fb4782dc2b582ed171f4ee0b98e6f3b3bf594c8f2ba34f601
-- Required PE imports include WINMM.dll.
+  3a167061b3fa1cc7cc8a237884690027fa11be9e2a8974efd1673c4004388a06
 - Newer beta static audit:
-  constructors=349 imports=391 relocations=103102
+  constructors=349 imports=393 relocations=103102
   PlayLayer->GJGameLevel=0x334 GJGameLevel->levelID=0x110
-  editor visibility pointers=1 calls=0
-  platformer visibility pointers=1 calls=0
+  native editor visibility pointers=1 calls=0
+  safe platformer visibility pointers=1 calls=0
   companion initH=0x18034671; complete ApplyHooks disabled
 - Earlier beta static audit:
   constructors=327 imports=366 relocations=91437
   PlayLayer->GJGameLevel=0x284 GJGameLevel->levelID=0x104
-  companion libgame absent; targeted companion hooks skipped
+  companion libgame absent; targeted companion bridges skipped
 
 Build identity
-- Output: dist-arm-wrapper-v22beta-bringup13
+- Output: dist-arm-wrapper-v22beta-bringup14
 - Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
 - Builder revision:
-  dynarmic-x64-builder24-v22beta-armv7-bringup13-large-level-visual-jump-waveout
+  dynarmic-x64-builder25-v22beta-armv7-bringup14-native-visibility
 
 Runtime boundary
-- Linux static validation cannot reproduce Windows gameplay, input, rendering,
-  or audio devices.
-- Test editor rendering, platformer jump/overlay, sound effects, then Power
-  Trip, Knock Em Out, Press Start, and repeated level switching.
-- Attach gd-v22beta-selected.log on any failure.
+- Static and cross-build validation cannot reproduce Windows gameplay,
+  rendering, input, or audio devices.
+- Test normal levels first, then editor rendering and the exact platformer
+  level from log 18. Attach gd-v22beta-selected.log on any failure.

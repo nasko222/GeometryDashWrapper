@@ -1040,10 +1040,16 @@ struct ElfRuntime {
     u32 v22_play_layer_level_offset = 0;
     u32 v22_game_level_id_offset = 0;
     u32 v22_companion_editor_init = 0;
-    u32 v22_companion_editor_visibility = 0;
-    u32 v22_companion_editor_visibility_original = 0;
-    u32 v22_companion_play_visibility = 0;
-    u32 v22_companion_play_visibility_original = 0;
+    u32 v22_game_object_add_main_sprite = 0;
+    u32 v22_game_object_has_secondary_color = 0;
+    u32 v22_game_object_add_color_sprite = 0;
+    u32 v22_game_object_activate = 0;
+    u32 v22_game_object_set_opacity = 0;
+    u32 v22_ccsprite_set_opacity = 0;
+    u32 v22_level_editor_update_object_colors = 0;
+    u32 v22_ccarray_remove_all_objects = 0;
+    u32 v22_gjbase_process_area_visual_actions = 0;
+    u32 v22_level_editor_sort_batchnode_children = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_companion_image_min = 0;
     u32 v22_companion_image_max = 0;
@@ -1276,6 +1282,26 @@ static void WriteV22ThumbImportThunk(ProbeEnvironment& env, u32 address,
     env.MemoryWrite16(address + 0u, 0xF8DFu); // ldr.w pc,[pc,#0]
     env.MemoryWrite16(address + 2u, 0xF000u);
     env.MemoryWrite32(address + 4u, destination);
+}
+
+static void WriteV22ThumbCallThenImportThunk(
+    ProbeEnvironment& env, u32 address, u32 original, u32 destination) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 chained thunk address is not aligned");
+    // Preserve `this` and the caller return address, run the untouched
+    // primary Thumb function in the current guest call, then invoke a host
+    // import for the small post-pass. This avoids a nested Dynarmic RunFunction
+    // on every rendered frame.
+    env.MemoryWrite16(address + 0u, 0xB501u); // push {r0,lr}
+    env.MemoryWrite16(address + 2u, 0x4B03u); // ldr r3,[pc,#12]
+    env.MemoryWrite16(address + 4u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 6u, 0x9800u); // ldr r0,[sp,#0]
+    env.MemoryWrite16(address + 8u, 0x4B02u); // ldr r3,[pc,#8]
+    env.MemoryWrite16(address + 10u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 12u, 0xBD01u); // pop {r0,pc}
+    env.MemoryWrite16(address + 14u, 0xBF00u); // nop/alignment
+    env.MemoryWrite32(address + 16u, original);
+    env.MemoryWrite32(address + 20u, destination);
 }
 
 static std::vector<u32> FindThumbBlCallSites(const ElfRuntime& runtime,
@@ -1862,41 +1888,7 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
     if (!editor_init)
         throw std::runtime_error(
             "companion libgame.so lacks LevelEditorLayerExt::initH");
-    const SymbolRecord* editor_visibility = FindSymbol(
-        companion, "_ZN19LevelEditorLayerExt17updateVisibilityHEf");
-    const SymbolRecord* editor_visibility_original = FindSymbol(
-        companion, "_ZN19LevelEditorLayerExt17updateVisibilityOE");
-    if (!editor_visibility || !editor_visibility_original)
-        throw std::runtime_error(
-            "companion libgame.so lacks the targeted editor visibility bridge");
     primary.v22_companion_editor_init = editor_init->address;
-    primary.v22_companion_editor_visibility = editor_visibility->address;
-    primary.v22_companion_editor_visibility_original =
-        editor_visibility_original->address;
-
-    // DPADHooks::ApplyHooks is intentionally not executed: its touch, editor,
-    // and gameplay replacements caused broad regressions in earlier bring-up
-    // builds. This exact companion's PlayLayer visibility helper is the one
-    // narrow piece that draws/updates the already-created platformer controls.
-    // Derive it from exported editor symbols, then validate both the function
-    // prologue and its original-function storage slot before using it.
-    constexpr u32 kPlayVisibilityFromEditorVisibility = 0x2090u;
-    constexpr u32 kPlayVisibilityOriginalFromEditorOriginal = 0x144u;
-    const u32 play_visibility =
-        editor_visibility->address + kPlayVisibilityFromEditorVisibility;
-    const u32 play_visibility_code = play_visibility & ~1u;
-    const u32 play_visibility_original =
-        editor_visibility_original->address +
-        kPlayVisibilityOriginalFromEditorOriginal;
-    if (!env.IsMapped(play_visibility_code, 4u) ||
-        env.MemoryRead16(play_visibility_code) != 0xb5b0u ||
-        env.MemoryRead16(play_visibility_code + 2u) != 0xaf02u ||
-        !env.IsMapped(play_visibility_original, 4u))
-        throw std::runtime_error(
-            "companion platformer visibility bridge layout is not recognized");
-    primary.v22_companion_play_visibility = play_visibility;
-    primary.v22_companion_play_visibility_original =
-        play_visibility_original;
     primary.v22_companion_image_min = companion.image_min;
     primary.v22_companion_image_max = companion.image_max;
     primary.v22_companion_executable_min = executable_min;
@@ -1916,47 +1908,83 @@ struct V22VisualHookCounts {
     std::pair<std::size_t, std::size_t> play_visibility;
 };
 
-static V22VisualHookCounts InstallV22VisualHooks(
+static V22VisualHookCounts InstallV22SafeVisualHooks(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     const SymbolRecord* editor_visibility = FindSymbol(
         runtime, "_ZN16LevelEditorLayer16updateVisibilityEf");
     const SymbolRecord* play_visibility = FindSymbol(
         runtime, "_ZN9PlayLayer16updateVisibilityEf");
-    if (!editor_visibility || !play_visibility ||
-        !runtime.v22_companion_editor_visibility ||
-        !runtime.v22_companion_editor_visibility_original ||
-        !runtime.v22_companion_play_visibility ||
-        !runtime.v22_companion_play_visibility_original)
+    const SymbolRecord* add_main_sprite = FindSymbol(
+        runtime, "_ZN10GameObject21addMainSpriteToParentEb");
+    const SymbolRecord* has_secondary_color = FindSymbol(
+        runtime, "_ZN10GameObject17hasSecondaryColorEv");
+    const SymbolRecord* add_color_sprite = FindSymbol(
+        runtime, "_ZN10GameObject22addColorSpriteToParentEb");
+    const SymbolRecord* activate_object = FindSymbol(
+        runtime, "_ZN10GameObject14activateObjectEv");
+    const SymbolRecord* game_object_opacity = FindSymbol(
+        runtime, "_ZN10GameObject10setOpacityEh");
+    const SymbolRecord* sprite_opacity = FindSymbol(
+        runtime, "_ZN7cocos2d8CCSprite10setOpacityEh");
+    const SymbolRecord* update_object_colors = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer18updateObjectColorsEPN7cocos2d7CCArrayE");
+    const SymbolRecord* remove_all_objects = FindSymbol(
+        runtime, "_ZN7cocos2d7CCArray16removeAllObjectsEv");
+    const SymbolRecord* process_area_visual_actions = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer24processAreaVisualActionsEv");
+    const SymbolRecord* sort_batchnode_children = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer21sortBatchnodeChildrenEf");
+    if (!editor_visibility || !play_visibility || !add_main_sprite ||
+        !has_secondary_color || !add_color_sprite || !activate_object ||
+        !game_object_opacity || !sprite_opacity || !update_object_colors ||
+        !remove_all_objects || !process_area_visual_actions ||
+        !sort_batchnode_children)
         throw std::runtime_error(
-            "targeted V22 visual hook symbols are unavailable");
+            "safe V22 visual bridge symbols are unavailable");
 
-    // The companion's full LevelEditorLayerExt::ApplyHooks also replaces
-    // LevelEditorLayer::init. That replacement caused Bringup11's repeatable
-    // RTTI runaway. Install only updateVisibility, while Bringup13's explicit
-    // initH entry path remains untouched.
-    env.MemoryWrite32(runtime.v22_companion_editor_visibility_original,
-                      editor_visibility->address);
+    runtime.v22_game_object_add_main_sprite = add_main_sprite->address;
+    runtime.v22_game_object_has_secondary_color =
+        has_secondary_color->address;
+    runtime.v22_game_object_add_color_sprite = add_color_sprite->address;
+    runtime.v22_game_object_activate = activate_object->address;
+    runtime.v22_game_object_set_opacity = game_object_opacity->address;
+    runtime.v22_ccsprite_set_opacity = sprite_opacity->address;
+    runtime.v22_level_editor_update_object_colors =
+        update_object_colors->address;
+    runtime.v22_ccarray_remove_all_objects = remove_all_objects->address;
+    runtime.v22_gjbase_process_area_visual_actions =
+        process_area_visual_actions->address;
+    runtime.v22_level_editor_sort_batchnode_children =
+        sort_batchnode_children->address;
+
+    // Bringup13 redirected these functions into companion libgame.so. Its
+    // editor helper walks all 10,000 editor sections in emulated ARM every
+    // frame, while its platformer helper lazily constructs GDPSManager and
+    // reaches an unsafe emulator-detection path. Keep the proven companion
+    // initH editor bootstrap, but route visibility through small host bridges
+    // that call only primary libcocos2dcpp.so functions.
+    const u32 editor_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_editor_visibility");
     const auto editor_visibility_counts = RedirectV22FunctionReferences(
-        runtime, env, *editor_visibility,
-        runtime.v22_companion_editor_visibility,
+        runtime, env, *editor_visibility, editor_host,
         kV22ThunkBase + 0x40u);
 
-    // The platformer buttons and touch targets are already created by the
-    // beta. The companion visibility helper updates their visible state. Keep
-    // all DPAD touch/input hooks disabled; Windows input queues buttons itself.
-    env.MemoryWrite32(runtime.v22_companion_play_visibility_original,
-                      play_visibility->address);
+    const u32 play_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_play_visibility");
+    EnsureV22ThunkPage(env);
+    const u32 play_wrapper = kV22ThunkBase + 0x60u;
+    WriteV22ThumbCallThenImportThunk(
+        env, play_wrapper, play_visibility->address, play_host);
     const auto play_visibility_counts = RedirectV22FunctionReferences(
-        runtime, env, *play_visibility,
-        runtime.v22_companion_play_visibility,
-        kV22ThunkBase + 0x48u);
+        runtime, env, *play_visibility, play_wrapper | 1u,
+        kV22ThunkBase + 0x78u);
 
     if (editor_visibility_counts.first +
                 editor_visibility_counts.second ==
             0u ||
         play_visibility_counts.first + play_visibility_counts.second == 0u)
         throw std::runtime_error(
-            "targeted V22 visual hooks did not find primary references");
+            "safe V22 visual hooks did not find primary references");
     return V22VisualHookCounts{
         editor_visibility_counts, play_visibility_counts};
 }
@@ -2266,7 +2294,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup13Window";
+        const char* class_name = "GeometryDashV22BetaBringup14Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2278,7 +2306,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup13",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup14",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -4359,6 +4387,241 @@ private:
         return ok;
     }
 
+    struct GuestCcArrayView {
+        u32 count = 0u;
+        u32 elements = 0u;
+    };
+
+    bool ReadGuestCcArray(u32 array, u32 maximum_count,
+                          GuestCcArrayView& view) {
+        view = {};
+        if (!array || !env_.IsMapped(array + 48u, 4u)) return false;
+        const u32 data = env_.MemoryRead32(array + 48u);
+        if (!data || !env_.IsMapped(data, 16u)) return false;
+        const u32 count = env_.MemoryRead32(data);
+        const u32 elements = env_.MemoryRead32(data + 12u);
+        if (count > maximum_count) return false;
+        const std::size_t bytes =
+            static_cast<std::size_t>(count) * sizeof(u32);
+        if (count && (!elements || !env_.IsMapped(elements, bytes)))
+            return false;
+        view.count = count;
+        view.elements = elements;
+        return true;
+    }
+
+    u32 FindDirectChildByTag(u32 node, s32 wanted_tag) {
+        if (!node || !env_.IsMapped(node + 188u, 4u)) return 0u;
+        GuestCcArrayView children;
+        if (!ReadGuestCcArray(env_.MemoryRead32(node + 188u), 4096u,
+                              children))
+            return 0u;
+        for (u32 index = 0; index < children.count; ++index) {
+            const u32 child =
+                env_.MemoryRead32(children.elements + index * 4u);
+            if (!child || !env_.IsMapped(child + 12u, 4u)) continue;
+            if (static_cast<s32>(env_.MemoryRead32(child + 12u)) ==
+                wanted_tag)
+                return child;
+        }
+        return 0u;
+    }
+
+    bool ForceSpriteVisibleAndOpaque(u32 sprite, const char* label) {
+        if (!LooksLikeGuestObject(runtime_, env_, sprite) ||
+            !env_.IsMapped(sprite + 265u, 1u))
+            return true;
+        env_.MemoryWrite8(sprite + 234u, 1u);
+        if (env_.MemoryRead8(sprite + 265u) == 255u) return true;
+        u32 ignored = 0u;
+        return RunNestedPreservingState(
+            runtime_.v22_ccsprite_set_opacity, {sprite, 255u}, ignored,
+            label, 100000000u);
+    }
+
+    bool HostV22PlayVisibility(u32 play_layer) {
+        if (!LooksLikeGuestObject(runtime_, env_, play_layer))
+            return Fail("V22 PlayLayer visibility received an invalid layer");
+
+        constexpr u32 kUiLayerOffset = 11424u;
+        if (!env_.IsMapped(play_layer + kUiLayerOffset, 4u)) return true;
+        const u32 ui_layer =
+            env_.MemoryRead32(play_layer + kUiLayerOffset);
+        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
+            !env_.IsMapped(ui_layer + 519u, 1u) ||
+            env_.MemoryRead8(ui_layer + 518u) == 0u)
+            return true;
+
+        // UILayer::init creates the platformer control sprite at +472 and the
+        // optional second control as direct child tag 2990. The companion
+        // helper only changed their opacity, but obtained that opacity through
+        // GDPSManager::sharedState(), whose constructor caused Log18's
+        // detectEmulators/__stack_chk_fail crash. Use the normal fully-visible
+        // value directly and never instantiate that unrelated singleton.
+        const u32 primary_control = env_.IsMapped(ui_layer + 472u, 4u)
+            ? env_.MemoryRead32(ui_layer + 472u) : 0u;
+        if (!ForceSpriteVisibleAndOpaque(
+                primary_control, "V22 platformer primary control opacity"))
+            return false;
+        const u32 secondary_control =
+            FindDirectChildByTag(ui_layer, 2990);
+        if (!ForceSpriteVisibleAndOpaque(
+                secondary_control, "V22 platformer secondary control opacity"))
+            return false;
+
+        if (v22_platformer_ui_logged_ != ui_layer) {
+            v22_platformer_ui_logged_ = ui_layer;
+            log_ << "RESULT: DYNARMIC_V22_PLATFORMER_CONTROLS_VISIBLE "
+                 << "ui=0x" << std::hex << ui_layer
+                 << " primary=0x" << primary_control
+                 << " secondary=0x" << secondary_control
+                 << std::dec
+                 << " source=host-opacity companion-gdps=disabled\n";
+            log_.flush();
+        }
+        return true;
+    }
+
+    bool HostV22EditorVisibility(u32 editor_layer) {
+        if (!LooksLikeGuestObject(runtime_, env_, editor_layer))
+            return Fail("V22 editor visibility received an invalid layer");
+        if (v22_editor_visual_layer_ != editor_layer) {
+            v22_editor_visual_layer_ = editor_layer;
+            v22_editor_visualized_objects_.clear();
+            v22_editor_visibility_passes_ = 0u;
+        }
+        ++v22_editor_visibility_passes_;
+
+        constexpr u32 kSectionArrayOffset = 840u;
+        if (!env_.IsMapped(editor_layer + kSectionArrayOffset, 4u))
+            return true;
+        GuestCcArrayView sections;
+        if (!ReadGuestCcArray(
+                env_.MemoryRead32(editor_layer + kSectionArrayOffset),
+                20000u, sections))
+            return true;
+
+        // Companion updateVisibilityH iterates every one of the beta's 10,000
+        // editor sections in ARM code on every frame. Walk the same compact
+        // CCArray storage natively and perform expensive guest activation only
+        // once per object. The per-frame activation cap prevents a large level
+        // from turning first entry into another apparent freeze.
+        constexpr u32 kMaximumObjectsPerSection = 100000u;
+        constexpr u32 kMaximumObjectsScanned = 250000u;
+        constexpr u32 kMaximumActivationsPerFrame = 32u;
+        u32 objects_scanned = 0u;
+        u32 newly_activated = 0u;
+        u32 pending = 0u;
+        for (u32 section_index = 0;
+             section_index < sections.count &&
+             objects_scanned < kMaximumObjectsScanned;
+             ++section_index) {
+            const u32 section = env_.MemoryRead32(
+                sections.elements + section_index * 4u);
+            if (!section) continue;
+            GuestCcArrayView objects;
+            if (!ReadGuestCcArray(
+                    section, kMaximumObjectsPerSection, objects))
+                continue;
+            for (u32 object_index = 0;
+                 object_index < objects.count &&
+                 objects_scanned < kMaximumObjectsScanned;
+                 ++object_index) {
+                const u32 object = env_.MemoryRead32(
+                    objects.elements + object_index * 4u);
+                ++objects_scanned;
+                if (!LooksLikeGuestObject(runtime_, env_, object) ||
+                    !env_.IsMapped(object + 1236u, 1u))
+                    continue;
+
+                // CCNode::m_bVisible and GameObject's stored opacity. The
+                // primary methods below propagate the state to child sprites.
+                env_.MemoryWrite8(object + 234u, 1u);
+                if (v22_editor_visualized_objects_.contains(object))
+                    continue;
+                if (newly_activated >= kMaximumActivationsPerFrame) {
+                    ++pending;
+                    continue;
+                }
+
+                u32 ignored = 0u;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_object_add_main_sprite,
+                        {object, 0u}, ignored,
+                        "V22 editor add main sprite", 100000000u))
+                    return false;
+                u32 has_secondary = 0u;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_object_has_secondary_color,
+                        {object}, has_secondary,
+                        "V22 editor secondary-color query", 100000000u))
+                    return false;
+                if (has_secondary &&
+                    !RunNestedPreservingState(
+                        runtime_.v22_game_object_add_color_sprite,
+                        {object, 0u}, ignored,
+                        "V22 editor add color sprite", 100000000u))
+                    return false;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_object_activate, {object}, ignored,
+                        "V22 editor activate object", 100000000u))
+                    return false;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_object_set_opacity,
+                        {object, 255u}, ignored,
+                        "V22 editor object opacity", 100000000u))
+                    return false;
+                env_.MemoryWrite8(object + 234u, 1u);
+                v22_editor_visualized_objects_.insert(object);
+                ++newly_activated;
+            }
+        }
+
+        if (newly_activated) {
+            u32 ignored = 0u;
+            constexpr u32 kColorArrayOffset = 11268u;
+            const u32 color_array =
+                env_.IsMapped(editor_layer + kColorArrayOffset, 4u)
+                ? env_.MemoryRead32(editor_layer + kColorArrayOffset) : 0u;
+            if (color_array) {
+                if (!RunNestedPreservingState(
+                        runtime_.v22_level_editor_update_object_colors,
+                        {editor_layer, color_array}, ignored,
+                        "V22 editor update object colors", 250000000u))
+                    return false;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_ccarray_remove_all_objects,
+                        {color_array}, ignored,
+                        "V22 editor clear color queue", 100000000u))
+                    return false;
+            }
+            if (!RunNestedPreservingState(
+                    runtime_.v22_gjbase_process_area_visual_actions,
+                    {editor_layer}, ignored,
+                    "V22 editor process area visuals", 250000000u))
+                return false;
+            if (!RunNestedPreservingState(
+                    runtime_.v22_level_editor_sort_batchnode_children,
+                    {editor_layer, 0u}, ignored,
+                    "V22 editor sort batch nodes", 250000000u))
+                return false;
+        }
+
+        if (newly_activated || v22_editor_visibility_passes_ == 1u) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_NATIVE_VISIBILITY "
+                 << "editor=0x" << std::hex << editor_layer << std::dec
+                 << " sections=" << sections.count
+                 << " scanned=" << objects_scanned
+                 << " activated=" << newly_activated
+                 << " total="
+                 << v22_editor_visualized_objects_.size()
+                 << " pending=" << pending
+                 << " pass=" << v22_editor_visibility_passes_ << '\n';
+            log_.flush();
+        }
+        return true;
+    }
+
     static std::string SanitizeV22LevelSettingsHeader(
         const std::string& original) {
         const std::size_t begin = original.find("kS38,");
@@ -4612,6 +4875,9 @@ private:
                                       "V22 LevelEditorLayer::create") ||
             !editor)
             return false;
+        v22_editor_visual_layer_ = editor;
+        v22_editor_visualized_objects_.clear();
+        v22_editor_visibility_passes_ = 0u;
         // Keep the narrow Bringup9 bridge. Calling the companion's complete
         // ApplyHooks sets caused a repeatable RTTI/upcast runaway before the
         // editor could open. initH alone is the path proven by Bringup9.
@@ -6949,6 +7215,14 @@ private:
         }
         if (name == "__dynarmic_v22_prepare_level_setup")
             return HostV22PrepareLevelSetup();
+        if (name == "__dynarmic_v22_editor_visibility") {
+            if (!HostV22EditorVisibility(r0)) return false;
+            return finish_hot(0u);
+        }
+        if (name == "__dynarmic_v22_play_visibility") {
+            if (!HostV22PlayVisibility(r0)) return false;
+            return finish_hot(0u);
+        }
         if (name == "__dynarmic_v22_edit_level_onEdit") {
             const bool ok = HostV22EditLevelButton();
             if (!ok) return false;
@@ -7617,6 +7891,10 @@ private:
     u64 v22_level_settings_native_failures_=0;
     u64 v22_level_settings_fallback_successes_=0;
     u64 v22_editor_entries_=0;
+    u32 v22_editor_visual_layer_=0;
+    u64 v22_editor_visibility_passes_=0;
+    std::unordered_set<u32> v22_editor_visualized_objects_;
+    u32 v22_platformer_ui_logged_=0;
     u64 v22_companion_hooks_installed_=0;
     u64 v22_level_catalog_decodes_=0;
     u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x100u;
@@ -7997,7 +8275,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup13 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup14 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8251,9 +8529,9 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup13");
-        emit("Bringup13: large level strings, visual-only companion hooks, "
-             "direct platformer jump, and waveOut sound effects");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup14");
+        emit("Bringup14: stable Bringup13 gameplay with native editor visibility "
+             "and companion-free platformer control opacity");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -8265,7 +8543,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup13 must be compiled as a 64-bit executable");
+                "V22BetaBringup14 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -8273,7 +8551,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP14_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -8353,7 +8631,7 @@ int main(int argc,char** argv) {
             companion_runtime = MapAndRelocateV22CompanionElf(
                 companion_libgame, env, runtime);
         if (!companion_libgame.empty())
-            visual_hooks = InstallV22VisualHooks(runtime, env);
+            visual_hooks = InstallV22SafeVisualHooks(runtime, env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         if(zip_hooks!=1u)
             throw std::runtime_error(
@@ -8452,18 +8730,19 @@ int main(int argc,char** argv) {
                  << runtime.v22_companion_executable_max << " initH=0x"
                  << runtime.v22_companion_editor_init << std::dec
                  << " constructors=not-run mode=bringup9-targeted-initH+"
-                    "visual-only ApplyHooks=disabled";
+                    "host-native-visibility ApplyHooks=disabled";
             emit(line.str());
             emit(
-                "RESULT: DYNARMIC_V22_COMPANION_EDITOR_VISUAL_HOOKS_READY "
-                "count=1 init-hook=disabled opacity-hook=disabled "
+                "RESULT: DYNARMIC_V22_EDITOR_NATIVE_VISUAL_HOOK_READY "
+                "count=1 init-hook=disabled companion-visibility=disabled "
                 "visibility-pointers=" +
                 std::to_string(visual_hooks.editor_visibility.first) +
                 " visibility-calls=" +
                 std::to_string(visual_hooks.editor_visibility.second));
             emit(
-                "RESULT: DYNARMIC_V22_COMPANION_PLATFORMER_VISUAL_HOOK_READY "
-                "count=1 touch-hooks=disabled visibility-pointers=" +
+                "RESULT: DYNARMIC_V22_PLATFORMER_SAFE_VISUAL_HOOK_READY "
+                "count=1 touch-hooks=disabled companion-gdps=disabled "
+                "visibility-pointers=" +
                 std::to_string(visual_hooks.play_visibility.first) +
                 " visibility-calls=" +
                 std::to_string(visual_hooks.play_visibility.second));
@@ -8797,7 +9076,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup13 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup14 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -8847,11 +9126,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP14_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP14_FAILED");
         return 1;
     }
 }
