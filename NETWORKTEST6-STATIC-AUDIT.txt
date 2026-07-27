@@ -1,0 +1,16 @@
+NETWORKTEST6 STATIC AUDIT
+========================
+PASS: signal deferred
+PASS: no immediate signal pump
+PASS: no immediate sem pump
+PASS: stub completion helper
+PASS: after svc completion
+PASS: slice entry recovery
+PASS: before save completion
+PASS: unsafe save guard
+PASS: frame pump
+PASS: async dns retained
+PASS: nonblocking sockets retained
+PASS: watchdog retained
+
+Result: PASS

@@ -1,0 +1,11 @@
+Apply this update to the NetworkTest5 full-source tree.
+
+Option A: copy the included files over the NetworkTest5 tree, preserving paths.
+Option B from the NetworkTest5 source root:
+  git apply GeometryDashWrapper-0.9.4-arm-v22beta-networktest6-safe-async-worker.diff
+
+Then build:
+  BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
+
+Expected output:
+  dist-arm-wrapper-v22beta-networktest6-safe-async-worker

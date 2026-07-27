@@ -1,38 +1,23 @@
-# Geometry Dash ARM Wrapper — NetworkTest5
+# Geometry Dash ARM Wrapper — NetworkTest6
 
-`networktest5-dyn14-exact-network` keeps the complete NetworkTest4/v22 beta
-runtime baseline and changes only `src/dynarmic_probe.cpp` in the runtime.
+`networktest6-safe-async-worker` keeps the complete v22 beta NetworkTest3
+baseline and changes only the network-worker execution path plus diagnostics.
 
-## Why NetworkTest4 froze
+The key fix restores DynarmicTest14's immediate worker wake from `sem_post`.
+NetworkTest2/3 deferred that wake to the next frame, which changed the ordering
+of CCHttpClient's foreground/worker synchronization. NetworkTest6 also wakes
+immediately on condition signals while retaining asynchronous DNS, nonblocking
+sockets, frame slicing, and the hard worker watchdog.
 
-Both supplied traces register the CCHttpClient worker, execute two short worker
-slices, then stop forever as slice 3 resumes OpenSSL around `CRYPTO_zalloc`.
-No DNS resolver, socket, connect, send, or receive import is reached. The hard
-watchdog only surrounded `cpu_.Run()`; it could not make the sliced OpenSSL
-execution model equivalent to the known-working DynarmicTest14 worker.
-
-## NetworkTest5 behavior
-
-NetworkTest5 removes worker frame slicing completely. A request signal resumes
-the ARM CCHttpClient worker immediately and runs it continuously until the guest
-reaches `pthread_cond_wait`, `sem_wait`, or exits. This is the DynarmicTest14
-run-to-wait model, adapted to this beta's condition-variable worker.
-
-It also restores DynarmicTest14's network semantics:
-
-- synchronous DNS in the HTTP worker;
-- host-completed nonblocking `connect` with the original 15-second bound;
-- original poll timeout behavior;
-- no render-frame worker pumping;
-- no pause/resume inside OpenSSL request setup.
-
-The NetworkTest4 forensic import ring and request/thread/socket logging remain.
-All editor, save, audio, platformer, lifecycle, APK-cache, inflate, and companion
-features outside this one translation unit are unchanged.
+The branch is intentionally verbose. The log now shows request creation,
+`pthread_create`, semaphores/conditions, DNS, sockets, send/receive/poll, caller
+addresses, a 512-call rolling import history, and 250 ms heartbeats during long
+guest calls.
 
 ## Build
 
-On the Windows build machine:
+Place the selected APK beside the built executable as
+`game-v22beta-selected.apk`, then run on the Windows build machine:
 
 ```bat
 BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
@@ -41,16 +26,16 @@ BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-networktest5-dyn14-exact-network\
+dist-arm-wrapper-v22beta-networktest6-safe-async-worker\
 ```
 
-Diagnostics:
+Primary diagnostics:
 
 ```text
-gd-networktest5.log
-gd-networktest5-imports.txt
-gd-networktest5-profile.csv
-gd-networktest5-profile-summary.txt
+gd-networktest6.log
+gd-networktest6-imports.txt
+gd-networktest6-profile.csv
+gd-networktest6-profile-summary.txt
 ```
 
 The source archive intentionally excludes APK files.

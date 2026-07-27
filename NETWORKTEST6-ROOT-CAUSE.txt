@@ -1,0 +1,32 @@
+NETWORKTEST6 ROOT CAUSE
+=======================
+
+NetworkTest5 moved the complete CCHttpClient ARM worker into the foreground
+pthread_cond_signal import. That explains the earlier visible freeze: the UI
+could not return from the button callback, so its press animation never
+finished.
+
+The two NetworkTest4 traces exposed the deeper deterministic fault:
+
+  run A slice 3: PC=0x21000044 (malloc synthetic import stub + 4)
+  run B slice 3: PC=0x210000cc (memset synthetic import stub + 4)
+
+Each imported function is represented by an ARM SVC followed by BX LR. The host
+handled the SVC, set PC to stub+4, then allowed the worker timeslice to end. The
+saved worker therefore resumed at the transient BX-LR half of a host import.
+Both failures occurred while OpenSSL was inside CRYPTO_malloc/CRYPTO_zalloc.
+
+NetworkTest6 fixes that state-machine bug rather than changing OpenSSL or the
+server:
+
+1. pthread_cond_signal/sem_post only mark the HTTP worker runnable. They never
+   execute it recursively inside the UI callback.
+2. After every worker SVC, the host atomically applies the synthetic BX LR:
+   PC <- LR & ~1 and CPSR.T <- LR bit 0.
+3. The same normalization runs on slice entry and immediately before saving.
+4. A safety check refuses to save a worker whose PC is still at any import,
+   JavaVM, or JNI stub + 4.
+5. Async DNS, nonblocking sockets, bounded slices, and the hard watchdog remain.
+
+This preserves responsiveness while preventing the exact invalid resume state
+recorded by both NetworkTest4 runs.
