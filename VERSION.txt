@@ -1,1 +1,1 @@
-0.9.4-arm-v22beta-networktest3-wall-watchdog
+0.9.4-arm-v22beta-networktest4-dyn14-wake-trace

@@ -1,5 +1,16 @@
 # DynarmicTest14 network reference
 
-DynarmicTest14 was inspected as the last known working network reference. Its worker model runs the guest networking routine synchronously and includes blocking compatibility behavior. Copying that model wholesale into the v22 beta runtime would put long DNS/connect/send/receive waits back on the render/UI thread.
+The important working behavior copied from DynarmicTest14 is not a wholesale
+replacement of the v22 runtime. It is the ordering of the worker wake:
 
-NetworkTest3 therefore uses DynarmicTest14 only to confirm guest ABI, socket import, and cooperative-worker control-flow expectations. NetworkTest2 remains the code baseline. The only implementation change is hard wall-clock preemption around the existing frame-sliced worker.
+1. increment the semaphore;
+2. set the foreground import result;
+3. advance the foreground PC past the import stub;
+4. immediately run/resume the registered guest HTTP worker;
+5. restore the foreground guest state after the worker yields.
+
+NetworkTest2 and NetworkTest3 changed step 4 into a next-frame wake. NetworkTest4
+restores immediate wake ordering but uses the newer bounded worker slices,
+nonblocking WinSock implementation, asynchronous DNS, and 4 ms hard watchdog.
+All editor, save, audio, platformer, APK cache, lifecycle, and companion-library
+fixes remain from the v22 baseline.

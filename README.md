@@ -1,44 +1,41 @@
-# Geometry Dash ARM Wrapper — v22 beta NetworkTest3
+# Geometry Dash ARM Wrapper — NetworkTest4
 
-`networktest3-wall-watchdog` is a separate branch for the current v22 beta APK. It is
-focused only on keeping the client responsive while the emulated HTTP worker
-runs.
+`networktest4-dyn14-wake-trace` keeps the complete v22 beta NetworkTest3
+baseline and changes only the network-worker execution path plus diagnostics.
+
+The key fix restores DynarmicTest14's immediate worker wake from `sem_post`.
+NetworkTest2/3 deferred that wake to the next frame, which changed the ordering
+of CCHttpClient's foreground/worker synchronization. NetworkTest4 also wakes
+immediately on condition signals while retaining asynchronous DNS, nonblocking
+sockets, frame slicing, and the hard worker watchdog.
+
+The branch is intentionally verbose. The log now shows request creation,
+`pthread_create`, semaphores/conditions, DNS, sockets, send/receive/poll, caller
+addresses, a 512-call rolling import history, and 250 ms heartbeats during long
+guest calls.
 
 ## Build
 
+Place the selected APK beside the built executable as
+`game-v22beta-selected.apk`, then run on the Windows build machine:
+
 ```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
+BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 ```
 
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-networktest3-wall-watchdog\
+dist-arm-wrapper-v22beta-networktest4-dyn14-wake-trace\
 ```
 
-Run:
+Primary diagnostics:
 
 ```text
-RUN_NETWORKTEST3.cmd
+gd-networktest4.log
+gd-networktest4-imports.txt
+gd-networktest4-profile.csv
+gd-networktest4-profile-summary.txt
 ```
 
-The focused log is `gd-networktest3.log`.
-
-## Scope
-
-- Frame-sliced guest HTTP worker instead of recursive execution on the UI call.
-- Nonblocking `connect`, `send`, and `recv` behavior for the newer curl client.
-- One-millisecond worker-side `poll` cap per host frame.
-- Existing desktop text-input offset suppression retained.
-- Existing local `save-v22beta` storage retained.
-- No temporary 90/95 MB APK size/hash check and no donor APK logic.
-- Companion constructors/hooks are disabled in the NetworkTest3 launcher so network behavior is isolated.
-
-## NetworkTest3 wall-clock watchdog
-
-NetworkTest2 already moved DNS off the UI thread and made sockets nonblocking,
-but the captured v22 worker could still remain inside one translated guest block
-so long that `Jit::Run()` never returned to enforce the frame budget. NetworkTest3
-preserves the full NetworkTest2 runtime and adds an asynchronous 4 ms hard halt to
-the CCHttpClient worker only. The exact guest state is saved and resumed on the
-next frame, preventing that guest/JIT stall from freezing the client.
+The source archive intentionally excludes APK files.

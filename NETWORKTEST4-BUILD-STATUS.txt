@@ -1,0 +1,26 @@
+NETWORKTEST4 BUILD STATUS
+=========================
+
+Source branch: 0.9.4-arm-v22beta-networktest4-dyn14-wake-trace
+Baseline: NetworkTest3 / NetworkTest2 v22 beta source
+Reference: DynarmicTest14 full source
+
+Implemented:
+- DynarmicTest14-style immediate HTTP-worker wake from sem_post.
+- Immediate wake from pthread_cond_signal / pthread_cond_broadcast.
+- Existing nonblocking WinSock bridge, asynchronous DNS and frame slicing kept.
+- Existing 4 ms hard Dynarmic worker watchdog kept.
+- 512-entry zero-allocation-at-rest imported-call trace ring.
+- Detailed thread/network call and return logs.
+- 250 ms long-call heartbeat and slow-call trace dumps.
+- Runtime-order import manifest with SVC and stub addresses.
+
+Verification in this environment:
+- Complete C++20 translation unit syntax check: PASS.
+- Preservation/hash audit: PASS (reported separately).
+- Windows x64 link/runtime test: unavailable because the supplied archives do
+  not include the pinned compiler executable and complete Windows dependency
+  headers. Build on the existing Windows build machine with BUILD_V22BETA_X64.cmd.
+
+Expected output directory:
+dist-arm-wrapper-v22beta-networktest4-dyn14-wake-trace\
