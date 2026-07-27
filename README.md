@@ -1,19 +1,25 @@
-# Geometry Dash ARM Wrapper — NetworkTest8
+# Geometry Dash ARM Wrapper — Milestone 1
 
-NetworkTest8 keeps the native `CCHttpClient::send` bridge introduced in NetworkTest7, but removes its single serial WinHTTP queue. Every request now runs on its own host thread, uses direct WinHTTP with bounded timeouts, and reports each transport stage back to the main log.
+Version and branch snapshot: `0.9.4-milestone1`
 
-Key changes:
+This freezes the exact working v2.2 beta wrapper state after the APK server override was restored and all tested online features began working.
 
-- independent native thread per HTTP request;
-- no guest pthread/libcurl/OpenSSL execution;
-- no serial head-of-line blocking;
-- direct connection (`WINHTTP_ACCESS_TYPE_NO_PROXY`);
-- resolve/connect/send/receive timeouts: 5/5/10/15 seconds;
-- automatic `Content-Type: application/x-www-form-urlencoded` for POST/PUT;
-- detailed stages: thread-start, crack-url, open-session, connect, open-request, send, receive, headers, finish/error;
-- original guest response callback remains on the main frame thread.
+## Included working state
 
-Build with:
+- Dynarmic ARMv7-A, Thumb-2, VFPv3 and NEON execution.
+- Local save redirection.
+- Editor and platformer compatibility fixes from the selected v2.2 beta branch.
+- Concurrent native `CCHttpClient::send` bridge using independent WinHTTP request threads.
+- Generic HTTPS-first handling that preserves the hostname supplied by the APK, including custom GDPS hosts.
+- Safe HTTP fallback for retryable read/download requests.
+- Redirect support, empty User-Agent compatibility and HTML error-page rejection for API calls.
+- Working level/server requests, song metadata and song downloads with the corrected APK.
+
+## APK
+
+No APK is included. Place the known-working v2.2 beta APK beside the source. The APK must have the unwanted GDPS override reverted to the intended server configuration.
+
+## Build
 
 ```bat
 BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
@@ -22,14 +28,14 @@ BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 Output directory:
 
 ```text
-dist-arm-wrapper-v22beta-networktest8-concurrent-winhttp
+dist-arm-wrapper-0.9.4-milestone1
 ```
 
-Logs:
+Runtime diagnostics:
 
 ```text
-gd-networktest8.log
-gd-networktest8-imports.txt
-gd-networktest8-profile.csv
-gd-networktest8-profile-summary.txt
+gd-milestone1.log
+gd-milestone1-imports.txt
+gd-milestone1-profile.csv
+gd-milestone1-profile-summary.txt
 ```

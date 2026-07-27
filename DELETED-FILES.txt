@@ -1,4 +1,0 @@
-BRINGUP19-STATIC-AUDIT.txt
-BRINGUP19-SYNTAX-CHECK.txt
-CHANGELOG-0.9.4-arm-v22beta-bringup19-selected-desktop-network.md
-V22BETA-BRINGUP19-NOTES.md

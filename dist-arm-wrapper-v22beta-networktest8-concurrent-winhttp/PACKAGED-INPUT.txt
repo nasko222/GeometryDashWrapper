@@ -1,5 +1,0 @@
-source=D:\Github\GeometryDashWrapper\game-v22beta-selected.apk
-name=game-v22beta-selected.apk
-bytes=147453391
-sha256=615fec9f72d7bf0d365627012d5b2753d8c03251f3c1420287c85ecd9d68d5a6
-scope=explicit-v22-apk-own-libraries-no-hash-gate

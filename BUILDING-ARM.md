@@ -1,9 +1,15 @@
-# Building NetworkTest8
+# Building 0.9.4-milestone1
 
-Run:
+Place the working v2.2 beta APK beside the source and run:
 
 ```bat
 BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
 ```
 
-The build output is `dist-arm-wrapper-v22beta-networktest8-concurrent-winhttp`. The selected APK is copied into the output as `game-v22beta-selected.apk`. The source archive intentionally excludes APK files.
+The output is created in:
+
+```text
+dist-arm-wrapper-0.9.4-milestone1
+```
+
+The selected APK is copied into the output directory as `game-v22beta-selected.apk`. APK files are intentionally excluded from this source archive.
