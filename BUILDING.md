@@ -1,42 +1,37 @@
-# Building 0.9.5-unified1
-
-## Requirements
+# Building 0.9.5-unified1-fix1
 
 Use 64-bit Windows 10/11 with Python 3 and Git for Windows. The command files
-download verified portable Zig, CMake, Ninja, and Boost files into
-`.build-tools/`; nothing is installed system-wide. The first ARM build also
-checks out the pinned public Dynarmic revision from GitLab.
+download portable Zig, CMake, Ninja, Boost, and the pinned Dynarmic revision into
+`.build-tools/`; nothing is installed system-wide.
 
-## x86
+## Build everything
 
-Run:
+Run `BUILD_ALL.cmd`. It builds in this order:
 
-```bat
-BUILD_X86.cmd
+1. x86 native (`0.9.3-alpha3`)
+2. legacy ARM and ARMv7 against one Dynarmic build
+
+Output:
+
+```text
+dist-unified/
+  game.apk
+  save/
+  x86/
+  arm-legacy/
+  armv7/
+  RUN_AUTO.cmd
+  run_auto.py
 ```
 
-Optional APK packaging:
+Place the APK at `dist-unified/game.apk` and run `RUN_AUTO.cmd`. Native x86 is
+always selected first when the APK also includes ARM libraries.
 
-```bat
-BUILD_X86.cmd "D:\APKs\game.apk"
-```
+## Individual builds
 
-Output: `dist-unified/x86/GeometryDashWrapper.exe`.
+- `BUILD_X86.cmd [optional-x86-apk]`
+- `BUILD_DYNARMIC.cmd`
 
-## Both ARM backends
-
-Run `BUILD_DYNARMIC.cmd`. One Dynarmic build emits:
-
-- `dist-unified/arm-legacy/GeometryDashArmLegacy.exe`
-- `dist-unified/armv7/GeometryDashArmV7.exe`
-
-The normal launchers avoid heavy profiling. Use each backend's separate
-`RUN_DEBUG.cmd` only when collecting a regression log.
-
-## Everything
-
-Run `BUILD_ALL.cmd`. It preserves all three sibling output folders and copies
-the automatic APK selector into `dist-unified/`.
-
-The source archive contains no APK. ARM builds never require or package one;
-copy the APK you are testing into the appropriate output folder as `game.apk`.
+The generated backend-specific `RUN.cmd` files also execute from the
+`dist-unified` root and therefore use the same `save/` folder and root
+`game.apk`.

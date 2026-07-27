@@ -1,5 +1,12 @@
-/.build-tools
-/build-cache
-/build-cache-windows
-/third_party/unicorn-2.1.4
+.build-tools/
+build-cache/
+build-cache-windows/
+build-dynarmic-x64/
+dist-unified/
 *.apk
+*.so
+*.exe
+*.pdb
+*.log
+*.csv
+__pycache__/

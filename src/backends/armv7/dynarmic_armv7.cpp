@@ -7080,7 +7080,7 @@ private:
         // The guest still supplies Android-style names, but they are only
         // virtual inputs to this interceptor. Never probe or create a host
         // drive-root data\data tree; all persistent files live directly in
-        // the wrapper's local save-v22beta directory.
+        // the wrapper's shared local save directory.
         static constexpr std::string_view kAndroidDataRoot = "/data/data/";
         if (normalized.starts_with(kAndroidDataRoot)) {
             const std::size_t package_end =
@@ -10834,7 +10834,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified1-fix1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11162,7 +11162,7 @@ int main(int argc,char** argv) {
         const std::filesystem::path absolute_input=
             std::filesystem::absolute(input_path);
         const std::filesystem::path writable=
-            std::filesystem::absolute("save-v22beta");
+            std::filesystem::absolute("save");
         emit("Input file: "+absolute_input.string());
         const std::vector<u8> input_bytes=ReadFile(absolute_input.string());
         emit("Input bytes: "+std::to_string(input_bytes.size()));

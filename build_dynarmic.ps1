@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder37-0.9.5-unified1-two-backends"
+$BuilderRevision = "dynarmic-x64-builder38-0.9.5-unified1-fix1-shared-save"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -452,47 +452,51 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutpu
 New-Item -ItemType Directory -Force -Path $ArmOutputPaths | Out-Null
 Copy-Item -Force $LegacyExe (Join-Path $LegacyOut "GeometryDashArmLegacy.exe")
 Copy-Item -Force $ArmV7Exe (Join-Path $ArmV7Out "GeometryDashArmV7.exe")
-New-Item -ItemType Directory -Force -Path (Join-Path $LegacyOut "save"), (Join-Path $ArmV7Out "save-v22beta") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $LegacyRun = @'
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 if not exist game.apk (
-  echo Put the ARM-only Geometry Dash 1.0-1.4 APK here as game.apk
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
   exit /b 2
 )
-GeometryDashArmLegacy.exe game.apk --log=gd-arm-legacy.log
+if not exist save mkdir save
+"%~dp0GeometryDashArmLegacy.exe" game.apk --log=gd-arm-legacy.log
 '@
 $LegacyDebug = @'
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 if not exist game.apk (
-  echo Put the ARM-only Geometry Dash 1.0-1.4 APK here as game.apk
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
   exit /b 2
 )
-GeometryDashArmLegacy.exe game.apk --debug-everything --dump-imports=gd-arm-legacy-imports.txt --log=gd-arm-legacy-debug.log --profile=gd-arm-legacy-profile.csv --profile-summary=gd-arm-legacy-profile-summary.txt
+if not exist save mkdir save
+"%~dp0GeometryDashArmLegacy.exe" game.apk --debug-everything --dump-imports=gd-arm-legacy-imports.txt --log=gd-arm-legacy-debug.log --profile=gd-arm-legacy-profile.csv --profile-summary=gd-arm-legacy-profile-summary.txt
 '@
 $ArmV7Run = @'
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 if not exist game.apk (
-  echo Put the ARMv7 Geometry Dash 2.2 APK here as game.apk
+  echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause
   exit /b 2
 )
-GeometryDashArmV7.exe game.apk --companion-hooks=off --log=gd-armv7.log
+if not exist save mkdir save
+"%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --log=gd-armv7.log
 '@
 $ArmV7Debug = @'
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 if not exist game.apk (
-  echo Put the ARMv7 Geometry Dash 2.2 APK here as game.apk
+  echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause
   exit /b 2
 )
-GeometryDashArmV7.exe game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
+if not exist save mkdir save
+"%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
 '@
 [IO.File]::WriteAllText((Join-Path $LegacyOut "RUN.cmd"), $LegacyRun, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $LegacyOut "RUN_DEBUG.cmd"), $LegacyDebug, [Text.Encoding]::ASCII)

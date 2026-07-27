@@ -807,10 +807,19 @@ static int vm_get_env(void *java_vm, void **environment, int version) {
 }
 
 void jni_shim_initialize(const char *executable_directory) {
+    char working_directory[MAX_PATH * 2];
     char storage_path[MAX_PATH * 2];
+    DWORD working_length;
+    const char *storage_base;
     size_t i;
-    snprintf(storage_path, sizeof(storage_path), "%s/save/",
-             executable_directory ? executable_directory : ".");
+
+    working_length = GetCurrentDirectoryA(
+        (DWORD)sizeof(working_directory), working_directory);
+    storage_base = working_length > 0 &&
+                           working_length < (DWORD)sizeof(working_directory)
+                       ? working_directory
+                       : (executable_directory ? executable_directory : ".");
+    snprintf(storage_path, sizeof(storage_path), "%s/save/", storage_base);
     for (i = 0; storage_path[i]; ++i) {
         if (storage_path[i] == '\\') {
             storage_path[i] = '/';
@@ -822,6 +831,10 @@ void jni_shim_initialize(const char *executable_directory) {
     /* CCFileUtilsAndroid only recognizes a leading slash as a disk path. */
     snprintf(g_writable_path, sizeof(g_writable_path), "/save");
     audio_initialize(executable_directory);
+    if (i > 0 && storage_path[i - 1] == '/') {
+        storage_path[i - 1] = 0;
+    }
+    audio_set_writable_directory(storage_path);
 
     for (i = 0; i < JNI_TABLE_SIZE; ++i) {
         g_jni_table[i] = (void *)jni_stub_zero;

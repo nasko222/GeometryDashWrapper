@@ -20,3 +20,9 @@
 - all Unicorn source, patches, licenses, toolchains, and backend code;
 - old bootstrap/performance/network-test notes, logs, audits, checksum reports,
   source-update bundles, generated executables, and build caches.
+
+## Unified1 fix1
+
+- fixes automatic detection of legacy APKs containing `lib/armeabi/libgame.so`;
+- makes x86 the documented and explicit first-priority architecture;
+- routes x86, legacy ARM, and ARMv7 to one root `dist-unified/save/` folder.

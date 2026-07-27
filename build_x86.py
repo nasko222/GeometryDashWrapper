@@ -234,19 +234,21 @@ def main() -> int:
     (output / "libgame.so").unlink(missing_ok=True)
     shutil.rmtree(output / "audio", ignore_errors=True)
 
+    (output / "game.apk").unlink(missing_ok=True)
+    shutil.rmtree(output / "save", ignore_errors=True)
     if apk:
-        shutil.copy2(apk, output / "game.apk")
+        shutil.copy2(apk, output.parent / "game.apk")
 
-    (output / "save").mkdir(exist_ok=True)
     (output / "RUN.cmd").write_text(
         '@echo off\r\n'
-        'cd /d "%~dp0"\r\n'
+        'cd /d "%~dp0.."\r\n'
         'if not exist game.apk (\r\n'
-        '  echo Put a supported x86 Geometry Dash APK here as game.apk\r\n'
+        '  echo Put a supported Geometry Dash APK in dist-unified as game.apk\r\n'
         '  pause\r\n'
         '  exit /b 2\r\n'
         ')\r\n'
-        'GeometryDashWrapper.exe --apk=game.apk\r\n',
+        'if not exist save mkdir save\r\n'
+        '"%~dp0GeometryDashWrapper.exe" --apk=game.apk\r\n',
         encoding="ascii",
         newline="",
     )
