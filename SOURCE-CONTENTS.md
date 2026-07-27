@@ -1,4 +1,4 @@
-# Source contents — v22beta Bringup14
+# Source contents — v22beta Bringup15
 
 Included:
 
@@ -6,7 +6,7 @@ Included:
 - Legacy x86 and Unicorn source retained for the future unified launcher.
 - Windows build scripts and pinned dependency acquisition.
 - Vendored zlib, stb_vorbis, and existing third-party license files.
-- Bringup14 technical notes and verification report.
+- Bringup15 technical notes and verification report.
 
 Excluded from the downloadable source archive:
 

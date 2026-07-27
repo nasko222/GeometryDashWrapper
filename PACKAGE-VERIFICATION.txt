@@ -1,4 +1,4 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup14
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup15
 
 Scope
 - Separate Dynarmic ARMv7 line for the supplied Geometry Dash 2.2 betas.
@@ -6,47 +6,51 @@ Scope
 - Release and source archives contain no APK or extracted game native library.
 
 Evidence and changes
-- Log 17 stopped after editor entry because the companion visibility helper
-  scanned all 10,000 editor sections in emulated ARM every frame.
-- Log 18 inflated the test platformer successfully, then crashed in companion
-  GDPSManager::detectEmulators through __stack_chk_fail.
-- Editor visibility now uses a bounded native CCArray scan and primary game
-  object functions, with at most 32 new activations per frame.
-- PlayLayer runs its untouched primary visibility implementation first; a
-  native post-pass sets only platformer-control opacity.
-- Companion GDPSManager, full ApplyHooks, constructors, DPAD touch hooks,
-  collision hooks, and broad gameplay hooks remain disabled.
-- Bringup13 level decoding/recovery, large strings, input, music, and waveOut
-  sound effects are preserved.
+- Log 19 shows host A/D delivery but no editor movement; Bringup15 routes
+  editor playtests through EditorUI and gameplay through UILayer.
+- Native UILayer canvas-touch state enables mouse jump only after the game's
+  own pause/control hit testing.
+- F2 directly opens My Levels through CreatorLayer::onMyLevels.
+- Companion editor helpers are optional and capability-gated. Only the
+  validated selected-beta CRC/layout may run targeted initH and visibility
+  bridges. Missing or unknown helpers continue with the primary game image.
+- Early-layout APKs receive a native editor callback bridge.
+- Empty level setup recovery adds GJGameLevel vtable validation, compatible
+  field scanning, official-song fallback, and non-fatal native passthrough.
+- Full companion ApplyHooks, constructors, GDPS, DPAD, collision, and broad
+  gameplay hooks remain disabled.
 
 Validation performed
-- Linux C++20 syntax/compile: -Wall -Wextra -Werror, passed.
+- Linux C++20 syntax/compile: passed.
 - Windows x64 C++20 cross-compile: Zig 0.14.1,
-  -Wall -Wextra -Werror, passed.
+  -O3 -Wall -Wextra, passed.
 - Windows artifact: PE32+ x86-64 console executable, passed.
 - Required PE imports include OPENGL32.dll, USER32.dll, GDI32.dll,
   WINMM.dll, ole32.dll, WS2_32.dll, and SHELL32.dll.
 - Windows executable SHA-256:
-  3a167061b3fa1cc7cc8a237884690027fa11be9e2a8974efd1673c4004388a06
+  892ef0f580bb7d4a4dbc1e4ad5d3f78bdf7e07368c0ccd99230ad3adc5c16218
 - Newer beta static audit:
   constructors=349 imports=393 relocations=103102
   PlayLayer->GJGameLevel=0x334 GJGameLevel->levelID=0x110
+  F2 target=1 queueButton=1 UILayer key=1 EditorUI key=1
   native editor visibility pointers=1 calls=0
   safe platformer visibility pointers=1 calls=0
-  companion initH=0x18034671; complete ApplyHooks disabled
+  companion CRC=0x90ac09a5 initH enabled; complete ApplyHooks disabled
 - Earlier beta static audit:
-  constructors=327 imports=366 relocations=91437
+  constructors=327 imports=367 relocations=91437
   PlayLayer->GJGameLevel=0x284 GJGameLevel->levelID=0x104
-  companion libgame absent; targeted companion bridges skipped
+  companion absent; native editor pointer=1; F2 target=1
+- Synthetic missing-initH companion audit:
+  mapper continued, companion editor extension skipped, static audit passed
 
 Build identity
-- Output: dist-arm-wrapper-v22beta-bringup14
+- Output: dist-arm-wrapper-v22beta-bringup15
 - Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
 - Builder revision:
-  dynarmic-x64-builder25-v22beta-armv7-bringup14-native-visibility
+  dynarmic-x64-builder26-v22beta-armv7-bringup15-input-capabilities
 
 Runtime boundary
 - Static and cross-build validation cannot reproduce Windows gameplay,
   rendering, input, or audio devices.
-- Test normal levels first, then editor rendering and the exact platformer
-  level from log 18. Attach gd-v22beta-selected.log on any failure.
+- Test normal levels first, then platformer mouse/keyboard, editor movement,
+  F2, and the early beta. Attach gd-v22beta-selected.log on any failure.

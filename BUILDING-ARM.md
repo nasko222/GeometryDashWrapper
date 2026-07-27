@@ -1,4 +1,4 @@
-# Building Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup14
+# Building Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup15
 
 Use a fresh extracted source directory on 64-bit Windows:
 
@@ -15,15 +15,18 @@ The build script pins:
 The output directory is:
 
 ```text
-dist-arm-wrapper-v22beta-bringup14\
+dist-arm-wrapper-v22beta-bringup15\
 ```
 
 Launch the copied APK with:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup14\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup15\RUN_V22_SELECTED_APK.cmd
 ```
 
-The newer beta's `lib/armeabi-v7a/libgame.so` is required for the repaired editor. Earlier APKs without that module still receive the level-data and level-settings fixes.
+The validated selected late beta can use its narrow
+`lib/armeabi-v7a/libgame.so` editor extension. An early-layout beta without
+that helper uses its native primary-library editor. Unknown companion ABIs are
+left untouched instead of being executed by name alone.
 
 No APK is included in the source package.
