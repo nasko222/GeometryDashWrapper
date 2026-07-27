@@ -1,6 +1,6 @@
 # Geometry Dash ARM Wrapper build notes
 
-## NetworkTest3 v22 beta build
+## NetworkTest5 v22 beta build
 
 ```bat
 BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
@@ -12,7 +12,7 @@ hard-coded APK size/hash allowlist and no donor-library argument.
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-networktest3-wall-watchdog\
+dist-arm-wrapper-v22beta-networktest5-dyn14-exact-network\
 ```
 
-Run `RUN_NETWORKTEST3.cmd` from that output folder.
+Run `RUN_NETWORKTEST5.cmd` from that output folder.
