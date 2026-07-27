@@ -10,6 +10,7 @@
 #include "jni_shim.h"
 #include "loader.h"
 #include "runtime.h"
+#include "build_info.h"
 
 typedef int (*JniOnLoadFunction)(void *java_vm, void *reserved);
 typedef void (*NativeSetApkPathFunction)(void *environment, void *object,

@@ -66,6 +66,8 @@ extern "C" {
 #include "zlib.h"
 #include "storage_win.h"
 #include "audio_win.h"
+#include "net_compat_win.h"
+#include "build_info.h"
 }
 
 using u8 = std::uint8_t;
@@ -2598,7 +2600,6 @@ enum class HostEventType {
     KeyDown,
     TextInput,
     DeleteBackward,
-    OpenEditor,
     PlatformButton,
     Pause,
     Resume
@@ -2648,7 +2649,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaMilestone1Window";
+        const char* class_name = "GeometryDashUnified ARMv7Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2660,7 +2661,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Milestone1",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARMv7 - Unified ARMv7",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2990,10 +2991,6 @@ private:
             }
             return 0;
         case WM_KEYDOWN:
-            if (wparam == VK_F2) {
-                self->Queue(HostEvent{HostEventType::OpenEditor});
-                return 0;
-            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -3223,7 +3220,7 @@ public:
         }
         sockets_.clear();
         if (async_dns_ || async_dns_queued_count_ || async_dns_timeout_count_) {
-            log_ << "RESULT: DYNARMIC_MILESTONE1_DNS_TOTALS queued="
+            log_ << "RESULT: DYNARMIC_UNIFIED_ARMV7_DNS_TOTALS queued="
                  << async_dns_queued_count_ << " completed="
                  << async_dns_completed_count_ << " timed_out="
                  << async_dns_timeout_count_ << " native_threads="
@@ -3989,7 +3986,7 @@ private:
 
     void QueueNativeHttpTrace(u64 id, std::string message) {
         std::ostringstream stream;
-        stream << "[host] Milestone1 native HTTP id=" << id << ' ' << message;
+        stream << "[host] Unified ARMv7 native HTTP id=" << id << ' ' << message;
         std::lock_guard<std::mutex> lock(native_http_mutex_);
         native_http_trace_.push_back(stream.str());
     }
@@ -4515,7 +4512,7 @@ private:
             return Fail("native HTTP send could not retain request object");
 
         ++native_http_queued_count_;
-        log_ << "[host] Milestone1 native HTTP queued id=" << job.id
+        log_ << "[host] Unified ARMv7 native HTTP queued id=" << job.id
              << " method=" << WideToUtf8(
                     NativeHttpMethod(job.request_type),
                     std::wcslen(NativeHttpMethod(job.request_type)))
@@ -4696,7 +4693,7 @@ private:
         if (!trace.empty()) log_.flush();
         for (const NativeHttpResult& result : ready) {
             ++native_http_completed_count_;
-            log_ << "[host] Milestone1 native HTTP completed id=" << result.id
+            log_ << "[host] Unified ARMv7 native HTTP completed id=" << result.id
                  << " success=" << (result.transport_success ? 1 : 0)
                  << " code=" << result.response_code
                  << " body=" << result.response_body.size()
@@ -5033,7 +5030,7 @@ private:
     void DumpImportTrace(const std::string& reason, std::size_t requested = 96u) {
         if (!import_trace_count_) return;
         const std::size_t count = std::min(requested, import_trace_count_);
-        log_ << "[trace] Milestone1 import-ring reason=" << reason
+        log_ << "[trace] Unified ARMv7 import-ring reason=" << reason
              << " entries=" << count << '/' << import_trace_count_ << '\n';
         const std::size_t oldest =
             (import_trace_cursor_ + import_trace_.size() - import_trace_count_) % import_trace_.size();
@@ -5068,7 +5065,7 @@ private:
         if (now < forensic_next_heartbeat_) return;
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             now - forensic_call_started_).count();
-        log_ << "[trace] Milestone1 guest heartbeat elapsed_ms="
+        log_ << "[trace] Unified ARMv7 guest heartbeat elapsed_ms="
              << std::fixed << std::setprecision(1) << elapsed_ms
              << " active=\"" << forensic_call_label_ << "\""
              << " current-import=" << current_import
@@ -5082,7 +5079,7 @@ private:
     }
 
     void LogForensicImport(const char* phase, const ImportRecord& import, bool ok = true) {
-        log_ << "[trace] Milestone1 import " << phase
+        log_ << "[trace] Unified ARMv7 import " << phase
              << " ctx=" << (running_cooperative_worker_ ? "worker" : "main")
              << " svc=" << import.svc
              << " stub=0x" << std::hex << import.address
@@ -5181,7 +5178,7 @@ private:
         cpu_.SetCpsr(cpsr);
         cpu_.Regs()[15] = lr & ~1u;
         if (cooperative_worker_stub_return_count_++ < 256u) {
-            log_ << "[host] Milestone1 completed pending stub return reason="
+            log_ << "[host] Unified ARMv7 completed pending stub return reason="
                  << (reason ? reason : "unspecified")
                  << " stub-pc=0x" << std::hex << pc
                  << " target=0x" << (lr & ~1u) << std::dec
@@ -7874,48 +7871,13 @@ private:
     }
 #ifdef _WIN32
     static int GuestAddressFamily(int host_family) {
-        if (host_family == AF_INET6) return 10;
-        if (host_family == AF_INET) return 2;
-        return host_family;
+        return gd_net_host_family_to_android(host_family);
     }
     static int HostAddressFamily(int guest_family) {
-        if (guest_family == 10) return AF_INET6;
-        if (guest_family == 2) return AF_INET;
-        return guest_family;
+        return gd_net_android_family_to_host(guest_family);
     }
     static int MapWsaError(int error) {
-        // SO_ERROR reports zero when a nonblocking connection completed
-        // successfully. Test10 converted that zero through the fallback map
-        // into guest EIO (5), so libcurl rejected an already-connected socket.
-        if (error == 0) return 0;
-        switch (error) {
-        case WSAEWOULDBLOCK: return 11;
-        case WSAEINPROGRESS: return 115;
-        case WSAEALREADY: return 114;
-        case WSAENOTSOCK: return 88;
-        case WSAEDESTADDRREQ: return 89;
-        case WSAEMSGSIZE: return 90;
-        case WSAEPROTOTYPE: return 91;
-        case WSAENOPROTOOPT: return 92;
-        case WSAEPROTONOSUPPORT: return 93;
-        case WSAESOCKTNOSUPPORT: return 94;
-        case WSAEOPNOTSUPP: return 95;
-        case WSAEAFNOSUPPORT: return 97;
-        case WSAEADDRINUSE: return 98;
-        case WSAEADDRNOTAVAIL: return 99;
-        case WSAENETDOWN: return 100;
-        case WSAENETUNREACH: return 101;
-        case WSAENETRESET: return 102;
-        case WSAECONNABORTED: return 103;
-        case WSAECONNRESET: return 104;
-        case WSAENOBUFS: return 105;
-        case WSAEISCONN: return 106;
-        case WSAENOTCONN: return 107;
-        case WSAETIMEDOUT: return 110;
-        case WSAECONNREFUSED: return 111;
-        case WSAEHOSTUNREACH: return 113;
-        default: return error ? error : 5;
-        }
+        return gd_net_wsa_error_to_android_passthrough(error);
     }
     u32 SocketFailure() {
         SetGuestErrno(MapWsaError(WSAGetLastError()));
@@ -7964,8 +7926,7 @@ private:
             HostAddressFamily(static_cast<int>(family)),
             static_cast<int>(type), static_cast<int>(protocol));
         if (socket_value == INVALID_SOCKET) return SocketFailure();
-        u_long nonblocking = 1u;
-        if (::ioctlsocket(socket_value, FIONBIO, &nonblocking) != 0) {
+        if (gd_net_set_nonblocking(socket_value, 1) != 0) {
             const int error = WSAGetLastError();
             ::closesocket(socket_value);
             SetGuestErrno(MapWsaError(error));
@@ -8421,7 +8382,7 @@ private:
         async_dns_ready_reported_ = false;
         ++async_dns_queued_count_;
 
-        log_ << "[host] Milestone1 DNS queued kind="
+        log_ << "[host] Unified ARMv7 DNS queued kind="
              << (kind == AsyncDnsKind::AddrInfo ? "getaddrinfo" : "gethostbyname")
              << " node=" << (node.empty() ? "<null>" : node)
              << " service=" << (service.empty() ? "<null>" : service)
@@ -8485,13 +8446,13 @@ private:
         cooperative_worker_runnable_ = cooperative_worker_.valid;
         if (finished && !async_dns_ready_reported_) {
             async_dns_ready_reported_ = true;
-            log_ << "[host] Milestone1 DNS completion ready code="
+            log_ << "[host] Unified ARMv7 DNS completion ready code="
                  << async_dns_->code.load(std::memory_order_relaxed)
                  << " resume-next-frame=1\n";
             log_.flush();
         } else if (timed_out && !async_dns_timeout_reported_) {
             async_dns_timeout_reported_ = true;
-            log_ << "[host] Milestone1 DNS timeout after 8000 ms; "
+            log_ << "[host] Unified ARMv7 DNS timeout after 8000 ms; "
                     "resume guest with EAI_AGAIN\n";
             log_.flush();
         }
@@ -8649,7 +8610,7 @@ private:
         }
         if (code == 0) result = CommitGuestAddrInfoRecords(records, result_address);
         else result = static_cast<u32>(code);
-        log_ << "[host] Milestone1 DNS delivered kind=getaddrinfo node="
+        log_ << "[host] Unified ARMv7 DNS delivered kind=getaddrinfo node="
              << (node.empty() ? "<null>" : node) << " result="
              << static_cast<s32>(result) << " records=" << records.size() << '\n';
         log_.flush();
@@ -8704,7 +8665,7 @@ private:
         }
         result = code == 0 ? CommitGuestHostEntRecords(node, records) : 0u;
         if (code != 0) SetGuestErrno(2);
-        log_ << "[host] Milestone1 DNS delivered kind=gethostbyname node="
+        log_ << "[host] Unified ARMv7 DNS delivered kind=gethostbyname node="
              << node << " result=" << code << " records=" << records.size()
              << '\n';
         log_.flush();
@@ -9006,7 +8967,7 @@ private:
         cooperative_worker_done_ = false;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
         ++cooperative_worker_registered_count_;
-        log_ << "[host] Milestone1 guest worker registered at 0x" << std::hex << start_routine
+        log_ << "[host] Unified ARMv7 guest worker registered at 0x" << std::hex << start_routine
              << " arg=0x" << argument << std::dec
              << " scheduling=deferred-frame-pump+safe-stub-return+wall-watchdog+forensic-trace" << '\n';
         log_.flush();
@@ -9029,7 +8990,7 @@ private:
         constexpr auto kHardRunWatchdog = std::chrono::milliseconds(8);
         const u64 resume_number = ++cooperative_worker_resume_count_;
         if (resume_number <= 128u) {
-            log_ << "[host] Milestone1 worker slice #" << resume_number
+            log_ << "[host] Unified ARMv7 worker slice #" << resume_number
                  << " trigger=" << (trigger ? trigger : "unspecified")
                  << " pc=0x" << std::hex << cooperative_worker_.regs[15]
                  << " lr=0x" << cooperative_worker_.regs[14] << std::dec << '\n';
@@ -9093,14 +9054,14 @@ private:
             cpu_.Run();
             stop_watchdog();
 
-            if (env_.invalid_access) return Fail("Milestone1 worker invalid guest memory");
-            if (env_.interpreter_fallback) return Fail("Milestone1 worker interpreter fallback");
-            if (env_.exception_seen) return Fail("Milestone1 worker guest exception");
+            if (env_.invalid_access) return Fail("Unified ARMv7 worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("Unified ARMv7 worker interpreter fallback");
+            if (env_.exception_seen) return Fail("Unified ARMv7 worker guest exception");
             if (watchdog_fired.load(std::memory_order_acquire)) {
                 watchdog_preempted = true;
                 ++cooperative_worker_watchdog_count_;
                 if (cooperative_worker_watchdog_count_ <= 128u) {
-                    log_ << "[host] Milestone1 worker watchdog preempted run=" << runs
+                    log_ << "[host] Unified ARMv7 worker watchdog preempted run=" << runs
                          << " pc=0x" << std::hex << cpu_.Regs()[15]
                          << " lr=0x" << cpu_.Regs()[14] << std::dec
                          << " pc-desc=" << DescribeAddress(cpu_.Regs()[15])
@@ -9116,7 +9077,7 @@ private:
                     cooperative_worker_done_ = true;
                     break;
                 }
-                if (!HandleSvc(env_.pending_svc, "Milestone1 CCHttpClient worker"))
+                if (!HandleSvc(env_.pending_svc, "Unified ARMv7 CCHttpClient worker"))
                     return false;
                 // HandleSvc leaves PC at the second half of the synthetic SVC/BX-LR
                 // trampoline.  NetworkTest2-4 could save that transient PC at a
@@ -9124,14 +9085,14 @@ private:
                 // seen in CRYPTO_malloc/CRYPTO_zalloc.  Retire BX LR atomically.
                 CompletePendingStubReturn("after-worker-svc");
             } else if (env_.ticks_left != 0u) {
-                return Fail("Milestone1 worker stopped without a trap");
+                return Fail("Unified ARMv7 worker stopped without a trap");
             }
         }
 
         CompletePendingStubReturn("before-slice-save");
         if (IsImportStubReturnPc(cpu_.Regs()[15]) || IsVmOrJniStubReturnPc(cpu_.Regs()[15])) {
             DumpImportTrace("unsafe-worker-save-pc", 128u);
-            return Fail("Milestone1 refused to save worker inside synthetic stub");
+            return Fail("Unified ARMv7 refused to save worker inside synthetic stub");
         }
         cooperative_worker_.regs = cpu_.Regs();
         cooperative_worker_.ext_regs = cpu_.ExtRegs();
@@ -9142,12 +9103,12 @@ private:
             cooperative_worker_.valid = false;
             cooperative_worker_runnable_ = false;
             if (cooperative_worker_done_count_++ < 16u)
-                log_ << "[host] Milestone1 worker exited\n";
+                log_ << "[host] Unified ARMv7 worker exited\n";
         } else if (cooperative_worker_yielded_) {
             cooperative_worker_runnable_ = false;
             ++cooperative_worker_yield_count_;
             if (network_worker_runs_++ < 128u)
-                log_ << "[host] Milestone1 worker waiting for signal"
+                log_ << "[host] Unified ARMv7 worker waiting for signal"
                      << " yields=" << cooperative_worker_yield_count_ << '\n';
         } else {
             cooperative_worker_runnable_ = true;
@@ -9155,7 +9116,7 @@ private:
             if (cooperative_worker_slice_yield_count_ <= 128u) {
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - started).count();
-                log_ << "[host] Milestone1 worker timeslice yield runs=" << runs
+                log_ << "[host] Unified ARMv7 worker timeslice yield runs=" << runs
                      << " elapsed_ms=" << std::fixed << std::setprecision(2)
                      << elapsed_ms
                      << " watchdog=" << (watchdog_preempted ? 1 : 0)
@@ -9983,7 +9944,7 @@ private:
             ++semaphores_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 512u)
-                log_ << "[host] Milestone1 semaphore post sem=0x" << std::hex
+                log_ << "[host] Unified ARMv7 semaphore post sem=0x" << std::hex
                      << r0 << std::dec << " pending=" << semaphores_[r0]
                      << " wake=deferred-next-frame" << '\n';
             // Do not recursively run the HTTP worker inside the foreground import.
@@ -10001,7 +9962,7 @@ private:
             ++condition_signals_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 512u)
-                log_ << "[host] Milestone1 condition signal cond=0x" << std::hex
+                log_ << "[host] Unified ARMv7 condition signal cond=0x" << std::hex
                      << r0 << std::dec << " pending=" << condition_signals_[r0]
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
                      << " wake=deferred-next-frame" << '\n';
@@ -10015,7 +9976,7 @@ private:
                 cooperative_worker_yielded_ = true;
                 cooperative_worker_runnable_ = false;
                 if (cooperative_condition_log_count_++ < 128u)
-                    log_ << "[host] Milestone1 worker cond-wait cond=0x"
+                    log_ << "[host] Unified ARMv7 worker cond-wait cond=0x"
                          << std::hex << r0 << std::dec << '\n';
                 return true; // Re-execute after a future signal token appears.
             } else {
@@ -10165,7 +10126,7 @@ private:
                 text.find("https://") != std::string::npos;
             if (request_like) {
                 ++network_request_marker_count_;
-                log_ << "[trace] Milestone1 request-marker #" << network_request_marker_count_
+                log_ << "[trace] Unified ARMv7 request-marker #" << network_request_marker_count_
                      << " text=\"" << SanitizeLogText(text) << "\""
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
 #ifdef _WIN32
@@ -10873,7 +10834,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.4-milestone1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11139,8 +11100,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-milestone1");
-        emit("Milestone1: concurrent direct WinHTTP bridge with independent request threads, stage tracing, short timeouts, and automatic form POST headers");
+        emit(std::string("Geometry Dash Wrapper ") + GD_WRAPPER_VERSION + " backend=" + GD_ARMV7_BACKEND_NAME);
+        emit("Unified ARMv7: concurrent direct WinHTTP bridge with independent request threads, stage tracing, short timeouts, and automatic form POST headers");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -11152,7 +11113,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaMilestone1 must be compiled as a 64-bit executable");
+                "The ARM Dynarmic backend must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -11160,7 +11121,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_MILESTONE1_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_UNIFIED_ARMV7_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -11398,10 +11359,6 @@ int main(int argc,char** argv) {
         const auto gameplay_edit_pointers = install_editor_bridge
             ? InstallV22GameplayEditButtonBridges(runtime, env)
             : std::pair<std::size_t, std::size_t>{};
-        const SymbolRecord* direct_editor_symbol = FindSymbol(
-            runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
-        const u32 direct_editor_address =
-            direct_editor_symbol ? direct_editor_symbol->address : 0u;
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -11551,9 +11508,6 @@ int main(int argc,char** argv) {
              " gameplay-edit-bridge="+
              std::to_string(gameplay_edit_pointers.first != 0u ||
                             gameplay_edit_pointers.second != 0u));
-        emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target="+
-             std::to_string(direct_editor_address != 0u)+
-             " action=MyLevels");
         emit("RESULT: DYNARMIC_V22_COMPANION_HOOK_POLICY mode=" +
              std::string(V22CompanionHookModeName(companion_hook_mode)) +
              " safe=MenuLayer,Options,EditLevelLayer,LevelEditorLayer,"
@@ -11828,18 +11782,6 @@ int main(int argc,char** argv) {
                         ok=executor.SendDeleteBackward(
                             runtime.native_delete_backward);
                     break;
-                case HostEventType::OpenEditor:
-                    if(!native_paused && direct_editor_address){
-                        emit("[host] V22 F2 direct My Levels entry requested");
-                        u32 ignored=0;
-                        ok=executor.RunFunction(
-                            direct_editor_address,{0u,0u},&ignored,
-                            "V22 direct My Levels entry",
-                            500000000u,std::chrono::milliseconds(30000));
-                        if(ok)
-                            emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_ENTERED source=F2");
-                    }
-                    break;
                 case HostEventType::PlatformButton:
                     if(!native_paused)
                         ok=executor.SendPlatformerButton(
@@ -12007,7 +11949,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Milestone1 | "
+                title<<"Geometry Dash ARMv7 - Unified ARMv7 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -12059,11 +12001,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_MILESTONE1_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_UNIFIED_ARMV7_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_MILESTONE1_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_UNIFIED_ARMV7_FAILED");
         return 1;
     }
 }

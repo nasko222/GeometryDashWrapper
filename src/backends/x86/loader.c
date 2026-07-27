@@ -7,7 +7,7 @@
 
 #include "loader.h"
 #include "runtime.h"
-#include "../third_party/zlib/zlib.h"
+#include "zlib.h"
 
 static int range_valid(size_t offset, size_t length, size_t total) {
     return offset <= total && length <= total - offset;

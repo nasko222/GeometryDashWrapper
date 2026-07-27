@@ -16,10 +16,10 @@
 #include "embedded_effects.h"
 #include "loader.h"
 #include "runtime.h"
-#include "../third_party/zlib/zlib.h"
+#include "zlib.h"
 
 #define STB_VORBIS_HEADER_ONLY
-#include "../third_party/stb/stb_vorbis.c"
+#include "stb_vorbis.c"
 
 #define MAX_EFFECT_SLOTS 48
 #define MAX_EFFECT_ASSET_CACHE 128

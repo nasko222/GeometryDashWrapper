@@ -1,8 +1,0 @@
-#!/usr/bin/env sh
-# QEMU's configure requires the command even though this static Win32 build
-# consumes no pkg-config packages.
-if [ "$1" = "--version" ]; then
-    echo 0.0-wrapper
-    exit 0
-fi
-exit 1

@@ -158,7 +158,7 @@ def main() -> int:
         "--effects-apk", type=Path, action="append", default=[],
         help="Additional APK whose Ogg effects should be embedded in the same EXE; repeatable",
     )
-    parser.add_argument("--out", type=Path, default=Path("dist"))
+    parser.add_argument("--out", type=Path, default=Path("dist-unified-x86"))
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -183,14 +183,15 @@ def main() -> int:
     generate_embedded_effects(effect_apks, embedded_effects, ffmpeg)
 
     sources = [
-        root / "src/main.c",
-        root / "src/loader.c",
-        root / "src/runtime.c",
-        root / "src/bionic_x86.S",
-        root / "src/jni_shim.c",
-        root / "src/audio_win.c",
-        root / "src/fmod_win.c",
-        root / "src/storage_win.c",
+        root / "src/backends/x86/main.c",
+        root / "src/backends/x86/loader.c",
+        root / "src/backends/x86/runtime.c",
+        root / "src/backends/x86/bionic_x86.S",
+        root / "src/backends/x86/jni_shim.c",
+        root / "src/shared/audio_win.c",
+        root / "src/backends/x86/fmod_win.c",
+        root / "src/shared/storage_win.c",
+        root / "src/shared/net_compat_win.c",
         embedded_effects,
         root / "third_party/stb/stb_vorbis.c",
         *sorted((root / "third_party/zlib").glob("*.c")),
@@ -208,7 +209,9 @@ def main() -> int:
         "-Wno-deprecated-non-prototype",
         "-mstackrealign",
         f"-I{root / 'third_party/zlib'}",
-        f"-I{root / 'src'}",
+        f"-I{root / 'third_party/stb'}",
+        f"-I{root / 'src/shared'}",
+        f"-I{root / 'src/backends/x86'}",
         "-o",
         str(output / "GeometryDashWrapper.exe"),
         *(str(path) for path in sources),
@@ -233,6 +236,20 @@ def main() -> int:
 
     if apk:
         shutil.copy2(apk, output / "game.apk")
+
+    (output / "save").mkdir(exist_ok=True)
+    (output / "RUN.cmd").write_text(
+        '@echo off\r\n'
+        'cd /d "%~dp0"\r\n'
+        'if not exist game.apk (\r\n'
+        '  echo Put a supported x86 Geometry Dash APK here as game.apk\r\n'
+        '  pause\r\n'
+        '  exit /b 2\r\n'
+        ')\r\n'
+        'GeometryDashWrapper.exe --apk=game.apk\r\n',
+        encoding="ascii",
+        newline="",
+    )
 
     print(output / "GeometryDashWrapper.exe")
     return 0

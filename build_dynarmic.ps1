@@ -1,7 +1,6 @@
 param(
-    [Parameter(Position = 0)]
-    [string]$Apk = "",
     [switch]$Clean,
+    [switch]$RefreshTools,
     [switch]$RefreshDynarmic
 )
 
@@ -13,8 +12,8 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
-$BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-0.9.4-milestone1"
+$BuildDir = Join-Path $BuildRoot "dynarmic-x64-unified"
+$Output = Join-Path $Root "dist-unified"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder36-0.9.4-milestone1"
+$BuilderRevision = "dynarmic-x64-builder37-0.9.5-unified1-two-backends"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -61,7 +60,7 @@ function Find-GitExecutable {
     foreach ($Candidate in $Candidates) {
         if ($Candidate -and (Test-Path -LiteralPath $Candidate)) { return $Candidate }
     }
-    throw "Git was not found. This x64 milestone uses Git only for a non-interactive public checkout from GitLab. Install Git for Windows or put git.exe on PATH, then rerun BUILD_DYNARMIC_X64.cmd."
+    throw "Git was not found. This unified Dynarmic build uses Git only for a non-interactive public checkout from GitLab. Install Git for Windows or put git.exe on PATH, then rerun BUILD_DYNARMIC.cmd."
 }
 
 function Get-PublicGitArguments {
@@ -202,8 +201,26 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 }
 
 New-Item -ItemType Directory -Force -Path $ToolsRoot, $Downloads, $BuildRoot | Out-Null
+if ($RefreshTools) {
+    $ToolDirectories = @(
+        (Join-Path $ToolsRoot "zig-$ZigVersion"),
+        (Join-Path $ToolsRoot "cmake-$CMakeVersion"),
+        (Join-Path $ToolsRoot "ninja-$NinjaVersion"),
+        $BoostDirectory
+    )
+    $ToolArchives = @(
+        (Join-Path $Downloads "zig-x86_64-windows-$ZigVersion.zip"),
+        (Join-Path $Downloads "cmake-$CMakeVersion-windows-x86_64.zip"),
+        (Join-Path $Downloads "ninja-win-$NinjaVersion.zip"),
+        $BoostArchive
+    )
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ToolDirectories
+    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $ToolArchives
+}
 if ($Clean) {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $BuildDir, $Output
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $BuildDir
+    $ArmOutputPaths = @((Join-Path $Output "arm-legacy"), (Join-Path $Output "armv7"))
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
 }
 if ($RefreshDynarmic) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DynarmicSource
@@ -316,7 +333,7 @@ if (-not $CheckoutReady) {
         )
     } catch {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $DynarmicSource
-        throw "The public Dynarmic GitLab checkout failed without requesting credentials. Check access to gitlab.com and rerun BUILD_DYNARMIC_X64.cmd.`n$($_.Exception.Message)"
+        throw "The public Dynarmic GitLab checkout failed without requesting credentials. Check access to gitlab.com and rerun BUILD_DYNARMIC.cmd.`n$($_.Exception.Message)"
     }
 } else {
     Write-Host "Using cached public Dynarmic checkout: $DynarmicSource"
@@ -368,7 +385,7 @@ if (Test-Path $BuildDir) {
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 $Toolchain = Join-Path $Root "tools\dynarmic-x64-zig.cmake"
-$ProjectSource = Join-Path $Root "dynarmic-x64"
+$ProjectSource = Join-Path $Root "cmake"
 Invoke-External -FilePath $CMakeExe -Arguments @(
     "-S", $ProjectSource,
     "-B", $BuildDir,
@@ -395,17 +412,20 @@ Invoke-External -FilePath $CMakeExe -Arguments @(
 
 # ZIP extraction can preserve source timestamps older than an existing Ninja object.
 # In that case Ninja may incorrectly reuse a stale probe executable even though the
-# source contents changed. Refresh only the wrapper probe sources before building;
+# source contents changed. Refresh only the two wrapper backend and shared sources before building;
 # Dynarmic's 173-object static library remains cached.
-Write-Host "Refreshing Dynarmic probe source timestamps to prevent stale Ninja output"
+Write-Host "Refreshing unified backend source timestamps to prevent stale Ninja output"
 $ProbeSourcesToRefresh = @(
-    (Join-Path $Root "src\dynarmic_probe.cpp"),
-    (Join-Path $Root "src\storage_win.c"),
-    (Join-Path $Root "src\audio_win.c"),
-    (Join-Path $Root "src\apk_extract_audio.c"),
-    (Join-Path $Root "src\embedded_effects_stub.c"),
+    (Join-Path $Root "src\backends\arm_legacy\dynarmic_legacy.cpp"),
+    (Join-Path $Root "src\backends\armv7\dynarmic_armv7.cpp"),
+    (Join-Path $Root "src\shared\storage_win.c"),
+    (Join-Path $Root "src\shared\audio_win.c"),
+    (Join-Path $Root "src\shared\apk_extract_audio.c"),
+    (Join-Path $Root "src\shared\embedded_effects_stub.c"),
+    (Join-Path $Root "src\shared\net_compat_win.c"),
+    (Join-Path $Root "src\shared\build_info.h"),
     (Join-Path $Root "third_party\stb\stb_vorbis.c"),
-    (Join-Path $Root "dynarmic-x64\CMakeLists.txt")
+    (Join-Path $Root "cmake\CMakeLists.txt")
 )
 $RefreshTime = Get-Date
 foreach ($ProbeSource in $ProbeSourcesToRefresh) {
@@ -416,67 +436,80 @@ foreach ($ProbeSource in $ProbeSourcesToRefresh) {
 
 Invoke-External -FilePath $CMakeExe -Arguments @("--build", $BuildDir, "--parallel")
 
-$ProbeMatches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashDynarmicProbe.exe" -File -Recurse)
-if ($ProbeMatches.Count -lt 1) { throw "Build completed but GeometryDashDynarmicProbe.exe was not found" }
-$ProbeExe = $ProbeMatches[0].FullName
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Output
+
+$LegacyMatches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashArmLegacy.exe" -File -Recurse)
+$ArmV7Matches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashArmV7.exe" -File -Recurse)
+if ($LegacyMatches.Count -lt 1) { throw "Build completed but GeometryDashArmLegacy.exe was not found" }
+if ($ArmV7Matches.Count -lt 1) { throw "Build completed but GeometryDashArmV7.exe was not found" }
+$LegacyExe = $LegacyMatches[0].FullName
+$ArmV7Exe = $ArmV7Matches[0].FullName
+
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
-Copy-Item -Force $ProbeExe (Join-Path $Output "GeometryDashDynarmicProbe.exe")
+$LegacyOut = Join-Path $Output "arm-legacy"
+$ArmV7Out = Join-Path $Output "armv7"
+$ArmOutputPaths = @($LegacyOut, $ArmV7Out)
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
+New-Item -ItemType Directory -Force -Path $ArmOutputPaths | Out-Null
+Copy-Item -Force $LegacyExe (Join-Path $LegacyOut "GeometryDashArmLegacy.exe")
+Copy-Item -Force $ArmV7Exe (Join-Path $ArmV7Out "GeometryDashArmV7.exe")
+New-Item -ItemType Directory -Force -Path (Join-Path $LegacyOut "save"), (Join-Path $ArmV7Out "save-v22beta") | Out-Null
 
-$ResolvedApk = $Apk
-if ([string]::IsNullOrWhiteSpace($ResolvedApk)) {
-    $DefaultSelected = Join-Path $Root "game-v22beta-selected.apk"
-    $DefaultSelectedAlt = Join-Path $Root "game-v22beta.apk"
-    if (Test-Path $DefaultSelected) { $ResolvedApk = $DefaultSelected }
-    elseif (Test-Path $DefaultSelectedAlt) { $ResolvedApk = $DefaultSelectedAlt }
-    else {
-        throw "Pass the current v22 beta APK to BUILD_V22BETA_X64.cmd."
-    }
-}
-if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK not found: $ResolvedApk" }
-$InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
-if ($InputExtension -ne ".apk") {
-    throw "Milestone1 accepts an APK input, not a raw .so or donor package: $ResolvedApk"
-}
-$PackagedInputName = "game-v22beta-selected.apk"
-$InputBytes = (Get-Item -LiteralPath $ResolvedApk).Length
-$InputSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ResolvedApk).Hash.ToLowerInvariant()
-Write-Host "Input APK: $InputBytes bytes, SHA-256 $InputSha256" -ForegroundColor DarkGray
-Copy-Item -Force $ResolvedApk (Join-Path $Output $PackagedInputName)
-
-# The temporary 90/95 MB bad compile is intentionally out of scope.  There is
-# no hard-coded size/hash gate: package the APK explicitly supplied by the user
-# and use only its own matching native libraries (no donor APK or sidecar).
-$License = Join-Path $DynarmicSource "LICENSE.txt"
-if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
-$BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
-if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "NETWORKTEST4-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "NETWORKTEST4-NOTES.md") }
-New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
-
-$SelectedLauncher = @'
+$LegacyRun = @'
 @echo off
-setlocal
 cd /d "%~dp0"
-if not exist game-v22beta-selected.apk (
-  echo game-v22beta-selected.apk is missing.
-  echo Rebuild with: BUILD_V22BETA_X64.cmd "D:\path\to\beta.apk"
+if not exist game.apk (
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK here as game.apk
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --companion-hooks=off --debug-everything --dump-imports=gd-milestone1-imports.txt --log=gd-milestone1.log --profile=gd-milestone1-profile.csv --profile-summary=gd-milestone1-profile-summary.txt
-set "RESULT=%ERRORLEVEL%"
-echo.
-echo Main log: gd-milestone1.log
-echo Imports: gd-milestone1-imports.txt
-pause
-exit /b %RESULT%
+GeometryDashArmLegacy.exe game.apk --log=gd-arm-legacy.log
 '@
-[IO.File]::WriteAllText((Join-Path $Output "RUN_NETWORKTEST4.cmd"), $SelectedLauncher, [Text.Encoding]::ASCII)
-[IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`nbytes=$InputBytes`r`nsha256=$InputSha256`r`nscope=explicit-v22-apk-own-libraries-no-hash-gate`r`n", [Text.Encoding]::ASCII)
-[IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
+$LegacyDebug = @'
+@echo off
+cd /d "%~dp0"
+if not exist game.apk (
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK here as game.apk
+  pause
+  exit /b 2
+)
+GeometryDashArmLegacy.exe game.apk --debug-everything --dump-imports=gd-arm-legacy-imports.txt --log=gd-arm-legacy-debug.log --profile=gd-arm-legacy-profile.csv --profile-summary=gd-arm-legacy-profile-summary.txt
+'@
+$ArmV7Run = @'
+@echo off
+cd /d "%~dp0"
+if not exist game.apk (
+  echo Put the ARMv7 Geometry Dash 2.2 APK here as game.apk
+  pause
+  exit /b 2
+)
+GeometryDashArmV7.exe game.apk --companion-hooks=off --log=gd-armv7.log
+'@
+$ArmV7Debug = @'
+@echo off
+cd /d "%~dp0"
+if not exist game.apk (
+  echo Put the ARMv7 Geometry Dash 2.2 APK here as game.apk
+  pause
+  exit /b 2
+)
+GeometryDashArmV7.exe game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
+'@
+[IO.File]::WriteAllText((Join-Path $LegacyOut "RUN.cmd"), $LegacyRun, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $LegacyOut "RUN_DEBUG.cmd"), $LegacyDebug, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN.cmd"), $ArmV7Run, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN_DEBUG.cmd"), $ArmV7Debug, [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 2.2 beta ARMv7 Milestone1 branch ready:" -ForegroundColor Green
-Write-Host "  $Output"
-Write-Host "Run: RUN_NETWORKTEST4.cmd"
+$License = Join-Path $DynarmicSource "LICENSE.txt"
+if (Test-Path $License) {
+    Copy-Item -Force $License (Join-Path $LegacyOut "DYNARMIC-LICENSE.txt")
+    Copy-Item -Force $License (Join-Path $ArmV7Out "DYNARMIC-LICENSE.txt")
+}
+$BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
+if (Test-Path $BoostLicense) {
+    Copy-Item -Force $BoostLicense (Join-Path $LegacyOut "BOOST-LICENSE.txt")
+    Copy-Item -Force $BoostLicense (Join-Path $ArmV7Out "BOOST-LICENSE.txt")
+}
+[IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
+Write-Host "`nUnified Dynarmic backends ready:" -ForegroundColor Green
+Write-Host "  $LegacyOut"
+Write-Host "  $ArmV7Out"

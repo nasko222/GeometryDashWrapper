@@ -1,41 +1,49 @@
-# Geometry Dash ARM Wrapper — Milestone 1
+# Geometry Dash Wrapper 0.9.5-unified1
 
-Version and branch snapshot: `0.9.4-milestone1`
+This branch combines the three exact last known-good lines without Unicorn:
 
-This freezes the exact working v2.2 beta wrapper state after the APK server override was restored and all tested online features began working.
+- **x86 native:** `0.9.3-alpha3`
+- **legacy ARM/Thumb:** `0.9.4-arm-dynarmictest14-fix1`
+- **ARMv7 / Geometry Dash 2.2:** `0.9.4-milestone1`
 
-## Included working state
+The package contains no APK, extracted proprietary game library, executable, or
+Unicorn dependency.
 
-- Dynarmic ARMv7-A, Thumb-2, VFPv3 and NEON execution.
-- Local save redirection.
-- Editor and platformer compatibility fixes from the selected v2.2 beta branch.
-- Concurrent native `CCHttpClient::send` bridge using independent WinHTTP request threads.
-- Generic HTTPS-first handling that preserves the hostname supplied by the APK, including custom GDPS hosts.
-- Safe HTTP fallback for retryable read/download requests.
-- Redirect support, empty User-Agent compatibility and HTML error-page rejection for API calls.
-- Working level/server requests, song metadata and song downloads with the corrected APK.
+## Source layout
 
-## APK
+- `src/backends/x86/` — the alpha3 native x86 loader/JNI/runtime.
+- `src/backends/arm_legacy/` — the DynarmicTest14-fix1 ARMv5TE/Thumb backend.
+- `src/backends/armv7/` — the Milestone1 ARMv7/Thumb-2 backend.
+- `src/shared/` — one shared implementation of storage, audio, APK audio
+  extraction, ELF definitions, build metadata, and Android/Winsock translation.
+- `cmake/` — one build graph that compiles both ARM generations against one
+  pinned Dynarmic checkout.
 
-No APK is included. Place the known-working v2.2 beta APK beside the source. The APK must have the unwanted GDPS override reverted to the intended server configuration.
+The version-specific emulation/JNI cores remain separate. They implement
+different CPU generations and game ABIs, so forcing them into one giant runtime
+would risk the working branches merely to reduce file count.
 
-## Build
+## Build and run
 
-```bat
-BUILD_V22BETA_X64.cmd game-v22beta-selected.apk
-```
+- `BUILD_X86.cmd` builds the 32-bit native x86 backend. Optionally pass an x86
+  APK path as its first argument.
+- `BUILD_DYNARMIC.cmd` builds both 64-bit Dynarmic backends.
+- `BUILD_ALL.cmd` builds all three.
 
-Output directory:
+Output is written beneath `dist-unified/`. Put the relevant APK beside a backend
+as `game.apk`, or use `RUN_AUTO.cmd D:\path\to\game.apk`; it selects x86,
+legacy ARM, or ARMv7 by inspecting the APK library folders.
 
-```text
-dist-arm-wrapper-0.9.4-milestone1
-```
+## Debug policy
 
-Runtime diagnostics:
+Normal ARM launchers do not enable full tracing. Each ARM output also includes
+`RUN_DEBUG.cmd`, which explicitly enables import dumps and frame profiling.
+This keeps normal gameplay logs readable while preserving the diagnostics for a
+real regression.
 
-```text
-gd-milestone1.log
-gd-milestone1-imports.txt
-gd-milestone1-profile.csv
-gd-milestone1-profile-summary.txt
-```
+## F2 removal
+
+The F2 editor shortcut is completely removed from the ARMv7 backend: no Windows
+key handler, queued event, execution switch case, symbol lookup, readiness line,
+or diagnostic path remains. Ordinary creator/editor buttons and their existing
+compatibility bridges remain.

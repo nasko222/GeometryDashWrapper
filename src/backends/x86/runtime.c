@@ -21,9 +21,11 @@
 #include <time.h>
 
 #include "runtime.h"
+#include "build_info.h"
+#include "net_compat_win.h"
 #include "fmod_win.h"
 #include "storage_win.h"
-#include "../third_party/zlib/zlib.h"
+#include "zlib.h"
 
 #define MAX_IMPORTS 1024
 #define THUNK_SIZE 16
@@ -280,7 +282,7 @@ void runtime_initialize(const char *log_path) {
     g_ctype_pointer = g_ctype;
     g_tolower_pointer = g_tolower;
     g_toupper_pointer = g_toupper;
-    runtime_log("Android x86 native compatibility wrapper 0.9.3-alpha3");
+    runtime_log("Geometry Dash Wrapper %s backend=%s", GD_WRAPPER_VERSION, GD_X86_BACKEND_NAME);
     runtime_log("Bionic ABI tables: ctype/tolower/toupper use table+1 indexing");
     runtime_log("Bionic stdio bridge: __sF sentinels translated; fopen streams stay on MSVCRT");
     runtime_log("System DLLs: msvcrt=%s ws2_32=%s opengl32=%s",
@@ -1370,16 +1372,6 @@ typedef struct {
 } AndroidIovec;
 
 enum {
-    ANDROID_AF_INET6 = 10,
-    ANDROID_SOL_SOCKET = 1,
-    ANDROID_F_GETFL = 3,
-    ANDROID_F_SETFL = 4,
-    ANDROID_O_NONBLOCK = 0x800,
-    ANDROID_FIONREAD = 0x541b,
-    ANDROID_FIONBIO = 0x5421,
-    ANDROID_MSG_NOSIGNAL = 0x4000,
-    ANDROID_SOCK_NONBLOCK = 0x800,
-    ANDROID_SOCK_CLOEXEC = 0x80000,
     ANDROID_POLLIN = 0x0001,
     ANDROID_POLLPRI = 0x0002,
     ANDROID_POLLOUT = 0x0004,
@@ -1392,119 +1384,9 @@ enum {
     ANDROID_POLLWRBAND = 0x0200
 };
 
-static int android_family_to_windows(int family) {
-    return family == ANDROID_AF_INET6 ? AF_INET6 : family;
-}
-
-static int windows_family_to_android(int family) {
-    return family == AF_INET6 ? ANDROID_AF_INET6 : family;
-}
-
-static int windows_error_to_android(int error) {
-    switch (error) {
-    case 0: return 0;
-    case WSAEINTR: return 4;
-    case WSAEBADF: return 9;
-    case WSAEACCES: return 13;
-    case WSAEFAULT: return 14;
-    case WSAEINVAL: return 22;
-    case WSAEMFILE: return 24;
-    case WSAEWOULDBLOCK: return 11;
-    case WSAEINPROGRESS: return 115;
-    case WSAEALREADY: return 114;
-    case WSAENOTSOCK: return 88;
-    case WSAEDESTADDRREQ: return 89;
-    case WSAEMSGSIZE: return 90;
-    case WSAEPROTOTYPE: return 91;
-    case WSAENOPROTOOPT: return 92;
-    case WSAEPROTONOSUPPORT: return 93;
-    case WSAESOCKTNOSUPPORT: return 94;
-    case WSAEOPNOTSUPP: return 95;
-    case WSAEPFNOSUPPORT: return 96;
-    case WSAEAFNOSUPPORT: return 97;
-    case WSAEADDRINUSE: return 98;
-    case WSAEADDRNOTAVAIL: return 99;
-    case WSAENETDOWN: return 100;
-    case WSAENETUNREACH: return 101;
-    case WSAENETRESET: return 102;
-    case WSAECONNABORTED: return 103;
-    case WSAECONNRESET: return 104;
-    case WSAENOBUFS: return 105;
-    case WSAEISCONN: return 106;
-    case WSAENOTCONN: return 107;
-    case WSAESHUTDOWN: return 108;
-    case WSAETOOMANYREFS: return 109;
-    case WSAETIMEDOUT: return 110;
-    case WSAECONNREFUSED: return 111;
-    case WSAEHOSTDOWN: return 112;
-    case WSAEHOSTUNREACH: return 113;
-    default: return 5;
-    }
-}
-
 static int set_socket_error(void) {
-    g_errno_value = windows_error_to_android(WSAGetLastError());
+    g_errno_value = gd_net_wsa_error_to_android(WSAGetLastError());
     return -1;
-}
-
-static const struct sockaddr *address_to_windows(
-    const struct sockaddr *address, int length, struct sockaddr_storage *storage,
-    int *windows_length) {
-    size_t copy_length;
-    if (!address || length <= 0 || !storage || !windows_length) {
-        return address;
-    }
-    copy_length = (size_t)length;
-    if (copy_length > sizeof(*storage)) {
-        copy_length = sizeof(*storage);
-    }
-    memset(storage, 0, sizeof(*storage));
-    memcpy(storage, address, copy_length);
-    ((struct sockaddr *)storage)->sa_family =
-        (ADDRESS_FAMILY)android_family_to_windows(address->sa_family);
-    *windows_length = (int)copy_length;
-    return (const struct sockaddr *)storage;
-}
-
-static void address_from_windows(struct sockaddr *destination,
-                                 int *destination_length,
-                                 const struct sockaddr *source,
-                                 int source_length) {
-    int capacity;
-    int copy_length;
-    if (!destination_length) {
-        return;
-    }
-    capacity = *destination_length;
-    *destination_length = source_length;
-    if (!destination || !source || capacity <= 0) {
-        return;
-    }
-    copy_length = capacity < source_length ? capacity : source_length;
-    memcpy(destination, source, (size_t)copy_length);
-    if (copy_length >= (int)sizeof(destination->sa_family)) {
-        destination->sa_family =
-            (ADDRESS_FAMILY)windows_family_to_android(source->sa_family);
-    }
-}
-
-static int android_ai_flags_to_windows(int flags) {
-    int result = 0;
-    /* These APKs use the legacy Bionic/FreeBSD values, not glibc's values. */
-    if (flags & 0x0001) result |= AI_PASSIVE;
-    if (flags & 0x0002) result |= AI_CANONNAME;
-    if (flags & 0x0004) result |= AI_NUMERICHOST;
-    if (flags & 0x0008) result |= AI_NUMERICSERV;
-#ifdef AI_V4MAPPED
-    if (flags & 0x0800) result |= AI_V4MAPPED;
-#endif
-#ifdef AI_ALL
-    if (flags & 0x0100) result |= AI_ALL;
-#endif
-#ifdef AI_ADDRCONFIG
-    if (flags & 0x0400) result |= AI_ADDRCONFIG;
-#endif
-    return result;
 }
 
 static void free_android_addrinfo(AndroidAddrInfo *entry) {
@@ -1536,8 +1418,8 @@ static int shim_getaddrinfo(const char *node, const char *service,
     *result = NULL;
     memset(&windows_hints, 0, sizeof(windows_hints));
     if (hints) {
-        windows_hints.ai_flags = android_ai_flags_to_windows(hints->ai_flags);
-        windows_hints.ai_family = android_family_to_windows(hints->ai_family);
+        windows_hints.ai_flags = gd_net_android_ai_flags_to_host(hints->ai_flags);
+        windows_hints.ai_family = gd_net_android_family_to_host(hints->ai_family);
         windows_hints.ai_socktype = hints->ai_socktype;
         windows_hints.ai_protocol = hints->ai_protocol;
     }
@@ -1556,10 +1438,10 @@ static int shim_getaddrinfo(const char *node, const char *service,
             return EAI_MEMORY;
         }
         entry->ai_flags = cursor->ai_flags;
-        entry->ai_family = windows_family_to_android(cursor->ai_family);
+        entry->ai_family = gd_net_host_family_to_android(cursor->ai_family);
         if (!first_family) first_family = entry->ai_family;
         if (entry->ai_family == AF_INET) ++ipv4_count;
-        if (entry->ai_family == ANDROID_AF_INET6) ++ipv6_count;
+        if (entry->ai_family == GD_ANDROID_AF_INET6) ++ipv6_count;
         entry->ai_socktype = cursor->ai_socktype;
         entry->ai_protocol = cursor->ai_protocol;
         entry->ai_addrlen = (uint32_t)cursor->ai_addrlen;
@@ -1597,7 +1479,7 @@ static int shim_getaddrinfo(const char *node, const char *service,
         if (trace <= 64) {
             runtime_log("Network DNS result #%ld: first=%s IPv4=%u IPv6=%u",
                         (long)trace,
-                        first_family == ANDROID_AF_INET6 ? "IPv6" :
+                        first_family == GD_ANDROID_AF_INET6 ? "IPv6" :
                         first_family == AF_INET ? "IPv4" : "other",
                         ipv4_count, ipv6_count);
         }
@@ -1614,14 +1496,13 @@ static void socket_trace_reset(int descriptor);
 static int shim_socket(int family, int type, int protocol) {
     static LONG trace_count;
     int windows_type = type & 0x0f;
-    SOCKET descriptor = socket(android_family_to_windows(family), windows_type,
+    SOCKET descriptor = socket(gd_net_android_family_to_host(family), windows_type,
                                protocol);
     if (descriptor == INVALID_SOCKET) {
         return set_socket_error();
     }
-    if (type & ANDROID_SOCK_NONBLOCK) {
-        u_long enabled = 1;
-        if (ioctlsocket(descriptor, FIONBIO, &enabled) == SOCKET_ERROR) {
+    if (type & GD_ANDROID_SOCK_NONBLOCK) {
+        if (gd_net_set_nonblocking(descriptor, 1) != 0) {
             int error = WSAGetLastError();
             closesocket(descriptor);
             WSASetLastError(error);
@@ -1630,7 +1511,7 @@ static int shim_socket(int family, int type, int protocol) {
     }
     /* Windows handles are non-inheritable by default; SOCK_CLOEXEC needs no
        additional operation. */
-    (void)ANDROID_SOCK_CLOEXEC;
+    (void)GD_ANDROID_SOCK_CLOEXEC;
     socket_trace_reset((int)(uintptr_t)descriptor);
     {
         LONG trace = InterlockedIncrement(&trace_count);
@@ -1647,7 +1528,7 @@ static int shim_bind(int descriptor, const struct sockaddr *address, int length)
     struct sockaddr_storage storage;
     int windows_length = length;
     const struct sockaddr *windows_address =
-        address_to_windows(address, length, &storage, &windows_length);
+        gd_net_sockaddr_to_host(address, length, &storage, &windows_length);
     if (bind((SOCKET)(uintptr_t)(uint32_t)descriptor, windows_address,
              windows_length) == SOCKET_ERROR) {
         return set_socket_error();
@@ -1662,18 +1543,18 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
     LONG trace = InterlockedIncrement(&trace_count);
     int raw_family = address ? (int)address->sa_family : -1;
     const char *family = address &&
-                                 (address->sa_family == ANDROID_AF_INET6 ||
+                                 (address->sa_family == GD_ANDROID_AF_INET6 ||
                                   address->sa_family == AF_INET6)
                              ? "IPv6"
                              : address && address->sa_family == AF_INET
                                    ? "IPv4"
                                    : "other";
     const struct sockaddr *windows_address =
-        address_to_windows(address, length, &storage, &windows_length);
+        gd_net_sockaddr_to_host(address, length, &storage, &windows_length);
     if (connect((SOCKET)(uintptr_t)(uint32_t)descriptor, windows_address,
                 windows_length) == SOCKET_ERROR) {
         int windows_error = WSAGetLastError();
-        int android_error = windows_error_to_android(windows_error);
+        int android_error = gd_net_wsa_error_to_android(windows_error);
         if (trace <= 64) {
             if (windows_error == WSAEWOULDBLOCK ||
                 windows_error == WSAEINPROGRESS) {
@@ -1717,7 +1598,7 @@ static int shim_accept(int descriptor, struct sockaddr *address, int *length) {
         return set_socket_error();
     }
     if (address && length) {
-        address_from_windows(address, length, (struct sockaddr *)&storage,
+        gd_net_sockaddr_from_host(address, length, (struct sockaddr *)&storage,
                              windows_length);
     }
     return (int)(uintptr_t)accepted;
@@ -1740,7 +1621,7 @@ static int shim_get_socket_name(int descriptor, struct sockaddr *address,
     if (status == SOCKET_ERROR) {
         return set_socket_error();
     }
-    address_from_windows(address, length, (struct sockaddr *)&storage,
+    gd_net_sockaddr_from_host(address, length, (struct sockaddr *)&storage,
                          windows_length);
     return 0;
 }
@@ -1754,7 +1635,7 @@ static int shim_getsockname(int descriptor, struct sockaddr *address, int *lengt
 }
 
 static int socket_option_to_windows(int level, int option) {
-    if (level != ANDROID_SOL_SOCKET) {
+    if (level != GD_ANDROID_SOL_SOCKET) {
         return option;
     }
     switch (option) {
@@ -1779,14 +1660,14 @@ static int socket_option_to_windows(int level, int option) {
 
 static int shim_getsockopt(int descriptor, int level, int option,
                            void *value, int *length) {
-    int windows_level = level == ANDROID_SOL_SOCKET ? SOL_SOCKET : level;
+    int windows_level = level == GD_ANDROID_SOL_SOCKET ? SOL_SOCKET : level;
     int windows_option = socket_option_to_windows(level, option);
     int status;
     if (windows_option < 0 || !value || !length) {
         g_errno_value = 92;
         return -1;
     }
-    if (level == ANDROID_SOL_SOCKET && (option == 20 || option == 21)) {
+    if (level == GD_ANDROID_SOL_SOCKET && (option == 20 || option == 21)) {
         DWORD milliseconds = 0;
         int windows_length = sizeof(milliseconds);
         AndroidTimeval timeout;
@@ -1805,29 +1686,29 @@ static int shim_getsockopt(int descriptor, int level, int option,
     if (status == SOCKET_ERROR) {
         return set_socket_error();
     }
-    if (level == ANDROID_SOL_SOCKET && option == 4 &&
+    if (level == GD_ANDROID_SOL_SOCKET && option == 4 &&
         *length >= (int)sizeof(int)) {
-        *(int *)value = windows_error_to_android(*(int *)value);
+        *(int *)value = gd_net_wsa_error_to_android(*(int *)value);
     }
     return 0;
 }
 
 static int shim_setsockopt(int descriptor, int level, int option,
                            const void *value, int length) {
-    int windows_level = level == ANDROID_SOL_SOCKET ? SOL_SOCKET : level;
+    int windows_level = level == GD_ANDROID_SOL_SOCKET ? SOL_SOCKET : level;
     int windows_option = socket_option_to_windows(level, option);
     const char *windows_value = (const char *)value;
     int windows_length = length;
     DWORD milliseconds;
     LINGER windows_linger;
-    if (level == ANDROID_SOL_SOCKET && option == 15) {
+    if (level == GD_ANDROID_SOL_SOCKET && option == 15) {
         return 0; /* SO_REUSEPORT has no exact Winsock counterpart. */
     }
     if (windows_option < 0 || !value) {
         g_errno_value = 92;
         return -1;
     }
-    if (level == ANDROID_SOL_SOCKET && (option == 20 || option == 21) &&
+    if (level == GD_ANDROID_SOL_SOCKET && (option == 20 || option == 21) &&
         length >= (int)sizeof(AndroidTimeval)) {
         const AndroidTimeval *timeout = (const AndroidTimeval *)value;
         uint64_t total = (uint64_t)(timeout->tv_sec > 0 ? timeout->tv_sec : 0) *
@@ -1837,7 +1718,7 @@ static int shim_setsockopt(int descriptor, int level, int option,
         milliseconds = total > UINT32_MAX ? UINT32_MAX : (DWORD)total;
         windows_value = (const char *)&milliseconds;
         windows_length = sizeof(milliseconds);
-    } else if (level == ANDROID_SOL_SOCKET && option == 13 &&
+    } else if (level == GD_ANDROID_SOL_SOCKET && option == 13 &&
                length >= 2 * (int)sizeof(int)) {
         const int *android_linger = (const int *)value;
         windows_linger.l_onoff = (u_short)(android_linger[0] != 0);
@@ -2127,7 +2008,7 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
-                  (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
+                  (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
         socket_trace_traffic(descriptor, buffer, (size_t)result, 0);
         trace_http_response(descriptor, buffer, result);
@@ -2135,7 +2016,7 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
     }
     if (result == SOCKET_ERROR) {
         int windows_error = WSAGetLastError();
-        int android_error = windows_error_to_android(windows_error);
+        int android_error = gd_net_wsa_error_to_android(windows_error);
         LONG trace = InterlockedIncrement(&error_count);
         if (trace <= 32 && windows_error != WSAEWOULDBLOCK) {
             runtime_log("Network recv error #%ld: fd=%d Winsock=%d Android errno=%d",
@@ -2153,7 +2034,7 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = send((SOCKET)(uintptr_t)(uint32_t)descriptor, (const char *)buffer,
-                  (int)length, flags & ~ANDROID_MSG_NOSIGNAL);
+                  (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
         socket_trace_traffic(descriptor, buffer, (size_t)result, 1);
         trace_http_request(descriptor, buffer, result);
@@ -2161,7 +2042,7 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     }
     if (result == SOCKET_ERROR) {
         int windows_error = WSAGetLastError();
-        int android_error = windows_error_to_android(windows_error);
+        int android_error = gd_net_wsa_error_to_android(windows_error);
         LONG trace = InterlockedIncrement(&error_count);
         if (trace <= 32 && windows_error != WSAEWOULDBLOCK) {
             runtime_log("Network send error #%ld: fd=%d Winsock=%d Android errno=%d",
@@ -2238,12 +2119,12 @@ static int shim_recvfrom(int descriptor, void *buffer, size_t length, int flags,
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = recvfrom((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
-                      (int)length, flags & ~ANDROID_MSG_NOSIGNAL,
+                      (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL,
                       address ? (struct sockaddr *)&storage : NULL,
                       address ? &windows_length : NULL);
     if (result == SOCKET_ERROR) return set_socket_error();
     if (address && address_length) {
-        address_from_windows(address, address_length,
+        gd_net_sockaddr_from_host(address, address_length,
                              (struct sockaddr *)&storage, windows_length);
     }
     return result;
@@ -2253,13 +2134,13 @@ static int shim_sendto(int descriptor, const void *buffer, size_t length, int fl
                        const struct sockaddr *address, int address_length) {
     struct sockaddr_storage storage;
     int windows_length = address_length;
-    const struct sockaddr *windows_address = address_to_windows(
+    const struct sockaddr *windows_address = gd_net_sockaddr_to_host(
         address, address_length, &storage, &windows_length);
     int result;
     if (length > INT_MAX) length = INT_MAX;
     result = sendto((SOCKET)(uintptr_t)(uint32_t)descriptor,
                     (const char *)buffer, (int)length,
-                    flags & ~ANDROID_MSG_NOSIGNAL, windows_address,
+                    flags & ~GD_ANDROID_MSG_NOSIGNAL, windows_address,
                     windows_length);
     return result == SOCKET_ERROR ? set_socket_error() : result;
 }
@@ -2362,20 +2243,20 @@ static int shim_fcntl(int descriptor, int command, ...) {
     va_list arguments;
     int flags = 0;
     u_long nonblocking;
-    if (command == ANDROID_F_GETFL) {
+    if (command == GD_ANDROID_F_GETFL) {
         return 0;
     }
     if (command == 1 || command == 2) { /* F_GETFD / F_SETFD */
         return 0;
     }
-    if (command != ANDROID_F_SETFL) {
+    if (command != GD_ANDROID_F_SETFL) {
         g_errno_value = 22;
         return -1;
     }
     va_start(arguments, command);
     flags = va_arg(arguments, int);
     va_end(arguments);
-    nonblocking = (flags & ANDROID_O_NONBLOCK) != 0;
+    nonblocking = (flags & GD_ANDROID_O_NONBLOCK) != 0;
     if (ioctlsocket((SOCKET)(uintptr_t)(uint32_t)descriptor, FIONBIO,
                     &nonblocking) == SOCKET_ERROR) {
         return set_socket_error();
@@ -2390,9 +2271,9 @@ static int shim_ioctl(int descriptor, unsigned long request, ...) {
     va_start(arguments, request);
     value = va_arg(arguments, u_long *);
     va_end(arguments);
-    if (request == ANDROID_FIONBIO) {
+    if (request == GD_ANDROID_FIONBIO) {
         windows_request = FIONBIO;
-    } else if (request == ANDROID_FIONREAD) {
+    } else if (request == GD_ANDROID_FIONREAD) {
         windows_request = FIONREAD;
     } else {
         g_errno_value = 22;
@@ -2477,7 +2358,7 @@ static struct hostent *shim_gethostbyname(const char *name) {
 static struct hostent *shim_gethostbyaddr(const void *address, int length,
                                           int family) {
     struct hostent *result = gethostbyaddr((const char *)address, length,
-                                           android_family_to_windows(family));
+                                           gd_net_android_family_to_host(family));
     if (!result) set_socket_error();
     return result;
 }
@@ -2498,7 +2379,7 @@ static int shim_getnameinfo(const struct sockaddr *address, int address_length,
                             size_t service_length, int flags) {
     struct sockaddr_storage storage;
     int windows_length = address_length;
-    const struct sockaddr *windows_address = address_to_windows(
+    const struct sockaddr *windows_address = gd_net_sockaddr_to_host(
         address, address_length, &storage, &windows_length);
     int status = getnameinfo(
         windows_address, windows_length, host,
@@ -2516,7 +2397,7 @@ static struct servent *shim_getservbyname(const char *name, const char *protocol
 
 static const char *shim_inet_ntop(int family, const void *source,
                                   char *destination, size_t size) {
-    const char *result = InetNtopA(android_family_to_windows(family),
+    const char *result = InetNtopA(gd_net_android_family_to_host(family),
                                    (void *)source, destination,
                                    size > UINT32_MAX ? UINT32_MAX : (DWORD)size);
     if (!result) set_socket_error();
@@ -2524,7 +2405,7 @@ static const char *shim_inet_ntop(int family, const void *source,
 }
 
 static int shim_inet_pton(int family, const char *source, void *destination) {
-    int result = InetPtonA(android_family_to_windows(family), source, destination);
+    int result = InetPtonA(gd_net_android_family_to_host(family), source, destination);
     if (result < 0) set_socket_error();
     return result;
 }
