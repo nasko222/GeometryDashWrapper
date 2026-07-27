@@ -2587,7 +2587,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup20Window";
+        const char* class_name = "GeometryDashV22BetaNetworkTestWindow";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2599,7 +2599,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup20",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3752,6 +3752,10 @@ public:
             log_.flush();
         }
         return true;
+    }
+
+    bool PumpNetworkWorkerFrame() {
+        return PumpCooperativeWorkerSlice("frame-pump");
     }
 
 private:
@@ -6852,8 +6856,21 @@ private:
     }
     u32 GuestSocket(u32 family, u32 type, u32 protocol) {
         if (!winsock_initialized_) { SetGuestErrno(100); return static_cast<u32>(-1); }
-        return RegisterSocket(::socket(HostAddressFamily(static_cast<int>(family)),
-                                       static_cast<int>(type), static_cast<int>(protocol)));
+        const SOCKET socket_value = ::socket(
+            HostAddressFamily(static_cast<int>(family)),
+            static_cast<int>(type), static_cast<int>(protocol));
+        if (socket_value == INVALID_SOCKET) return SocketFailure();
+        u_long nonblocking = 1u;
+        if (::ioctlsocket(socket_value, FIONBIO, &nonblocking) != 0) {
+            const int error = WSAGetLastError();
+            ::closesocket(socket_value);
+            SetGuestErrno(MapWsaError(error));
+            return static_cast<u32>(-1);
+        }
+        const u32 guest_fd = RegisterSocket(socket_value);
+        if (guest_fd != static_cast<u32>(-1))
+            nonblocking_sockets_.insert(guest_fd);
+        return guest_fd;
     }
     u32 GuestConnect(u32 guest_fd, u32 address, u32 length) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
@@ -6874,7 +6891,6 @@ private:
             port = ntohs(ipv6->sin6_port);
         }
 
-        const auto started = std::chrono::steady_clock::now();
         const int code = ::connect(socket_value, reinterpret_cast<const sockaddr*>(&host_address), host_length);
         const int initial_error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
         if (code == 0 || initial_error == WSAEISCONN) {
@@ -6886,55 +6902,21 @@ private:
             return 0u;
         }
 
-        // Bionic/libcurl uses nonblocking sockets. Windows reports
-        // WSAEWOULDBLOCK while POSIX connect reports EINPROGRESS. Test9
-        // translated it to EAGAIN, making libcurl reject a healthy connection.
-        // Complete the pending connect on the host, then return a connected socket.
+        // NetworkTest keeps the v22 beta socket genuinely nonblocking.
+        // Do not wait up to 15 seconds on the Win32/UI thread.  Modern curl
+        // expects EINPROGRESS and completes the connection through poll +
+        // getsockopt(SO_ERROR).
         if (initial_error == WSAEWOULDBLOCK || initial_error == WSAEINPROGRESS ||
             initial_error == WSAEALREADY) {
-            fd_set writable{};
-            fd_set exceptional{};
-            FD_ZERO(&writable);
-            FD_ZERO(&exceptional);
-            FD_SET(socket_value, &writable);
-            FD_SET(socket_value, &exceptional);
-            timeval timeout{};
-            timeout.tv_sec = 15;
-            timeout.tv_usec = 0;
-            const int ready = ::select(0, nullptr, &writable, &exceptional, &timeout);
-            if (ready > 0) {
-                int socket_error = 0;
-                int socket_error_length = sizeof(socket_error);
-                if (::getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
-                                 reinterpret_cast<char*>(&socket_error), &socket_error_length) == 0 &&
-                    socket_error == 0 && FD_ISSET(socket_value, &writable)) {
-                    SetGuestErrno(0);
-                    if (network_log_count_++ < 96u) {
-                        const double elapsed = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - started).count();
-                        log_ << "[host] Socket connect fd=" << guest_fd << " target="
-                             << (address_text[0] ? address_text : "?") << ':' << port
-                             << " status=connected pending=yes wait_ms=" << std::fixed
-                             << std::setprecision(1) << elapsed << '\n';
-                    }
-                    return 0u;
-                }
-                if (socket_error == 0) socket_error = WSAECONNREFUSED;
-                SetGuestErrno(MapWsaError(socket_error));
-                if (network_log_count_++ < 96u)
-                    log_ << "[host] Socket connect fd=" << guest_fd << " target="
-                         << (address_text[0] ? address_text : "?") << ':' << port
-                         << " status=failed pending=yes wsa=" << socket_error
-                         << " errno=" << MapWsaError(socket_error) << '\n';
-                return static_cast<u32>(-1);
+            constexpr int kGuestEinprogress = 115;
+            SetGuestErrno(kGuestEinprogress);
+            if (network_log_count_++ < 192u) {
+                log_ << "[host] NetworkTest socket connect fd=" << guest_fd
+                     << " target=" << (address_text[0] ? address_text : "?")
+                     << ':' << port << " status=in-progress errno="
+                     << kGuestEinprogress << '\n';
+                log_.flush();
             }
-            const int wait_error = ready == 0 ? WSAETIMEDOUT : WSAGetLastError();
-            SetGuestErrno(MapWsaError(wait_error));
-            if (network_log_count_++ < 96u)
-                log_ << "[host] Socket connect fd=" << guest_fd << " target="
-                     << (address_text[0] ? address_text : "?") << ':' << port
-                     << (ready == 0 ? " status=timeout" : " status=select-failed")
-                     << " wsa=" << wait_error << " errno=" << MapWsaError(wait_error) << '\n';
             return static_cast<u32>(-1);
         }
 
@@ -6995,28 +6977,12 @@ private:
         int code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
         int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
 
-        // A nonblocking socket can become temporarily unwritable after libcurl
-        // queues headers/body. Wait for Windows to report it writable and retry
-        // once rather than leaking WSAEWOULDBLOCK through the old Android curl.
         if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
-            fd_set writable{};
-            fd_set exceptional{};
-            FD_ZERO(&writable);
-            FD_ZERO(&exceptional);
-            FD_SET(socket_value, &writable);
-            FD_SET(socket_value, &exceptional);
-            timeval timeout{};
-            timeout.tv_sec = 15;
-            const int ready = ::select(0, nullptr, &writable, &exceptional, &timeout);
-            if (ready > 0 && FD_ISSET(socket_value, &writable) && !FD_ISSET(socket_value, &exceptional)) {
-                code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
-                error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
-            } else if (ready == 0) {
-                SetGuestErrno(11);
-                return static_cast<u32>(-1);
-            } else if (ready == SOCKET_ERROR) {
-                error = WSAGetLastError();
-            }
+            SetGuestErrno(11);
+            if (network_log_count_++ < 192u)
+                log_ << "[host] NetworkTest socket send would-block fd="
+                     << guest_fd << " errno=11\n";
+            return static_cast<u32>(-1);
         }
 
         if (code >= 0) {
@@ -7047,57 +7013,12 @@ private:
         int code = ::recv(socket_value, data, host_length, HostMessageFlags(flags));
         int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
 
-        // Test11 connected and sent correctly, but the old ARM libcurl asks for
-        // recv immediately. On Windows that commonly returns WSAEWOULDBLOCK
-        // before the first response byte arrives. Its legacy poll/error path then
-        // turns the harmless race into CURLE_RECV_ERROR. Wait for readability and
-        // retry here so the guest sees actual data, EOF, or a real socket error.
         if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
-            fd_set readable{};
-            fd_set exceptional{};
-            FD_ZERO(&readable);
-            FD_ZERO(&exceptional);
-            FD_SET(socket_value, &readable);
-            FD_SET(socket_value, &exceptional);
-            timeval timeout{};
-            timeout.tv_sec = 15;
-            const auto started = std::chrono::steady_clock::now();
-            const int ready = ::select(0, &readable, nullptr, &exceptional, &timeout);
-            if (ready > 0 && FD_ISSET(socket_value, &readable)) {
-                int socket_error = 0;
-                int socket_error_length = sizeof(socket_error);
-                if (::getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
-                                 reinterpret_cast<char*>(&socket_error), &socket_error_length) != 0) {
-                    socket_error = WSAGetLastError();
-                }
-                if (socket_error != 0) {
-                    SetGuestErrno(MapWsaError(socket_error));
-                    if (network_log_count_++ < 128u)
-                        log_ << "[host] Socket recv readiness error fd=" << guest_fd
-                             << " wsa=" << socket_error << " errno=" << MapWsaError(socket_error) << '\n';
-                    return static_cast<u32>(-1);
-                }
-                code = ::recv(socket_value, data, host_length, HostMessageFlags(flags));
-                error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
-                if (network_log_count_++ < 128u) {
-                    const double elapsed = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - started).count();
-                    log_ << "[host] Socket recv wait fd=" << guest_fd << " wait_ms="
-                         << std::fixed << std::setprecision(1) << elapsed
-                         << " result=" << code;
-                    if (code == SOCKET_ERROR) log_ << " wsa=" << error;
-                    log_ << '\n';
-                }
-            } else if (ready == 0) {
-                // Keep POSIX nonblocking semantics on timeout. Curl can apply its
-                // own total timeout instead of receiving a fabricated peer error.
-                SetGuestErrno(11);
-                if (network_log_count_++ < 128u)
-                    log_ << "[host] Socket recv wait timeout fd=" << guest_fd << " errno=11\n";
-                return static_cast<u32>(-1);
-            } else {
-                error = ready == SOCKET_ERROR ? WSAGetLastError() : WSAECONNABORTED;
-            }
+            SetGuestErrno(11);
+            if (network_log_count_++ < 192u)
+                log_ << "[host] NetworkTest socket recv would-block fd="
+                     << guest_fd << " errno=11\n";
+            return static_cast<u32>(-1);
         }
 
         if (code >= 0) {
@@ -7252,11 +7173,16 @@ private:
             FD_SET(socket_value, &exceptional);
         }
 
+        // The network worker shares the UI thread.  Limit each poll to one
+        // millisecond and let subsequent host frames continue the wait.
+        const s32 effective_timeout = running_cooperative_worker_
+            ? (timeout == 0 ? 0 : 1)
+            : timeout;
         timeval timeval_value{};
         timeval* timeval_pointer = nullptr;
-        if (timeout >= 0) {
-            timeval_value.tv_sec = timeout / 1000;
-            timeval_value.tv_usec = (timeout % 1000) * 1000;
+        if (effective_timeout >= 0) {
+            timeval_value.tv_sec = effective_timeout / 1000;
+            timeval_value.tv_usec = (effective_timeout % 1000) * 1000;
             timeval_pointer = &timeval_value;
         }
 
@@ -7264,8 +7190,8 @@ private:
         if (have_valid_socket) {
             selected = ::select(0, &readable, &writable, &exceptional, timeval_pointer);
             if (selected == SOCKET_ERROR) return SocketFailure();
-        } else if (timeout > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+        } else if (effective_timeout > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(effective_timeout));
         }
 
         u32 ready_count = invalid_count;
@@ -7615,29 +7541,44 @@ private:
         cooperative_worker_.regs[15] = start_routine & ~1u;
         cooperative_worker_.cpsr = 0x10u | ((start_routine & 1u) ? 0x20u : 0u);
         cooperative_worker_.valid = true;
+        cooperative_worker_runnable_ = true;
+        cooperative_worker_yielded_ = false;
+        cooperative_worker_done_ = false;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
         ++cooperative_worker_registered_count_;
-        log_ << "[host] Cooperative guest worker registered at 0x" << std::hex << start_routine
+        log_ << "[host] NetworkTest guest worker registered at 0x" << std::hex << start_routine
              << " arg=0x" << argument << std::dec
-             << " sync=pthread-cond-or-semaphore" << '\n';
+             << " scheduling=frame-sliced" << '\n';
+        log_.flush();
         return true;
     }
-    bool ResumeCooperativeWorker(const char* trigger = "unspecified") {
-        if (!cooperative_worker_.valid || running_cooperative_worker_) return true;
+
+    bool PumpCooperativeWorkerSlice(const char* trigger = "frame-pump") {
+        if (!cooperative_worker_.valid || running_cooperative_worker_ ||
+            !cooperative_worker_runnable_) return true;
+
+        constexpr u32 kTicksPerRun = 100000u;
+        constexpr u32 kMaximumRunsPerSlice = 24u;
+        constexpr auto kMaximumSlice = std::chrono::milliseconds(3);
         const u64 resume_number = ++cooperative_worker_resume_count_;
-        if (resume_number <= 64u) {
-            log_ << "[host] Cooperative HTTP worker resume #" << resume_number
+        if (resume_number <= 128u) {
+            log_ << "[host] NetworkTest worker slice #" << resume_number
                  << " trigger=" << (trigger ? trigger : "unspecified") << '\n';
+            log_.flush();
         }
+
         const auto saved_regs = cpu_.Regs();
         const auto saved_ext = cpu_.ExtRegs();
         const u32 saved_cpsr = cpu_.Cpsr();
         const u32 saved_fpscr = cpu_.Fpscr();
         ScopeExit restore([&] {
-            cpu_.Regs() = saved_regs; cpu_.ExtRegs() = saved_ext;
-            cpu_.SetCpsr(saved_cpsr); cpu_.SetFpscr(saved_fpscr);
+            cpu_.Regs() = saved_regs;
+            cpu_.ExtRegs() = saved_ext;
+            cpu_.SetCpsr(saved_cpsr);
+            cpu_.SetFpscr(saved_fpscr);
             running_cooperative_worker_ = false;
         });
+
         cpu_.Regs() = cooperative_worker_.regs;
         cpu_.ExtRegs() = cooperative_worker_.ext_regs;
         cpu_.SetCpsr(cooperative_worker_.cpsr);
@@ -7645,37 +7586,60 @@ private:
         running_cooperative_worker_ = true;
         cooperative_worker_yielded_ = false;
         cooperative_worker_done_ = false;
+
         const auto started = std::chrono::steady_clock::now();
-        while (!cooperative_worker_yielded_ && !cooperative_worker_done_) {
-            if (std::chrono::steady_clock::now() - started > std::chrono::seconds(120))
-                return Fail("cooperative HTTP worker exceeded 120 second guard");
-            env_.ResetStopState(); env_.ticks_left = 5000000u;
-            cpu_.Run(); cpu_.ClearHalt(kCallbackHalt);
-            if (env_.invalid_access) return Fail("cooperative HTTP worker invalid guest memory");
-            if (env_.interpreter_fallback) return Fail("cooperative HTTP worker interpreter fallback");
-            if (env_.exception_seen) return Fail("cooperative HTTP worker guest exception");
+        u32 runs = 0u;
+        while (!cooperative_worker_yielded_ && !cooperative_worker_done_ &&
+               runs < kMaximumRunsPerSlice &&
+               std::chrono::steady_clock::now() - started < kMaximumSlice) {
+            ++runs;
+            env_.ResetStopState();
+            env_.ticks_left = kTicksPerRun;
+            cpu_.Run();
+            cpu_.ClearHalt(kCallbackHalt);
+            if (env_.invalid_access) return Fail("NetworkTest worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("NetworkTest worker interpreter fallback");
+            if (env_.exception_seen) return Fail("NetworkTest worker guest exception");
             if (env_.svc_pending) {
-                if (env_.pending_svc == kSvcReturn) { cooperative_worker_done_ = true; break; }
-                if (!HandleSvc(env_.pending_svc, "CCHttpClient worker")) return false;
+                if (env_.pending_svc == kSvcReturn) {
+                    cooperative_worker_done_ = true;
+                    break;
+                }
+                if (!HandleSvc(env_.pending_svc, "NetworkTest CCHttpClient worker"))
+                    return false;
             } else if (env_.ticks_left != 0u) {
-                return Fail("cooperative HTTP worker stopped without a trap");
+                return Fail("NetworkTest worker stopped without a trap");
             }
         }
+
         cooperative_worker_.regs = cpu_.Regs();
         cooperative_worker_.ext_regs = cpu_.ExtRegs();
         cooperative_worker_.cpsr = cpu_.Cpsr();
         cooperative_worker_.fpscr = cpu_.Fpscr();
+
         if (cooperative_worker_done_) {
             cooperative_worker_.valid = false;
+            cooperative_worker_runnable_ = false;
             if (cooperative_worker_done_count_++ < 16u)
-                log_ << "[host] Cooperative HTTP worker exited\n";
-        }
-        if (cooperative_worker_yielded_) {
+                log_ << "[host] NetworkTest worker exited\n";
+        } else if (cooperative_worker_yielded_) {
+            cooperative_worker_runnable_ = false;
             ++cooperative_worker_yield_count_;
-            if (network_worker_runs_++ < 64u)
-                log_ << "[host] Cooperative HTTP worker idle after processing queued request(s)"
+            if (network_worker_runs_++ < 128u)
+                log_ << "[host] NetworkTest worker waiting for signal"
                      << " yields=" << cooperative_worker_yield_count_ << '\n';
+        } else {
+            cooperative_worker_runnable_ = true;
+            ++cooperative_worker_slice_yield_count_;
+            if (cooperative_worker_slice_yield_count_ <= 128u) {
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                log_ << "[host] NetworkTest worker timeslice yield runs=" << runs
+                     << " elapsed_ms=" << std::fixed << std::setprecision(2)
+                     << elapsed_ms << '\n';
+            }
         }
+        log_.flush();
         return true;
     }
 
@@ -8454,52 +8418,59 @@ private:
         else if (name == "pthread_setspecific") { thread_values_[r0] = r1; result = 0; }
         else if (name == "pthread_getspecific") result = thread_values_[r0];
         else if (name == "pthread_create") {
-            const bool initialized = InitializeCooperativeWorker(r0, r2, r3);
-            cpu_.Regs()[0] = initialized ? 0u : static_cast<u32>(-1);
-            ResumeAfterStub(import.address);
-            // Start once immediately. This covers both common orderings:
-            // thread-create then signal, and queue/signal then lazy thread-create.
-            // With no work, pthread_cond_wait yields back to the main loop.
-            return initialized ? ResumeCooperativeWorker("pthread_create-bootstrap") : true;
+            // NetworkTest never runs a guest worker recursively inside the
+            // foreground import.  Register it and let the host frame pump give
+            // it short slices, keeping the Win32 client responsive.
+            result = InitializeCooperativeWorker(r0, r2, r3)
+                ? 0u : static_cast<u32>(-1);
         } else if (name == "pthread_exit") {
-            if (running_cooperative_worker_) { cooperative_worker_done_ = true; return true; }
+            if (running_cooperative_worker_) {
+                cooperative_worker_done_ = true;
+                return true;
+            }
             result = 0;
         } else if (name == "sem_init") {
-            semaphores_[r0] = r2; result = 0;
+            semaphores_[r0] = r2;
+            result = 0;
         } else if (name == "sem_destroy") {
-            semaphores_.erase(r0); result = 0;
+            semaphores_.erase(r0);
+            result = 0;
         } else if (name == "sem_wait") {
             u32& count = semaphores_[r0];
-            if (count) { --count; result = 0; }
-            else if (running_cooperative_worker_) {
+            if (count) {
+                --count;
+                result = 0;
+            } else if (running_cooperative_worker_) {
                 cooperative_worker_yielded_ = true;
-                return true; // Keep PC on sem_wait; resume when sem_post adds work.
-            } else { SetGuestErrno(11); result = static_cast<u32>(-1); }
+                cooperative_worker_runnable_ = false;
+                return true; // Keep PC on sem_wait until sem_post supplies work.
+            } else {
+                SetGuestErrno(11);
+                result = static_cast<u32>(-1);
+            }
         } else if (name == "sem_post") {
             ++semaphores_[r0];
-            cpu_.Regs()[0] = 0u;
-            ResumeAfterStub(import.address);
-            return running_cooperative_worker_ ? true : ResumeCooperativeWorker("sem_post");
+            cooperative_worker_runnable_ = cooperative_worker_.valid;
+            if (cooperative_condition_log_count_++ < 128u)
+                log_ << "[host] NetworkTest semaphore post sem=0x" << std::hex
+                     << r0 << std::dec << " pending=" << semaphores_[r0] << '\n';
+            result = 0;
         } else if (name == "pthread_cond_init") {
             condition_signals_[r0] = 0u;
             result = 0;
         } else if (name == "pthread_cond_destroy") {
             condition_signals_.erase(r0);
             result = 0;
-        } else if (name == "pthread_cond_signal" || name == "pthread_cond_broadcast") {
-            // Newer Cocos2d-x builds use a pthread condition variable instead
-            // of the semaphore used by DynarmicTest14-era CCHttpClient.  The
-            // old no-op stub accepted the request but never woke the guest
-            // worker, so no DNS/socket call could ever occur.
+        } else if (name == "pthread_cond_signal" ||
+                   name == "pthread_cond_broadcast") {
             ++condition_signals_[r0];
-            if (cooperative_condition_log_count_++ < 64u)
-                log_ << "[host] Guest condition signal cond=0x" << std::hex << r0
-                     << std::dec << " pending=" << condition_signals_[r0] << '\n';
-            cpu_.Regs()[0] = 0u;
-            ResumeAfterStub(import.address);
-            return running_cooperative_worker_ ? true : ResumeCooperativeWorker(
-                name == "pthread_cond_broadcast" ? "pthread_cond_broadcast" :
-                                                    "pthread_cond_signal");
+            cooperative_worker_runnable_ = cooperative_worker_.valid;
+            if (cooperative_condition_log_count_++ < 128u)
+                log_ << "[host] NetworkTest condition signal cond=0x" << std::hex
+                     << r0 << std::dec << " pending=" << condition_signals_[r0]
+                     << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
+                     << '\n';
+            result = 0;
         } else if (name == "pthread_cond_wait") {
             u32& pending = condition_signals_[r0];
             if (pending) {
@@ -8507,13 +8478,13 @@ private:
                 result = 0;
             } else if (running_cooperative_worker_) {
                 cooperative_worker_yielded_ = true;
-                if (cooperative_condition_log_count_++ < 64u)
-                    log_ << "[host] Cooperative HTTP worker waiting cond=0x"
+                cooperative_worker_runnable_ = false;
+                if (cooperative_condition_log_count_++ < 128u)
+                    log_ << "[host] NetworkTest worker cond-wait cond=0x"
                          << std::hex << r0 << std::dec << '\n';
-                return true; // Keep PC on cond_wait until a signal supplies a token.
+                return true; // Re-execute after a future signal token appears.
             } else {
-                // A foreground wait cannot block the one-thread host loop.
-                // Return success, matching the old permissive behavior.
+                // Never block the single foreground host thread.
                 result = 0;
             }
         } else if (name == "pthread_detach" || name == "pthread_mutex_init" ||
@@ -8880,12 +8851,14 @@ private:
     std::unordered_map<u32,u32> condition_signals_;
     CooperativeWorkerContext cooperative_worker_;
     bool running_cooperative_worker_=false;
+    bool cooperative_worker_runnable_=false;
     bool cooperative_worker_yielded_=false;
     bool cooperative_worker_done_=false;
     u64 cooperative_worker_registered_count_=0;
     u64 cooperative_worker_resume_count_=0;
     u64 cooperative_worker_yield_count_=0;
     u64 cooperative_worker_done_count_=0;
+    u64 cooperative_worker_slice_yield_count_=0;
     u64 cooperative_condition_log_count_=0;
     u64 network_worker_runs_=0;
     u64 network_poll_log_count_=0;
@@ -9307,7 +9280,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup20-dyn14-network debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-networktest debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -9561,9 +9534,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup20-dyn14-network");
-        emit("Bringup20: current v22 beta APK, desktop text input, local-only saves, "
-             "and DynarmicTest14-style condition-variable networking");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest");
+        emit("NetworkTest: nonblocking sockets and frame-sliced v22 beta HTTP worker");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -9575,7 +9547,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup20 must be compiled as a 64-bit executable");
+                "V22BetaNetworkTest must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -9583,7 +9555,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -10289,6 +10261,8 @@ int main(int argc,char** argv) {
                 running=false;
                 break;
             }
+            if(!executor.PumpNetworkWorkerFrame())
+                throw std::runtime_error(executor.LastError());
             if(native_paused||!executor.WindowActive()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -10417,7 +10391,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup20 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;

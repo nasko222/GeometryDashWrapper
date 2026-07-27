@@ -1,1 +1,1 @@
-0.9.4-arm-v22beta-bringup20-dyn14-network
+0.9.4-arm-v22beta-networktest

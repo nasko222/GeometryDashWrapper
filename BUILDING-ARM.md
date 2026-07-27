@@ -1,6 +1,6 @@
 # Geometry Dash ARM Wrapper build notes
 
-## Bringup20 v22 beta build
+## NetworkTest v22 beta build
 
 ```bat
 BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
@@ -12,5 +12,7 @@ hard-coded APK size/hash allowlist and no donor-library argument.
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-bringup20-dyn14-network\
+dist-arm-wrapper-v22beta-networktest\
 ```
+
+Run `RUN_NETWORKTEST.cmd` from that output folder.
