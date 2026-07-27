@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashV22BetaBringup9 LANGUAGES C CXX)
+project(GeometryDashV22BetaBringup12 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -51,7 +51,6 @@ target_compile_definitions(GeometryDashDynarmicProbe PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
-    _WIN32_WINNT=0x0600
     crc32=gd_z_crc32
 )
 target_compile_options(GeometryDashDynarmicProbe PRIVATE

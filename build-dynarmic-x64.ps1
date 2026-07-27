@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup9"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup12"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder20-v22beta-armv7-bringup9-settings-companion-editor"
+$BuilderRevision = "dynarmic-x64-builder23-v22beta-armv7-bringup12-targeted-editor-safe-level-recovery"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -445,8 +445,8 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "V22BETA-BRINGUP9-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP9-NOTES.md") }
+$V22Notes = Join-Path $Root "V22BETA-BRINGUP12-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP12-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
 
 $RawProbeLauncher = @'
@@ -477,7 +477,6 @@ if not exist game-v22beta-selected.apk (
   pause
   exit /b 2
 )
-echo Press F2 in-game to open My Levels directly.
 GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --debug-everything --dump-imports=gd-v22beta-selected-imports.txt --log=gd-v22beta-selected.log --profile=gd-v22beta-selected-profile.csv --profile-summary=gd-v22beta-selected-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
@@ -529,4 +528,4 @@ exit /b %RESULT%
 Write-Host "`nDynarmic x64 2.2 beta ARMv7 bring-up branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Raw .so: RUN_V22_RAW_SO_PROBE.cmd"
-Write-Host "Selected APK: RUN_V22_SELECTED_APK.cmd`nPress F2 in-game for direct My Levels/editor entry.`nNewer/earlier named APK launchers are also included."
+Write-Host "Selected APK: RUN_V22_SELECTED_APK.cmd`nNewer/earlier named APK launchers are also included."

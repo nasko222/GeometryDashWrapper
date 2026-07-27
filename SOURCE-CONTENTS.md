@@ -1,7 +1,16 @@
-# Source contents — v22beta Bringup9
+# Source contents — v22beta Bringup12
 
-The archive contains the complete wrapper source tree, Windows build scripts, pinned dependency preparation, the retained raw `libcocos2dcpp.so` probe input, Bringup9 notes, and static-audit results.
+Included:
 
-No APK files are included. No extracted `libgame.so` is included. Both libraries are read from the user-selected external APK at runtime/build time.
+- Dynarmic ARMv7 wrapper and Win32 host bridges.
+- Legacy x86 and Unicorn source retained for the future unified launcher.
+- Windows build scripts and pinned dependency acquisition.
+- Vendored zlib, stb_vorbis, and existing third-party license files.
+- Bringup12 technical notes and verification report.
 
-Historical wrapper changelog files are not included.
+Excluded from the downloadable source archive:
+
+- APK files.
+- Extracted game or companion native libraries.
+- Generated build caches and distribution directories.
+- Superseded bringup notes and audits.

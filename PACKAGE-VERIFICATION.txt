@@ -1,18 +1,43 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup9
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup12
 
-Package policy:
-- complete source and pinned dependency tree retained
-- no APK files included
-- no extracted companion libgame.so included
-- no historical wrapper changelog files included
-- raw libcocos2dcpp.so probe retained
+Scope
+- Separate Dynarmic ARMv7 branch for the supplied Geometry Dash 2.2 betas.
+- Stable Dynarmic Test14-fix1 source for Geometry Dash 1.0-1.4 was not modified.
+- Release and source archives contain no APK or extracted game native library.
 
-Bringup9 validation:
-- portable C++20 syntax passed with Dynarmic interface stubs and warnings treated as errors
-- Linux static-audit executable built from the exact source
-- newer beta companion mapped at 0x18000000-0x180a3000
-- companion LevelEditorLayerExt::initH resolved at 0x18034671
-- newer beta: one LevelSettingsObject parser callsite and one EditLevelLayer callback pointer patched
-- earlier beta: one LevelSettingsObject parser callsite patched; editor bridge deliberately left unpatched because libgame.so is absent
-- APK count in source tree: zero
-- ZIP integrity and SHA-256 verified after packaging
+Runtime regression addressed
+- Bringup11 installed six companion editor hooks before editor creation.
+- The supplied log then exhausted 500,000,000 guest ticks in
+  __vmi_class_type_info::__do_upcast while LevelEditorLayer::create was active.
+- Bringup12 removes the complete ApplyHooks path and restores Bringup9's
+  targeted LevelEditorLayer::create + LevelEditorLayerExt::initH sequence.
+- Bringup11 also replaced valid non-empty level setups with catalog data.
+- Bringup12 preserves valid guest setups and uses the APK catalog/latest inflate
+  only to recover an empty or unreadable setup.
+- The Bringup11 COW-release experiment was removed from the repair path.
+
+Validation performed
+- C++20 syntax check: -Wall -Wextra -Werror, passed.
+- Windows cross-compile: Zig 0.14.1, PE32+ x86-64, passed.
+- Windows executable SHA-256:
+  ea036ac046c01304aac3832967714e82b53fde78ce213e6bfc930796ef6482d1
+- Newer beta static audit:
+  constructors=349 imports=391 relocations=103102
+  PlayLayer->GJGameLevel=0x334 GJGameLevel->levelID=0x110
+  companion initH=0x18034671, ApplyHooks disabled
+- Earlier beta static audit:
+  constructors=327 imports=366 relocations=91437
+  PlayLayer->GJGameLevel=0x284 GJGameLevel->levelID=0x104
+
+Build identity
+- Output: dist-arm-wrapper-v22beta-bringup12
+- Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
+- Builder revision:
+  dynarmic-x64-builder23-v22beta-armv7-bringup12-targeted-editor-safe-level-recovery
+
+Runtime boundary
+- Linux static validation cannot reproduce Windows gameplay.
+- This build is deliberately a Bringup9 behavioral recovery, not a claim that
+  every 2.2 beta level is fixed before runtime testing.
+- Test the editor first, then Power Trip, Knock Em Out, Press Start, and repeated
+  level switching. Attach gd-v22beta-selected.log on any failure.
