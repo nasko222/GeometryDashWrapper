@@ -1,1 +1,1 @@
-0.9.4-arm-v22beta-networktest2-async-dns
+0.9.4-arm-v22beta-networktest3-wall-watchdog

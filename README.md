@@ -1,6 +1,6 @@
-# Geometry Dash ARM Wrapper — v22 beta NetworkTest2
+# Geometry Dash ARM Wrapper — v22 beta NetworkTest3
 
-`networktest2-async-dns` is a separate branch for the current v22 beta APK. It is
+`networktest3-wall-watchdog` is a separate branch for the current v22 beta APK. It is
 focused only on keeping the client responsive while the emulated HTTP worker
 runs.
 
@@ -13,16 +13,16 @@ BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-networktest2-async-dns\
+dist-arm-wrapper-v22beta-networktest3-wall-watchdog\
 ```
 
 Run:
 
 ```text
-RUN_NETWORKTEST2.cmd
+RUN_NETWORKTEST3.cmd
 ```
 
-The focused log is `gd-networktest2.log`.
+The focused log is `gd-networktest3.log`.
 
 ## Scope
 
@@ -32,8 +32,13 @@ The focused log is `gd-networktest2.log`.
 - Existing desktop text-input offset suppression retained.
 - Existing local `save-v22beta` storage retained.
 - No temporary 90/95 MB APK size/hash check and no donor APK logic.
-- Companion constructors/hooks are disabled in the NetworkTest2 launcher so network behavior is isolated.
+- Companion constructors/hooks are disabled in the NetworkTest3 launcher so network behavior is isolated.
 
-## NetworkTest2 async DNS
+## NetworkTest3 wall-clock watchdog
 
-The original NetworkTest still froze because the guest timeslice did not bound time spent inside a synchronous host import. NetworkTest2 moves DNS resolution off the UI thread and resumes the parked guest worker only after the native resolver completes or times out.
+NetworkTest2 already moved DNS off the UI thread and made sockets nonblocking,
+but the captured v22 worker could still remain inside one translated guest block
+so long that `Jit::Run()` never returned to enforce the frame budget. NetworkTest3
+preserves the full NetworkTest2 runtime and adds an asynchronous 4 ms hard halt to
+the CCHttpClient worker only. The exact guest state is saved and resumed on the
+next frame, preventing that guest/JIT stall from freezing the client.

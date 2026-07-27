@@ -1,0 +1,11 @@
+NetworkTest3 source update
+==========================
+
+Apply these files over GeometryDashWrapper-0.9.4-arm-v22beta-networktest2-async-dns.
+No baseline file is deleted. The only runtime implementation file changed is src/dynarmic_probe.cpp.
+
+Patch method from the NetworkTest2 source root:
+  git apply GeometryDashWrapper-0.9.4-arm-v22beta-networktest3-wall-watchdog.diff
+
+The patch was apply-tested against the supplied NetworkTest2 archive.
+For a clean tree, use the full-source-no-apk archive.

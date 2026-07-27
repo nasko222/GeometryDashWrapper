@@ -1,1 +1,1 @@
-networktest2-async-dns
+networktest3-wall-watchdog

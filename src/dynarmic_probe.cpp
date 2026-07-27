@@ -35,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_set>
 #include <type_traits>
 #include <climits>
@@ -2620,7 +2621,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaNetworkTest22Window";
+        const char* class_name = "GeometryDashV22BetaNetworkTest3Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2632,7 +2633,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest2",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest3",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3158,7 +3159,7 @@ public:
         }
         sockets_.clear();
         if (async_dns_ || async_dns_queued_count_ || async_dns_timeout_count_) {
-            log_ << "RESULT: DYNARMIC_NETWORKTEST2_DNS_TOTALS queued="
+            log_ << "RESULT: DYNARMIC_NETWORKTEST3_DNS_TOTALS queued="
                  << async_dns_queued_count_ << " completed="
                  << async_dns_completed_count_ << " timed_out="
                  << async_dns_timeout_count_ << " native_threads="
@@ -3301,6 +3302,8 @@ public:
         out << "registered=" << cooperative_worker_registered_count_
             << " resumes=" << cooperative_worker_resume_count_
             << " yields=" << cooperative_worker_yield_count_
+            << " slice-yields=" << cooperative_worker_slice_yield_count_
+            << " watchdog-preemptions=" << cooperative_worker_watchdog_count_
             << " exits=" << cooperative_worker_done_count_
             << " pending-cond-objects=" << condition_signals_.size();
 #ifdef _WIN32
@@ -7372,7 +7375,7 @@ private:
         async_dns_ready_reported_ = false;
         ++async_dns_queued_count_;
 
-        log_ << "[host] NetworkTest2 DNS queued kind="
+        log_ << "[host] NetworkTest3 DNS queued kind="
              << (kind == AsyncDnsKind::AddrInfo ? "getaddrinfo" : "gethostbyname")
              << " node=" << (node.empty() ? "<null>" : node)
              << " service=" << (service.empty() ? "<null>" : service)
@@ -7436,13 +7439,13 @@ private:
         cooperative_worker_runnable_ = cooperative_worker_.valid;
         if (finished && !async_dns_ready_reported_) {
             async_dns_ready_reported_ = true;
-            log_ << "[host] NetworkTest2 DNS completion ready code="
+            log_ << "[host] NetworkTest3 DNS completion ready code="
                  << async_dns_->code.load(std::memory_order_relaxed)
                  << " resume-next-frame=1\n";
             log_.flush();
         } else if (timed_out && !async_dns_timeout_reported_) {
             async_dns_timeout_reported_ = true;
-            log_ << "[host] NetworkTest2 DNS timeout after 8000 ms; "
+            log_ << "[host] NetworkTest3 DNS timeout after 8000 ms; "
                     "resume guest with EAI_AGAIN\n";
             log_.flush();
         }
@@ -7600,7 +7603,7 @@ private:
         }
         if (code == 0) result = CommitGuestAddrInfoRecords(records, result_address);
         else result = static_cast<u32>(code);
-        log_ << "[host] NetworkTest2 DNS delivered kind=getaddrinfo node="
+        log_ << "[host] NetworkTest3 DNS delivered kind=getaddrinfo node="
              << (node.empty() ? "<null>" : node) << " result="
              << static_cast<s32>(result) << " records=" << records.size() << '\n';
         log_.flush();
@@ -7655,7 +7658,7 @@ private:
         }
         result = code == 0 ? CommitGuestHostEntRecords(node, records) : 0u;
         if (code != 0) SetGuestErrno(2);
-        log_ << "[host] NetworkTest2 DNS delivered kind=gethostbyname node="
+        log_ << "[host] NetworkTest3 DNS delivered kind=gethostbyname node="
              << node << " result=" << code << " records=" << records.size()
              << '\n';
         log_.flush();
@@ -7957,9 +7960,9 @@ private:
         cooperative_worker_done_ = false;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
         ++cooperative_worker_registered_count_;
-        log_ << "[host] NetworkTest2 guest worker registered at 0x" << std::hex << start_routine
+        log_ << "[host] NetworkTest3 guest worker registered at 0x" << std::hex << start_routine
              << " arg=0x" << argument << std::dec
-             << " scheduling=frame-sliced" << '\n';
+             << " scheduling=frame-sliced+wall-watchdog" << '\n';
         log_.flush();
         return true;
     }
@@ -7968,12 +7971,19 @@ private:
         if (!cooperative_worker_.valid || running_cooperative_worker_ ||
             !cooperative_worker_runnable_) return true;
 
+        // NetworkTest2 bounded translated ARM ticks and total slice wall time, but
+        // either limit is only observed after Dynarmic::A32::Jit::Run() returns.
+        // The v22 CCHttpClient worker can remain in one translated guest block long
+        // enough to freeze the window.  A separate host watchdog therefore uses
+        // Dynarmic's asynchronous HaltExecution path to regain control even when a
+        // guest block does not naturally reach the tick callback in time.
         constexpr u32 kTicksPerRun = 25000u;
         constexpr u32 kMaximumRunsPerSlice = 12u;
         constexpr auto kMaximumSlice = std::chrono::milliseconds(2);
+        constexpr auto kHardRunWatchdog = std::chrono::milliseconds(4);
         const u64 resume_number = ++cooperative_worker_resume_count_;
         if (resume_number <= 128u) {
-            log_ << "[host] NetworkTest2 worker slice #" << resume_number
+            log_ << "[host] NetworkTest3 worker slice #" << resume_number
                  << " trigger=" << (trigger ? trigger : "unspecified")
                  << " pc=0x" << std::hex << cooperative_worker_.regs[15]
                  << " lr=0x" << cooperative_worker_.regs[14] << std::dec << '\n';
@@ -8002,26 +8012,64 @@ private:
 
         const auto started = std::chrono::steady_clock::now();
         u32 runs = 0u;
+        bool watchdog_preempted = false;
         while (!cooperative_worker_yielded_ && !cooperative_worker_done_ &&
                runs < kMaximumRunsPerSlice &&
                std::chrono::steady_clock::now() - started < kMaximumSlice) {
             ++runs;
             env_.ResetStopState();
             env_.ticks_left = kTicksPerRun;
+
+            std::mutex watchdog_mutex;
+            std::condition_variable watchdog_cv;
+            bool watchdog_cancelled = false;
+            std::atomic<bool> watchdog_fired{false};
+            std::thread watchdog([&] {
+                std::unique_lock<std::mutex> lock(watchdog_mutex);
+                if (!watchdog_cv.wait_for(lock, kHardRunWatchdog,
+                                          [&] { return watchdog_cancelled; })) {
+                    watchdog_fired.store(true, std::memory_order_release);
+                    cpu_.HaltExecution(kCallbackHalt);
+                }
+            });
+            auto stop_watchdog = [&] {
+                {
+                    std::lock_guard<std::mutex> lock(watchdog_mutex);
+                    watchdog_cancelled = true;
+                }
+                watchdog_cv.notify_one();
+                if (watchdog.joinable()) watchdog.join();
+                cpu_.ClearHalt(kCallbackHalt);
+            };
+            ScopeExit watchdog_cleanup(stop_watchdog);
+
             cpu_.Run();
-            cpu_.ClearHalt(kCallbackHalt);
-            if (env_.invalid_access) return Fail("NetworkTest2 worker invalid guest memory");
-            if (env_.interpreter_fallback) return Fail("NetworkTest2 worker interpreter fallback");
-            if (env_.exception_seen) return Fail("NetworkTest2 worker guest exception");
+            stop_watchdog();
+
+            if (env_.invalid_access) return Fail("NetworkTest3 worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("NetworkTest3 worker interpreter fallback");
+            if (env_.exception_seen) return Fail("NetworkTest3 worker guest exception");
+            if (watchdog_fired.load(std::memory_order_acquire)) {
+                watchdog_preempted = true;
+                ++cooperative_worker_watchdog_count_;
+                if (cooperative_worker_watchdog_count_ <= 128u) {
+                    log_ << "[host] NetworkTest3 worker watchdog preempted run=" << runs
+                         << " pc=0x" << std::hex << cpu_.Regs()[15]
+                         << " lr=0x" << cpu_.Regs()[14] << std::dec
+                         << " hard_limit_ms=" << kHardRunWatchdog.count() << '\n';
+                    log_.flush();
+                }
+                break;
+            }
             if (env_.svc_pending) {
                 if (env_.pending_svc == kSvcReturn) {
                     cooperative_worker_done_ = true;
                     break;
                 }
-                if (!HandleSvc(env_.pending_svc, "NetworkTest2 CCHttpClient worker"))
+                if (!HandleSvc(env_.pending_svc, "NetworkTest3 CCHttpClient worker"))
                     return false;
             } else if (env_.ticks_left != 0u) {
-                return Fail("NetworkTest2 worker stopped without a trap");
+                return Fail("NetworkTest3 worker stopped without a trap");
             }
         }
 
@@ -8034,12 +8082,12 @@ private:
             cooperative_worker_.valid = false;
             cooperative_worker_runnable_ = false;
             if (cooperative_worker_done_count_++ < 16u)
-                log_ << "[host] NetworkTest2 worker exited\n";
+                log_ << "[host] NetworkTest3 worker exited\n";
         } else if (cooperative_worker_yielded_) {
             cooperative_worker_runnable_ = false;
             ++cooperative_worker_yield_count_;
             if (network_worker_runs_++ < 128u)
-                log_ << "[host] NetworkTest2 worker waiting for signal"
+                log_ << "[host] NetworkTest3 worker waiting for signal"
                      << " yields=" << cooperative_worker_yield_count_ << '\n';
         } else {
             cooperative_worker_runnable_ = true;
@@ -8047,9 +8095,10 @@ private:
             if (cooperative_worker_slice_yield_count_ <= 128u) {
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - started).count();
-                log_ << "[host] NetworkTest2 worker timeslice yield runs=" << runs
+                log_ << "[host] NetworkTest3 worker timeslice yield runs=" << runs
                      << " elapsed_ms=" << std::fixed << std::setprecision(2)
-                     << elapsed_ms << '\n';
+                     << elapsed_ms
+                     << " watchdog=" << (watchdog_preempted ? 1 : 0) << '\n';
             }
         }
         log_.flush();
@@ -8865,7 +8914,7 @@ private:
             ++semaphores_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 128u)
-                log_ << "[host] NetworkTest2 semaphore post sem=0x" << std::hex
+                log_ << "[host] NetworkTest3 semaphore post sem=0x" << std::hex
                      << r0 << std::dec << " pending=" << semaphores_[r0] << '\n';
             result = 0;
         } else if (name == "pthread_cond_init") {
@@ -8879,7 +8928,7 @@ private:
             ++condition_signals_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 128u)
-                log_ << "[host] NetworkTest2 condition signal cond=0x" << std::hex
+                log_ << "[host] NetworkTest3 condition signal cond=0x" << std::hex
                      << r0 << std::dec << " pending=" << condition_signals_[r0]
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
                      << '\n';
@@ -8893,7 +8942,7 @@ private:
                 cooperative_worker_yielded_ = true;
                 cooperative_worker_runnable_ = false;
                 if (cooperative_condition_log_count_++ < 128u)
-                    log_ << "[host] NetworkTest2 worker cond-wait cond=0x"
+                    log_ << "[host] NetworkTest3 worker cond-wait cond=0x"
                          << std::hex << r0 << std::dec << '\n';
                 return true; // Re-execute after a future signal token appears.
             } else {
@@ -9282,6 +9331,7 @@ private:
     u64 cooperative_worker_yield_count_=0;
     u64 cooperative_worker_done_count_=0;
     u64 cooperative_worker_slice_yield_count_=0;
+    u64 cooperative_worker_watchdog_count_=0;
     u64 cooperative_condition_log_count_=0;
     u64 network_worker_runs_=0;
     u64 network_poll_log_count_=0;
@@ -9709,7 +9759,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-networktest2-async-dns debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-networktest3-wall-watchdog debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -9963,8 +10013,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest2-async-dns");
-        emit("NetworkTest2: async native DNS, nonblocking sockets, and frame-sliced v22 beta HTTP worker");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest3-wall-watchdog");
+        emit("NetworkTest3: NetworkTest2 async DNS/nonblocking sockets plus hard wall-clock worker preemption");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -9976,7 +10026,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaNetworkTest2 must be compiled as a 64-bit executable");
+                "V22BetaNetworkTest3 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -9984,7 +10034,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST3_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -10820,7 +10870,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest2 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest3 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -10872,11 +10922,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST3_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST3_FAILED");
         return 1;
     }
 }

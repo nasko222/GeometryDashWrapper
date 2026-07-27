@@ -1,0 +1,2 @@
+quick fired=0 elapsed_ms=1.12675
+stuck fired=1 elapsed_ms=4.16157
