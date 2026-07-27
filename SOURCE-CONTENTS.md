@@ -1,10 +1,9 @@
-# Source contents — v22beta Bringup18
+# Source contents — v22beta Bringup19
 
-This archive contains the complete source/build scripts for
-`0.9.4-arm-v22beta-bringup18-runtime-hooks`.
+This archive contains the complete wrapper source needed to build
+`0.9.4-arm-v22beta-bringup19-selected-desktop-network`, except for proprietary
+APK content. No APK or extracted game library is included.
 
-Included: Dynarmic wrapper source, portable Windows builder, save recovery,
-Bringup18 notes/changelog, static audit, and syntax report.
-
-Not included: APKs, `libcocos2dcpp.so`, `libgame.so`, `libhooking.so`, Dobby,
-FMOD binaries, build caches, or generated dist folders.
+The source includes the pinned portable Windows build scripts, Dynarmic build
+integration, zlib/STB sources, host storage/audio code, Bringup19 notes,
+changelog, static audit and syntax report.

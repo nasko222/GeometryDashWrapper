@@ -1,0 +1,49 @@
+Geometry Dash ARM Wrapper Bringup19 static audit
+===================================================
+
+Target
+- selected APK bytes: 144490721
+- selected APK SHA-256: b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1
+- selected APK ARMv7 libraries: 5
+  - libcocos2dcpp.so: 9578364 bytes
+  - libdobby.so: 177844 bytes
+  - libfmod.so: 989528 bytes
+  - libgame.so: 636668 bytes
+  - libhooking.so: 371128 bytes
+
+Editor ABI comparison
+- selected primary LevelEditorLayer::init size: 4 bytes
+- stock SubZero primary LevelEditorLayer::init size: 4 bytes
+- selected libgame LevelEditorLayerExt::initH size: 2044 bytes
+- stock SubZero ARMv7 libraries: libcocos2dcpp.so, libfmod.so
+- conclusion: both primary libraries expose only the 4-byte editor stub; only the selected APK contains the matching libgame.so full editor initializer. Stock SubZero has no full editor implementation to call.
+
+Desktop text-entry patch
+- patchable keyboard show/hide/forceOffset symbols including thunks: 11
+- patchable textInputShouldOffset symbols including thunks: 28
+- CustomSongLayer offset delegate present: True
+- intended result: Win32 WM_CHAR input remains active while Android software-keyboard scene panning returns immediately/false.
+
+Networking bridge
+- gethostbyname: implemented
+- getnameinfo: implemented
+- shutdown: implemented
+- writev: implemented
+- pipe: implemented
+- socketpair: implemented
+- existing socket/connect/send/recv/poll/getaddrinfo/fcntl/ioctl/cooperative worker code remains present.
+
+Local-save policy
+- legacy mounted-drive migration routine present: False
+- RECOVER_V22_SAVES.cmd exists: False
+- RECOVER_V22_SAVES.ps1 exists: False
+- guest /data/data strings are virtual path inputs only and are mapped directly into local save-v22beta; no host drive-root scan remains.
+
+Source/package checks
+- source payload files: 1117
+- APK/.so files in source tree: 0
+- PowerShell here-strings start/end: 3/3
+- PowerShell braces open/close: 73/73
+- PowerShell parentheses open/close: 185/185
+- non-Windows C++20 syntax check: PASS
+- Windows cross-link/runtime test: NOT AVAILABLE in this environment

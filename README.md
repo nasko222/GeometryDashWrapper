@@ -1,36 +1,36 @@
-# Geometry Dash ARM Wrapper — 2.2 beta Bringup18
+# Geometry Dash ARM Wrapper — 2.2 beta Bringup19
 
-Bringup18 fixes the end-level crash found in the Bringup17 test log and finally
-executes the selected beta's packaged feature hooks instead of merely detecting
-them.
+Bringup19 is intentionally focused on the selected **144,490,721-byte** GDPS
+Editor/SubZero beta APK. It keeps the stable gameplay/platformer and companion
+feature work from Bringup18, but stops trying to make unrelated APKs share the
+same editor ABI.
 
-## Build selected beta
+## Changes in this branch
 
-```bat
-BUILD_V22BETA_X64.cmd "D:\APKs\selected-beta.apk"
-```
+- Saves live only in `save-v22beta`; no mounted-drive `data/data` recovery scan.
+- Android software-keyboard panning is disabled on Windows, including the
+  custom-song ID field.
+- The POSIX/WinSock bridge now implements `gethostbyname`, `getnameinfo`,
+  `shutdown`, `writev`, `pipe`, and `socketpair` instead of returning empty
+  stubs.
+- The selected APK continues to use its own matching `libgame.so`; no donor
+  library is accepted by the build script.
 
-Output: `dist-arm-wrapper-v22beta-bringup18-runtime-hooks\`
-
-Use `RUN_V22_SELECTED_APK.cmd` for the safer feature set. Use
-`RUN_V22_SELECTED_APK_ALL_HOOKS.cmd` to test every discovered feature group.
-
-## Give stock SubZero the late-beta editor/features companion
-
-Stock SubZero has a compatible late primary-library layout but does not contain
-`libgame.so`. Pass the selected beta as a donor:
+## Build
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\APKs\SubZero.apk" "D:\APKs\selected-beta.apk"
+BUILD_V22BETA_X64.cmd "D:\path\to\game-v22beta-selected.apk"
 ```
 
-The builder extracts only `lib/armeabi-v7a/libgame.so` into the generated dist
-folder. Source packages contain neither APKs nor proprietary native libraries.
+Output:
 
-## Important boundary
+```text
+dist-arm-wrapper-v22beta-bringup19-selected-desktop-network\
+```
 
-The 95 MB early beta uses a different ABI and its `libgdkit.so` does not contain
-the missing full editor. A late-beta donor is deliberately rejected for that
-layout.
+Run `RUN_V22_SELECTED_APK.cmd`. The optional all-hooks launcher remains for
+feature comparison, but the safe launcher is the normal test target.
 
-See `V22BETA-BRINGUP18-NOTES.md` for hook profiles and technical details.
+All persistent files are under `save-v22beta`. Guest `/data/data/...` strings
+are intercepted in memory and mapped there; the wrapper never scans a real
+`D:\data\data` tree.

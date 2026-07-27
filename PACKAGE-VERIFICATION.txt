@@ -1,17 +1,12 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup18-runtime-hooks
-Branch: v22beta-bringup18-runtime-hooks
+Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup19-selected-desktop-network
+Package verification
 
-Package policy: complete source, no APK, no extracted proprietary .so.
-Build output: dist-arm-wrapper-v22beta-bringup18-runtime-hooks
-Builder revision: dynarmic-x64-builder29-v22beta-armv7-bringup18-runtime-hooks
-
-Validation performed:
-- C++20 syntax-only check: PASS
-- selected/stock symbol-layout comparison: 24,464/24,464 exact
-- early-beta layout rejection verified by symbol comparison
-- safe/all companion feature symbols present in selected libgame.so
-- end-screen crash signature matched to null CCString::floatValue
-
-Not performed here:
-- Windows link
-- live ARM runtime test
+Source target: selected 144490721-byte APK only
+Expected APK SHA-256: b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1
+Source payload files: 1117
+Forbidden APK/.so files in source: 0
+Legacy drive-root save migration: absent
+Recovery scripts: absent
+C++20 syntax check: PASS (3 pre-existing unused-field warnings)
+PowerShell structural check: here-strings 3/3, braces 73/73, parentheses 185/185
+Windows build/link/live test: not run in this environment

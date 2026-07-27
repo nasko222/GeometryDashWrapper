@@ -1,0 +1,23 @@
+Geometry Dash ARM Wrapper Bringup19 syntax check
+================================================
+
+Command:
+clang++ -std=c++20 -fsyntax-only -Wall -Wextra -I/mnt/data/dynarmic-stub -I./src -I./third_party/zlib src/dynarmic_probe.cpp
+
+Result: PASS
+
+Warnings (pre-existing unused private fields):
+src/dynarmic_probe.cpp:8817:9: warning: private field 'network_poll_log_count_' is not used [-Wunused-private-field]
+ 8817 |     u64 network_poll_log_count_=0;
+      |         ^
+src/dynarmic_probe.cpp:8908:9: warning: private field 'gl_array_buffer_binding_' is not used [-Wunused-private-field]
+ 8908 |     u32 gl_array_buffer_binding_=0;
+      |         ^
+src/dynarmic_probe.cpp:8909:9: warning: private field 'gl_element_buffer_binding_' is not used [-Wunused-private-field]
+ 8909 |     u32 gl_element_buffer_binding_=0;
+      |         ^
+3 warnings generated.
+
+Windows cross-link/runtime test: NOT AVAILABLE in this environment.
+The Linux-host syntax pass does not compile the _WIN32-only Winsock branches.
+PowerShell structural counts are recorded in BRINGUP19-STATIC-AUDIT.txt.
