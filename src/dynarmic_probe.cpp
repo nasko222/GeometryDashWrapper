@@ -3994,7 +3994,81 @@ private:
         native_http_trace_.push_back(stream.str());
     }
 
-    NativeHttpResult ExecuteNativeHttp(const NativeHttpJob& job) {
+    static bool NativeHttpIsPlainHttpUrl(const std::string& url) {
+        return url.rfind("http://", 0) == 0;
+    }
+
+    static std::string NativeHttpHttpsVariant(const std::string& url) {
+        if (!NativeHttpIsPlainHttpUrl(url)) return url;
+        return "https://" + url.substr(7);
+    }
+
+    static bool NativeHttpLooksLikeApiUrl(const std::string& url) {
+        std::string lower = url;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char value) {
+                           return static_cast<char>(std::tolower(value));
+                       });
+        const std::size_t query = lower.find('?');
+        if (query != std::string::npos) lower.resize(query);
+        return lower.size() >= 4u &&
+               lower.compare(lower.size() - 4u, 4u, ".php") == 0;
+    }
+
+    static bool NativeHttpLooksLikeHtmlResponse(
+            const std::vector<u8>& body) {
+        if (body.empty()) return false;
+        const std::size_t sample_size =
+            std::min<std::size_t>(body.size(), 8192u);
+        std::string sample(
+            reinterpret_cast<const char*>(body.data()), sample_size);
+        std::transform(sample.begin(), sample.end(), sample.begin(),
+                       [](unsigned char value) {
+                           return static_cast<char>(std::tolower(value));
+                       });
+        return sample.find("<!doctype html") != std::string::npos ||
+               sample.find("<html") != std::string::npos ||
+               sample.find("attention required! | cloudflare") !=
+                   std::string::npos ||
+               sample.find("sorry, you have been blocked") !=
+                   std::string::npos;
+    }
+
+    static bool NativeHttpRequestCanRetryAfterResponse(
+            const NativeHttpJob& job) {
+        if (job.request_type == 0u) return true;
+        if (job.request_type != 1u) return false;
+
+        std::string path = job.url;
+        const std::size_t query = path.find('?');
+        if (query != std::string::npos) path.resize(query);
+        const std::size_t slash = path.find_last_of('/');
+        if (slash != std::string::npos) path.erase(0, slash + 1u);
+        std::transform(path.begin(), path.end(), path.begin(),
+                       [](unsigned char value) {
+                           return static_cast<char>(std::tolower(value));
+                       });
+        return path.rfind("get", 0) == 0 ||
+               path.rfind("download", 0) == 0;
+    }
+
+    static bool NativeHttpFailureWasBeforeResponse(
+            const NativeHttpResult& result) {
+        if (result.response_code != 0u || !result.response_body.empty())
+            return false;
+        return result.error.find("WinHttpReceiveResponse failed") ==
+                   std::string::npos &&
+               result.error.find("WinHttpQueryDataAvailable failed") ==
+                   std::string::npos &&
+               result.error.find("WinHttpReadData failed") ==
+                   std::string::npos;
+    }
+
+    NativeHttpResult ExecuteNativeHttpAttempt(
+            const NativeHttpJob& job,
+            const std::string& attempt_url,
+            std::size_t attempt_index,
+            std::size_t attempt_count) {
         NativeHttpResult output;
         output.id = job.id;
         output.client = job.client;
@@ -4009,13 +4083,16 @@ private:
             output.elapsed_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count();
         };
-        auto fail = [&](const std::string& step, DWORD error = GetLastError()) {
+        auto fail = [&](const std::string& step,
+                        DWORD error = GetLastError()) {
             output.transport_success = false;
             output.error = step;
             const std::string detail = NativeHttpWin32Error(error);
             if (!detail.empty()) output.error += ": " + detail;
             std::ostringstream line;
-            line << "failed stage=\"" << step << "\" win32=" << error;
+            line << "attempt=" << (attempt_index + 1u) << '/'
+                 << attempt_count << " failed stage=\"" << step
+                 << "\" win32=" << error;
             if (!detail.empty())
                 line << " detail=\"" << SanitizeLogText(detail) << "\"";
             trace(line.str());
@@ -4023,37 +4100,24 @@ private:
         auto finish_trace = [&] {
             finish_elapsed();
             std::ostringstream line;
-            line << "thread-finish success="
-                 << (output.transport_success ? 1 : 0)
+            line << "attempt-finish index=" << (attempt_index + 1u)
+                 << '/' << attempt_count
+                 << " success=" << (output.transport_success ? 1 : 0)
                  << " status=" << output.response_code
                  << " body=" << output.response_body.size()
                  << " elapsed_ms=" << std::fixed << std::setprecision(1)
                  << output.elapsed_ms;
             if (!output.error.empty())
-                line << " error=\"" << SanitizeLogText(output.error) << "\"";
+                line << " error=\"" << SanitizeLogText(output.error)
+                     << "\"";
             trace(line.str());
         };
 
-        trace("thread-start method=" + WideToUtf8(
-                  NativeHttpMethod(job.request_type),
-                  std::wcslen(NativeHttpMethod(job.request_type))) +
-              " url=\"" + SanitizeLogText(job.url) + "\" body=" +
-              std::to_string(job.body.size()) + " headers=" +
-              std::to_string(job.headers.size()));
+        trace("attempt-start index=" + std::to_string(attempt_index + 1u) +
+              "/" + std::to_string(attempt_count) + " url=\"" +
+              SanitizeLogText(attempt_url) + "\"");
 
-        std::string effective_url = job.url;
-        const bool boomlings_http =
-            effective_url.rfind("http://www.boomlings.com/", 0) == 0 ||
-            effective_url.rfind("http://boomlings.com/", 0) == 0;
-        if (boomlings_http) {
-            effective_url.replace(0, 7, "https://");
-            trace("stage=url-policy original=\"" +
-                  SanitizeLogText(job.url) + "\" effective=\"" +
-                  SanitizeLogText(effective_url) +
-                  "\" reason=boomlings-https");
-        }
-
-        const std::wstring url = Utf8ToWide(effective_url);
+        const std::wstring url = Utf8ToWide(attempt_url);
         if (url.empty()) {
             fail("URL conversion failed", ERROR_INVALID_PARAMETER);
             finish_trace();
@@ -4066,7 +4130,8 @@ private:
         parts.dwHostNameLength = static_cast<DWORD>(-1);
         parts.dwUrlPathLength = static_cast<DWORD>(-1);
         parts.dwExtraInfoLength = static_cast<DWORD>(-1);
-        trace("stage=crack-url");
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=crack-url");
         if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
             !parts.lpszHostName || !parts.dwHostNameLength) {
             fail("WinHttpCrackUrl failed");
@@ -4082,7 +4147,8 @@ private:
             path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
         const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
 
-        trace("stage=open-session proxy=none");
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=open-session proxy=none user-agent=empty");
         HINTERNET session = WinHttpOpen(
             L"",
             WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -4097,7 +4163,8 @@ private:
 
         {
             std::ostringstream line;
-            line << "stage=connect host=\""
+            line << "attempt=" << (attempt_index + 1u)
+                 << " stage=connect host=\""
                  << SanitizeLogText(WideToUtf8(host.data(), host.size()))
                  << "\" port=" << parts.nPort
                  << " secure=" << (secure ? 1 : 0);
@@ -4113,7 +4180,8 @@ private:
         ScopeExit close_connection([&] { WinHttpCloseHandle(connection); });
 
         const wchar_t* accept_types[] = {L"*/*", nullptr};
-        trace("stage=open-request");
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=open-request");
         HINTERNET request = WinHttpOpenRequest(
             connection, NativeHttpMethod(job.request_type), path.c_str(),
             nullptr, WINHTTP_NO_REFERER, accept_types,
@@ -4139,7 +4207,8 @@ private:
                            [](unsigned char value) {
                                return static_cast<char>(std::tolower(value));
                            });
-            if (lower.rfind("content-type:", 0) == 0) has_content_type = true;
+            if (lower.rfind("content-type:", 0) == 0)
+                has_content_type = true;
             const std::wstring wide_header = Utf8ToWide(header);
             if (!wide_header.empty())
                 WinHttpAddRequestHeaders(
@@ -4155,6 +4224,7 @@ private:
                 request, kFormHeader, static_cast<DWORD>(-1L),
                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
         }
+
         void* body_pointer = job.body.empty()
             ? WINHTTP_NO_REQUEST_DATA
             : const_cast<u8*>(job.body.data());
@@ -4167,7 +4237,8 @@ private:
             return output;
         }
 
-        trace("stage=send bytes=" + std::to_string(body_size));
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=send bytes=" + std::to_string(body_size));
         if (!WinHttpSendRequest(
                 request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                 body_pointer, body_size, body_size, 0)) {
@@ -4175,7 +4246,9 @@ private:
             finish_trace();
             return output;
         }
-        trace("stage=receive");
+
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=receive");
         if (!WinHttpReceiveResponse(request, nullptr)) {
             fail("WinHttpReceiveResponse failed");
             finish_trace();
@@ -4190,7 +4263,9 @@ private:
                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
                 WINHTTP_NO_HEADER_INDEX))
             output.response_code = status;
-        trace("stage=headers status=" + std::to_string(output.response_code));
+        trace("attempt=" + std::to_string(attempt_index + 1u) +
+              " stage=headers status=" +
+              std::to_string(output.response_code));
 
         DWORD header_bytes = 0;
         WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
@@ -4198,16 +4273,19 @@ private:
                             &header_bytes, WINHTTP_NO_HEADER_INDEX);
         if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && header_bytes) {
             std::vector<wchar_t> header_buffer(
-                (header_bytes + sizeof(wchar_t) - 1u) / sizeof(wchar_t));
+                (header_bytes + sizeof(wchar_t) - 1u) /
+                sizeof(wchar_t));
             if (WinHttpQueryHeaders(
                     request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
                     WINHTTP_HEADER_NAME_BY_INDEX, header_buffer.data(),
                     &header_bytes, WINHTTP_NO_HEADER_INDEX)) {
-                std::size_t characters = header_bytes / sizeof(wchar_t);
-                while (characters && header_buffer[characters - 1u] == L'\0')
+                std::size_t characters =
+                    header_bytes / sizeof(wchar_t);
+                while (characters &&
+                       header_buffer[characters - 1u] == L'\0')
                     --characters;
-                const std::string utf8 = WideToUtf8(header_buffer.data(),
-                                                     characters);
+                const std::string utf8 =
+                    WideToUtf8(header_buffer.data(), characters);
                 output.response_headers.assign(utf8.begin(), utf8.end());
             }
         }
@@ -4222,7 +4300,8 @@ private:
                 return output;
             }
             if (!available) break;
-            if (output.response_body.size() + available > kMaximumResponse) {
+            if (output.response_body.size() + available >
+                kMaximumResponse) {
                 fail("response exceeds 128 MiB safety limit",
                      ERROR_FILE_TOO_LARGE);
                 finish_trace();
@@ -4231,9 +4310,10 @@ private:
             const std::size_t old_size = output.response_body.size();
             output.response_body.resize(old_size + available);
             DWORD read = 0;
-            if (!WinHttpReadData(request,
-                                 output.response_body.data() + old_size,
-                                 available, &read)) {
+            if (!WinHttpReadData(
+                    request,
+                    output.response_body.data() + old_size,
+                    available, &read)) {
                 output.response_body.resize(old_size);
                 fail("WinHttpReadData failed");
                 finish_trace();
@@ -4242,13 +4322,105 @@ private:
             output.response_body.resize(old_size + read);
             if (!read) break;
         }
+
         output.transport_success =
-            output.response_code >= 200u && output.response_code < 300u;
+            output.response_code >= 200u &&
+            output.response_code < 300u;
         if (!output.transport_success && output.error.empty())
-            output.error = "HTTP status " +
-                           std::to_string(output.response_code);
+            output.error =
+                "HTTP status " + std::to_string(output.response_code);
         finish_trace();
         return output;
+    }
+
+    NativeHttpResult ExecuteNativeHttp(const NativeHttpJob& job) {
+        const auto thread_started = std::chrono::steady_clock::now();
+        auto trace = [&](const std::string& stage) {
+            QueueNativeHttpTrace(job.id, stage);
+        };
+
+        trace("thread-start method=" + WideToUtf8(
+                  NativeHttpMethod(job.request_type),
+                  std::wcslen(NativeHttpMethod(job.request_type))) +
+              " url=\"" + SanitizeLogText(job.url) + "\" body=" +
+              std::to_string(job.body.size()) + " headers=" +
+              std::to_string(job.headers.size()));
+
+        std::vector<std::string> attempts;
+        if (NativeHttpIsPlainHttpUrl(job.url)) {
+            attempts.push_back(NativeHttpHttpsVariant(job.url));
+            attempts.push_back(job.url);
+            trace("stage=url-policy original=\"" +
+                  SanitizeLogText(job.url) +
+                  "\" primary=\"" +
+                  SanitizeLogText(attempts.front()) +
+                  "\" fallback=\"" +
+                  SanitizeLogText(attempts.back()) +
+                  "\" reason=generic-https-first-preserve-host");
+        } else {
+            attempts.push_back(job.url);
+            trace("stage=url-policy original=\"" +
+                  SanitizeLogText(job.url) +
+                  "\" primary=original reason=already-secure-or-non-http");
+        }
+
+        NativeHttpResult final_result;
+        const bool can_retry_after_response =
+            NativeHttpRequestCanRetryAfterResponse(job);
+
+        for (std::size_t index = 0; index < attempts.size(); ++index) {
+            NativeHttpResult attempt = ExecuteNativeHttpAttempt(
+                job, attempts[index], index, attempts.size());
+            const bool html_api_response =
+                attempt.transport_success &&
+                NativeHttpLooksLikeApiUrl(attempts[index]) &&
+                NativeHttpLooksLikeHtmlResponse(
+                    attempt.response_body);
+            if (html_api_response) {
+                attempt.transport_success = false;
+                attempt.error =
+                    "HTML/block page returned by API endpoint";
+                trace("attempt=" + std::to_string(index + 1u) +
+                      " rejected reason=html-api-response");
+            }
+
+            final_result = std::move(attempt);
+            if (final_result.transport_success) break;
+
+            const bool has_fallback = index + 1u < attempts.size();
+            if (!has_fallback) break;
+
+            const bool retry_safe =
+                can_retry_after_response ||
+                NativeHttpFailureWasBeforeResponse(final_result);
+            if (!retry_safe) {
+                trace("fallback-suppressed reason=request-may-have-been-"
+                      "processed");
+                break;
+            }
+
+            trace("fallback-next from=\"" +
+                  SanitizeLogText(attempts[index]) +
+                  "\" to=\"" +
+                  SanitizeLogText(attempts[index + 1u]) +
+                  "\" reason=\"" +
+                  SanitizeLogText(final_result.error) + "\"");
+        }
+
+        final_result.elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - thread_started).count();
+        std::ostringstream line;
+        line << "thread-finish success="
+             << (final_result.transport_success ? 1 : 0)
+             << " status=" << final_result.response_code
+             << " body=" << final_result.response_body.size()
+             << " elapsed_ms=" << std::fixed << std::setprecision(1)
+             << final_result.elapsed_ms;
+        if (!final_result.error.empty())
+            line << " error=\"" <<
+                SanitizeLogText(final_result.error) << "\"";
+        trace(line.str());
+        return final_result;
     }
 
     void JoinNativeHttpWorkers() {
