@@ -2648,7 +2648,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaNetworkTest7Window";
+        const char* class_name = "GeometryDashV22BetaNetworkTest8Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2660,7 +2660,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest7",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest8",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3182,7 +3182,7 @@ public:
 
     ~GuestExecutor() {
 #ifdef _WIN32
-        StopNativeHttpWorker();
+        JoinNativeHttpWorkers();
 #endif
         for (auto& [handle, file] : files_) {
             (void)handle;
@@ -3223,7 +3223,7 @@ public:
         }
         sockets_.clear();
         if (async_dns_ || async_dns_queued_count_ || async_dns_timeout_count_) {
-            log_ << "RESULT: DYNARMIC_NETWORKTEST7_DNS_TOTALS queued="
+            log_ << "RESULT: DYNARMIC_NETWORKTEST8_DNS_TOTALS queued="
                  << async_dns_queued_count_ << " completed="
                  << async_dns_completed_count_ << " timed_out="
                  << async_dns_timeout_count_ << " native_threads="
@@ -3321,9 +3321,11 @@ public:
         } else {
             log_ << "WARNING: Winsock initialization failed; legacy guest socket bridge unavailable\n";
         }
-        StartNativeHttpWorker();
         log_ << "RESULT: DYNARMIC_V22_NATIVE_WINHTTP_WORKER_READY "
-                "mode=CCHttpClient-send-hook host-thread=1 guest-pthread=bypassed guest-curl=bypassed guest-openssl=bypassed\n";
+                "mode=CCHttpClient-send-hook per-request-host-threads=1 "
+                "proxy=none timeouts-ms=5000,5000,10000,15000 "
+                "form-content-type=automatic guest-pthread=bypassed "
+                "guest-curl=bypassed guest-openssl=bypassed\n";
 #endif
         storage_initialize(writable_path_.c_str());
         const std::filesystem::path executable_directory =
@@ -3385,7 +3387,9 @@ public:
         out << " request-markers=" << network_request_marker_count_
             << " native-http-queued=" << native_http_queued_count_
             << " native-http-completed=" << native_http_completed_count_
-            << " native-http-callbacks=" << native_http_callback_count_;
+            << " native-http-callbacks=" << native_http_callback_count_
+            << " native-http-active="
+            << native_http_active_count_.load(std::memory_order_relaxed);
         return out.str();
     }
     const std::string& LastError() const { return last_error_; }
@@ -3983,7 +3987,14 @@ private:
         }
     }
 
-    static NativeHttpResult ExecuteNativeHttp(const NativeHttpJob& job) {
+    void QueueNativeHttpTrace(u64 id, std::string message) {
+        std::ostringstream stream;
+        stream << "[host] NetworkTest8 native HTTP id=" << id << ' ' << message;
+        std::lock_guard<std::mutex> lock(native_http_mutex_);
+        native_http_trace_.push_back(stream.str());
+    }
+
+    NativeHttpResult ExecuteNativeHttp(const NativeHttpJob& job) {
         NativeHttpResult output;
         output.id = job.id;
         output.client = job.client;
@@ -3991,18 +4002,49 @@ private:
         output.request_type = job.request_type;
         output.url = job.url;
         const auto started = std::chrono::steady_clock::now();
+        auto trace = [&](const std::string& stage) {
+            QueueNativeHttpTrace(job.id, stage);
+        };
+        auto finish_elapsed = [&] {
+            output.elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+        };
         auto fail = [&](const std::string& step, DWORD error = GetLastError()) {
             output.transport_success = false;
             output.error = step;
             const std::string detail = NativeHttpWin32Error(error);
             if (!detail.empty()) output.error += ": " + detail;
+            std::ostringstream line;
+            line << "failed stage=\"" << step << "\" win32=" << error;
+            if (!detail.empty())
+                line << " detail=\"" << SanitizeLogText(detail) << "\"";
+            trace(line.str());
         };
+        auto finish_trace = [&] {
+            finish_elapsed();
+            std::ostringstream line;
+            line << "thread-finish success="
+                 << (output.transport_success ? 1 : 0)
+                 << " status=" << output.response_code
+                 << " body=" << output.response_body.size()
+                 << " elapsed_ms=" << std::fixed << std::setprecision(1)
+                 << output.elapsed_ms;
+            if (!output.error.empty())
+                line << " error=\"" << SanitizeLogText(output.error) << "\"";
+            trace(line.str());
+        };
+
+        trace("thread-start method=" + WideToUtf8(
+                  NativeHttpMethod(job.request_type),
+                  std::wcslen(NativeHttpMethod(job.request_type))) +
+              " url=\"" + SanitizeLogText(job.url) + "\" body=" +
+              std::to_string(job.body.size()) + " headers=" +
+              std::to_string(job.headers.size()));
 
         const std::wstring url = Utf8ToWide(job.url);
         if (url.empty()) {
             fail("URL conversion failed", ERROR_INVALID_PARAMETER);
-            output.elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count();
+            finish_trace();
             return output;
         }
 
@@ -4012,11 +4054,11 @@ private:
         parts.dwHostNameLength = static_cast<DWORD>(-1);
         parts.dwUrlPathLength = static_cast<DWORD>(-1);
         parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+        trace("stage=crack-url");
         if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
             !parts.lpszHostName || !parts.dwHostNameLength) {
             fail("WinHttpCrackUrl failed");
-            output.elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count();
+            finish_trace();
             return output;
         }
         const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
@@ -4028,38 +4070,45 @@ private:
             path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
         const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
 
+        trace("stage=open-session proxy=none");
         HINTERNET session = WinHttpOpen(
-            L"GeometryDash/2.2 GeometryDashWrapper/NetworkTest7",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            L"GeometryDash/2.2 GeometryDashWrapper/NetworkTest8",
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!session) {
             fail("WinHttpOpen failed");
-            output.elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count();
+            finish_trace();
             return output;
         }
         ScopeExit close_session([&] { WinHttpCloseHandle(session); });
-        WinHttpSetTimeouts(session, 10000, 20000, 60000, 60000);
+        WinHttpSetTimeouts(session, 5000, 5000, 10000, 15000);
 
+        {
+            std::ostringstream line;
+            line << "stage=connect host=\""
+                 << SanitizeLogText(WideToUtf8(host.data(), host.size()))
+                 << "\" port=" << parts.nPort
+                 << " secure=" << (secure ? 1 : 0);
+            trace(line.str());
+        }
         HINTERNET connection = WinHttpConnect(session, host.c_str(),
                                                parts.nPort, 0);
         if (!connection) {
             fail("WinHttpConnect failed");
-            output.elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count();
+            finish_trace();
             return output;
         }
         ScopeExit close_connection([&] { WinHttpCloseHandle(connection); });
 
         const wchar_t* accept_types[] = {L"*/*", nullptr};
+        trace("stage=open-request");
         HINTERNET request = WinHttpOpenRequest(
             connection, NativeHttpMethod(job.request_type), path.c_str(),
             nullptr, WINHTTP_NO_REFERER, accept_types,
             secure ? WINHTTP_FLAG_SECURE : 0);
         if (!request) {
             fail("WinHttpOpenRequest failed");
-            output.elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count();
+            finish_trace();
             return output;
         }
         ScopeExit close_request([&] { WinHttpCloseHandle(request); });
@@ -4072,14 +4121,33 @@ private:
         WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION,
                          &decompression, sizeof(decompression));
 #endif
+        bool has_content_type = false;
         for (const std::string& header : job.headers) {
+            std::string lower = header;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char value) {
+                               return static_cast<char>(std::tolower(value));
+                           });
+            if (lower.rfind("content-type:", 0) == 0) has_content_type = true;
             const std::wstring wide_header = Utf8ToWide(header);
             if (!wide_header.empty())
                 WinHttpAddRequestHeaders(
                     request, wide_header.c_str(),
                     static_cast<DWORD>(wide_header.size()),
-                    WINHTTP_ADDREQ_FLAG_ADD);
+                    WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
         }
+        if ((job.request_type == 1u || job.request_type == 2u) &&
+            !has_content_type) {
+            static constexpr wchar_t kFormHeader[] =
+                L"Content-Type: application/x-www-form-urlencoded";
+            WinHttpAddRequestHeaders(
+                request, kFormHeader, static_cast<DWORD>(-1L),
+                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+        static constexpr wchar_t kConnectionClose[] = L"Connection: close";
+        WinHttpAddRequestHeaders(
+            request, kConnectionClose, static_cast<DWORD>(-1L),
+            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
 
         void* body_pointer = job.body.empty()
             ? WINHTTP_NO_REQUEST_DATA
@@ -4087,110 +4155,97 @@ private:
         const DWORD body_size = job.body.size() > MAXDWORD
             ? MAXDWORD : static_cast<DWORD>(job.body.size());
         if (job.body.size() > MAXDWORD) {
-            fail("request body exceeds WinHTTP DWORD limit", ERROR_FILE_TOO_LARGE);
-        } else if (!WinHttpSendRequest(
-                       request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                       body_pointer, body_size, body_size, 0)) {
-            fail("WinHttpSendRequest failed");
-        } else if (!WinHttpReceiveResponse(request, nullptr)) {
-            fail("WinHttpReceiveResponse failed");
-        } else {
-            DWORD status = 0;
-            DWORD status_size = sizeof(status);
-            if (WinHttpQueryHeaders(
-                    request,
-                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                    WINHTTP_NO_HEADER_INDEX))
-                output.response_code = status;
-
-            DWORD header_bytes = 0;
-            WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                                WINHTTP_HEADER_NAME_BY_INDEX, nullptr,
-                                &header_bytes, WINHTTP_NO_HEADER_INDEX);
-            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && header_bytes) {
-                std::vector<wchar_t> header_buffer(
-                    (header_bytes + sizeof(wchar_t) - 1u) / sizeof(wchar_t));
-                if (WinHttpQueryHeaders(
-                        request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                        WINHTTP_HEADER_NAME_BY_INDEX, header_buffer.data(),
-                        &header_bytes, WINHTTP_NO_HEADER_INDEX)) {
-                    std::size_t characters = header_bytes / sizeof(wchar_t);
-                    while (characters && header_buffer[characters - 1u] == L'\0')
-                        --characters;
-                    const std::string utf8 = WideToUtf8(
-                        header_buffer.data(), characters);
-                    output.response_headers.assign(utf8.begin(), utf8.end());
-                }
-            }
-
-            static constexpr std::size_t kMaximumResponse = 128u * 1024u * 1024u;
-            bool read_ok = true;
-            while (read_ok) {
-                DWORD available = 0;
-                if (!WinHttpQueryDataAvailable(request, &available)) {
-                    fail("WinHttpQueryDataAvailable failed");
-                    read_ok = false;
-                    break;
-                }
-                if (!available) break;
-                if (output.response_body.size() + available > kMaximumResponse) {
-                    fail("response exceeds 128 MiB safety limit", ERROR_FILE_TOO_LARGE);
-                    read_ok = false;
-                    break;
-                }
-                const std::size_t old_size = output.response_body.size();
-                output.response_body.resize(old_size + available);
-                DWORD read = 0;
-                if (!WinHttpReadData(request,
-                                     output.response_body.data() + old_size,
-                                     available, &read)) {
-                    output.response_body.resize(old_size);
-                    fail("WinHttpReadData failed");
-                    read_ok = false;
-                    break;
-                }
-                output.response_body.resize(old_size + read);
-                if (!read) break;
-            }
-            if (read_ok) output.transport_success = true;
+            fail("request body exceeds WinHTTP DWORD limit",
+                 ERROR_FILE_TOO_LARGE);
+            finish_trace();
+            return output;
         }
-        output.elapsed_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
+
+        trace("stage=send bytes=" + std::to_string(body_size));
+        if (!WinHttpSendRequest(
+                request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                body_pointer, body_size, body_size, 0)) {
+            fail("WinHttpSendRequest failed");
+            finish_trace();
+            return output;
+        }
+        trace("stage=receive");
+        if (!WinHttpReceiveResponse(request, nullptr)) {
+            fail("WinHttpReceiveResponse failed");
+            finish_trace();
+            return output;
+        }
+
+        DWORD status = 0;
+        DWORD status_size = sizeof(status);
+        if (WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                WINHTTP_NO_HEADER_INDEX))
+            output.response_code = status;
+        trace("stage=headers status=" + std::to_string(output.response_code));
+
+        DWORD header_bytes = 0;
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                            WINHTTP_HEADER_NAME_BY_INDEX, nullptr,
+                            &header_bytes, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && header_bytes) {
+            std::vector<wchar_t> header_buffer(
+                (header_bytes + sizeof(wchar_t) - 1u) / sizeof(wchar_t));
+            if (WinHttpQueryHeaders(
+                    request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                    WINHTTP_HEADER_NAME_BY_INDEX, header_buffer.data(),
+                    &header_bytes, WINHTTP_NO_HEADER_INDEX)) {
+                std::size_t characters = header_bytes / sizeof(wchar_t);
+                while (characters && header_buffer[characters - 1u] == L'\0')
+                    --characters;
+                const std::string utf8 = WideToUtf8(header_buffer.data(),
+                                                     characters);
+                output.response_headers.assign(utf8.begin(), utf8.end());
+            }
+        }
+
+        static constexpr std::size_t kMaximumResponse =
+            128u * 1024u * 1024u;
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available)) {
+                fail("WinHttpQueryDataAvailable failed");
+                finish_trace();
+                return output;
+            }
+            if (!available) break;
+            if (output.response_body.size() + available > kMaximumResponse) {
+                fail("response exceeds 128 MiB safety limit",
+                     ERROR_FILE_TOO_LARGE);
+                finish_trace();
+                return output;
+            }
+            const std::size_t old_size = output.response_body.size();
+            output.response_body.resize(old_size + available);
+            DWORD read = 0;
+            if (!WinHttpReadData(request,
+                                 output.response_body.data() + old_size,
+                                 available, &read)) {
+                output.response_body.resize(old_size);
+                fail("WinHttpReadData failed");
+                finish_trace();
+                return output;
+            }
+            output.response_body.resize(old_size + read);
+            if (!read) break;
+        }
+        output.transport_success = true;
+        finish_trace();
         return output;
     }
 
-    void StartNativeHttpWorker() {
-        if (native_http_thread_.joinable()) return;
-        native_http_stop_ = false;
-        native_http_thread_ = std::thread([this] {
-            for (;;) {
-                NativeHttpJob job;
-                {
-                    std::unique_lock<std::mutex> lock(native_http_mutex_);
-                    native_http_condition_.wait(lock, [this] {
-                        return native_http_stop_ || !native_http_jobs_.empty();
-                    });
-                    if (native_http_stop_ && native_http_jobs_.empty()) break;
-                    job = std::move(native_http_jobs_.front());
-                    native_http_jobs_.pop_front();
-                }
-                NativeHttpResult result = ExecuteNativeHttp(job);
-                {
-                    std::lock_guard<std::mutex> lock(native_http_mutex_);
-                    native_http_results_.push_back(std::move(result));
-                }
-            }
-        });
-    }
-
-    void StopNativeHttpWorker() {
-        {
-            std::lock_guard<std::mutex> lock(native_http_mutex_);
-            native_http_stop_ = true;
+    void JoinNativeHttpWorkers() {
+        for (std::thread& worker : native_http_threads_) {
+            if (worker.joinable()) worker.join();
         }
-        native_http_condition_.notify_all();
-        if (native_http_thread_.joinable()) native_http_thread_.join();
+        native_http_threads_.clear();
     }
 #endif
 
@@ -4255,8 +4310,6 @@ private:
         (void)request;
         return Fail("native HTTP bridge requires Windows WinHTTP");
 #else
-        if (!native_http_thread_.joinable())
-            return Fail("native HTTP worker is not running");
         if (!client || !request || !env_.IsMapped(request, 0x74u))
             return Fail("native HTTP send received an invalid request object");
         NativeHttpJob job;
@@ -4264,11 +4317,12 @@ private:
         job.client = client;
         job.request = request;
         job.request_type = env_.MemoryRead32(request + 0x30u);
-        if (!ReadGuestCowStringObject(request + 0x34u, job.url, 4u * 1024u * 1024u) ||
+        if (!ReadGuestCowStringObject(request + 0x34u, job.url,
+                                      4u * 1024u * 1024u) ||
             job.url.empty())
             return Fail("native HTTP send could not read the request URL");
-        if (!ReadGuestByteVector(request + 0x38u, 128u * 1024u * 1024u,
-                                 job.body))
+        if (!ReadGuestByteVector(request + 0x38u,
+                                 128u * 1024u * 1024u, job.body))
             return Fail("native HTTP send could not read the request body");
         if (!ReadGuestStringVector(request + 0x58u, 1024u, job.headers))
             return Fail("native HTTP send could not read request headers");
@@ -4277,19 +4331,61 @@ private:
                         std::to_string(job.request_type));
         if (!RetainGuestObjectDirect(request))
             return Fail("native HTTP send could not retain request object");
-        {
-            std::lock_guard<std::mutex> lock(native_http_mutex_);
-            native_http_jobs_.push_back(job);
-        }
-        native_http_condition_.notify_one();
+
         ++native_http_queued_count_;
-        log_ << "[host] NetworkTest7 native HTTP queued id=" << job.id
-             << " method=" << WideToUtf8(NativeHttpMethod(job.request_type),
-                                           std::wcslen(NativeHttpMethod(job.request_type)))
+        log_ << "[host] NetworkTest8 native HTTP queued id=" << job.id
+             << " method=" << WideToUtf8(
+                    NativeHttpMethod(job.request_type),
+                    std::wcslen(NativeHttpMethod(job.request_type)))
              << " url=\"" << SanitizeLogText(job.url) << "\""
              << " body=" << job.body.size()
-             << " headers=" << job.headers.size() << '\n';
+             << " headers=" << job.headers.size()
+             << " scheduling=independent-request-thread\n";
         log_.flush();
+        try {
+            native_http_threads_.emplace_back(
+                [this, job = std::move(job)]() mutable {
+                    native_http_active_count_.fetch_add(
+                        1u, std::memory_order_relaxed);
+                    NativeHttpResult result;
+                    try {
+                        result = ExecuteNativeHttp(job);
+                    } catch (const std::exception& error) {
+                        result.id = job.id;
+                        result.client = job.client;
+                        result.request = job.request;
+                        result.request_type = job.request_type;
+                        result.url = job.url;
+                        result.transport_success = false;
+                        result.error = std::string(
+                            "native HTTP thread exception: ") + error.what();
+                        QueueNativeHttpTrace(
+                            job.id, "thread-exception error="" +
+                                        SanitizeLogText(result.error) + """);
+                    } catch (...) {
+                        result.id = job.id;
+                        result.client = job.client;
+                        result.request = job.request;
+                        result.request_type = job.request_type;
+                        result.url = job.url;
+                        result.transport_success = false;
+                        result.error = "native HTTP thread unknown exception";
+                        QueueNativeHttpTrace(job.id,
+                            "thread-exception error="unknown"");
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(native_http_mutex_);
+                        native_http_results_.push_back(std::move(result));
+                    }
+                    native_http_active_count_.fetch_sub(
+                        1u, std::memory_order_relaxed);
+                });
+        } catch (const std::exception& error) {
+            ReleaseGuestObject(request, "native HTTP thread launch cleanup");
+            return Fail(std::string(
+                            "native HTTP request thread launch failed: ") +
+                        error.what());
+        }
         return true;
 #endif
     }
@@ -4407,14 +4503,18 @@ private:
 #ifndef _WIN32
         return true;
 #else
+        std::deque<std::string> trace;
         std::deque<NativeHttpResult> ready;
         {
             std::lock_guard<std::mutex> lock(native_http_mutex_);
+            trace.swap(native_http_trace_);
             ready.swap(native_http_results_);
         }
+        for (const std::string& line : trace) log_ << line << '\n';
+        if (!trace.empty()) log_.flush();
         for (const NativeHttpResult& result : ready) {
             ++native_http_completed_count_;
-            log_ << "[host] NetworkTest7 native HTTP completed id=" << result.id
+            log_ << "[host] NetworkTest8 native HTTP completed id=" << result.id
                  << " success=" << (result.transport_success ? 1 : 0)
                  << " code=" << result.response_code
                  << " body=" << result.response_body.size()
@@ -4751,7 +4851,7 @@ private:
     void DumpImportTrace(const std::string& reason, std::size_t requested = 96u) {
         if (!import_trace_count_) return;
         const std::size_t count = std::min(requested, import_trace_count_);
-        log_ << "[trace] NetworkTest7 import-ring reason=" << reason
+        log_ << "[trace] NetworkTest8 import-ring reason=" << reason
              << " entries=" << count << '/' << import_trace_count_ << '\n';
         const std::size_t oldest =
             (import_trace_cursor_ + import_trace_.size() - import_trace_count_) % import_trace_.size();
@@ -4786,7 +4886,7 @@ private:
         if (now < forensic_next_heartbeat_) return;
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             now - forensic_call_started_).count();
-        log_ << "[trace] NetworkTest7 guest heartbeat elapsed_ms="
+        log_ << "[trace] NetworkTest8 guest heartbeat elapsed_ms="
              << std::fixed << std::setprecision(1) << elapsed_ms
              << " active=\"" << forensic_call_label_ << "\""
              << " current-import=" << current_import
@@ -4800,7 +4900,7 @@ private:
     }
 
     void LogForensicImport(const char* phase, const ImportRecord& import, bool ok = true) {
-        log_ << "[trace] NetworkTest7 import " << phase
+        log_ << "[trace] NetworkTest8 import " << phase
              << " ctx=" << (running_cooperative_worker_ ? "worker" : "main")
              << " svc=" << import.svc
              << " stub=0x" << std::hex << import.address
@@ -4899,7 +4999,7 @@ private:
         cpu_.SetCpsr(cpsr);
         cpu_.Regs()[15] = lr & ~1u;
         if (cooperative_worker_stub_return_count_++ < 256u) {
-            log_ << "[host] NetworkTest7 completed pending stub return reason="
+            log_ << "[host] NetworkTest8 completed pending stub return reason="
                  << (reason ? reason : "unspecified")
                  << " stub-pc=0x" << std::hex << pc
                  << " target=0x" << (lr & ~1u) << std::dec
@@ -8139,7 +8239,7 @@ private:
         async_dns_ready_reported_ = false;
         ++async_dns_queued_count_;
 
-        log_ << "[host] NetworkTest7 DNS queued kind="
+        log_ << "[host] NetworkTest8 DNS queued kind="
              << (kind == AsyncDnsKind::AddrInfo ? "getaddrinfo" : "gethostbyname")
              << " node=" << (node.empty() ? "<null>" : node)
              << " service=" << (service.empty() ? "<null>" : service)
@@ -8203,13 +8303,13 @@ private:
         cooperative_worker_runnable_ = cooperative_worker_.valid;
         if (finished && !async_dns_ready_reported_) {
             async_dns_ready_reported_ = true;
-            log_ << "[host] NetworkTest7 DNS completion ready code="
+            log_ << "[host] NetworkTest8 DNS completion ready code="
                  << async_dns_->code.load(std::memory_order_relaxed)
                  << " resume-next-frame=1\n";
             log_.flush();
         } else if (timed_out && !async_dns_timeout_reported_) {
             async_dns_timeout_reported_ = true;
-            log_ << "[host] NetworkTest7 DNS timeout after 8000 ms; "
+            log_ << "[host] NetworkTest8 DNS timeout after 8000 ms; "
                     "resume guest with EAI_AGAIN\n";
             log_.flush();
         }
@@ -8367,7 +8467,7 @@ private:
         }
         if (code == 0) result = CommitGuestAddrInfoRecords(records, result_address);
         else result = static_cast<u32>(code);
-        log_ << "[host] NetworkTest7 DNS delivered kind=getaddrinfo node="
+        log_ << "[host] NetworkTest8 DNS delivered kind=getaddrinfo node="
              << (node.empty() ? "<null>" : node) << " result="
              << static_cast<s32>(result) << " records=" << records.size() << '\n';
         log_.flush();
@@ -8422,7 +8522,7 @@ private:
         }
         result = code == 0 ? CommitGuestHostEntRecords(node, records) : 0u;
         if (code != 0) SetGuestErrno(2);
-        log_ << "[host] NetworkTest7 DNS delivered kind=gethostbyname node="
+        log_ << "[host] NetworkTest8 DNS delivered kind=gethostbyname node="
              << node << " result=" << code << " records=" << records.size()
              << '\n';
         log_.flush();
@@ -8724,7 +8824,7 @@ private:
         cooperative_worker_done_ = false;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
         ++cooperative_worker_registered_count_;
-        log_ << "[host] NetworkTest7 guest worker registered at 0x" << std::hex << start_routine
+        log_ << "[host] NetworkTest8 guest worker registered at 0x" << std::hex << start_routine
              << " arg=0x" << argument << std::dec
              << " scheduling=deferred-frame-pump+safe-stub-return+wall-watchdog+forensic-trace" << '\n';
         log_.flush();
@@ -8747,7 +8847,7 @@ private:
         constexpr auto kHardRunWatchdog = std::chrono::milliseconds(8);
         const u64 resume_number = ++cooperative_worker_resume_count_;
         if (resume_number <= 128u) {
-            log_ << "[host] NetworkTest7 worker slice #" << resume_number
+            log_ << "[host] NetworkTest8 worker slice #" << resume_number
                  << " trigger=" << (trigger ? trigger : "unspecified")
                  << " pc=0x" << std::hex << cooperative_worker_.regs[15]
                  << " lr=0x" << cooperative_worker_.regs[14] << std::dec << '\n';
@@ -8811,14 +8911,14 @@ private:
             cpu_.Run();
             stop_watchdog();
 
-            if (env_.invalid_access) return Fail("NetworkTest7 worker invalid guest memory");
-            if (env_.interpreter_fallback) return Fail("NetworkTest7 worker interpreter fallback");
-            if (env_.exception_seen) return Fail("NetworkTest7 worker guest exception");
+            if (env_.invalid_access) return Fail("NetworkTest8 worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("NetworkTest8 worker interpreter fallback");
+            if (env_.exception_seen) return Fail("NetworkTest8 worker guest exception");
             if (watchdog_fired.load(std::memory_order_acquire)) {
                 watchdog_preempted = true;
                 ++cooperative_worker_watchdog_count_;
                 if (cooperative_worker_watchdog_count_ <= 128u) {
-                    log_ << "[host] NetworkTest7 worker watchdog preempted run=" << runs
+                    log_ << "[host] NetworkTest8 worker watchdog preempted run=" << runs
                          << " pc=0x" << std::hex << cpu_.Regs()[15]
                          << " lr=0x" << cpu_.Regs()[14] << std::dec
                          << " pc-desc=" << DescribeAddress(cpu_.Regs()[15])
@@ -8834,7 +8934,7 @@ private:
                     cooperative_worker_done_ = true;
                     break;
                 }
-                if (!HandleSvc(env_.pending_svc, "NetworkTest7 CCHttpClient worker"))
+                if (!HandleSvc(env_.pending_svc, "NetworkTest8 CCHttpClient worker"))
                     return false;
                 // HandleSvc leaves PC at the second half of the synthetic SVC/BX-LR
                 // trampoline.  NetworkTest2-4 could save that transient PC at a
@@ -8842,14 +8942,14 @@ private:
                 // seen in CRYPTO_malloc/CRYPTO_zalloc.  Retire BX LR atomically.
                 CompletePendingStubReturn("after-worker-svc");
             } else if (env_.ticks_left != 0u) {
-                return Fail("NetworkTest7 worker stopped without a trap");
+                return Fail("NetworkTest8 worker stopped without a trap");
             }
         }
 
         CompletePendingStubReturn("before-slice-save");
         if (IsImportStubReturnPc(cpu_.Regs()[15]) || IsVmOrJniStubReturnPc(cpu_.Regs()[15])) {
             DumpImportTrace("unsafe-worker-save-pc", 128u);
-            return Fail("NetworkTest7 refused to save worker inside synthetic stub");
+            return Fail("NetworkTest8 refused to save worker inside synthetic stub");
         }
         cooperative_worker_.regs = cpu_.Regs();
         cooperative_worker_.ext_regs = cpu_.ExtRegs();
@@ -8860,12 +8960,12 @@ private:
             cooperative_worker_.valid = false;
             cooperative_worker_runnable_ = false;
             if (cooperative_worker_done_count_++ < 16u)
-                log_ << "[host] NetworkTest7 worker exited\n";
+                log_ << "[host] NetworkTest8 worker exited\n";
         } else if (cooperative_worker_yielded_) {
             cooperative_worker_runnable_ = false;
             ++cooperative_worker_yield_count_;
             if (network_worker_runs_++ < 128u)
-                log_ << "[host] NetworkTest7 worker waiting for signal"
+                log_ << "[host] NetworkTest8 worker waiting for signal"
                      << " yields=" << cooperative_worker_yield_count_ << '\n';
         } else {
             cooperative_worker_runnable_ = true;
@@ -8873,7 +8973,7 @@ private:
             if (cooperative_worker_slice_yield_count_ <= 128u) {
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - started).count();
-                log_ << "[host] NetworkTest7 worker timeslice yield runs=" << runs
+                log_ << "[host] NetworkTest8 worker timeslice yield runs=" << runs
                      << " elapsed_ms=" << std::fixed << std::setprecision(2)
                      << elapsed_ms
                      << " watchdog=" << (watchdog_preempted ? 1 : 0)
@@ -9701,7 +9801,7 @@ private:
             ++semaphores_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 512u)
-                log_ << "[host] NetworkTest7 semaphore post sem=0x" << std::hex
+                log_ << "[host] NetworkTest8 semaphore post sem=0x" << std::hex
                      << r0 << std::dec << " pending=" << semaphores_[r0]
                      << " wake=deferred-next-frame" << '\n';
             // Do not recursively run the HTTP worker inside the foreground import.
@@ -9719,7 +9819,7 @@ private:
             ++condition_signals_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 512u)
-                log_ << "[host] NetworkTest7 condition signal cond=0x" << std::hex
+                log_ << "[host] NetworkTest8 condition signal cond=0x" << std::hex
                      << r0 << std::dec << " pending=" << condition_signals_[r0]
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
                      << " wake=deferred-next-frame" << '\n';
@@ -9733,7 +9833,7 @@ private:
                 cooperative_worker_yielded_ = true;
                 cooperative_worker_runnable_ = false;
                 if (cooperative_condition_log_count_++ < 128u)
-                    log_ << "[host] NetworkTest7 worker cond-wait cond=0x"
+                    log_ << "[host] NetworkTest8 worker cond-wait cond=0x"
                          << std::hex << r0 << std::dec << '\n';
                 return true; // Re-execute after a future signal token appears.
             } else {
@@ -9883,7 +9983,7 @@ private:
                 text.find("https://") != std::string::npos;
             if (request_like) {
                 ++network_request_marker_count_;
-                log_ << "[trace] NetworkTest7 request-marker #" << network_request_marker_count_
+                log_ << "[trace] NetworkTest8 request-marker #" << network_request_marker_count_
                      << " text=\"" << SanitizeLogText(text) << "\""
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
 #ifdef _WIN32
@@ -10229,13 +10329,12 @@ private:
     u64 native_http_queued_count_=0;
     u64 native_http_completed_count_=0;
     u64 native_http_callback_count_=0;
+    std::atomic<u64> native_http_active_count_{0};
 #ifdef _WIN32
     std::mutex native_http_mutex_;
-    std::condition_variable native_http_condition_;
-    std::deque<NativeHttpJob> native_http_jobs_;
+    std::deque<std::string> native_http_trace_;
     std::deque<NativeHttpResult> native_http_results_;
-    std::thread native_http_thread_;
-    bool native_http_stop_=false;
+    std::vector<std::thread> native_http_threads_;
     bool winsock_initialized_=false;
     u32 next_socket_fd_=0x4000u;
     std::unordered_map<u32, SOCKET> sockets_;
@@ -10592,7 +10691,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-networktest7-native-winhttp-bridge debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-networktest8-concurrent-winhttp debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -10858,8 +10957,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest7-native-winhttp-bridge");
-        emit("NetworkTest7: native WinHTTP bridge at CCHttpClient::send; guest pthread, libcurl, OpenSSL, DNS, and sockets bypassed");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest8-concurrent-winhttp");
+        emit("NetworkTest8: concurrent direct WinHTTP bridge with independent request threads, stage tracing, short timeouts, and automatic form POST headers");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -10871,7 +10970,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaNetworkTest7 must be compiled as a 64-bit executable");
+                "V22BetaNetworkTest8 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -10879,7 +10978,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST7_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST8_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -11153,8 +11252,10 @@ int main(int argc,char** argv) {
              std::to_string(browser_hooks));
         emit("RESULT: DYNARMIC_V22_NATIVE_HTTP_BRIDGE_READY count="+
              std::to_string(native_http_hooks)+
-             " boundary=CCHttpClient::send transport=WinHTTP host-thread=1 "
-             "guest-pthread=unused guest-curl=unused guest-openssl=unused");
+             " boundary=CCHttpClient::send transport=WinHTTP "
+             "concurrency=per-request proxy=none "
+             "form-content-type=automatic guest-pthread=unused "
+             "guest-curl=unused guest-openssl=unused");
         emit("RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count="+
              std::to_string(inflate_hooks)+
              " codec=gzip+zlib+raw original-cpp-decompress=1 hidden-sret=guest-native");
@@ -11724,7 +11825,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest7 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest8 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -11776,11 +11877,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST7_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST8_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST7_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST8_FAILED");
         return 1;
     }
 }

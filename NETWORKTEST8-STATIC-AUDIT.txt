@@ -1,0 +1,16 @@
+PASS branch marker
+PASS per request threads
+PASS no serial condition queue
+PASS direct no proxy
+PASS bounded timeouts
+PASS automatic form content type
+PASS stage trace thread start
+PASS stage trace connect
+PASS stage trace receive
+PASS stage trace errors
+PASS trace queue pumped on main thread
+PASS callback remains main-thread pump
+PASS winhttp linked
+PASS networktest8 output
+PASS networktest8 log
+ALL CHECKS PASS

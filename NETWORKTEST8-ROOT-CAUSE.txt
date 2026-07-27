@@ -1,0 +1,21 @@
+NETWORKTEST8 ROOT-CAUSE ANALYSIS
+================================
+
+Observed NetworkTest7 runtime totals:
+- native-http-queued=3
+- native-http-completed=0
+- native-http-callbacks=0
+
+The first request was queued around frame 219 and the process ended around frame
+1708. At roughly 60 FPS, the first request had only about 25 seconds to run.
+NetworkTest7 used one serial WinHTTP worker and a 60-second receive timeout.
+Therefore one stalled GDPS request could occupy the only worker for the entire
+session while later Boomlings requests remained queued behind it.
+
+NetworkTest8 removes that head-of-line blocking:
+- one independent host thread per request;
+- direct WinHTTP connection (no proxy auto-discovery);
+- resolve/connect/send/receive timeouts of 5/5/10/15 seconds;
+- automatic application/x-www-form-urlencoded Content-Type for POST/PUT;
+- transport stage/error messages are queued back to the main log;
+- completed callbacks still execute on the main frame thread.

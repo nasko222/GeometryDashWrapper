@@ -1,0 +1,137 @@
+{
+  "base": "NetworkTest7 native WinHTTP bridge",
+  "target": "NetworkTest8 concurrent WinHTTP",
+  "source_files": 21,
+  "identical_source_files": 20,
+  "changed_source_files": [
+    "src/dynarmic_probe.cpp"
+  ],
+  "rows": [
+    {
+      "path": "src/apk_extract_audio.c",
+      "identical": true,
+      "base_sha256": "8fde56a2fc8937420faf4c3d0cee1e88e6089182eb657e79d30a646d254ad896",
+      "final_sha256": "8fde56a2fc8937420faf4c3d0cee1e88e6089182eb657e79d30a646d254ad896"
+    },
+    {
+      "path": "src/arm_probe.c",
+      "identical": true,
+      "base_sha256": "c0bc7d0aa5ec898cd64c55d3eeef47abc1cfec13123a057c4b4c0b43ddc33463",
+      "final_sha256": "c0bc7d0aa5ec898cd64c55d3eeef47abc1cfec13123a057c4b4c0b43ddc33463"
+    },
+    {
+      "path": "src/arm_wrapper.c",
+      "identical": true,
+      "base_sha256": "910eff8855bf234d6b343ed768f98ed163384b242de1f9b5d3c0630939808af4",
+      "final_sha256": "910eff8855bf234d6b343ed768f98ed163384b242de1f9b5d3c0630939808af4"
+    },
+    {
+      "path": "src/audio_win.c",
+      "identical": true,
+      "base_sha256": "344038ab2409da2ec55af372cd61c31b1178f1bf91701e103cb8f93cb81df238",
+      "final_sha256": "344038ab2409da2ec55af372cd61c31b1178f1bf91701e103cb8f93cb81df238"
+    },
+    {
+      "path": "src/audio_win.h",
+      "identical": true,
+      "base_sha256": "9391fa578e4e32ed2089bf7020e2c0bc13e0227cdab87296c1d617a11e43d840",
+      "final_sha256": "9391fa578e4e32ed2089bf7020e2c0bc13e0227cdab87296c1d617a11e43d840"
+    },
+    {
+      "path": "src/bionic_x86.S",
+      "identical": true,
+      "base_sha256": "8f32f29e95063a0c6825d8cdcaca0cba9022114ebf371dddb803811373191a4c",
+      "final_sha256": "8f32f29e95063a0c6825d8cdcaca0cba9022114ebf371dddb803811373191a4c"
+    },
+    {
+      "path": "src/dynarmic_probe.cpp",
+      "identical": false,
+      "base_sha256": "bf0a972bea76c02090ab8731e066b89571d721f6f6aab7929d30c73b8f09bd1f",
+      "final_sha256": "ff48d2d6a4391bb2a603985866081637cb7e0cc12b83b01cb7192f1dbf7437e1"
+    },
+    {
+      "path": "src/elf32.h",
+      "identical": true,
+      "base_sha256": "c63d23fefc310b57470b55accb70801785435efffb022384269f2837229f7288",
+      "final_sha256": "c63d23fefc310b57470b55accb70801785435efffb022384269f2837229f7288"
+    },
+    {
+      "path": "src/embedded_effects.h",
+      "identical": true,
+      "base_sha256": "4192f57fecf2ae92a7e8f3baa2ee514b1ac24a581fef17b7ebe1fa507defab35",
+      "final_sha256": "4192f57fecf2ae92a7e8f3baa2ee514b1ac24a581fef17b7ebe1fa507defab35"
+    },
+    {
+      "path": "src/embedded_effects_stub.c",
+      "identical": true,
+      "base_sha256": "65bd794c47dc999eba748159195cde661731fb3b3ef2b9dfe00a849d56ab04b1",
+      "final_sha256": "65bd794c47dc999eba748159195cde661731fb3b3ef2b9dfe00a849d56ab04b1"
+    },
+    {
+      "path": "src/fmod_win.c",
+      "identical": true,
+      "base_sha256": "a953e50d4ec1daf37b2aecb2ef402614cbd74c72e7cbd847be4de0a892ff42ad",
+      "final_sha256": "a953e50d4ec1daf37b2aecb2ef402614cbd74c72e7cbd847be4de0a892ff42ad"
+    },
+    {
+      "path": "src/fmod_win.h",
+      "identical": true,
+      "base_sha256": "b4021ee8d9f2734753a61bcb46dd46dd13e9634bedd9aa121fc4a01464f894d9",
+      "final_sha256": "b4021ee8d9f2734753a61bcb46dd46dd13e9634bedd9aa121fc4a01464f894d9"
+    },
+    {
+      "path": "src/jni_shim.c",
+      "identical": true,
+      "base_sha256": "b35850cf79bfcae259e1b671f299193093f097f7a568b3fd4aedf7cf3717ef5e",
+      "final_sha256": "b35850cf79bfcae259e1b671f299193093f097f7a568b3fd4aedf7cf3717ef5e"
+    },
+    {
+      "path": "src/jni_shim.h",
+      "identical": true,
+      "base_sha256": "734579595bbaad054f9204a6da5cc935991934ed9079a8361f3ffddeb40c34fa",
+      "final_sha256": "734579595bbaad054f9204a6da5cc935991934ed9079a8361f3ffddeb40c34fa"
+    },
+    {
+      "path": "src/loader.c",
+      "identical": true,
+      "base_sha256": "8a0ec62301a802762d04ae0ae08dab0c481f3cb8690d29e32875c3f8c1746622",
+      "final_sha256": "8a0ec62301a802762d04ae0ae08dab0c481f3cb8690d29e32875c3f8c1746622"
+    },
+    {
+      "path": "src/loader.h",
+      "identical": true,
+      "base_sha256": "fe40c8007ad5444a79b0e22a8d923e66d6fd79d0c9e03665938546bbb609edce",
+      "final_sha256": "fe40c8007ad5444a79b0e22a8d923e66d6fd79d0c9e03665938546bbb609edce"
+    },
+    {
+      "path": "src/main.c",
+      "identical": true,
+      "base_sha256": "69e371db376566fa9d1a1406fac534c1c5db30b77a65594a22c0d3bc2e62a21d",
+      "final_sha256": "69e371db376566fa9d1a1406fac534c1c5db30b77a65594a22c0d3bc2e62a21d"
+    },
+    {
+      "path": "src/runtime.c",
+      "identical": true,
+      "base_sha256": "74e38a940cbf385e8b3afa6daa29286750d8c39bc2f667006239383daaf5b0a9",
+      "final_sha256": "74e38a940cbf385e8b3afa6daa29286750d8c39bc2f667006239383daaf5b0a9"
+    },
+    {
+      "path": "src/runtime.h",
+      "identical": true,
+      "base_sha256": "d1f3fdf2a74caa71fea1d027035a9d641e45f45aea30f554f4126939287f9470",
+      "final_sha256": "d1f3fdf2a74caa71fea1d027035a9d641e45f45aea30f554f4126939287f9470"
+    },
+    {
+      "path": "src/storage_win.c",
+      "identical": true,
+      "base_sha256": "90f21bf5405e725013b4848b5a5242120a1e74db43879f0bed70dbf904344945",
+      "final_sha256": "90f21bf5405e725013b4848b5a5242120a1e74db43879f0bed70dbf904344945"
+    },
+    {
+      "path": "src/storage_win.h",
+      "identical": true,
+      "base_sha256": "0124f70b8b99d66502db553aa345efde5625780cb90d2421062e9f8b3cdd8a05",
+      "final_sha256": "0124f70b8b99d66502db553aa345efde5625780cb90d2421062e9f8b3cdd8a05"
+    }
+  ]
+}

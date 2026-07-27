@@ -1,9 +1,0 @@
-Apply to the root of the NetworkTest4 full source tree:
-
-  patch -p1 < GeometryDashWrapper-0.9.4-arm-v22beta-networktest5-dyn14-exact-network.diff
-
-Or copy the files from the source-update ZIP over NetworkTest4.
-
-Then build on Windows:
-
-  BUILD_V22BETA_X64.cmd game-v22beta-selected.apk

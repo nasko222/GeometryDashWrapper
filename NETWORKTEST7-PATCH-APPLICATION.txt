@@ -1,1 +1,0 @@
-PASS relative git patch applies cleanly to supplied NetworkTest6 tree and produces an exact NetworkTest7 tree match.

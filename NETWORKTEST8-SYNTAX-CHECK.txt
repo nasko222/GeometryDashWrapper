@@ -1,0 +1,12 @@
+NETWORKTEST8 C++20 SYNTAX CHECK
+==============================
+
+Command class:
+  clang++ -std=c++20 -fsyntax-only -Wall -Wextra
+  with the local Dynarmic interface syntax stub and project include paths.
+
+Result: PASS (exit status 0)
+
+Warnings are pre-existing unused-field warnings in the non-Windows syntax path.
+The container does not include the Windows SDK/Zig toolchain, so it cannot link
+the WinHTTP executable here.

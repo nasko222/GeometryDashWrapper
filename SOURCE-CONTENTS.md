@@ -1,8 +1,5 @@
-# Source contents — v22beta NetworkTest7
+# Source contents — v22beta NetworkTest8
 
-Version: `0.9.4-arm-v22beta-networktest7-native-winhttp-bridge`
+Version: `0.9.4-arm-v22beta-networktest8-concurrent-winhttp`
 
-The source archive excludes proprietary APK files, generated executables,
-build directories, and tool caches. It retains the complete wrapper source,
-Dynarmic build scripts, third-party source already present in NetworkTest6,
-and the NetworkTest2–NetworkTest7 diagnostic history.
+This package contains the complete wrapper source and third-party source dependencies already present in NetworkTest7. APK files and generated build outputs are excluded. Runtime changes are limited to the native HTTP bridge in `src/dynarmic_probe.cpp`; the build metadata names the NetworkTest8 output and logs.

@@ -1,0 +1,9 @@
+NETWORKTEST8 PRESERVATION AUDIT
+===============================
+
+Source files checked: 21
+Byte-for-byte identical: 20
+Changed source files: 1
+- src/dynarmic_probe.cpp
+
+Result: PASS

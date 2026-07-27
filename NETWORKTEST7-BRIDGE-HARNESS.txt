@@ -1,4 +1,0 @@
-PASS response-layout-size=0x58 request=0x30 body=0x38 headers=0x44 status=0x50 error=0x54
-PASS request-types=GET,POST,PUT,DELETE unsupported-sentinel=4
-PASS member-pointer-decode=nonvirtual-positive,nonvirtual-negative,virtual
-PASS ownership=1->2->1->0
