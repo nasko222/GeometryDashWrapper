@@ -1,0 +1,6 @@
+Apply these files over the previous networktest source tree.
+Delete the following obsolete files:
+- NETWORKTEST-NOTES.md
+- NETWORKTEST-STATIC-AUDIT.txt
+- NETWORKTEST-SYNTAX-CHECK.txt
+- PACKAGE-VERIFICATION-NETWORKTEST.txt

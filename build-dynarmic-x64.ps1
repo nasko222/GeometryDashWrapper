@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-networktest"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-networktest2-async-dns"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder32-v22beta-networktest"
+$BuilderRevision = "dynarmic-x64-builder33-v22beta-networktest2-async-dns"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -436,7 +436,7 @@ if ([string]::IsNullOrWhiteSpace($ResolvedApk)) {
 if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK not found: $ResolvedApk" }
 $InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
 if ($InputExtension -ne ".apk") {
-    throw "NetworkTest accepts an APK input, not a raw .so or donor package: $ResolvedApk"
+    throw "NetworkTest2 accepts an APK input, not a raw .so or donor package: $ResolvedApk"
 }
 $PackagedInputName = "game-v22beta-selected.apk"
 $InputBytes = (Get-Item -LiteralPath $ResolvedApk).Length
@@ -451,8 +451,8 @@ $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "NETWORKTEST-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "NETWORKTEST-NOTES.md") }
+$V22Notes = Join-Path $Root "NETWORKTEST2-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "NETWORKTEST2-NOTES.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
 
 $SelectedLauncher = @'
@@ -465,18 +465,18 @@ if not exist game-v22beta-selected.apk (
   pause
   exit /b 2
 )
-GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --companion-hooks=safe --debug-everything --dump-imports=gd-networktest-imports.txt --log=gd-networktest.log --profile=gd-networktest-profile.csv --profile-summary=gd-networktest-profile-summary.txt
+GeometryDashDynarmicProbe.exe game-v22beta-selected.apk --companion-hooks=off --debug-everything --dump-imports=gd-networktest2-imports.txt --log=gd-networktest2.log --profile=gd-networktest2-profile.csv --profile-summary=gd-networktest2-profile-summary.txt
 set "RESULT=%ERRORLEVEL%"
 echo.
-echo Main log: gd-networktest.log
-echo Imports: gd-networktest-imports.txt
+echo Main log: gd-networktest2.log
+echo Imports: gd-networktest2-imports.txt
 pause
 exit /b %RESULT%
 '@
-[IO.File]::WriteAllText((Join-Path $Output "RUN_NETWORKTEST.cmd"), $SelectedLauncher, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "RUN_NETWORKTEST2.cmd"), $SelectedLauncher, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`nbytes=$InputBytes`r`nsha256=$InputSha256`r`nscope=explicit-v22-apk-own-libraries-no-hash-gate`r`n", [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 2.2 beta ARMv7 NetworkTest branch ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 2.2 beta ARMv7 NetworkTest2 branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
-Write-Host "Run: RUN_NETWORKTEST.cmd"
+Write-Host "Run: RUN_NETWORKTEST2.cmd"

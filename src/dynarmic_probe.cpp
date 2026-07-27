@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -33,6 +34,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <type_traits>
 #include <climits>
@@ -2509,6 +2511,37 @@ struct GuestAddrInfoAllocation {
     std::vector<u32> blocks;
 };
 
+#ifdef _WIN32
+enum class AsyncDnsKind { AddrInfo, HostByName };
+
+struct HostAddrInfoRecord {
+    int flags = 0;
+    int family = AF_UNSPEC;
+    int socktype = 0;
+    int protocol = 0;
+    std::vector<u8> address;
+    std::string canonical;
+};
+
+static std::atomic<u32> g_async_dns_threads_active{0};
+
+struct AsyncDnsRequest {
+    AsyncDnsKind kind = AsyncDnsKind::AddrInfo;
+    std::string node;
+    std::string service;
+    bool has_hints = false;
+    int flags = 0;
+    int family = AF_UNSPEC;
+    int socktype = 0;
+    int protocol = 0;
+    std::chrono::steady_clock::time_point started{};
+    std::atomic<int> state{0}; // 0=pending, 1=finished
+    std::atomic<int> code{EAI_AGAIN};
+    std::mutex mutex;
+    std::vector<HostAddrInfoRecord> records;
+};
+#endif
+
 struct GuestPollFd {
     s32 fd;
     std::int16_t events;
@@ -2587,7 +2620,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaNetworkTestWindow";
+        const char* class_name = "GeometryDashV22BetaNetworkTest22Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2599,7 +2632,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - NetworkTest2",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3124,7 +3157,23 @@ public:
             closesocket(host_socket);
         }
         sockets_.clear();
-        if (winsock_initialized_) { WSACleanup(); winsock_initialized_ = false; }
+        if (async_dns_ || async_dns_queued_count_ || async_dns_timeout_count_) {
+            log_ << "RESULT: DYNARMIC_NETWORKTEST2_DNS_TOTALS queued="
+                 << async_dns_queued_count_ << " completed="
+                 << async_dns_completed_count_ << " timed_out="
+                 << async_dns_timeout_count_ << " native_threads="
+                 << g_async_dns_threads_active.load(std::memory_order_relaxed)
+                 << '\n';
+            log_.flush();
+        }
+        if (winsock_initialized_) {
+            // A timed-out detached resolver may still be inside WinSock. The
+            // process owns this one WinSock lifetime, so skip WSACleanup while
+            // a resolver thread remains active and let process teardown clean it.
+            if (g_async_dns_threads_active.load(std::memory_order_relaxed) == 0u)
+                WSACleanup();
+            winsock_initialized_ = false;
+        }
 #endif
         if (audio_initialized_) {
             audio_shutdown();
@@ -3256,7 +3305,10 @@ public:
             << " pending-cond-objects=" << condition_signals_.size();
 #ifdef _WIN32
         out << " sockets=" << sockets_.size()
-            << " network-log-events=" << network_log_count_;
+            << " network-log-events=" << network_log_count_
+            << " dns-queued=" << async_dns_queued_count_
+            << " dns-completed=" << async_dns_completed_count_
+            << " dns-timeouts=" << async_dns_timeout_count_;
 #endif
         return out.str();
     }
@@ -3755,6 +3807,9 @@ public:
     }
 
     bool PumpNetworkWorkerFrame() {
+#ifdef _WIN32
+        UpdateAsyncDnsWorkerState();
+#endif
         return PumpCooperativeWorkerSlice("frame-pump");
     }
 
@@ -7255,6 +7310,360 @@ private:
         socket_receive_logged_.erase(guest_fd);
         return code == 0 ? 0u : SocketFailure();
     }
+    struct GuestDnsHints {
+        bool present = false;
+        int flags = 0;
+        int family = AF_UNSPEC;
+        int socktype = 0;
+        int protocol = 0;
+    };
+
+    GuestDnsHints ReadGuestDnsHints(u32 hints_address) {
+        GuestDnsHints output;
+        if (!hints_address) return output;
+        output.present = true;
+        const u32 guest_flags = env_.MemoryRead32(hints_address + 0u);
+        if (guest_flags & 0x001u) output.flags |= AI_PASSIVE;
+        if (guest_flags & 0x002u) output.flags |= AI_CANONNAME;
+        if (guest_flags & 0x004u) output.flags |= AI_NUMERICHOST;
+#ifdef AI_NUMERICSERV
+        if (guest_flags & 0x400u) output.flags |= AI_NUMERICSERV;
+#endif
+        output.family = HostAddressFamily(
+            static_cast<int>(env_.MemoryRead32(hints_address + 4u)));
+        output.socktype = static_cast<int>(env_.MemoryRead32(hints_address + 8u));
+        output.protocol = static_cast<int>(env_.MemoryRead32(hints_address + 12u));
+        return output;
+    }
+
+    static std::vector<HostAddrInfoRecord> CopyHostAddrInfo(addrinfo* results) {
+        std::vector<HostAddrInfoRecord> records;
+        for (addrinfo* item = results; item; item = item->ai_next) {
+            if (!item->ai_addr || item->ai_addrlen <= 0 ||
+                item->ai_addrlen > static_cast<int>(sizeof(sockaddr_storage)))
+                continue;
+            HostAddrInfoRecord record;
+            record.flags = item->ai_flags;
+            record.family = item->ai_family;
+            record.socktype = item->ai_socktype;
+            record.protocol = item->ai_protocol;
+            const auto* first = reinterpret_cast<const u8*>(item->ai_addr);
+            record.address.assign(first, first + item->ai_addrlen);
+            if (item->ai_canonname) record.canonical = item->ai_canonname;
+            records.push_back(std::move(record));
+        }
+        return records;
+    }
+
+    void StartAsyncDns(AsyncDnsKind kind, const std::string& node,
+                       const std::string& service, const GuestDnsHints& hints) {
+        auto request = std::make_shared<AsyncDnsRequest>();
+        request->kind = kind;
+        request->node = node;
+        request->service = service;
+        request->has_hints = hints.present;
+        request->flags = hints.flags;
+        request->family = hints.family;
+        request->socktype = hints.socktype;
+        request->protocol = hints.protocol;
+        request->started = std::chrono::steady_clock::now();
+        async_dns_ = request;
+        async_dns_timeout_reported_ = false;
+        async_dns_ready_reported_ = false;
+        ++async_dns_queued_count_;
+
+        log_ << "[host] NetworkTest2 DNS queued kind="
+             << (kind == AsyncDnsKind::AddrInfo ? "getaddrinfo" : "gethostbyname")
+             << " node=" << (node.empty() ? "<null>" : node)
+             << " service=" << (service.empty() ? "<null>" : service)
+             << " worker-pc=0x" << std::hex << cpu_.Regs()[15] << std::dec << '\n';
+        log_.flush();
+
+        g_async_dns_threads_active.fetch_add(1u, std::memory_order_relaxed);
+        std::thread([request] {
+            addrinfo host_hints{};
+            addrinfo* hints_pointer = nullptr;
+            if (request->has_hints) {
+                host_hints.ai_flags = request->flags;
+                host_hints.ai_family = request->family;
+                host_hints.ai_socktype = request->socktype;
+                host_hints.ai_protocol = request->protocol;
+                hints_pointer = &host_hints;
+            }
+            addrinfo* results = nullptr;
+            const int code = ::getaddrinfo(
+                request->node.empty() ? nullptr : request->node.c_str(),
+                request->service.empty() ? nullptr : request->service.c_str(),
+                hints_pointer, &results);
+            std::vector<HostAddrInfoRecord> copied;
+            if (code == 0 && results) copied = CopyHostAddrInfo(results);
+            if (results) ::freeaddrinfo(results);
+            {
+                std::lock_guard<std::mutex> lock(request->mutex);
+                request->records = std::move(copied);
+                request->code.store(code, std::memory_order_relaxed);
+            }
+            request->state.store(1, std::memory_order_release);
+            g_async_dns_threads_active.fetch_sub(1u, std::memory_order_relaxed);
+        }).detach();
+    }
+
+    bool AsyncDnsMatches(AsyncDnsKind kind, const std::string& node,
+                         const std::string& service,
+                         const GuestDnsHints& hints) const {
+        if (!async_dns_) return false;
+        return async_dns_->kind == kind && async_dns_->node == node &&
+               async_dns_->service == service &&
+               async_dns_->has_hints == hints.present &&
+               async_dns_->flags == hints.flags &&
+               async_dns_->family == hints.family &&
+               async_dns_->socktype == hints.socktype &&
+               async_dns_->protocol == hints.protocol;
+    }
+
+    bool AsyncDnsTimedOut() const {
+        return async_dns_ && async_dns_->state.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() - async_dns_->started >=
+                   std::chrono::seconds(8);
+    }
+
+    void UpdateAsyncDnsWorkerState() {
+        if (!async_dns_) return;
+        const bool finished =
+            async_dns_->state.load(std::memory_order_acquire) != 0;
+        const bool timed_out = AsyncDnsTimedOut();
+        if (!finished && !timed_out) return;
+        cooperative_worker_runnable_ = cooperative_worker_.valid;
+        if (finished && !async_dns_ready_reported_) {
+            async_dns_ready_reported_ = true;
+            log_ << "[host] NetworkTest2 DNS completion ready code="
+                 << async_dns_->code.load(std::memory_order_relaxed)
+                 << " resume-next-frame=1\n";
+            log_.flush();
+        } else if (timed_out && !async_dns_timeout_reported_) {
+            async_dns_timeout_reported_ = true;
+            log_ << "[host] NetworkTest2 DNS timeout after 8000 ms; "
+                    "resume guest with EAI_AGAIN\n";
+            log_.flush();
+        }
+    }
+
+    u32 CommitGuestAddrInfoRecords(const std::vector<HostAddrInfoRecord>& records,
+                                   u32 result_address) {
+        if (!result_address) return static_cast<u32>(EAI_FAIL);
+        env_.MemoryWrite32(result_address, 0u);
+        GuestAddrInfoAllocation allocation;
+        u32 first = 0u, previous = 0u;
+        for (const HostAddrInfoRecord& item : records) {
+            if (item.address.empty() ||
+                item.address.size() > sizeof(sockaddr_storage))
+                continue;
+            const u32 node_block = Allocate(32u);
+            const u32 address_block = Allocate(
+                static_cast<u32>(item.address.size()));
+            if (!node_block || !address_block) break;
+            allocation.blocks.push_back(node_block);
+            allocation.blocks.push_back(address_block);
+            std::vector<u8> address_bytes = item.address;
+            const u16 family = static_cast<u16>(GuestAddressFamily(item.family));
+            if (address_bytes.size() >= sizeof(family))
+                std::memcpy(address_bytes.data(), &family, sizeof(family));
+            env_.WriteBytes(address_block, address_bytes.data(),
+                            address_bytes.size());
+            u32 canonical = 0u;
+            if (!item.canonical.empty()) {
+                canonical = AllocateString(item.canonical);
+                if (canonical) allocation.blocks.push_back(canonical);
+            }
+            env_.MemoryWrite32(node_block + 0u, static_cast<u32>(item.flags));
+            env_.MemoryWrite32(node_block + 4u,
+                               static_cast<u32>(GuestAddressFamily(item.family)));
+            env_.MemoryWrite32(node_block + 8u,
+                               static_cast<u32>(item.socktype));
+            env_.MemoryWrite32(node_block + 12u,
+                               static_cast<u32>(item.protocol));
+            env_.MemoryWrite32(node_block + 16u,
+                               static_cast<u32>(item.address.size()));
+            env_.MemoryWrite32(node_block + 20u, canonical);
+            env_.MemoryWrite32(node_block + 24u, address_block);
+            env_.MemoryWrite32(node_block + 28u, 0u);
+            if (!first) first = node_block;
+            if (previous) env_.MemoryWrite32(previous + 28u, node_block);
+            previous = node_block;
+        }
+        if (!first) {
+            for (u32 block : allocation.blocks) Free(block);
+            return static_cast<u32>(EAI_MEMORY);
+        }
+        guest_addrinfo_[first] = std::move(allocation);
+        env_.MemoryWrite32(result_address, first);
+        return 0u;
+    }
+
+    u32 CommitGuestHostEntRecords(const std::string& name,
+                                  const std::vector<HostAddrInfoRecord>& records) {
+        FreeGuestHostEnt();
+        std::vector<std::array<u8, 4>> addresses;
+        for (const HostAddrInfoRecord& item : records) {
+            if (item.family != AF_INET ||
+                item.address.size() < sizeof(sockaddr_in))
+                continue;
+            const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(
+                item.address.data());
+            std::array<u8, 4> bytes{};
+            std::memcpy(bytes.data(), &ipv4->sin_addr, bytes.size());
+            if (std::find(addresses.begin(), addresses.end(), bytes) ==
+                addresses.end())
+                addresses.push_back(bytes);
+        }
+        if (addresses.empty()) {
+            SetGuestErrno(2);
+            return 0u;
+        }
+        auto allocate_block = [&](u32 size) -> u32 {
+            const u32 block = Allocate(size);
+            if (block) guest_hostent_.blocks.push_back(block);
+            return block;
+        };
+        const u32 canonical = AllocateString(name);
+        if (canonical) guest_hostent_.blocks.push_back(canonical);
+        const u32 aliases = allocate_block(4u);
+        const u32 address_list = allocate_block(
+            static_cast<u32>((addresses.size() + 1u) * sizeof(u32)));
+        const u32 hostent = allocate_block(20u);
+        if (!canonical || !aliases || !address_list || !hostent) {
+            FreeGuestHostEnt();
+            SetGuestErrno(12);
+            return 0u;
+        }
+        env_.MemoryWrite32(aliases, 0u);
+        for (std::size_t index = 0; index < addresses.size(); ++index) {
+            const u32 address_block = allocate_block(4u);
+            if (!address_block) {
+                FreeGuestHostEnt();
+                SetGuestErrno(12);
+                return 0u;
+            }
+            env_.WriteBytes(address_block, addresses[index].data(), 4u);
+            env_.MemoryWrite32(
+                address_list + static_cast<u32>(index * 4u), address_block);
+        }
+        env_.MemoryWrite32(
+            address_list + static_cast<u32>(addresses.size() * 4u), 0u);
+        env_.MemoryWrite32(hostent + 0u, canonical);
+        env_.MemoryWrite32(hostent + 4u, aliases);
+        env_.MemoryWrite32(hostent + 8u, 2u);
+        env_.MemoryWrite32(hostent + 12u, 4u);
+        env_.MemoryWrite32(hostent + 16u, address_list);
+        guest_hostent_address_ = hostent;
+        SetGuestErrno(0);
+        return hostent;
+    }
+
+    bool DispatchAsyncGetAddrInfo(u32 node_address, u32 service_address,
+                                  u32 hints_address, u32 result_address,
+                                  u32& result) {
+        const std::string node = ReadCString(node_address);
+        const std::string service = ReadCString(service_address);
+        const GuestDnsHints hints = ReadGuestDnsHints(hints_address);
+        if (!AsyncDnsMatches(AsyncDnsKind::AddrInfo, node, service, hints)) {
+            if (async_dns_ &&
+                async_dns_->state.load(std::memory_order_acquire) == 0 &&
+                !AsyncDnsTimedOut()) {
+                cooperative_worker_yielded_ = true;
+                cooperative_worker_runnable_ = false;
+                return false;
+            }
+            async_dns_.reset();
+            StartAsyncDns(AsyncDnsKind::AddrInfo, node, service, hints);
+            cooperative_worker_yielded_ = true;
+            cooperative_worker_runnable_ = false;
+            return false;
+        }
+        if (AsyncDnsTimedOut()) {
+            result = static_cast<u32>(EAI_AGAIN);
+            ++async_dns_timeout_count_;
+            async_dns_.reset();
+            return true;
+        }
+        if (async_dns_->state.load(std::memory_order_acquire) == 0) {
+            cooperative_worker_yielded_ = true;
+            cooperative_worker_runnable_ = false;
+            return false;
+        }
+        int code = EAI_FAIL;
+        std::vector<HostAddrInfoRecord> records;
+        {
+            std::lock_guard<std::mutex> lock(async_dns_->mutex);
+            code = async_dns_->code.load(std::memory_order_relaxed);
+            records = async_dns_->records;
+        }
+        if (code == 0) result = CommitGuestAddrInfoRecords(records, result_address);
+        else result = static_cast<u32>(code);
+        log_ << "[host] NetworkTest2 DNS delivered kind=getaddrinfo node="
+             << (node.empty() ? "<null>" : node) << " result="
+             << static_cast<s32>(result) << " records=" << records.size() << '\n';
+        log_.flush();
+        ++async_dns_completed_count_;
+        async_dns_.reset();
+        return true;
+    }
+
+    bool DispatchAsyncGetHostByName(u32 name_address, u32& result) {
+        const std::string node = ReadCString(name_address);
+        if (node.empty()) {
+            SetGuestErrno(22);
+            result = 0u;
+            return true;
+        }
+        GuestDnsHints hints;
+        hints.present = true;
+        hints.family = AF_INET;
+        hints.socktype = SOCK_STREAM;
+        if (!AsyncDnsMatches(AsyncDnsKind::HostByName, node, {}, hints)) {
+            if (async_dns_ &&
+                async_dns_->state.load(std::memory_order_acquire) == 0 &&
+                !AsyncDnsTimedOut()) {
+                cooperative_worker_yielded_ = true;
+                cooperative_worker_runnable_ = false;
+                return false;
+            }
+            async_dns_.reset();
+            StartAsyncDns(AsyncDnsKind::HostByName, node, {}, hints);
+            cooperative_worker_yielded_ = true;
+            cooperative_worker_runnable_ = false;
+            return false;
+        }
+        if (AsyncDnsTimedOut()) {
+            SetGuestErrno(2);
+            result = 0u;
+            ++async_dns_timeout_count_;
+            async_dns_.reset();
+            return true;
+        }
+        if (async_dns_->state.load(std::memory_order_acquire) == 0) {
+            cooperative_worker_yielded_ = true;
+            cooperative_worker_runnable_ = false;
+            return false;
+        }
+        int code = EAI_FAIL;
+        std::vector<HostAddrInfoRecord> records;
+        {
+            std::lock_guard<std::mutex> lock(async_dns_->mutex);
+            code = async_dns_->code.load(std::memory_order_relaxed);
+            records = async_dns_->records;
+        }
+        result = code == 0 ? CommitGuestHostEntRecords(node, records) : 0u;
+        if (code != 0) SetGuestErrno(2);
+        log_ << "[host] NetworkTest2 DNS delivered kind=gethostbyname node="
+             << node << " result=" << code << " records=" << records.size()
+             << '\n';
+        log_.flush();
+        ++async_dns_completed_count_;
+        async_dns_.reset();
+        return true;
+    }
+
     u32 GuestGetAddrInfo(u32 node_address, u32 service_address, u32 hints_address, u32 result_address) {
         if (!result_address) return static_cast<u32>(EAI_FAIL);
         env_.MemoryWrite32(result_address, 0u);
@@ -7406,6 +7815,8 @@ private:
         if (!ReadGuestSockaddr(address, length, storage, storage_length))
             return static_cast<u32>(EAI_FAIL);
         int flags = 0;
+        if (running_cooperative_worker_)
+            flags |= NI_NUMERICHOST | NI_NUMERICSERV;
         if (guest_flags & 0x01u) flags |= NI_NOFQDN;
         if (guest_flags & 0x02u) flags |= NI_NUMERICHOST;
         if (guest_flags & 0x04u) flags |= NI_NAMEREQD;
@@ -7546,7 +7957,7 @@ private:
         cooperative_worker_done_ = false;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
         ++cooperative_worker_registered_count_;
-        log_ << "[host] NetworkTest guest worker registered at 0x" << std::hex << start_routine
+        log_ << "[host] NetworkTest2 guest worker registered at 0x" << std::hex << start_routine
              << " arg=0x" << argument << std::dec
              << " scheduling=frame-sliced" << '\n';
         log_.flush();
@@ -7557,13 +7968,15 @@ private:
         if (!cooperative_worker_.valid || running_cooperative_worker_ ||
             !cooperative_worker_runnable_) return true;
 
-        constexpr u32 kTicksPerRun = 100000u;
-        constexpr u32 kMaximumRunsPerSlice = 24u;
-        constexpr auto kMaximumSlice = std::chrono::milliseconds(3);
+        constexpr u32 kTicksPerRun = 25000u;
+        constexpr u32 kMaximumRunsPerSlice = 12u;
+        constexpr auto kMaximumSlice = std::chrono::milliseconds(2);
         const u64 resume_number = ++cooperative_worker_resume_count_;
         if (resume_number <= 128u) {
-            log_ << "[host] NetworkTest worker slice #" << resume_number
-                 << " trigger=" << (trigger ? trigger : "unspecified") << '\n';
+            log_ << "[host] NetworkTest2 worker slice #" << resume_number
+                 << " trigger=" << (trigger ? trigger : "unspecified")
+                 << " pc=0x" << std::hex << cooperative_worker_.regs[15]
+                 << " lr=0x" << cooperative_worker_.regs[14] << std::dec << '\n';
             log_.flush();
         }
 
@@ -7597,18 +8010,18 @@ private:
             env_.ticks_left = kTicksPerRun;
             cpu_.Run();
             cpu_.ClearHalt(kCallbackHalt);
-            if (env_.invalid_access) return Fail("NetworkTest worker invalid guest memory");
-            if (env_.interpreter_fallback) return Fail("NetworkTest worker interpreter fallback");
-            if (env_.exception_seen) return Fail("NetworkTest worker guest exception");
+            if (env_.invalid_access) return Fail("NetworkTest2 worker invalid guest memory");
+            if (env_.interpreter_fallback) return Fail("NetworkTest2 worker interpreter fallback");
+            if (env_.exception_seen) return Fail("NetworkTest2 worker guest exception");
             if (env_.svc_pending) {
                 if (env_.pending_svc == kSvcReturn) {
                     cooperative_worker_done_ = true;
                     break;
                 }
-                if (!HandleSvc(env_.pending_svc, "NetworkTest CCHttpClient worker"))
+                if (!HandleSvc(env_.pending_svc, "NetworkTest2 CCHttpClient worker"))
                     return false;
             } else if (env_.ticks_left != 0u) {
-                return Fail("NetworkTest worker stopped without a trap");
+                return Fail("NetworkTest2 worker stopped without a trap");
             }
         }
 
@@ -7621,12 +8034,12 @@ private:
             cooperative_worker_.valid = false;
             cooperative_worker_runnable_ = false;
             if (cooperative_worker_done_count_++ < 16u)
-                log_ << "[host] NetworkTest worker exited\n";
+                log_ << "[host] NetworkTest2 worker exited\n";
         } else if (cooperative_worker_yielded_) {
             cooperative_worker_runnable_ = false;
             ++cooperative_worker_yield_count_;
             if (network_worker_runs_++ < 128u)
-                log_ << "[host] NetworkTest worker waiting for signal"
+                log_ << "[host] NetworkTest2 worker waiting for signal"
                      << " yields=" << cooperative_worker_yield_count_ << '\n';
         } else {
             cooperative_worker_runnable_ = true;
@@ -7634,7 +8047,7 @@ private:
             if (cooperative_worker_slice_yield_count_ <= 128u) {
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - started).count();
-                log_ << "[host] NetworkTest worker timeslice yield runs=" << runs
+                log_ << "[host] NetworkTest2 worker timeslice yield runs=" << runs
                      << " elapsed_ms=" << std::fixed << std::setprecision(2)
                      << elapsed_ms << '\n';
             }
@@ -8452,7 +8865,7 @@ private:
             ++semaphores_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 128u)
-                log_ << "[host] NetworkTest semaphore post sem=0x" << std::hex
+                log_ << "[host] NetworkTest2 semaphore post sem=0x" << std::hex
                      << r0 << std::dec << " pending=" << semaphores_[r0] << '\n';
             result = 0;
         } else if (name == "pthread_cond_init") {
@@ -8466,7 +8879,7 @@ private:
             ++condition_signals_[r0];
             cooperative_worker_runnable_ = cooperative_worker_.valid;
             if (cooperative_condition_log_count_++ < 128u)
-                log_ << "[host] NetworkTest condition signal cond=0x" << std::hex
+                log_ << "[host] NetworkTest2 condition signal cond=0x" << std::hex
                      << r0 << std::dec << " pending=" << condition_signals_[r0]
                      << " worker-valid=" << (cooperative_worker_.valid ? 1 : 0)
                      << '\n';
@@ -8480,7 +8893,7 @@ private:
                 cooperative_worker_yielded_ = true;
                 cooperative_worker_runnable_ = false;
                 if (cooperative_condition_log_count_++ < 128u)
-                    log_ << "[host] NetworkTest worker cond-wait cond=0x"
+                    log_ << "[host] NetworkTest2 worker cond-wait cond=0x"
                          << std::hex << r0 << std::dec << '\n';
                 return true; // Re-execute after a future signal token appears.
             } else {
@@ -8744,7 +9157,12 @@ private:
 #endif
         } else if (name == "getaddrinfo") {
 #ifdef _WIN32
-            result = GuestGetAddrInfo(r0, r1, r2, r3);
+            if (running_cooperative_worker_) {
+                if (!DispatchAsyncGetAddrInfo(r0, r1, r2, r3, result))
+                    return true; // Keep PC on import stub until native DNS completes.
+            } else {
+                result = GuestGetAddrInfo(r0, r1, r2, r3);
+            }
 #else
             result = static_cast<u32>(-1);
 #endif
@@ -8768,7 +9186,12 @@ private:
 #endif
         } else if (name == "gethostbyname") {
 #ifdef _WIN32
-            result = GuestGetHostByName(r0);
+            if (running_cooperative_worker_) {
+                if (!DispatchAsyncGetHostByName(r0, result))
+                    return true; // Re-execute after async resolver completion.
+            } else {
+                result = GuestGetHostByName(r0);
+            }
 #else
             result = 0;
 #endif
@@ -8937,6 +9360,12 @@ private:
     std::unordered_set<u32> socket_send_logged_;
     std::unordered_set<u32> socket_receive_logged_;
     std::unordered_map<u32, GuestAddrInfoAllocation> guest_addrinfo_;
+    std::shared_ptr<AsyncDnsRequest> async_dns_;
+    bool async_dns_timeout_reported_=false;
+    bool async_dns_ready_reported_=false;
+    u64 async_dns_queued_count_=0;
+    u64 async_dns_completed_count_=0;
+    u64 async_dns_timeout_count_=0;
     GuestAddrInfoAllocation guest_hostent_;
     u32 guest_hostent_address_=0;
     u64 network_log_count_=0;
@@ -9280,7 +9709,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-networktest debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-networktest2-async-dns debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -9534,8 +9963,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest");
-        emit("NetworkTest: nonblocking sockets and frame-sliced v22 beta HTTP worker");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-networktest2-async-dns");
+        emit("NetworkTest2: async native DNS, nonblocking sockets, and frame-sliced v22 beta HTTP worker");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -9547,7 +9976,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaNetworkTest must be compiled as a 64-bit executable");
+                "V22BetaNetworkTest2 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -9555,7 +9984,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -10391,7 +10820,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - NetworkTest2 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -10443,11 +10872,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_NETWORKTEST2_FAILED");
         return 1;
     }
 }

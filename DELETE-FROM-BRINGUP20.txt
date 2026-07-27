@@ -1,6 +1,0 @@
-When applying this source update over Bringup20, delete these obsolete branch-only files:
-BRINGUP20-STATIC-AUDIT.txt
-BRINGUP20-SYNTAX-CHECK.txt
-CHANGELOG-0.9.4-arm-v22beta-bringup20-dyn14-network.md
-PACKAGE-VERIFICATION.txt
-V22BETA-BRINGUP20-NOTES.md

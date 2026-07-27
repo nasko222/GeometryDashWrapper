@@ -1,0 +1,46 @@
+Geometry Dash ARM Wrapper NetworkTest2 static audit
+==================================================
+
+branch_networktest2_async_dns: PASS
+version_networktest2_async_dns: PASS
+no_apk_in_source: PASS
+no_apk_size_or_sha_allowlist: PASS
+no_donor_apk_logic: PASS
+frame_pump_present: PASS
+no_recursive_worker_resume: PASS
+worker_slice_limit_2ms: PASS
+worker_run_limit_12: PASS
+async_getaddrinfo_thread: PASS
+async_gethostbyname_thread: PASS
+guest_pc_parked_on_dns_import: PASS
+dns_completion_resumes_next_frame: PASS
+dns_timeout_8_seconds: PASS
+getnameinfo_numeric_in_worker: PASS
+connect_einprogress: PASS
+send_wouldblock_eagain: PASS
+recv_wouldblock_eagain: PASS
+worker_poll_cap_1ms: PASS
+socket_forced_nonblocking: PASS
+network_logs_flush_immediately: PASS
+companion_hooks_disabled_in_launcher: PASS
+launcher_RUN_NETWORKTEST2: PASS
+focused_log_gd_networktest2: PASS
+
+Root cause addressed:
+- NetworkTest bounded guest ARM execution, but not time spent inside a host import.
+- The log ended immediately after worker slice #2 began, before the old post-call
+  DNS diagnostic. A synchronous WinSock resolver call on the UI thread could
+  therefore freeze the entire window indefinitely.
+- NetworkTest2 performs resolver work on detached native threads and leaves the
+  guest worker parked on its import stub. The main frame pump wakes it only after
+  completion or the 8-second resolver timeout.
+
+Scope:
+- current v22 beta APK supplied to the builder
+- existing desktop keyboard-pan suppression retained
+- existing local save-v22beta redirection retained
+- editor/companion feature experiments are not the focus of this branch
+
+Limitations:
+- no Windows cross-link or live network test was possible in this environment
+- the Linux syntax pass does not compile _WIN32-only WinSock code

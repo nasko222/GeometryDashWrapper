@@ -1,3 +1,0 @@
-Delete these obsolete generated reports after applying the update:
-BRINGUP17-STATIC-AUDIT.txt
-BRINGUP17-SYNTAX-CHECK.txt
