@@ -4360,8 +4360,8 @@ private:
                         result.error = std::string(
                             "native HTTP thread exception: ") + error.what();
                         QueueNativeHttpTrace(
-                            job.id, "thread-exception error="" +
-                                        SanitizeLogText(result.error) + """);
+                            job.id, "thread-exception error=" +
+                                        SanitizeLogText(result.error));
                     } catch (...) {
                         result.id = job.id;
                         result.client = job.client;
@@ -4371,7 +4371,7 @@ private:
                         result.transport_success = false;
                         result.error = "native HTTP thread unknown exception";
                         QueueNativeHttpTrace(job.id,
-                            "thread-exception error="unknown"");
+                            "thread-exception error=unknown");
                     }
                     {
                         std::lock_guard<std::mutex> lock(native_http_mutex_);
