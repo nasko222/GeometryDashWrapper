@@ -1,17 +1,16 @@
-# Building the ARMv7 wrapper
+# Geometry Dash ARM Wrapper build notes
 
-## Bringup19 selected-APK build
+## Bringup20 v22 beta build
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\game-v22beta-selected.apk"
+BUILD_V22BETA_X64.cmd "D:\path\to\current-v22-beta.apk"
 ```
 
-The portable builder downloads its pinned Zig, CMake, Ninja, Boost and Dynarmic
-dependencies into `.build-tools`, then creates:
+The APK is copied to the output as `game-v22beta-selected.apk`. There is no
+hard-coded APK size/hash allowlist and no donor-library argument.
+
+Output:
 
 ```text
-dist-arm-wrapper-v22beta-bringup19-selected-desktop-network\
+dist-arm-wrapper-v22beta-bringup20-dyn14-network\
 ```
-
-This branch targets the 144,490,721-byte selected APK. It does not package a
-`libgame.so` donor and does not include save-recovery scripts.

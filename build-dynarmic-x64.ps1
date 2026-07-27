@@ -14,7 +14,7 @@ $ToolsRoot = Join-Path $Root ".build-tools"
 $Downloads = Join-Path $ToolsRoot "downloads"
 $BuildRoot = Join-Path $Root "build-cache-windows"
 $BuildDir = Join-Path $BuildRoot "dynarmic-x64-probe"
-$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup19-selected-desktop-network"
+$Output = Join-Path $Root "dist-arm-wrapper-v22beta-bringup20-dyn14-network"
 $DynarmicVersion = "6.7.0"
 $DynarmicRevision = "a41c380246d3d9f9874f0f792d234dc0cc17c180"
 $DynarmicRevisionShort = $DynarmicRevision.Substring(0, 12)
@@ -33,7 +33,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder30-v22beta-armv7-bringup19-selected-desktop-network"
+$BuilderRevision = "dynarmic-x64-builder31-v22beta-armv7-bringup20-dyn14-network"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -430,31 +430,31 @@ if ([string]::IsNullOrWhiteSpace($ResolvedApk)) {
     if (Test-Path $DefaultSelected) { $ResolvedApk = $DefaultSelected }
     elseif (Test-Path $DefaultSelectedAlt) { $ResolvedApk = $DefaultSelectedAlt }
     else {
-        throw "Bringup19 targets the selected 140 MB APK. Pass it to BUILD_V22BETA_X64.cmd."
+        throw "Pass the current v22 beta APK to BUILD_V22BETA_X64.cmd."
     }
 }
-if (-not (Test-Path $ResolvedApk)) { throw "Selected 2.2 beta APK not found: $ResolvedApk" }
+if (-not (Test-Path $ResolvedApk)) { throw "2.2 beta APK not found: $ResolvedApk" }
 $InputExtension = [IO.Path]::GetExtension($ResolvedApk).ToLowerInvariant()
 if ($InputExtension -ne ".apk") {
-    throw "Bringup19 accepts only the selected 140 MB APK, not raw .so files or donor APKs: $ResolvedApk"
+    throw "Bringup20 accepts an APK input, not a raw .so or donor package: $ResolvedApk"
 }
 $PackagedInputName = "game-v22beta-selected.apk"
 $InputBytes = (Get-Item -LiteralPath $ResolvedApk).Length
 $InputSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ResolvedApk).Hash.ToLowerInvariant()
-$ExpectedInputSha256 = "b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1"
-
+Write-Host "Input APK: $InputBytes bytes, SHA-256 $InputSha256" -ForegroundColor DarkGray
 Copy-Item -Force $ResolvedApk (Join-Path $Output $PackagedInputName)
 
-# Bringup19 is intentionally single-APK. The selected APK already contains its
-# matching libgame.so; no cross-APK donor or sidecar is packaged.
+# The temporary 90/95 MB bad compile is intentionally out of scope.  There is
+# no hard-coded size/hash gate: package the APK explicitly supplied by the user
+# and use only its own matching native libraries (no donor APK or sidecar).
 $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) { Copy-Item -Force $License (Join-Path $Output "DYNARMIC-LICENSE.txt") }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) { Copy-Item -Force $BoostLicense (Join-Path $Output "BOOST-LICENSE.txt") }
-$V22Notes = Join-Path $Root "V22BETA-BRINGUP19-NOTES.md"
-if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP19-NOTES.md") }
-$V22Changelog = Join-Path $Root "CHANGELOG-0.9.4-arm-v22beta-bringup19-selected-desktop-network.md"
-if (Test-Path $V22Changelog) { Copy-Item -Force $V22Changelog (Join-Path $Output "CHANGELOG-0.9.4-arm-v22beta-bringup19-selected-desktop-network.md") }
+$V22Notes = Join-Path $Root "V22BETA-BRINGUP20-NOTES.md"
+if (Test-Path $V22Notes) { Copy-Item -Force $V22Notes (Join-Path $Output "V22BETA-BRINGUP20-NOTES.md") }
+$V22Changelog = Join-Path $Root "CHANGELOG-0.9.4-arm-v22beta-bringup20-dyn14-network.md"
+if (Test-Path $V22Changelog) { Copy-Item -Force $V22Changelog (Join-Path $Output "CHANGELOG-0.9.4-arm-v22beta-bringup20-dyn14-network.md") }
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save-v22beta") | Out-Null
 
 $SelectedLauncher = @'
@@ -494,10 +494,10 @@ pause
 exit /b %RESULT%
 '@
 [IO.File]::WriteAllText((Join-Path $Output "RUN_V22_SELECTED_APK_ALL_HOOKS.cmd"), $AllHooksLauncher, [Text.Encoding]::ASCII)
-[IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`nbytes=$InputBytes`r`nsha256=$InputSha256`r`nscope=selected-140mb-apk-only`r`n", [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $Output "PACKAGED-INPUT.txt"), "source=$ResolvedApk`r`nname=$PackagedInputName`r`nbytes=$InputBytes`r`nsha256=$InputSha256`r`nscope=explicit-v22-apk-own-libraries-no-hash-gate`r`n", [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 
-Write-Host "`nDynarmic x64 2.2 beta ARMv7 Bringup19 selected-APK branch ready:" -ForegroundColor Green
+Write-Host "`nDynarmic x64 2.2 beta ARMv7 Bringup20 network branch ready:" -ForegroundColor Green
 Write-Host "  $Output"
 Write-Host "Run: RUN_V22_SELECTED_APK.cmd"
 Write-Host "Experimental full feature profile: RUN_V22_SELECTED_APK_ALL_HOOKS.cmd"

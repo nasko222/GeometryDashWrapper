@@ -1,0 +1,59 @@
+Geometry Dash ARM Wrapper Bringup20 static audit
+===================================================
+
+Latest Bringup19 runtime evidence
+- input APK bytes reported by log: 147466048
+- custom-song request body occurrences for songID 700355: 15
+- cooperative workers registered: 1
+- DNS getaddrinfo events: 0
+- socket connect events: 0
+- first send events: 0
+- first receive events: 0
+- HTTP response-code lines: 0
+- conclusion: the request was queued and a guest worker was created, but the worker was never woken; no network request reached DNS or WinSock.
+
+Synchronization ABI finding
+- current APK imports pthread_create: True
+- current APK imports pthread_cond_wait: True
+- current APK imports pthread_cond_signal: True
+- current APK imports sem_wait: False
+- current APK imports sem_post: False
+- Bringup19 behavior: semaphore wake-up implemented; condition wait/signal returned success without scheduling the worker.
+- Bringup20 behavior: pthread_create bootstrap run + condition signal tokens + cooperative condition wait/yield/resume.
+
+DynarmicTest14 network-path comparison
+- u32 GuestSocket: byte-for-byte function body retained=True
+- u32 GuestConnect: byte-for-byte function body retained=True
+- u32 GuestSend: byte-for-byte function body retained=True
+- u32 GuestReceive: byte-for-byte function body retained=True
+- u32 GuestPoll: byte-for-byte function body retained=True
+- u32 GuestGetAddrInfo: byte-for-byte function body retained=True
+- u32 GuestFreeAddrInfo: byte-for-byte function body retained=True
+- worker execution loop retained and extended only with trigger/yield diagnostics and condition-variable wake support.
+
+Builder/input policy
+- hard-coded ExpectedInputSha256 present: False
+- hard-coded 144490721 byte gate present: False
+- APK extension check retained: True
+- donor APK argument/path present: False
+- packaged input records actual bytes and SHA-256 for diagnostics, but does not reject a changed APK.
+- temporary bad 90/95 MB build is documented as out of scope rather than encoded as a special rejection rule.
+
+Desktop/local behavior retained
+- desktop software-keyboard pan patch present: True
+- mounted-drive legacy migration routine present: False
+- save-v22beta output creation present: True
+
+Source/package checks
+- source payload files before generated reports: 1115
+- APK/.so files in source tree: 0
+- PowerShell here-strings start/end: 3/3
+- PowerShell braces open/close: 72/72
+- PowerShell parentheses open/close: 185/185
+- non-Windows C++20 syntax check: PASS
+- Windows cross-link/runtime test: NOT AVAILABLE in this environment
+
+Patch reproducibility
+- git-am patch applied to clean Bringup19: exact matching tree
+- plain git-apply diff applied to clean Bringup19: exact matching tree
+- syntax check after both applications: PASS

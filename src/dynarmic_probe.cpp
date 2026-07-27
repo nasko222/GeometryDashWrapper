@@ -2587,7 +2587,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup19Window";
+        const char* class_name = "GeometryDashV22BetaBringup20Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2599,7 +2599,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup19",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup20",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -3247,6 +3247,19 @@ public:
     double FrameInterval() const { return frame_interval_; }
     u64 PermissiveStubCalls() const { return permissive_stub_calls_; }
     const std::set<std::string>& PermissiveNames() const { return permissive_names_; }
+    std::string DescribeCooperativeNetwork() const {
+        std::ostringstream out;
+        out << "registered=" << cooperative_worker_registered_count_
+            << " resumes=" << cooperative_worker_resume_count_
+            << " yields=" << cooperative_worker_yield_count_
+            << " exits=" << cooperative_worker_done_count_
+            << " pending-cond-objects=" << condition_signals_.size();
+#ifdef _WIN32
+        out << " sockets=" << sockets_.size()
+            << " network-log-events=" << network_log_count_;
+#endif
+        return out.str();
+    }
     const std::string& LastError() const { return last_error_; }
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
@@ -7603,12 +7616,19 @@ private:
         cooperative_worker_.cpsr = 0x10u | ((start_routine & 1u) ? 0x20u : 0u);
         cooperative_worker_.valid = true;
         if (thread_address) env_.MemoryWrite32(thread_address, next_thread_id_++);
+        ++cooperative_worker_registered_count_;
         log_ << "[host] Cooperative guest worker registered at 0x" << std::hex << start_routine
-             << " arg=0x" << argument << std::dec << '\n';
+             << " arg=0x" << argument << std::dec
+             << " sync=pthread-cond-or-semaphore" << '\n';
         return true;
     }
-    bool ResumeCooperativeWorker() {
+    bool ResumeCooperativeWorker(const char* trigger = "unspecified") {
         if (!cooperative_worker_.valid || running_cooperative_worker_) return true;
+        const u64 resume_number = ++cooperative_worker_resume_count_;
+        if (resume_number <= 64u) {
+            log_ << "[host] Cooperative HTTP worker resume #" << resume_number
+                 << " trigger=" << (trigger ? trigger : "unspecified") << '\n';
+        }
         const auto saved_regs = cpu_.Regs();
         const auto saved_ext = cpu_.ExtRegs();
         const u32 saved_cpsr = cpu_.Cpsr();
@@ -7645,9 +7665,17 @@ private:
         cooperative_worker_.ext_regs = cpu_.ExtRegs();
         cooperative_worker_.cpsr = cpu_.Cpsr();
         cooperative_worker_.fpscr = cpu_.Fpscr();
-        if (cooperative_worker_done_) cooperative_worker_.valid = false;
-        if (cooperative_worker_yielded_ && network_worker_runs_++ < 32u)
-            log_ << "[host] Cooperative HTTP worker idle after processing queued request(s)\n";
+        if (cooperative_worker_done_) {
+            cooperative_worker_.valid = false;
+            if (cooperative_worker_done_count_++ < 16u)
+                log_ << "[host] Cooperative HTTP worker exited\n";
+        }
+        if (cooperative_worker_yielded_) {
+            ++cooperative_worker_yield_count_;
+            if (network_worker_runs_++ < 64u)
+                log_ << "[host] Cooperative HTTP worker idle after processing queued request(s)"
+                     << " yields=" << cooperative_worker_yield_count_ << '\n';
+        }
         return true;
     }
 
@@ -8426,7 +8454,13 @@ private:
         else if (name == "pthread_setspecific") { thread_values_[r0] = r1; result = 0; }
         else if (name == "pthread_getspecific") result = thread_values_[r0];
         else if (name == "pthread_create") {
-            result = InitializeCooperativeWorker(r0, r2, r3) ? 0u : static_cast<u32>(-1);
+            const bool initialized = InitializeCooperativeWorker(r0, r2, r3);
+            cpu_.Regs()[0] = initialized ? 0u : static_cast<u32>(-1);
+            ResumeAfterStub(import.address);
+            // Start once immediately. This covers both common orderings:
+            // thread-create then signal, and queue/signal then lazy thread-create.
+            // With no work, pthread_cond_wait yields back to the main loop.
+            return initialized ? ResumeCooperativeWorker("pthread_create-bootstrap") : true;
         } else if (name == "pthread_exit") {
             if (running_cooperative_worker_) { cooperative_worker_done_ = true; return true; }
             result = 0;
@@ -8445,11 +8479,46 @@ private:
             ++semaphores_[r0];
             cpu_.Regs()[0] = 0u;
             ResumeAfterStub(import.address);
-            return running_cooperative_worker_ ? true : ResumeCooperativeWorker();
+            return running_cooperative_worker_ ? true : ResumeCooperativeWorker("sem_post");
+        } else if (name == "pthread_cond_init") {
+            condition_signals_[r0] = 0u;
+            result = 0;
+        } else if (name == "pthread_cond_destroy") {
+            condition_signals_.erase(r0);
+            result = 0;
+        } else if (name == "pthread_cond_signal" || name == "pthread_cond_broadcast") {
+            // Newer Cocos2d-x builds use a pthread condition variable instead
+            // of the semaphore used by DynarmicTest14-era CCHttpClient.  The
+            // old no-op stub accepted the request but never woke the guest
+            // worker, so no DNS/socket call could ever occur.
+            ++condition_signals_[r0];
+            if (cooperative_condition_log_count_++ < 64u)
+                log_ << "[host] Guest condition signal cond=0x" << std::hex << r0
+                     << std::dec << " pending=" << condition_signals_[r0] << '\n';
+            cpu_.Regs()[0] = 0u;
+            ResumeAfterStub(import.address);
+            return running_cooperative_worker_ ? true : ResumeCooperativeWorker(
+                name == "pthread_cond_broadcast" ? "pthread_cond_broadcast" :
+                                                    "pthread_cond_signal");
+        } else if (name == "pthread_cond_wait") {
+            u32& pending = condition_signals_[r0];
+            if (pending) {
+                --pending;
+                result = 0;
+            } else if (running_cooperative_worker_) {
+                cooperative_worker_yielded_ = true;
+                if (cooperative_condition_log_count_++ < 64u)
+                    log_ << "[host] Cooperative HTTP worker waiting cond=0x"
+                         << std::hex << r0 << std::dec << '\n';
+                return true; // Keep PC on cond_wait until a signal supplies a token.
+            } else {
+                // A foreground wait cannot block the one-thread host loop.
+                // Return success, matching the old permissive behavior.
+                result = 0;
+            }
         } else if (name == "pthread_detach" || name == "pthread_mutex_init" ||
                    name == "pthread_mutex_destroy" || name == "pthread_mutex_lock" ||
-                   name == "pthread_mutex_unlock" || name == "pthread_cond_broadcast" ||
-                   name == "pthread_cond_wait") result = 0;
+                   name == "pthread_mutex_unlock") result = 0;
         else if (name == "gettimeofday") {
             const auto now = std::chrono::system_clock::now();
             const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
@@ -8748,8 +8817,7 @@ private:
         } else if (name == "alarm" || name == "raise" || name == "sigaction" ||
                    name == "sigprocmask" || name == "sched_yield" || name == "usleep" ||
                    name == "pthread_join" || name == "pthread_attr_init" ||
-                   name == "pthread_cond_init" || name == "pthread_cond_destroy" ||
-                   name == "pthread_cond_signal" || name == "pthread_rwlock_init" ||
+                   name == "pthread_rwlock_init" ||
                    name == "pthread_rwlock_destroy" || name == "pthread_rwlock_rdlock" ||
                    name == "pthread_rwlock_wrlock" || name == "pthread_rwlock_unlock" ||
                    name == "__google_potentially_blocking_region_begin" ||
@@ -8809,10 +8877,16 @@ private:
     u32 next_thread_id_=1;
     std::unordered_map<u32,u32> thread_values_;
     std::unordered_map<u32,u32> semaphores_;
+    std::unordered_map<u32,u32> condition_signals_;
     CooperativeWorkerContext cooperative_worker_;
     bool running_cooperative_worker_=false;
     bool cooperative_worker_yielded_=false;
     bool cooperative_worker_done_=false;
+    u64 cooperative_worker_registered_count_=0;
+    u64 cooperative_worker_resume_count_=0;
+    u64 cooperative_worker_yield_count_=0;
+    u64 cooperative_worker_done_count_=0;
+    u64 cooperative_condition_log_count_=0;
     u64 network_worker_runs_=0;
     u64 network_poll_log_count_=0;
     u64 random_state_=1;
@@ -9233,7 +9307,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup19-selected-desktop-network debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup20-dyn14-network debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -9487,9 +9561,9 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup19-selected-desktop-network");
-        emit("Bringup19: selected 140 MB APK, desktop text input, local-only saves, "
-             "and restored GD/custom-song networking");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup20-dyn14-network");
+        emit("Bringup20: current v22 beta APK, desktop text input, local-only saves, "
+             "and DynarmicTest14-style condition-variable networking");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -9501,7 +9575,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup19 must be compiled as a 64-bit executable");
+                "V22BetaBringup20 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -9509,7 +9583,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP19_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -10343,7 +10417,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup19 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup20 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -10382,6 +10456,8 @@ int main(int argc,char** argv) {
              executor.DescribeTopImports(20u,true));
         emit("Dynarmic sampled host import costs: "+
              executor.DescribeTopImportHostSamples(20u));
+        emit("Cooperative network totals: "+
+             executor.DescribeCooperativeNetwork());
         emit("Permissive runtime import calls: "+
              std::to_string(executor.PermissiveStubCalls())+
              " unique="+
@@ -10393,11 +10469,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP19_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP19_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP20_FAILED");
         return 1;
     }
 }
