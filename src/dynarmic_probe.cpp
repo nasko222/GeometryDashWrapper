@@ -4041,7 +4041,19 @@ private:
               std::to_string(job.body.size()) + " headers=" +
               std::to_string(job.headers.size()));
 
-        const std::wstring url = Utf8ToWide(job.url);
+        std::string effective_url = job.url;
+        const bool boomlings_http =
+            effective_url.rfind("http://www.boomlings.com/", 0) == 0 ||
+            effective_url.rfind("http://boomlings.com/", 0) == 0;
+        if (boomlings_http) {
+            effective_url.replace(0, 7, "https://");
+            trace("stage=url-policy original=\"" +
+                  SanitizeLogText(job.url) + "\" effective=\"" +
+                  SanitizeLogText(effective_url) +
+                  "\" reason=boomlings-https");
+        }
+
+        const std::wstring url = Utf8ToWide(effective_url);
         if (url.empty()) {
             fail("URL conversion failed", ERROR_INVALID_PARAMETER);
             finish_trace();
@@ -4072,7 +4084,7 @@ private:
 
         trace("stage=open-session proxy=none");
         HINTERNET session = WinHttpOpen(
-            L"GeometryDash/2.2 GeometryDashWrapper/NetworkTest8",
+            L"",
             WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!session) {
@@ -4113,14 +4125,13 @@ private:
         }
         ScopeExit close_request([&] { WinHttpCloseHandle(request); });
 
-#if defined(WINHTTP_OPTION_DECOMPRESSION) && \
-    defined(WINHTTP_DECOMPRESSION_FLAG_GZIP) && \
-    defined(WINHTTP_DECOMPRESSION_FLAG_DEFLATE)
-        DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_GZIP |
-                              WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
-        WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION,
-                         &decompression, sizeof(decompression));
+#if defined(WINHTTP_OPTION_REDIRECT_POLICY) && \
+    defined(WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS)
+        DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+                         &redirect_policy, sizeof(redirect_policy));
 #endif
+
         bool has_content_type = false;
         for (const std::string& header : job.headers) {
             std::string lower = header;
@@ -4144,11 +4155,6 @@ private:
                 request, kFormHeader, static_cast<DWORD>(-1L),
                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
         }
-        static constexpr wchar_t kConnectionClose[] = L"Connection: close";
-        WinHttpAddRequestHeaders(
-            request, kConnectionClose, static_cast<DWORD>(-1L),
-            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
         void* body_pointer = job.body.empty()
             ? WINHTTP_NO_REQUEST_DATA
             : const_cast<u8*>(job.body.data());
@@ -4236,7 +4242,11 @@ private:
             output.response_body.resize(old_size + read);
             if (!read) break;
         }
-        output.transport_success = true;
+        output.transport_success =
+            output.response_code >= 200u && output.response_code < 300u;
+        if (!output.transport_success && output.error.empty())
+            output.error = "HTTP status " +
+                           std::to_string(output.response_code);
         finish_trace();
         return output;
     }
