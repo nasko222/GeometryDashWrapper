@@ -1,56 +1,39 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup15
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup17
+Branch: v22beta-bringup17-safe-companions
 
 Scope
-- Separate Dynarmic ARMv7 line for the supplied Geometry Dash 2.2 betas.
-- Stable Dynarmic Test14-fix1 for Geometry Dash 1.0-1.4 was not modified.
-- Release and source archives contain no APK or extracted game native library.
+- Starts from the Bringup16 stable 2.2-beta runtime.
+- Fixes package-agnostic portable saves and targeted gameplay Edit entry.
+- Inventories all APK ARM libraries without blindly running all constructors.
+- Stable Dynarmic Test14-fix1 for Geometry Dash 1.0-1.4 is untouched.
+- Source archive contains no APK or extracted proprietary native library.
 
-Evidence and changes
-- Log 19 shows host A/D delivery but no editor movement; Bringup15 routes
-  editor playtests through EditorUI and gameplay through UILayer.
-- Native UILayer canvas-touch state enables mouse jump only after the game's
-  own pause/control hit testing.
-- F2 directly opens My Levels through CreatorLayer::onMyLevels.
-- Companion editor helpers are optional and capability-gated. Only the
-  validated selected-beta CRC/layout may run targeted initH and visibility
-  bridges. Missing or unknown helpers continue with the primary game image.
-- Early-layout APKs receive a native editor callback bridge.
-- Empty level setup recovery adds GJGameLevel vtable validation, compatible
-  field scanning, official-song fallback, and non-fatal native passthrough.
-- Full companion ApplyHooks, constructors, GDPS, DPAD, collision, and broad
-  gameplay hooks remain disabled.
+Implemented
+- `/data/data/<any-package>/...` -> local `save-v22beta` translation.
+- Copy-only recovery of misplaced drive-root CCGameManager/CCLocalLevels files.
+- Standalone RECOVER_V22_SAVES helper for pre-build listing/recovery.
+- PauseLayer and EndLevelLayer Edit callback bridges to validated editor entry.
+- Existing wrench/hammer targeted companion `initH` entry retained.
+- Native `.so` inventory with explicit primary/companion/audit-only policy.
+- Broad libgame/libhooking/Dobby/libgdkit constructors and ApplyHooks disabled.
 
-Validation performed
-- Linux C++20 syntax/compile: passed.
-- Windows x64 C++20 cross-compile: Zig 0.14.1,
-  -O3 -Wall -Wextra, passed.
-- Windows artifact: PE32+ x86-64 console executable, passed.
-- Required PE imports include OPENGL32.dll, USER32.dll, GDI32.dll,
-  WINMM.dll, ole32.dll, WS2_32.dll, and SHELL32.dll.
-- Windows executable SHA-256:
-  892ef0f580bb7d4a4dbc1e4ad5d3f78bdf7e07368c0ccd99230ad3adc5c16218
-- Newer beta static audit:
-  constructors=349 imports=393 relocations=103102
-  PlayLayer->GJGameLevel=0x334 GJGameLevel->levelID=0x110
-  F2 target=1 queueButton=1 UILayer key=1 EditorUI key=1
-  native editor visibility pointers=1 calls=0
-  safe platformer visibility pointers=1 calls=0
-  companion CRC=0x90ac09a5 initH enabled; complete ApplyHooks disabled
-- Earlier beta static audit:
-  constructors=327 imports=367 relocations=91437
-  PlayLayer->GJGameLevel=0x284 GJGameLevel->levelID=0x104
-  companion absent; native editor pointer=1; F2 target=1
-- Synthetic missing-initH companion audit:
-  mapper continued, companion editor extension skipped, static audit passed
+Static evidence
+- Selected APK libraries: libcocos2dcpp, libfmod, libgame, libhooking, libdobby.
+- Selected primary PauseLayer::onEdit and EndLevelLayer::onEdit are size-2 stubs.
+- Both stub addresses have aligned pointer references in the selected ELF.
+- Selected companion provides compatible LevelEditorLayerExt::initH.
+- Stock SubZero has no companion libgame and only a base editor initializer.
+- Legacy libgdkit is a hook framework, not a stock editor implementation.
+
+Validation performed in this handoff
+- C++20 syntax check: PASS (three pre-existing unused-field warnings).
+- Source/version/branch consistency audit: PASS.
+- APK inclusion audit: PASS; no APK files in source package.
+- Windows x64 cross-build/link: NOT RUN in this Linux environment.
+- Live gameplay/editor/save migration: requires Windows test build.
 
 Build identity
-- Output: dist-arm-wrapper-v22beta-bringup15
+- Output: dist-arm-wrapper-v22beta-bringup17
 - Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
 - Builder revision:
-  dynarmic-x64-builder26-v22beta-armv7-bringup15-input-capabilities
-
-Runtime boundary
-- Static and cross-build validation cannot reproduce Windows gameplay,
-  rendering, input, or audio devices.
-- Test normal levels first, then platformer mouse/keyboard, editor movement,
-  F2, and the early beta. Attach gd-v22beta-selected.log on any failure.
+  dynarmic-x64-builder28-v22beta-armv7-bringup17-local-saves-pause-editor

@@ -326,6 +326,62 @@ static std::vector<u8> ExtractZipMember(const std::vector<u8>& zip, std::string_
     throw std::runtime_error("APK member not found: " + std::string(requested_name));
 }
 
+struct ZipNativeLibraryInfo {
+    std::string name;
+    u32 uncompressed_size = 0;
+    u32 crc = 0;
+};
+
+static std::vector<ZipNativeLibraryInfo> ListZipNativeLibraries(
+    const std::vector<u8>& zip) {
+    constexpr u32 kEocdSignature = 0x06054B50u;
+    constexpr u32 kCentralSignature = 0x02014B50u;
+    const std::size_t search_start =
+        zip.size() > (0xFFFFu + 22u) ? zip.size() - (0xFFFFu + 22u) : 0u;
+    std::optional<std::size_t> eocd;
+    if (zip.size() >= 22u) {
+        for (std::size_t pos = zip.size() - 22u;; --pos) {
+            if (ReadLe32(zip, pos) == kEocdSignature) {
+                eocd = pos;
+                break;
+            }
+            if (pos == search_start) break;
+        }
+    }
+    if (!eocd)
+        throw std::runtime_error("APK end-of-central-directory record not found");
+    const u16 count = ReadLe16(zip, *eocd + 10u);
+    std::size_t pos = ReadLe32(zip, *eocd + 16u);
+    std::vector<ZipNativeLibraryInfo> result;
+    for (u16 index = 0; index < count; ++index) {
+        if (pos + 46u > zip.size() ||
+            ReadLe32(zip, pos) != kCentralSignature)
+            throw std::runtime_error("invalid APK central-directory entry");
+        const u32 crc = ReadLe32(zip, pos + 16u);
+        const u32 size = ReadLe32(zip, pos + 24u);
+        const u16 name_length = ReadLe16(zip, pos + 28u);
+        const u16 extra_length = ReadLe16(zip, pos + 30u);
+        const u16 comment_length = ReadLe16(zip, pos + 32u);
+        const std::size_t next =
+            pos + 46ull + name_length + extra_length + comment_length;
+        if (next > zip.size())
+            throw std::runtime_error("truncated APK central-directory entry");
+        std::string name(reinterpret_cast<const char*>(zip.data() + pos + 46u),
+                         name_length);
+        std::replace(name.begin(), name.end(), '\\', '/');
+        const bool native_path =
+            name.starts_with("lib/armeabi-v7a/") ||
+            name.starts_with("lib/armeabi/");
+        if (native_path && name.ends_with(".so"))
+            result.push_back(ZipNativeLibraryInfo{name, size, crc});
+        pos = next;
+    }
+    std::sort(result.begin(), result.end(),
+              [](const ZipNativeLibraryInfo& lhs,
+                 const ZipNativeLibraryInfo& rhs) { return lhs.name < rhs.name; });
+    return result;
+}
+
 static bool IsElf32ArmImage(const std::vector<u8>& bytes) {
     if (bytes.size() < sizeof(Elf32Ehdr)) return false;
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(bytes, 0);
@@ -1055,10 +1111,7 @@ struct ElfRuntime {
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
-    u32 v22_editor_ui_key_down = 0;
-    u32 v22_editor_ui_key_up = 0;
     u32 v22_ui_layer_offset = 0;
-    u32 v22_editor_ui_offset = 0;
     u32 v22_editor_playtest_state_offset = 0;
     u32 v22_companion_image_min = 0;
     u32 v22_companion_image_max = 0;
@@ -1618,6 +1671,47 @@ static std::size_t InstallV22EditButtonBridge(ElfRuntime& runtime,
     return patched;
 }
 
+static std::pair<std::size_t, std::size_t>
+InstallV22GameplayEditButtonBridges(ElfRuntime& runtime,
+                                    ProbeEnvironment& env) {
+    const SymbolRecord* pause_on_edit = FindSymbol(
+        runtime, "_ZN10PauseLayer6onEditEPN7cocos2d8CCObjectE");
+    const SymbolRecord* end_on_edit = FindSymbol(
+        runtime, "_ZN13EndLevelLayer6onEditEPN7cocos2d8CCObjectE");
+    if (!pause_on_edit && !end_on_edit) return {};
+
+    EnsureV22ThunkPage(env);
+    u32 pause_thunk = 0u;
+    u32 end_thunk = 0u;
+    if (pause_on_edit) {
+        pause_thunk = kV22ThunkBase + 0x30u;
+        const u32 destination = EnsureImport(
+            runtime, env, "__dynarmic_v22_pause_onEdit");
+        WriteV22ThumbImportThunk(env, pause_thunk, destination);
+    }
+    if (end_on_edit) {
+        end_thunk = kV22ThunkBase + 0x38u;
+        const u32 destination = EnsureImport(
+            runtime, env, "__dynarmic_v22_end_onEdit");
+        WriteV22ThumbImportThunk(env, end_thunk, destination);
+    }
+
+    std::size_t pause_pointers = 0u;
+    std::size_t end_pointers = 0u;
+    for (u32 address = (runtime.image_min + 3u) & ~3u;
+         address <= runtime.image_max - 4u; address += 4u) {
+        const u32 value = env.MemoryRead32(address);
+        if (pause_on_edit && value == pause_on_edit->address) {
+            env.MemoryWrite32(address, pause_thunk | 1u);
+            ++pause_pointers;
+        } else if (end_on_edit && value == end_on_edit->address) {
+            env.MemoryWrite32(address, end_thunk | 1u);
+            ++end_pointers;
+        }
+    }
+    return {pause_pointers, end_pointers};
+}
+
 static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     const auto resolve = [&runtime](const char* name) -> u32 {
         const SymbolRecord* symbol = FindSymbol(runtime, name);
@@ -1632,10 +1726,6 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
         resolve("_ZN7UILayer7keyDownEN7cocos2d12enumKeyCodesE");
     runtime.v22_ui_key_up =
         resolve("_ZN7UILayer5keyUpEN7cocos2d12enumKeyCodesE");
-    runtime.v22_editor_ui_key_down =
-        resolve("_ZN8EditorUI7keyDownEN7cocos2d12enumKeyCodesE");
-    runtime.v22_editor_ui_key_up =
-        resolve("_ZN8EditorUI5keyUpEN7cocos2d12enumKeyCodesE");
 
     // These offsets belong to the 9,578,364-byte late-beta ARM image. They are
     // enabled from its independently discovered PlayLayer/GJGameLevel layout,
@@ -1643,7 +1733,6 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     if (runtime.v22_play_layer_level_offset == 820u &&
         runtime.v22_game_level_id_offset == 272u) {
         runtime.v22_ui_layer_offset = 11424u;
-        runtime.v22_editor_ui_offset = 852u;
         runtime.v22_editor_playtest_state_offset = 11404u;
     }
 }
@@ -1946,6 +2035,60 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
                   return lhs.size > rhs.size;
               });
     return companion;
+}
+
+static bool HasV22PrimaryEditorInitializer(const ElfRuntime& runtime,
+                                           ProbeEnvironment& env) {
+    const SymbolRecord* initializer = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer4initEP11GJGameLevelb");
+    if (!initializer)
+        initializer = FindSymbol(
+            runtime, "_ZN16LevelEditorLayer4initEP11GJGameLevel");
+    if (!initializer || initializer->address < runtime.image_min ||
+        initializer->address >= runtime.image_max)
+        return false;
+
+    // SubZero and both supplied beta layouts intentionally replace the editor
+    // initializer with a four-byte tail branch to GJBaseGameLayer::init. A
+    // future APK with a real in-image implementation can use the same bridge,
+    // but never treat that base-only stub as a complete editor.
+    if (initializer->size <= 4u) return false;
+    return env.IsMapped(initializer->address & ~1u, initializer->size);
+}
+
+static bool HasCompatibleV22CompanionEditorInitializer(
+    const ElfRuntime& runtime, ProbeEnvironment& env,
+    bool late_beta_layout) {
+    if (!late_beta_layout || !runtime.v22_companion_editor_init ||
+        runtime.v22_companion_editor_init < runtime.v22_companion_executable_min ||
+        runtime.v22_companion_editor_init >= runtime.v22_companion_executable_max)
+        return false;
+    const SymbolRecord* initializer = FindSymbol(
+        runtime, "_ZN19LevelEditorLayerExt5initHEP11GJGameLevel");
+    if (!initializer ||
+        initializer->address != runtime.v22_companion_editor_init ||
+        initializer->size < 256u ||
+        !env.IsMapped(initializer->address & ~1u, initializer->size))
+        return false;
+    const u32 begin = initializer->address & ~1u;
+    const u16 prologue = env.MemoryRead16(begin);
+    if (prologue != 0xB5F0u && prologue != 0xE92Du) return false;
+
+    // Validate ABI-defining writes instead of pinning support to one APK CRC.
+    // The compatible late-beta helper stores GJGameLevel at layer+316 and the
+    // newly-created EditorUI at layer+852. A same-named function from another
+    // layout is not safe to call merely because its symbol exists.
+    bool stores_level = false;
+    bool stores_editor_ui = false;
+    for (u32 offset = 0u; offset + 4u <= initializer->size; offset += 2u) {
+        const u16 first = env.MemoryRead16(begin + offset);
+        const u16 second = env.MemoryRead16(begin + offset + 2u);
+        if (first != 0xF8C5u) continue; // str.w Rt,[r5,#imm12]
+        const u32 field = second & 0x0FFFu;
+        stores_level |= field == 316u;
+        stores_editor_ui |= field == 852u;
+    }
+    return stores_level && stores_editor_ui;
 }
 
 struct V22VisualHookCounts {
@@ -2340,7 +2483,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup15Window";
+        const char* class_name = "GeometryDashV22BetaBringup17Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2352,7 +2495,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup15",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup17",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2933,6 +3076,15 @@ public:
         } else {
             log_ << "RESULT: DYNARMIC_BACKGROUND_MUSIC_PRECACHE_SKIPPED raw-so=1\n";
         }
+        std::error_code save_directory_error;
+        std::filesystem::create_directories(
+            std::filesystem::path(writable_path_), save_directory_error);
+        const std::size_t migrated_saves = MigrateLegacyRootedAndroidSaves();
+        log_ << "RESULT: DYNARMIC_V22_LOCAL_SAVE_REDIRECT_READY root="
+             << writable_path_
+             << " android-package=wildcard legacy-files-copied="
+             << migrated_saves << '\n';
+        log_.flush();
 #ifdef _WIN32
         CreateDirectoryA(writable_path_.c_str(), nullptr);
         WSADATA winsock_data{};
@@ -3153,21 +3305,16 @@ public:
         return true;
     }
 
-    bool IsV22EditorPlaytestActive(u32& editor, u32& editor_ui) const {
+    bool IsV22EditorPlaytestActive(u32& editor) const {
         editor = v22_editor_visual_layer_;
-        editor_ui = 0u;
-        if (!runtime_.v22_editor_ui_offset ||
-            !runtime_.v22_editor_playtest_state_offset ||
+        if (!runtime_.v22_editor_playtest_state_offset ||
             !LooksLikeGuestObject(runtime_, env_, editor) ||
             !env_.IsMapped(
                 editor + runtime_.v22_editor_playtest_state_offset, 4u) ||
             env_.MemoryRead32(
-                editor + runtime_.v22_editor_playtest_state_offset) != 1u ||
-            !env_.IsMapped(editor + runtime_.v22_editor_ui_offset, 4u))
+                editor + runtime_.v22_editor_playtest_state_offset) != 1u)
             return false;
-        editor_ui = env_.MemoryRead32(
-            editor + runtime_.v22_editor_ui_offset);
-        return LooksLikeGuestObject(runtime_, env_, editor_ui);
+        return true;
     }
 
     static u32 PlatformerButtonKeyCode(u32 button) {
@@ -3183,29 +3330,24 @@ public:
         const char* name =
             button == 1u ? "jump" : button == 2u ? "left" : "right";
 
-        // GameManager's active-layer field is not reliable while the editor is
-        // playtesting. Route through the editor's own EditorUI object, exactly
-        // as EditorUI::keyDown/keyUp does on a native desktop build.
-        u32 editor = 0u, editor_ui = 0u;
-        if (IsV22EditorPlaytestActive(editor, editor_ui)) {
-            const u32 function = pressed
-                ? runtime_.v22_editor_ui_key_down
-                : runtime_.v22_editor_ui_key_up;
-            if (function) {
-                const u32 key_code = PlatformerButtonKeyCode(button);
-                LogHostDispatch(
-                    pressed ? "editorPlatformerKeyDown"
-                            : "editorPlatformerKeyUp",
-                    function,
-                    std::string("button=") + name +
-                        " key=" + std::to_string(key_code));
-                return RunFunction(
-                    function, {editor_ui, key_code}, nullptr,
-                    pressed ? "EditorUI::keyDown"
-                            : "EditorUI::keyUp",
-                    0u, std::chrono::milliseconds(10000));
-            }
-            layer = editor;
+        // GameManager's active-layer field is stale while the editor is
+        // playtesting. Bringup15 sent A/D through EditorUI::keyDown, but that
+        // desktop-only path dereferences an uninitialised beta field and
+        // crashes at EditorUI::keyDown+0x45. LevelEditorLayer is itself a
+        // GJBaseGameLayer, so queue the same player command directly.
+        u32 editor = 0u;
+        if (IsV22EditorPlaytestActive(editor)) {
+            if (!runtime_.v22_gjbase_queue_button) return true;
+            LogHostDispatch(
+                "editorPlatformerQueueButton",
+                runtime_.v22_gjbase_queue_button,
+                std::string("button=") + name +
+                    " pressed=" + (pressed ? "1" : "0"));
+            return RunFunction(
+                runtime_.v22_gjbase_queue_button,
+                {editor, button, pressed ? 1u : 0u, 0u}, nullptr,
+                "LevelEditorLayer::queueButton", 0u,
+                std::chrono::milliseconds(10000));
         }
 
         // Use the game's UILayer keyboard path when available. Besides queuing
@@ -3242,15 +3384,9 @@ public:
                            std::chrono::milliseconds(10000));
     }
 
-    bool SyncV22MousePlatformerJump(bool pressed) {
-        if (!pressed) {
-            if (!v22_mouse_platformer_jump_down_) return true;
-            v22_mouse_platformer_jump_down_ = false;
-            return SendPlatformerButton(1u, false);
-        }
-        if (v22_mouse_platformer_jump_down_ ||
-            !runtime_.v22_ui_layer_offset)
-            return true;
+    bool PrepareV22MousePlatformerTouch() {
+        v22_mouse_platformer_touch_ui_ = 0u;
+        if (!runtime_.v22_ui_layer_offset) return true;
         u32 layer = 0u;
         if (!ResolveV22ActiveGameLayer(layer)) return false;
         if (!layer ||
@@ -3260,15 +3396,52 @@ public:
             layer + runtime_.v22_ui_layer_offset);
         if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
             !env_.IsMapped(ui_layer + 518u, 1u) ||
-            !env_.IsMapped(ui_layer + 517u, 1u) ||
-            env_.MemoryRead8(ui_layer + 518u) == 0u ||
-            env_.MemoryRead8(ui_layer + 517u) == 0u)
+            !env_.IsMapped(ui_layer + 476u, 4u) ||
+            env_.MemoryRead8(ui_layer + 518u) == 0u)
             return true;
 
-        // UILayer::ccTouchBegan sets +517 only for a platformer canvas touch.
-        // Its left/right controls take the other branch, and pause/menu
-        // controls consume the touch before UILayer sees it. This gives mouse
-        // jump the native exclusion behavior without screen-coordinate hacks.
+        // UILayer stores the touch identifier claimed by its native
+        // platformer left/right control at +476. Windows sends one pointer
+        // with identifier zero. Reset a stale completed touch before native
+        // dispatch; ccTouchBegan writes zero only when that control owns this
+        // new press.
+        env_.MemoryWrite32(ui_layer + 476u, 0xFFFFFFFFu);
+        v22_mouse_platformer_touch_ui_ = ui_layer;
+        return true;
+    }
+
+    bool SyncV22MousePlatformerJump(bool pressed) {
+        if (!pressed) {
+            if (!v22_mouse_platformer_jump_down_) {
+                v22_mouse_platformer_touch_ui_ = 0u;
+                return true;
+            }
+            v22_mouse_platformer_jump_down_ = false;
+            v22_mouse_platformer_touch_ui_ = 0u;
+            return SendPlatformerButton(1u, false);
+        }
+        if (v22_mouse_platformer_jump_down_)
+            return true;
+        const u32 ui_layer = v22_mouse_platformer_touch_ui_;
+        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
+            !env_.IsMapped(ui_layer + 518u, 1u) ||
+            !env_.IsMapped(ui_layer + 476u, 4u) ||
+            env_.MemoryRead8(ui_layer + 518u) == 0u)
+            return true;
+
+        if (env_.MemoryRead32(ui_layer + 476u) == 0u) {
+            log_ << "[host] V22 mouse jump suppressed: native platformer "
+                    "control owns touch ui=0x"
+                 << std::hex << ui_layer << std::dec << '\n';
+            log_.flush();
+            v22_mouse_platformer_touch_ui_ = 0u;
+            return true;
+        }
+
+        // +517 is the native control's current direction, not a canvas-touch
+        // marker. Bringup15's use of it made mouse jump stop after the user
+        // touched the left/right overlay. The ownership field above is stable
+        // across direction changes and scene reloads.
         v22_mouse_platformer_jump_down_ = true;
         log_ << "[host] V22 platformer canvas mouse jump pressed ui=0x"
              << std::hex << ui_layer << std::dec << '\n';
@@ -5123,40 +5296,28 @@ private:
         return true;
     }
 
-    bool HostV22EditLevelButton() {
-        const u32 edit_layer = cpu_.Regs()[0];
-        if (!edit_layer || !env_.IsMapped(
-                edit_layer, runtime_.v22_edit_level_pointer_offset + 4u))
-            return Fail("V22 EditLevelLayer pointer is invalid");
-        const u32 level = env_.MemoryRead32(
-            edit_layer + runtime_.v22_edit_level_pointer_offset);
-        if (!LooksLikeGuestObject(runtime_, env_, level)) {
+    bool EnterV22LevelEditor(u32 level, u32 create_mode,
+                               bool set_editor_state,
+                               std::string_view source) {
+        if (!IsV22GameLevelObject(level)) {
             std::ostringstream error;
-            error << "V22 editor button has invalid GJGameLevel pointer 0x"
-                  << std::hex << level << " at EditLevelLayer+0x"
-                  << runtime_.v22_edit_level_pointer_offset;
+            error << "V22 editor entry has invalid GJGameLevel pointer 0x"
+                  << std::hex << level << " source=" << source;
             return Fail(error.str());
         }
-        log_ << "[host] V22 wrench-and-hammer editor button editLayer=0x"
-             << std::hex << edit_layer << " level=0x" << level
-             << std::dec << '\n';
-        log_.flush();
 
-        u32 director = 0, editor = 0, scene = 0, transition = 0, ignored = 0;
-        if (!RunNestedPreservingState(runtime_.v22_edit_close_text_inputs,
-                                      {edit_layer}, ignored,
-                                      "V22 EditLevelLayer::closeTextInputs"))
-            return false;
-        if (!RunNestedPreservingState(runtime_.v22_edit_verify_level_name,
-                                      {edit_layer}, ignored,
-                                      "V22 EditLevelLayer::verifyLevelName"))
-            return false;
-        if (runtime_.v22_game_manager_editor_state_offset) {
-            u32 game_manager = 0;
+        u32 director = 0u;
+        u32 editor = 0u;
+        u32 scene = 0u;
+        u32 transition = 0u;
+        u32 ignored = 0u;
+        if (set_editor_state && runtime_.v22_game_manager_editor_state_offset) {
+            u32 game_manager = 0u;
             if (!RunNestedPreservingState(runtime_.v22_game_manager_shared, {},
                                           game_manager,
                                           "V22 GameManager::sharedState") ||
-                !game_manager || !env_.IsMapped(
+                !game_manager ||
+                !env_.IsMapped(
                     game_manager + runtime_.v22_game_manager_editor_state_offset,
                     4u))
                 return Fail("V22 GameManager editor-state field is unavailable");
@@ -5165,21 +5326,22 @@ private:
                 3u);
         }
         if (!RunNestedPreservingState(runtime_.v22_director_shared, {},
-                                      director, "V22 CCDirector::sharedDirector") ||
+                                      director,
+                                      "V22 CCDirector::sharedDirector") ||
             !director)
             return false;
         if (!RunNestedPreservingState(runtime_.v22_level_editor_create,
-                                      {level, 1u}, editor,
+                                      {level, create_mode}, editor,
                                       "V22 LevelEditorLayer::create") ||
             !editor)
             return false;
         v22_editor_visual_layer_ = editor;
         v22_editor_visualized_objects_.clear();
         v22_editor_visibility_passes_ = 0u;
-        // The late selected beta needs the narrow Bringup9 companion init,
-        // while the early 2019 image has a self-contained native editor.
-        // Unknown companion ABIs are never called merely because a symbol with
-        // the same name happens to exist.
+        // The selected late beta needs only this ABI-validated initializer.
+        // Do not run libgame.so constructors or ApplyHooks globally: they also
+        // install unrelated DPAD/GDPS/timer/shader hooks and can overwrite the
+        // wrapper's stable primary-library bridges.
         if (runtime_.v22_companion_editor_init_enabled) {
             u32 companion_init_result = 0u;
             if (!RunNestedPreservingState(
@@ -5189,20 +5351,23 @@ private:
                     3000000000u))
                 return false;
             if (!companion_init_result)
-                return Fail(
-                    "V22 companion editor initialization returned false");
+                return Fail("V22 companion editor initialization returned false");
             log_ << "RESULT: DYNARMIC_V22_COMPANION_EDITOR_INIT_OK editor=0x"
                  << std::hex << editor << " level=0x" << level
                  << " init=0x" << runtime_.v22_companion_editor_init
-                 << std::dec << " mode=capability-gated-targeted-initH\n";
+                 << std::dec
+                 << " mode=capability-gated-targeted-initH source="
+                 << source << '\n';
         } else {
             log_ << "RESULT: DYNARMIC_V22_NATIVE_EDITOR_INIT_OK editor=0x"
                  << std::hex << editor << " level=0x" << level
-                 << std::dec << " mode=primary-library-only\n";
+                 << std::dec << " mode=primary-library-only source="
+                 << source << '\n';
         }
         log_.flush();
         if (!RunNestedPreservingState(runtime_.v22_scene_create, {}, scene,
-                                      "V22 CCScene::create") || !scene)
+                                      "V22 CCScene::create") ||
+            !scene)
             return false;
         if (!RunNestedPreservingState(runtime_.v22_node_add_child,
                                       {scene, editor}, ignored,
@@ -5219,11 +5384,68 @@ private:
             return false;
 
         ++v22_editor_entries_;
-        log_ << "RESULT: DYNARMIC_V22_LEVEL_EDITOR_ENTERED source=wrench-hammer count="
-             << v22_editor_entries_ << '\n';
+        log_ << "RESULT: DYNARMIC_V22_LEVEL_EDITOR_ENTERED source=" << source
+             << " count=" << v22_editor_entries_ << '\n';
         log_.flush();
         cpu_.Regs()[0] = 0u;
         return true;
+    }
+
+    bool HostV22EditLevelButton() {
+        const u32 edit_layer = cpu_.Regs()[0];
+        if (!edit_layer ||
+            !env_.IsMapped(edit_layer,
+                           runtime_.v22_edit_level_pointer_offset + 4u))
+            return Fail("V22 EditLevelLayer pointer is invalid");
+        const u32 level = env_.MemoryRead32(
+            edit_layer + runtime_.v22_edit_level_pointer_offset);
+        if (!IsV22GameLevelObject(level)) {
+            std::ostringstream error;
+            error << "V22 editor button has invalid GJGameLevel pointer 0x"
+                  << std::hex << level << " at EditLevelLayer+0x"
+                  << runtime_.v22_edit_level_pointer_offset;
+            return Fail(error.str());
+        }
+        log_ << "[host] V22 wrench-and-hammer editor button editLayer=0x"
+             << std::hex << edit_layer << " level=0x" << level
+             << std::dec << '\n';
+        log_.flush();
+
+        u32 ignored = 0u;
+        if (!RunNestedPreservingState(runtime_.v22_edit_close_text_inputs,
+                                      {edit_layer}, ignored,
+                                      "V22 EditLevelLayer::closeTextInputs"))
+            return false;
+        if (!RunNestedPreservingState(runtime_.v22_edit_verify_level_name,
+                                      {edit_layer}, ignored,
+                                      "V22 EditLevelLayer::verifyLevelName"))
+            return false;
+        return EnterV22LevelEditor(level, 1u, true, "wrench-hammer");
+    }
+
+    bool HostV22GameplayEditorButton(std::string_view source) {
+        u32 game_manager = 0u;
+        if (!runtime_.v22_game_manager_shared ||
+            !RunNestedPreservingState(runtime_.v22_game_manager_shared, {},
+                                      game_manager,
+                                      "V22 GameManager::sharedState") ||
+            !game_manager || !env_.IsMapped(game_manager + 0x168u, 4u))
+            return Fail("V22 gameplay editor bridge cannot find GameManager");
+        const u32 play_layer = env_.MemoryRead32(game_manager + 0x168u);
+        if (!play_layer || !env_.IsMapped(play_layer + 0x13Cu, 4u))
+            return Fail("V22 gameplay editor bridge cannot find PlayLayer");
+        const u32 level = env_.MemoryRead32(play_layer + 0x13Cu);
+        if (!IsV22GameLevelObject(level)) {
+            std::ostringstream error;
+            error << "V22 gameplay editor bridge has invalid level 0x"
+                  << std::hex << level << " PlayLayer=0x" << play_layer;
+            return Fail(error.str());
+        }
+        log_ << "[host] V22 gameplay editor button source=" << source
+             << " playLayer=0x" << std::hex << play_layer
+             << " level=0x" << level << std::dec << '\n';
+        log_.flush();
+        return EnterV22LevelEditor(level, 0u, false, source);
     }
 
     static bool InflateV22PayloadWithWindow(const std::vector<u8>& compressed,
@@ -5560,17 +5782,116 @@ private:
         }
         return nullptr;
     }
+    std::size_t MigrateLegacyRootedAndroidSaves() {
+#ifdef _WIN32
+        std::set<std::filesystem::path> android_roots;
+        const auto add_root = [&android_roots](const std::filesystem::path& path) {
+            const std::filesystem::path root = path.root_path();
+            if (!root.empty()) android_roots.insert(root / "data" / "data");
+        };
+        add_root(std::filesystem::current_path());
+        add_root(std::filesystem::path(apk_path_));
+        add_root(std::filesystem::path(writable_path_));
+
+        static constexpr const char* kSaveFiles[] = {
+            "CCGameManager.dat",
+            "CCLocalLevels.dat",
+            "CCGameManager.dat.bak",
+            "CCLocalLevels.dat.bak",
+        };
+        std::size_t copied = 0u;
+        std::error_code ec;
+        for (const char* file_name : kSaveFiles) {
+            const std::filesystem::path destination =
+                std::filesystem::path(writable_path_) / file_name;
+            if (std::filesystem::exists(destination, ec)) {
+                ec.clear();
+                continue;
+            }
+
+            std::optional<std::filesystem::path> newest_source;
+            std::filesystem::file_time_type newest_time{};
+            for (const std::filesystem::path& android_root : android_roots) {
+                if (!std::filesystem::is_directory(android_root, ec)) {
+                    ec.clear();
+                    continue;
+                }
+                for (const auto& package_entry :
+                     std::filesystem::directory_iterator(android_root, ec)) {
+                    if (ec) {
+                        ec.clear();
+                        break;
+                    }
+                    if (!package_entry.is_directory(ec)) {
+                        ec.clear();
+                        continue;
+                    }
+                    const std::filesystem::path candidate =
+                        package_entry.path() / file_name;
+                    if (!std::filesystem::is_regular_file(candidate, ec)) {
+                        ec.clear();
+                        continue;
+                    }
+                    const auto candidate_time =
+                        std::filesystem::last_write_time(candidate, ec);
+                    if (ec) {
+                        ec.clear();
+                        continue;
+                    }
+                    if (!newest_source || candidate_time > newest_time) {
+                        newest_source = candidate;
+                        newest_time = candidate_time;
+                    }
+                }
+            }
+            if (!newest_source) continue;
+
+            std::filesystem::create_directories(destination.parent_path(), ec);
+            ec.clear();
+            if (std::filesystem::copy_file(
+                    *newest_source, destination,
+                    std::filesystem::copy_options::skip_existing, ec)) {
+                ++copied;
+                log_ << "[host] Migrated newest misplaced Android save "
+                     << newest_source->string() << " -> "
+                     << destination.string() << '\n';
+            }
+            ec.clear();
+        }
+        return copied;
+#else
+        return 0u;
+#endif
+    }
+
     std::string TranslatePath(const std::string& input) const {
         if (input.empty()) return input;
         std::string normalized = input;
         std::replace(normalized.begin(), normalized.end(), '\\', '/');
         std::string apk_normalized = apk_path_;
         std::replace(apk_normalized.begin(), apk_normalized.end(), '\\', '/');
-        if (normalized == apk_normalized || normalized == "game.apk" || normalized.ends_with("/game.apk")) return apk_path_;
-        const std::string data_prefix = "/data/data/com.robtopx.geometryjump/";
-        if (normalized.starts_with(data_prefix)) return writable_path_ + "\\" + normalized.substr(data_prefix.size());
-        if (normalized == "/save" || normalized == "/save/") return writable_path_;
-        if (normalized.starts_with("/save/")) return writable_path_ + "\\" + normalized.substr(6);
+        if (normalized == apk_normalized || normalized == "game.apk" ||
+            normalized.ends_with("/game.apk"))
+            return apk_path_;
+        // Android package names vary across the original game, SubZero, GDPS
+        // Editor and community betas. Redirect every /data/data/<package>/...
+        // path into the wrapper's local save-v22beta directory instead of
+        // recognizing only the old com.robtopx.geometryjump package.
+        static constexpr std::string_view kAndroidDataRoot = "/data/data/";
+        if (normalized.starts_with(kAndroidDataRoot)) {
+            const std::size_t package_end =
+                normalized.find('/', kAndroidDataRoot.size());
+            if (package_end == std::string::npos) return writable_path_;
+            const std::string relative = normalized.substr(package_end + 1u);
+            if (relative.empty()) return writable_path_;
+            return (std::filesystem::path(writable_path_) /
+                    std::filesystem::path(relative)).string();
+        }
+        if (normalized == "/save" || normalized == "/save/")
+            return writable_path_;
+        if (normalized.starts_with("/save/"))
+            return (std::filesystem::path(writable_path_) /
+                    std::filesystem::path(normalized.substr(6u))).string();
 #ifdef _WIN32
         if (normalized.size() >= 2 && normalized[1] == ':') return input;
 #endif
@@ -7536,6 +7857,16 @@ private:
             if (!ok) return false;
             return finish_hot(cpu_.Regs()[0]);
         }
+        if (name == "__dynarmic_v22_pause_onEdit") {
+            const bool ok = HostV22GameplayEditorButton("pause-menu");
+            if (!ok) return false;
+            return finish_hot(cpu_.Regs()[0]);
+        }
+        if (name == "__dynarmic_v22_end_onEdit") {
+            const bool ok = HostV22GameplayEditorButton("end-level");
+            if (!ok) return false;
+            return finish_hot(cpu_.Regs()[0]);
+        }
         if (name == "__dynarmic_v22_creator_editor_unlock") {
             if (!v22_editor_callback_address_)
                 return Fail("CreatorLayer editor callback address is unavailable");
@@ -8205,6 +8536,7 @@ private:
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_platformer_ui_logged_=0;
     bool v22_mouse_platformer_jump_down_=false;
+    u32 v22_mouse_platformer_touch_ui_=0;
     u64 v22_companion_hooks_installed_=0;
     u64 v22_level_catalog_decodes_=0;
     u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x100u;
@@ -8586,7 +8918,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup15 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup17 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8840,9 +9172,9 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup15");
-        emit("Bringup15: stable Bringup14 levels with native platformer input, "
-             "F2 My Levels, and capability-gated beta companions");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup17");
+        emit("Bringup17: local save redirect/migration, pause/end editor bridge, "
+             "native-library inventory, and ABI-gated companions");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -8854,7 +9186,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup15 must be compiled as a 64-bit executable");
+                "V22BetaBringup17 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -8862,7 +9194,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP15_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -8900,6 +9232,9 @@ int main(int argc,char** argv) {
         std::vector<u8> libgame;
         std::vector<u8> companion_libgame;
         u32 companion_crc = 0u;
+        bool companion_hooking_present = false;
+        bool companion_dobby_present = false;
+        bool legacy_gdkit_present = false;
         std::string library_member;
         if(input_is_apk){
             apk=input_bytes;
@@ -8907,12 +9242,43 @@ int main(int argc,char** argv) {
             emit("Input type: APK");
             emit("Extracted "+library_member+": "+
                  std::to_string(libgame.size())+" bytes");
+            const std::vector<ZipNativeLibraryInfo> native_libraries =
+                ListZipNativeLibraries(apk);
+            {
+                std::ostringstream line;
+                line << "RESULT: DYNARMIC_V22_NATIVE_LIBRARY_INVENTORY count="
+                     << native_libraries.size() << " libs=";
+                for (std::size_t index = 0; index < native_libraries.size();
+                     ++index) {
+                    if (index) line << ',';
+                    const std::filesystem::path member(native_libraries[index].name);
+                    line << member.filename().string() << ':'
+                         << native_libraries[index].uncompressed_size;
+                }
+                line << " policy=map-primary+validated-libgame "
+                        "other-libraries=audit-only-no-constructors";
+                emit(line.str());
+            }
             try {
                 companion_libgame = ExtractZipMember(
                     apk, "lib/armeabi-v7a/libgame.so");
             } catch (const std::exception&) {
                 companion_libgame.clear();
             }
+            const auto has_apk_member =
+                [&apk](std::string_view name) {
+                    try {
+                        return !ExtractZipMember(apk, name).empty();
+                    } catch (const std::exception&) {
+                        return false;
+                    }
+                };
+            companion_hooking_present = has_apk_member(
+                "lib/armeabi-v7a/libhooking.so");
+            companion_dobby_present = has_apk_member(
+                "lib/armeabi-v7a/libdobby.so");
+            legacy_gdkit_present = has_apk_member(
+                "lib/armeabi-v7a/libgdkit.so");
             if (!companion_libgame.empty()) {
                 companion_crc = static_cast<u32>(crc32(
                     0, reinterpret_cast<const Bytef*>(
@@ -8930,6 +9296,25 @@ int main(int argc,char** argv) {
                 emit("RESULT: DYNARMIC_V22_COMPANION_LIBGAME_ABSENT "
                      "editor-unlock=main-library-force-true");
             }
+            emit(
+                "RESULT: DYNARMIC_V22_APK_EXTENSION_MANIFEST "
+                "libgame=" +
+                std::to_string(!companion_libgame.empty()) +
+                " libhooking=" +
+                std::to_string(companion_hooking_present) +
+                " libdobby=" +
+                std::to_string(companion_dobby_present) +
+                " libgdkit=" +
+                std::to_string(legacy_gdkit_present) +
+                " discovered-features=" +
+                std::string(
+                    !companion_libgame.empty()
+                        ? "editor-init,DPAD,CollisionFix,ShaderFix,"
+                          "SpeedrunTimer,GDPSManager,Options"
+                        : legacy_gdkit_present
+                            ? "legacy-touch,update,menu,unlock"
+                            : "none") +
+                " execution=capability-gated-no-global-loader");
         }else{
             libgame=input_bytes;
             library_member="raw:libcocos2dcpp.so";
@@ -8981,25 +9366,27 @@ int main(int argc,char** argv) {
         const bool early_beta_layout =
             runtime.v22_play_layer_level_offset == 644u &&
             runtime.v22_game_level_id_offset == 260u;
-        constexpr u32 kKnownStableCompanionCrc = 0x90ac09a5u;
+        const bool primary_editor_initializer =
+            HasV22PrimaryEditorInitializer(runtime, env);
         runtime.v22_companion_editor_init_enabled =
-            late_beta_layout &&
-            companion_crc == kKnownStableCompanionCrc &&
-            runtime.v22_companion_editor_init != 0u;
+            HasCompatibleV22CompanionEditorInitializer(
+                runtime, env, late_beta_layout);
         if (runtime.v22_companion_editor_init_enabled)
             visual_hooks = InstallV22SafeVisualHooks(runtime, env);
 
         ResolveV22InputBridgeSymbols(runtime);
-        const bool native_editor_bridge = early_beta_layout;
         const bool install_editor_bridge =
             runtime.v22_companion_editor_init_enabled ||
-            native_editor_bridge;
+            primary_editor_initializer;
         const std::size_t edit_button_pointers = install_editor_bridge
             ? InstallV22EditButtonBridge(runtime, env) : 0u;
-        if (runtime.v22_companion_editor_init_enabled &&
+        if (install_editor_bridge &&
             edit_button_pointers == 0u)
             throw std::runtime_error(
-                "stable selected-beta EditLevelLayer callback pointer was not found");
+                "capable beta EditLevelLayer callback pointer was not found");
+        const auto gameplay_edit_pointers = install_editor_bridge
+            ? InstallV22GameplayEditButtonBridges(runtime, env)
+            : std::pair<std::size_t, std::size_t>{};
         const SymbolRecord* direct_editor_symbol = FindSymbol(
             runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
         const u32 direct_editor_address =
@@ -9088,7 +9475,7 @@ int main(int argc,char** argv) {
                         ? "initH-absent"
                         : !late_beta_layout
                             ? "primary-layout-mismatch"
-                            : "unvalidated-companion-crc";
+                            : "initH-abi-validation-failed";
                 emit(
                     "RESULT: DYNARMIC_V22_COMPANION_EDITOR_EXTENSION_SKIPPED "
                     "reason=" + reason +
@@ -9109,24 +9496,53 @@ int main(int argc,char** argv) {
                 std::string(
                     install_editor_bridge
                         ? "callback-pointer-not-found"
-                        : "unknown-companion-or-layout-native-callback-preserved"));
+                        : (late_beta_layout || early_beta_layout)
+                            ? "primary-editor-init-is-base-only-stub"
+                            : "unknown-layout-native-callback-preserved"));
         }
+        if (gameplay_edit_pointers.first || gameplay_edit_pointers.second) {
+            emit("RESULT: DYNARMIC_V22_GAMEPLAY_EDIT_BUTTON_BRIDGE_READY "
+                 "pause-pointers=" +
+                 std::to_string(gameplay_edit_pointers.first) +
+                 " end-pointers=" +
+                 std::to_string(gameplay_edit_pointers.second) +
+                 " target=validated-editor-entry-no-global-hooks");
+        } else {
+            emit("RESULT: DYNARMIC_V22_GAMEPLAY_EDIT_BUTTON_BRIDGE_UNAVAILABLE "
+                 "reason=no-compatible-editor-initializer-or-callback-pointer");
+        }
+        emit("RESULT: DYNARMIC_V22_EDITOR_CAPABILITIES layout="+
+             std::string(late_beta_layout
+                             ? "late"
+                             : early_beta_layout ? "early" : "unknown")+
+             " creator-entry-unlock="+
+             std::to_string(editor_redirects != 0u)+
+             " primary-full-init="+
+             std::to_string(primary_editor_initializer)+
+             " companion-compatible-init="+
+             std::to_string(runtime.v22_companion_editor_init_enabled)+
+             " edit-level-bridge="+
+             std::to_string(edit_button_pointers != 0u)+
+             " gameplay-edit-bridge="+
+             std::to_string(gameplay_edit_pointers.first != 0u ||
+                            gameplay_edit_pointers.second != 0u));
         emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target="+
              std::to_string(direct_editor_address != 0u)+
              " action=MyLevels");
         emit("RESULT: DYNARMIC_V22_COMPANION_GAMEPLAY_HOOKS_DISABLED "
-             "sets=DPAD,CollisionFix reason=global-gameplay-regression");
+             "sets=DPAD,CollisionFix,ShaderFix,SpeedrunTimer,GDPSManager "
+             "reason=constructors-and-global-hooks-regress-stable-gameplay "
+             "targeted-editor-init=capability-gated");
         emit("RESULT: DYNARMIC_V22_PLATFORMER_WINDOWS_INPUT_READY "
-             "mouse=native-touch+canvas-jump "
+             "mouse=native-touch-id-ownership+host-jump "
              "keyboard=Space,Up,A,D,Left,Right "
-             "editor-playtest=EditorUI-key-path "
+             "editor-playtest=LevelEditorLayer-queueButton "
              "button-visuals=UILayer-key-path "
              "buttons=jump:1,left:2,right:3 queueButton="+
              std::to_string(runtime.v22_gjbase_queue_button != 0u)+
              " ui-key="+
              std::to_string(runtime.v22_ui_key_down != 0u)+
-             " editor-key="+
-             std::to_string(runtime.v22_editor_ui_key_down != 0u));
+             " unsafe-editor-ui-key-path=disabled");
         emit("RESULT: DYNARMIC_V22_AUDIO_PATH music=MCI effects=waveOut imports="+
              std::to_string(std::count_if(
                  runtime.imports.begin(),runtime.imports.end(),
@@ -9248,9 +9664,11 @@ int main(int argc,char** argv) {
                 switch(event.type){
                 case HostEventType::TouchBegin:
                     if(!native_paused) {
-                        ok=executor.SendTouchPoint(
-                            runtime.native_touch_begin,event.x,event.y,
-                            "nativeTouchesBegin");
+                        ok=executor.PrepareV22MousePlatformerTouch();
+                        if(ok)
+                            ok=executor.SendTouchPoint(
+                                runtime.native_touch_begin,event.x,event.y,
+                                "nativeTouchesBegin");
                         if(ok)
                             ok=executor.SyncV22MousePlatformerJump(true);
                     }
@@ -9462,7 +9880,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup15 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup17 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -9512,11 +9930,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP15_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP15_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP17_FAILED");
         return 1;
     }
 }
