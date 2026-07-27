@@ -1025,8 +1025,6 @@ struct ElfRuntime {
     u32 native_delete_backward = 0;
     u32 native_pause = 0;
     u32 native_resume = 0;
-    u32 v22_string_append_bytes = 0;
-    u32 v22_empty_string_data = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -1188,106 +1186,22 @@ static void InstallThumbLiteralPcHookPreservingAllArguments(
     env.MemoryWrite32(address + 4u, destination);
 }
 
-static std::optional<u32> DecodeThumbBlTarget(u32 instruction_address,
-                                                     u16 first, u16 second) {
-    if ((first & 0xF800u) != 0xF000u ||
-        (second & 0xD000u) != 0xD000u)
-        return std::nullopt;
-    const u32 sign = (first >> 10u) & 1u;
-    const u32 imm10 = first & 0x03FFu;
-    const u32 j1 = (second >> 13u) & 1u;
-    const u32 j2 = (second >> 11u) & 1u;
-    const u32 imm11 = second & 0x07FFu;
-    const u32 i1 = (~(j1 ^ sign)) & 1u;
-    const u32 i2 = (~(j2 ^ sign)) & 1u;
-    const u32 encoded = (sign << 24u) | (i1 << 23u) |
-                        (i2 << 22u) | (imm10 << 12u) |
-                        (imm11 << 1u);
-    const s32 displacement =
-        static_cast<s32>(encoded << 7u) >> 7u;
-    return static_cast<u32>(instruction_address + 4u + displacement);
-}
-
-static bool DiscoverV22GuestStringBuilder(ElfRuntime& runtime,
-                                          ProbeEnvironment& env,
-                                          const SymbolRecord& function) {
-    const u32 begin = function.address & ~1u;
-    if (function.size < 32u || begin < runtime.image_min ||
-        begin > runtime.image_max - function.size)
-        return false;
-
-    u32 builder = 0;
-    u32 empty_data = 0;
-    for (u32 offset = 0; offset + 6u <= function.size; offset += 2u) {
-        const u32 address = begin + offset;
-        if (env.MemoryRead16(address) != 0x4620u) continue; // mov r0,r4
-        const auto target = DecodeThumbBlTarget(
-            address + 2u, env.MemoryRead16(address + 2u),
-            env.MemoryRead16(address + 4u));
-        if (!target || *target < runtime.image_min ||
-            *target >= runtime.image_max)
-            continue;
-        builder = *target | 1u;
-        break;
-    }
-
-    // The original routine initializes a temporary std::string with
-    // _S_empty_rep_storage + 12 immediately before calling the byte builder:
-    //   ldr r3,[pc,#imm]; add r3,pc; ldr r3,[r3]; adds r3,#12
-    // Decode that exact sequence after ELF relocations so this stays ABI-native.
-    for (u32 offset = 0; offset + 12u <= function.size; offset += 2u) {
-        const u32 address = begin + offset;
-        const u16 literal_load = env.MemoryRead16(address);
-        if ((literal_load & 0xFF00u) != 0x4B00u) continue;
-        u32 add_address = 0;
-        for (u32 delta = 2u; delta <= 8u &&
-             offset + delta + 6u <= function.size; delta += 2u) {
-            if (env.MemoryRead16(address + delta) == 0x447Bu &&
-                env.MemoryRead16(address + delta + 2u) == 0x681Bu &&
-                env.MemoryRead16(address + delta + 4u) == 0x330Cu) {
-                add_address = address + delta;
-                break;
-            }
-        }
-        if (!add_address) continue;
-        const u32 literal_address =
-            ((address + 4u) & ~3u) +
-            static_cast<u32>(literal_load & 0x00FFu) * 4u;
-        if (!env.IsMapped(literal_address, 4u)) continue;
-        const s32 relative = static_cast<s32>(
-            env.MemoryRead32(literal_address));
-        const u32 got_slot = static_cast<u32>(
-            add_address + 4u + relative);
-        if (!env.IsMapped(got_slot, 4u)) continue;
-        const u32 representation = env.MemoryRead32(got_slot);
-        const u32 candidate = representation + 12u;
-        if (!env.IsMapped(candidate - 12u, 13u)) continue;
-        if (env.MemoryRead32(candidate - 12u) != 0u ||
-            env.MemoryRead32(candidate - 8u) != 0u)
-            continue;
-        empty_data = candidate;
-        break;
-    }
-
-    if (!builder || !empty_data) return false;
-    runtime.v22_string_append_bytes = builder;
-    runtime.v22_empty_string_data = empty_data;
-    return true;
-}
-
-static std::size_t InstallV22DecompressStringHook(ElfRuntime& runtime,
-                                                  ProbeEnvironment& env) {
+static std::size_t InstallV22InflateMemoryHook(ElfRuntime& runtime,
+                                               ProbeEnvironment& env) {
     static constexpr const char* kSymbol =
-        "_ZN7cocos2d8ZipUtils16decompressStringESsbi";
+        "_ZN7cocos2d8ZipUtils15ccInflateMemoryEPhjPS1_";
     const SymbolRecord* target = FindSymbol(runtime, kSymbol);
     if (!target) return 0u;
-    if (!DiscoverV22GuestStringBuilder(runtime, env, *target))
-        throw std::runtime_error(
-            "could not discover the beta's guest std::string byte builder");
     const u32 destination =
-        EnsureImport(runtime, env, "__dynarmic_ziputils_decompressString");
+        EnsureImport(runtime, env, "__dynarmic_ziputils_ccInflateMemory");
+    // The two known ARMv7 betas expose this as an eight-byte Thumb-2 wrapper:
+    //   mov.w r3,#0x40000
+    //   b.w   ccInflateMemoryWithHint
+    // Replacing only this C-style boundary leaves the original guest
+    // decompressString, base64 decoder, std::string construction, copies,
+    // destructors and hidden sret ABI completely untouched.
     InstallThumbLiteralPcHookPreservingAllArguments(
-        env, runtime, *target, 0xE92Du, destination);
+        env, runtime, *target, 0xF44Fu, destination);
     return 1u;
 }
 
@@ -1650,6 +1564,7 @@ enum class HostEventType {
     KeyDown,
     TextInput,
     DeleteBackward,
+    OpenEditor,
     Pause,
     Resume
 };
@@ -1697,7 +1612,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup6Window";
+        const char* class_name = "GeometryDashV22BetaBringup7Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2015,6 +1930,10 @@ private:
             }
             return 0;
         case WM_KEYDOWN:
+            if (wparam == VK_F2) {
+                self->Queue(HostEvent{HostEventType::OpenEditor});
+                return 0;
+            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -2144,7 +2063,7 @@ public:
         }
         apk_member_cache_.Report();
         if (v22_decompress_successes_ || v22_decompress_failures_) {
-            log_ << "RESULT: DYNARMIC_V22_DECOMPRESS_TOTALS success="
+            log_ << "RESULT: DYNARMIC_V22_INFLATE_TOTALS success="
                  << v22_decompress_successes_ << " failures="
                  << v22_decompress_failures_ << '\n';
             log_.flush();
@@ -3591,101 +3510,6 @@ private:
         return true;
     }
 
-    bool ReadGuestCowString(u32 object_address, std::string& value,
-                            std::size_t maximum = 64u * 1024u * 1024u) const {
-        value.clear();
-        if (!object_address) return false;
-        const u32 data_address = env_.MemoryRead32(object_address);
-        if (!data_address || data_address < 12u) return false;
-        const u32 length = env_.MemoryRead32(data_address - 12u);
-        if (length > maximum) return false;
-        const void* bytes = env_.HostPointer(data_address, length);
-        if (!bytes && length) return false;
-        value.assign(static_cast<const char*>(bytes), length);
-        return true;
-    }
-
-    bool BuildGuestStringFromBytes(u32 object_address,
-                                   const std::string& value) {
-        if (!object_address || !runtime_.v22_string_append_bytes ||
-            !runtime_.v22_empty_string_data ||
-            value.size() > 64u * 1024u * 1024u ||
-            value.size() > std::numeric_limits<u32>::max() - 1u)
-            return false;
-
-        const u32 length = static_cast<u32>(value.size());
-        const u32 source = Allocate(length + 1u);
-        if (!source) return false;
-        const bool copied = value.empty() ||
-            env_.WriteBytes(source, value.data(), value.size());
-        env_.MemoryWrite8(source + length, 0u);
-        if (!copied) {
-            Free(source);
-            return false;
-        }
-
-        // Match the beta's own implementation exactly: initialize the object
-        // with its relocated empty-string singleton, then invoke its native
-        // append/assign-from-bytes routine. This avoids guessing libstdc++ ABI
-        // details such as COW refcounts and empty-representation identity.
-        env_.MemoryWrite32(object_address, runtime_.v22_empty_string_data);
-        const auto saved_regs = cpu_.Regs();
-        const auto saved_ext = cpu_.ExtRegs();
-        const u32 saved_cpsr = cpu_.Cpsr();
-        const u32 saved_fpscr = cpu_.Fpscr();
-        u32 ignored = 0;
-        const bool ok = RunFunction(
-            runtime_.v22_string_append_bytes,
-            {object_address, source, length}, &ignored,
-            "V22 guest std::string byte builder", 100000000u,
-            std::chrono::milliseconds(15000));
-        cpu_.Regs() = saved_regs;
-        cpu_.ExtRegs() = saved_ext;
-        cpu_.SetCpsr(saved_cpsr);
-        cpu_.SetFpscr(saved_fpscr);
-        Free(source);
-        if (!ok) return false;
-
-        std::string validation;
-        if (!ReadGuestCowString(object_address, validation) ||
-            validation != value) {
-            log_ << "ERROR: V22 guest std::string validation failed expected="
-                 << value.size() << " actual=" << validation.size()
-                 << " object=0x" << std::hex << object_address
-                 << " builder=0x" << runtime_.v22_string_append_bytes
-                 << std::dec << '\n';
-            log_.flush();
-            return false;
-        }
-        return true;
-    }
-
-    static bool DecodeBase64Url(const std::string& encoded,
-                                std::vector<u8>& decoded) {
-        decoded.clear();
-        decoded.reserve((encoded.size() / 4u) * 3u + 3u);
-        u32 accumulator = 0u;
-        int bits = -8;
-        for (unsigned char character : encoded) {
-            if (std::isspace(character)) continue;
-            if (character == '=') break;
-            int value = -1;
-            if (character >= 'A' && character <= 'Z') value = character - 'A';
-            else if (character >= 'a' && character <= 'z') value = character - 'a' + 26;
-            else if (character >= '0' && character <= '9') value = character - '0' + 52;
-            else if (character == '+' || character == '-') value = 62;
-            else if (character == '/' || character == '_') value = 63;
-            else return false;
-            accumulator = (accumulator << 6u) | static_cast<u32>(value);
-            bits += 6;
-            if (bits >= 0) {
-                decoded.push_back(static_cast<u8>((accumulator >> bits) & 0xffu));
-                bits -= 8;
-            }
-        }
-        return !decoded.empty();
-    }
-
     static bool InflateV22PayloadWithWindow(const std::vector<u8>& compressed,
                                             int window_bits,
                                             std::string& output) {
@@ -3726,43 +3550,57 @@ private:
                InflateV22PayloadWithWindow(compressed, -15, output);
     }
 
-    bool HostV22DecompressString(u32 output_object, u32 input_object,
-                                 u32 encrypted, u32 key, u32& result) {
-        result = output_object;
-        std::string encoded;
-        if (!ReadGuestCowString(input_object, encoded)) {
+    bool HostV22InflateMemory(u32 input_address, u32 input_size,
+                              u32 output_pointer, u32& result) {
+        result = 0u;
+        if (!output_pointer || !env_.IsMapped(output_pointer, 4u)) {
             ++v22_decompress_failures_;
-            return BuildGuestStringFromBytes(output_object, {});
+            return true;
         }
-        std::string transformed = encoded;
-        if (encrypted) {
-            const u8 xor_key = static_cast<u8>(key);
-            for (char& character : transformed)
-                character = static_cast<char>(
-                    static_cast<u8>(character) ^ xor_key);
+        env_.MemoryWrite32(output_pointer, 0u);
+        constexpr u32 kMaximumInput = 64u * 1024u * 1024u;
+        if (!input_address || !input_size || input_size > kMaximumInput) {
+            ++v22_decompress_failures_;
+            return true;
         }
-        std::vector<u8> compressed;
+        const u8* input = static_cast<const u8*>(
+            env_.HostPointer(input_address, input_size));
+        if (!input) {
+            ++v22_decompress_failures_;
+            return true;
+        }
+        std::vector<u8> compressed(input, input + input_size);
         std::string decompressed;
-        const bool decoded = DecodeBase64Url(transformed, compressed) &&
-                             InflateV22Payload(compressed, decompressed);
-        const std::string& selected = decoded ? decompressed : encoded;
-        const bool built = BuildGuestStringFromBytes(output_object, selected);
-        if (!built) {
+        if (!InflateV22Payload(compressed, decompressed) ||
+            decompressed.empty() ||
+            decompressed.size() > std::numeric_limits<u32>::max() - 1u) {
             ++v22_decompress_failures_;
-            return false;
+            if (v22_decompress_log_count_ < 16u) {
+                ++v22_decompress_log_count_;
+                log_ << "[host] V22 ccInflateMemory input=" << input_size
+                     << " output=0 status=failed\n";
+                log_.flush();
+            }
+            return true;
         }
-        if (decoded) ++v22_decompress_successes_;
-        else ++v22_decompress_failures_;
+        const u32 output_size = static_cast<u32>(decompressed.size());
+        const u32 guest_output = Allocate(output_size + 1u);
+        if (!guest_output ||
+            !env_.WriteBytes(guest_output, decompressed.data(), output_size)) {
+            if (guest_output) Free(guest_output);
+            ++v22_decompress_failures_;
+            return true;
+        }
+        env_.MemoryWrite8(guest_output + output_size, 0u);
+        env_.MemoryWrite32(output_pointer, guest_output);
+        result = output_size;
+        ++v22_decompress_successes_;
         if (v22_decompress_log_count_ < 16u) {
             ++v22_decompress_log_count_;
-            log_ << "[host] V22 decompressString input=" << encoded.size()
-                 << " compressed=" << compressed.size()
-                 << " output=" << decompressed.size()
-                 << " guest_string=" << selected.size()
-                 << " encrypted=" << (encrypted ? 1 : 0)
-                 << " status=" << (decoded ? "ok" : "fallback")
-                 << " builder=0x" << std::hex
-                 << runtime_.v22_string_append_bytes << std::dec << '\n';
+            log_ << "[host] V22 ccInflateMemory input=" << input_size
+                 << " output=" << output_size
+                 << " guest=0x" << std::hex << guest_output << std::dec
+                 << " status=ok original-cpp-string-path=1\n";
             log_.flush();
         }
         return true;
@@ -5817,10 +5655,9 @@ private:
                          ((v22_editor_callback_address_ & 1u) ? 0x20u : 0u));
             return true;
         }
-        if (name == "__dynarmic_ziputils_decompressString") {
+        if (name == "__dynarmic_ziputils_ccInflateMemory") {
             u32 value = 0;
-            if (!HostV22DecompressString(r0, r1, r2, r3, value))
-                return false;
+            if (!HostV22InflateMemory(r0, r1, r2, value)) return false;
             return finish_hot(value);
         }
         if (name == "__dynarmic_ccfileutils_getFileDataFromZip")
@@ -6830,7 +6667,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup6 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup7 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7084,8 +6921,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup6");
-        emit("Milestone: guest-native level string construction, companion libgame editor unlock compatibility, and dual-beta runtime support");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup7");
+        emit("Milestone: guest-original C++ level decompression via low-level inflate bridge and F2 direct editor entry");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -7097,7 +6934,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup6 must be compiled as a 64-bit executable");
+                "V22BetaBringup7 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -7105,7 +6942,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP6_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -7188,11 +7025,11 @@ int main(int argc,char** argv) {
         if(browser_hooks!=1u)
             throw std::runtime_error(
                 "required cocos2d openURL hook was not found");
-        const std::size_t decompress_hooks=
-            InstallV22DecompressStringHook(runtime,env);
-        if(decompress_hooks!=1u)
+        const std::size_t inflate_hooks=
+            InstallV22InflateMemoryHook(runtime,env);
+        if(inflate_hooks!=1u)
             throw std::runtime_error(
-                "required cocos2d ZipUtils::decompressString hook was not found");
+                "required cocos2d ZipUtils::ccInflateMemory hook was not found");
         const std::size_t can_play_unlocks =
             InstallV22CanPlayOnlineLevelsForceTrue(runtime, env);
         if (can_play_unlocks != 1u)
@@ -7200,6 +7037,12 @@ int main(int argc,char** argv) {
                 "required CreatorLayer::canPlayOnlineLevels symbol was not found");
         const std::size_t editor_redirects =
             InstallV22CreatorEditorUnlock(runtime, env);
+        const SymbolRecord* direct_editor_symbol = FindSymbol(
+            runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
+        if (!direct_editor_symbol)
+            throw std::runtime_error(
+                "required CreatorLayer::onMyLevels direct editor entry was not found");
+        const u32 direct_editor_address = direct_editor_symbol->address;
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -7230,23 +7073,22 @@ int main(int argc,char** argv) {
              " scratch=r0 args=r1-r3-preserved");
         emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
              std::to_string(browser_hooks));
-        {
-            std::ostringstream line;
-            line << "RESULT: DYNARMIC_V22_DECOMPRESS_HOOK_READY count="
-                 << decompress_hooks
-                 << " codec=base64url+gzip max_output_mb=64"
-                 << " guest_string_builder=0x" << std::hex
-                 << runtime.v22_string_append_bytes
-                 << " empty_data=0x" << runtime.v22_empty_string_data
-                 << std::dec;
-            emit(line.str());
-        }
+        emit("RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count="+
+             std::to_string(inflate_hooks)+
+             " codec=gzip+zlib+raw original-cpp-decompress=1 hidden-sret=guest-native");
         emit("RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE count="+
              std::to_string(can_play_unlocks)+
              " source=companion-libgame-compatible");
         emit("RESULT: DYNARMIC_V22_CREATOR_EDITOR_REDIRECT_FALLBACK count="+
              std::to_string(editor_redirects)+
              " redirect=onOnlyFullVersion->onMyLevels");
+        {
+            std::ostringstream line;
+            line << "RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target=0x"
+                 << std::hex << direct_editor_address << std::dec
+                 << " bypass=broken-beta-button";
+            emit(line.str());
+        }
         emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports="+
              std::to_string(std::count_if(
                  runtime.imports.begin(),runtime.imports.end(),
@@ -7398,6 +7240,17 @@ int main(int argc,char** argv) {
                     if(!native_paused)
                         ok=executor.SendDeleteBackward(
                             runtime.native_delete_backward);
+                    break;
+                case HostEventType::OpenEditor:
+                    if(!native_paused){
+                        emit("[host] V22 F2 direct editor entry requested");
+                        u32 ignored=0;
+                        ok=executor.RunFunction(
+                            direct_editor_address,{0u,0u},&ignored,
+                            "V22 direct My Levels editor entry",
+                            500000000u,std::chrono::milliseconds(30000));
+                        if(ok) emit("RESULT: DYNARMIC_V22_DIRECT_EDITOR_ENTERED source=F2");
+                    }
                     break;
                 case HostEventType::Pause:
                     if(!native_paused){
@@ -7607,11 +7460,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP6_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP6_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP7_FAILED");
         return 1;
     }
 }

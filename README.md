@@ -1,4 +1,4 @@
-# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup6
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup7
 
 Separate ARMv7-A / Thumb-2 / VFPv3 / NEON bring-up branch. It does not replace the stable ARMv5 Test14-fix1 branch.
 
@@ -13,28 +13,39 @@ BUILD_V22BETA_X64.cmd "D:\path\to\your-2.2-beta.apk"
 Run:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup6\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup7\RUN_V22_SELECTED_APK.cmd
 ```
 
-## Bringup6 changes
+## Important editor workaround
 
-- Builds decoded level strings through the beta's own relocated libstdc++ `std::string` byte routine and empty-string singleton instead of fabricating the COW representation.
-- Validates the guest string byte-for-byte before returning it to `PlayLayer`.
-- Forces `CreatorLayer::canPlayOnlineLevels()` to return true, reproducing the exact editor-unlock hook found in the newer APK's companion `libgame.so`.
-- Detects and reports optional `lib/armeabi-v7a/libgame.so`; its Android Dobby loader is not executed.
-- Retains the older `onOnlyFullVersion -> onMyLevels` redirect as a secondary fallback.
-- Retains FMOD 1.05.04-compatible music, 60 Hz timing, ARM exclusive memory, dual-beta hooks, and host level decompression.
+The beta's visible editor button is known to do nothing on some real Android devices as well as this wrapper. In Bringup7, press **F2** from the menu or Creator screen. F2 calls the beta's genuine `CreatorLayer::onMyLevels` function directly and does not depend on the broken button callback.
 
-Expected markers:
+## Bringup7 changes
+
+- Restores the beta's original C++ `ZipUtils::decompressString` implementation completely.
+- Hooks only the eight-byte C-style `ZipUtils::ccInflateMemory(unsigned char*, unsigned int, unsigned char**)` boundary.
+- The beta itself now performs Base64 decoding, hidden return-object handling, `std::string` construction, copying and destruction exactly as compiled.
+- Adds F2 direct My Levels/editor entry for both supplied native beta builds.
+- Retains the `canPlayOnlineLevels()` force-true patch found in the optional companion `libgame.so`.
+- Detects optional `lib/armeabi-v7a/libgame.so` but does not execute its Android Dobby loader.
+- Retains FMOD 1.05.04-compatible music, 60 Hz timing and ARM exclusive memory.
+
+Expected startup markers:
 
 ```text
-RESULT: DYNARMIC_V22_COMPANION_LIBGAME_DETECTED ... role=editor-hooks
-RESULT: DYNARMIC_V22_DECOMPRESS_HOOK_READY ... guest_string_builder=0x...
-RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE count=1
+RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count=1 ... original-cpp-decompress=1
+RESULT: DYNARMIC_V22_DIRECT_EDITOR_HOTKEY_READY key=F2 target=0x...
 ```
 
-A successful level decode now includes `guest_string=<same decoded size>`:
+Expected level marker:
 
 ```text
-[host] V22 decompressString ... output=1241094 guest_string=1241094 status=ok
+[host] V22 ccInflateMemory input=123801 output=1241094 ... original-cpp-string-path=1
+```
+
+Expected F2 marker:
+
+```text
+[host] V22 F2 direct editor entry requested
+RESULT: DYNARMIC_V22_DIRECT_EDITOR_ENTERED source=F2
 ```
