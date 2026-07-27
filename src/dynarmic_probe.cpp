@@ -125,6 +125,7 @@ constexpr u32 kEnvObject = kControlBase + 0x10000u;
 constexpr u32 kEnvTable = kControlBase + 0x11000u;
 constexpr u32 kEnvStubs = kControlBase + 0x12000u;
 constexpr u32 kFakeRefBase = kControlBase + 0x30000u;
+constexpr std::size_t kMaximumGuestCString = 64u * 1024u * 1024u;
 constexpr u32 kGuestFileObjectSize = 0x100u;
 constexpr u32 kBionicFileFlagsOffset = 12u;
 constexpr u32 kBionicFileDescriptorOffset = 14u;
@@ -672,7 +673,7 @@ public:
     }
 
     bool ReadCString(u32 address, std::string& output,
-                     std::size_t maximum = 1u << 20) const {
+                     std::size_t maximum = kMaximumGuestCString) const {
         output.clear();
         while (output.size() < maximum) {
             const u64 current64 = static_cast<u64>(address) +
@@ -1039,6 +1040,10 @@ struct ElfRuntime {
     u32 v22_play_layer_level_offset = 0;
     u32 v22_game_level_id_offset = 0;
     u32 v22_companion_editor_init = 0;
+    u32 v22_companion_editor_visibility = 0;
+    u32 v22_companion_editor_visibility_original = 0;
+    u32 v22_companion_play_visibility = 0;
+    u32 v22_companion_play_visibility_original = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_companion_image_min = 0;
     u32 v22_companion_image_max = 0;
@@ -1857,7 +1862,41 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
     if (!editor_init)
         throw std::runtime_error(
             "companion libgame.so lacks LevelEditorLayerExt::initH");
+    const SymbolRecord* editor_visibility = FindSymbol(
+        companion, "_ZN19LevelEditorLayerExt17updateVisibilityHEf");
+    const SymbolRecord* editor_visibility_original = FindSymbol(
+        companion, "_ZN19LevelEditorLayerExt17updateVisibilityOE");
+    if (!editor_visibility || !editor_visibility_original)
+        throw std::runtime_error(
+            "companion libgame.so lacks the targeted editor visibility bridge");
     primary.v22_companion_editor_init = editor_init->address;
+    primary.v22_companion_editor_visibility = editor_visibility->address;
+    primary.v22_companion_editor_visibility_original =
+        editor_visibility_original->address;
+
+    // DPADHooks::ApplyHooks is intentionally not executed: its touch, editor,
+    // and gameplay replacements caused broad regressions in earlier bring-up
+    // builds. This exact companion's PlayLayer visibility helper is the one
+    // narrow piece that draws/updates the already-created platformer controls.
+    // Derive it from exported editor symbols, then validate both the function
+    // prologue and its original-function storage slot before using it.
+    constexpr u32 kPlayVisibilityFromEditorVisibility = 0x2090u;
+    constexpr u32 kPlayVisibilityOriginalFromEditorOriginal = 0x144u;
+    const u32 play_visibility =
+        editor_visibility->address + kPlayVisibilityFromEditorVisibility;
+    const u32 play_visibility_code = play_visibility & ~1u;
+    const u32 play_visibility_original =
+        editor_visibility_original->address +
+        kPlayVisibilityOriginalFromEditorOriginal;
+    if (!env.IsMapped(play_visibility_code, 4u) ||
+        env.MemoryRead16(play_visibility_code) != 0xb5b0u ||
+        env.MemoryRead16(play_visibility_code + 2u) != 0xaf02u ||
+        !env.IsMapped(play_visibility_original, 4u))
+        throw std::runtime_error(
+            "companion platformer visibility bridge layout is not recognized");
+    primary.v22_companion_play_visibility = play_visibility;
+    primary.v22_companion_play_visibility_original =
+        play_visibility_original;
     primary.v22_companion_image_min = companion.image_min;
     primary.v22_companion_image_max = companion.image_max;
     primary.v22_companion_executable_min = executable_min;
@@ -1870,6 +1909,56 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
                   return lhs.size > rhs.size;
               });
     return companion;
+}
+
+struct V22VisualHookCounts {
+    std::pair<std::size_t, std::size_t> editor_visibility;
+    std::pair<std::size_t, std::size_t> play_visibility;
+};
+
+static V22VisualHookCounts InstallV22VisualHooks(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    const SymbolRecord* editor_visibility = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer16updateVisibilityEf");
+    const SymbolRecord* play_visibility = FindSymbol(
+        runtime, "_ZN9PlayLayer16updateVisibilityEf");
+    if (!editor_visibility || !play_visibility ||
+        !runtime.v22_companion_editor_visibility ||
+        !runtime.v22_companion_editor_visibility_original ||
+        !runtime.v22_companion_play_visibility ||
+        !runtime.v22_companion_play_visibility_original)
+        throw std::runtime_error(
+            "targeted V22 visual hook symbols are unavailable");
+
+    // The companion's full LevelEditorLayerExt::ApplyHooks also replaces
+    // LevelEditorLayer::init. That replacement caused Bringup11's repeatable
+    // RTTI runaway. Install only updateVisibility, while Bringup13's explicit
+    // initH entry path remains untouched.
+    env.MemoryWrite32(runtime.v22_companion_editor_visibility_original,
+                      editor_visibility->address);
+    const auto editor_visibility_counts = RedirectV22FunctionReferences(
+        runtime, env, *editor_visibility,
+        runtime.v22_companion_editor_visibility,
+        kV22ThunkBase + 0x40u);
+
+    // The platformer buttons and touch targets are already created by the
+    // beta. The companion visibility helper updates their visible state. Keep
+    // all DPAD touch/input hooks disabled; Windows input queues buttons itself.
+    env.MemoryWrite32(runtime.v22_companion_play_visibility_original,
+                      play_visibility->address);
+    const auto play_visibility_counts = RedirectV22FunctionReferences(
+        runtime, env, *play_visibility,
+        runtime.v22_companion_play_visibility,
+        kV22ThunkBase + 0x48u);
+
+    if (editor_visibility_counts.first +
+                editor_visibility_counts.second ==
+            0u ||
+        play_visibility_counts.first + play_visibility_counts.second == 0u)
+        throw std::runtime_error(
+            "targeted V22 visual hooks did not find primary references");
+    return V22VisualHookCounts{
+        editor_visibility_counts, play_visibility_counts};
 }
 
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
@@ -2177,7 +2266,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup12Window";
+        const char* class_name = "GeometryDashV22BetaBringup13Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -2189,7 +2278,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup12",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup13",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2316,9 +2405,8 @@ public:
         text_input_active_ = active;
         if (active && keyboard_down_) {
             keyboard_down_ = false;
-            Queue(HostEvent{HostEventType::TouchEnd,
-                            static_cast<float>(native_width_) * 0.5f,
-                            static_cast<float>(native_height_) * 0.5f, 0});
+            Queue(HostEvent{HostEventType::PlatformButton,
+                            0.0f, 0.0f, 1u, false});
         }
         if (active && platform_left_down_) {
             platform_left_down_ = false;
@@ -2478,6 +2566,11 @@ private:
                     self->Queue(HostEvent{HostEventType::PlatformButton,
                                           0.0f, 0.0f, 3u, false});
                 }
+                if (!becoming_active && self->keyboard_down_) {
+                    self->keyboard_down_ = false;
+                    self->Queue(HostEvent{HostEventType::PlatformButton,
+                                          0.0f, 0.0f, 1u, false});
+                }
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
@@ -2538,9 +2631,8 @@ private:
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
                 self->keyboard_down_ = true;
-                self->Queue(HostEvent{HostEventType::TouchBegin,
-                                      static_cast<float>(self->native_width_) * 0.5f,
-                                      static_cast<float>(self->native_height_) * 0.5f, 0});
+                self->Queue(HostEvent{HostEventType::PlatformButton,
+                                      0.0f, 0.0f, 1u, true});
                 return 0;
             }
             break;
@@ -2561,9 +2653,8 @@ private:
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) && self->keyboard_down_) {
                 self->keyboard_down_ = false;
-                self->Queue(HostEvent{HostEventType::TouchEnd,
-                                      static_cast<float>(self->native_width_) * 0.5f,
-                                      static_cast<float>(self->native_height_) * 0.5f, 0});
+                self->Queue(HostEvent{HostEventType::PlatformButton,
+                                      0.0f, 0.0f, 1u, false});
                 return 0;
             }
             break;
@@ -2981,7 +3072,8 @@ public:
             return true;
         const u32 layer = env_.MemoryRead32(game_manager + 0x168u);
         if (!LooksLikeGuestObject(runtime_, env_, layer)) return true;
-        const char* name = button == 2u ? "left" : "right";
+        const char* name =
+            button == 1u ? "jump" : button == 2u ? "left" : "right";
         LogHostDispatch("platformerQueueButton", runtime_.v22_gjbase_queue_button,
                         std::string("button=") + name +
                         " pressed=" + (pressed ? "1" : "0"));
@@ -3706,11 +3798,13 @@ private:
         std::size_t available = 0;
         const u8* bytes = env_.HostPointerToRegionEnd(address, available);
         if (!bytes) return 0;
-        const std::size_t maximum = std::min<std::size_t>(available, 1u << 20);
+        const std::size_t maximum =
+            std::min<std::size_t>(available, kMaximumGuestCString);
         const void* end = std::memchr(bytes, 0, maximum);
         return end ? static_cast<u32>(static_cast<const u8*>(end) - bytes) : 0;
     }
-    std::string ReadCString(u32 address, std::size_t maximum = 1u << 20) const {
+    std::string ReadCString(
+        u32 address, std::size_t maximum = kMaximumGuestCString) const {
         std::string text;
         if (!env_.ReadCString(address, text, maximum)) return {};
         return text;
@@ -4812,7 +4906,7 @@ private:
         const u8* b = env_.HostPointerToRegionEnd(right, right_available);
         if (!a || !b) return 0;
         std::size_t limit = std::min(left_available, right_available);
-        limit = std::min<std::size_t>(limit, 1u << 20);
+        limit = std::min<std::size_t>(limit, kMaximumGuestCString);
         if (limited) limit = std::min<std::size_t>(limit, maximum);
         for (std::size_t index = 0; index < limit; ++index) {
             unsigned char av = a[index], bv = b[index];
@@ -7903,7 +7997,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup12 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup13 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8157,8 +8251,9 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup12");
-        emit("Recovery: Bringup9 targeted editor init and non-destructive level fallback");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup13");
+        emit("Bringup13: large level strings, visual-only companion hooks, "
+             "direct platformer jump, and waveOut sound effects");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -8170,7 +8265,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup12 must be compiled as a 64-bit executable");
+                "V22BetaBringup13 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -8178,7 +8273,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP12_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -8253,9 +8348,12 @@ int main(int argc,char** argv) {
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         ElfRuntime companion_runtime{};
+        V22VisualHookCounts visual_hooks{};
         if (!companion_libgame.empty())
             companion_runtime = MapAndRelocateV22CompanionElf(
                 companion_libgame, env, runtime);
+        if (!companion_libgame.empty())
+            visual_hooks = InstallV22VisualHooks(runtime, env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         if(zip_hooks!=1u)
             throw std::runtime_error(
@@ -8353,9 +8451,22 @@ int main(int argc,char** argv) {
                  << runtime.v22_companion_executable_min << "-0x"
                  << runtime.v22_companion_executable_max << " initH=0x"
                  << runtime.v22_companion_editor_init << std::dec
-                 << " constructors=not-run mode=bringup9-targeted-initH "
-                    "ApplyHooks=disabled";
+                 << " constructors=not-run mode=bringup9-targeted-initH+"
+                    "visual-only ApplyHooks=disabled";
             emit(line.str());
+            emit(
+                "RESULT: DYNARMIC_V22_COMPANION_EDITOR_VISUAL_HOOKS_READY "
+                "count=1 init-hook=disabled opacity-hook=disabled "
+                "visibility-pointers=" +
+                std::to_string(visual_hooks.editor_visibility.first) +
+                " visibility-calls=" +
+                std::to_string(visual_hooks.editor_visibility.second));
+            emit(
+                "RESULT: DYNARMIC_V22_COMPANION_PLATFORMER_VISUAL_HOOK_READY "
+                "count=1 touch-hooks=disabled visibility-pointers=" +
+                std::to_string(visual_hooks.play_visibility.first) +
+                " visibility-calls=" +
+                std::to_string(visual_hooks.play_visibility.second));
         }
         if (edit_button_pointers) {
             emit("RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_READY pointers="+
@@ -8368,9 +8479,10 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_COMPANION_GAMEPLAY_HOOKS_DISABLED "
              "sets=DPAD,CollisionFix reason=global-gameplay-regression");
         emit("RESULT: DYNARMIC_V22_PLATFORMER_WINDOWS_INPUT_READY "
-             "mouse=native-touch keyboard=A,D,Left,Right queueButton="+
+             "mouse=native-touch keyboard=Space,Up,A,D,Left,Right "
+             "buttons=jump:1,left:2,right:3 queueButton="+
              std::to_string(runtime.v22_gjbase_queue_button != 0u));
-        emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports="+
+        emit("RESULT: DYNARMIC_V22_AUDIO_PATH music=MCI effects=waveOut imports="+
              std::to_string(std::count_if(
                  runtime.imports.begin(),runtime.imports.end(),
                  [](const ImportRecord& import){return GuestExecutor::IsFmodImportName(import.name);})) +
@@ -8685,7 +8797,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup12 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup13 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -8735,11 +8847,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP12_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP12_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP13_FAILED");
         return 1;
     }
 }

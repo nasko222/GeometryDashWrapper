@@ -1,4 +1,6 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #define COBJMACROS
 #include <windows.h>
 #include <mmsystem.h>
@@ -21,13 +23,19 @@
 
 #define MAX_EFFECT_SLOTS 48
 #define MAX_EFFECT_ASSET_CACHE 128
+#define GD_WAVE_FORMAT_IEEE_FLOAT 0x0003u
+#define GD_WAVE_FORMAT_EXTENSIBLE 0xfffeu
 
 typedef struct {
     unsigned identifier;
     int open;
     int paused;
+    int loop;
     float volume;
-    char alias[32];
+    HWAVEOUT output;
+    WAVEHDR header;
+    unsigned char *wave_file;
+    size_t wave_file_size;
     char path[MAX_PATH * 2];
 } EffectSlot;
 
@@ -74,6 +82,7 @@ static volatile LONG g_output_peak_bits;
 static volatile LONG g_output_peak_logged;
 static volatile LONG g_short_path_logged;
 static volatile LONG g_effect_cache_hit_logged;
+static volatile LONG g_waveout_backend_logged;
 static SRWLOCK g_mci_lock = SRWLOCK_INIT;
 
 static SRWLOCK g_effect_state_lock = SRWLOCK_INIT;
@@ -792,39 +801,39 @@ static int open_music(const char *requested) {
 }
 
 static void close_effect_slot(EffectSlot *slot) {
-    char command[80];
-    if (!slot || !slot->open) return;
-    snprintf(command, sizeof(command), "stop %s", slot->alias);
-    mci_command(command, NULL, 0, 0);
-    snprintf(command, sizeof(command), "close %s", slot->alias);
-    mci_command(command, NULL, 0, 0);
+    if (!slot) return;
+    if (slot->output) {
+        waveOutReset(slot->output);
+        if ((slot->header.dwFlags & WHDR_PREPARED) != 0)
+            waveOutUnprepareHeader(
+                slot->output, &slot->header, sizeof(slot->header));
+        waveOutClose(slot->output);
+    }
+    free(slot->wave_file);
+    memset(&slot->header, 0, sizeof(slot->header));
+    slot->output = NULL;
+    slot->wave_file = NULL;
+    slot->wave_file_size = 0;
     slot->open = 0;
     slot->paused = 0;
+    slot->loop = 0;
     slot->identifier = 0;
     slot->volume = 1.0f;
     slot->path[0] = 0;
 }
 
 static void park_effect_slot(EffectSlot *slot) {
-    char command[80];
     if (!slot || !slot->open) return;
-    snprintf(command, sizeof(command), "stop %s", slot->alias);
-    mci_command(command, NULL, 0, 0);
-    snprintf(command, sizeof(command), "seek %s to start", slot->alias);
-    mci_command(command, NULL, 0, 0);
+    if (slot->output) waveOutReset(slot->output);
     slot->paused = 0;
+    slot->loop = 0;
     slot->identifier = 0;
     slot->volume = 1.0f;
 }
 
 static int effect_slot_playing(EffectSlot *slot) {
-    char command[80];
-    char mode[32] = {0};
     if (!slot || !slot->open || !slot->identifier) return 0;
-    snprintf(command, sizeof(command), "status %s mode", slot->alias);
-    if (!mci_command(command, mode, sizeof(mode), 0)) return 0;
-    return _stricmp(mode, "playing") == 0 ||
-           _stricmp(mode, "paused") == 0;
+    return slot->paused || (slot->header.dwFlags & WHDR_DONE) == 0;
 }
 
 static EffectSlot *reusable_effect_slot(const char *path) {
@@ -841,18 +850,166 @@ static EffectSlot *reusable_effect_slot(const char *path) {
     return NULL;
 }
 
+static unsigned read_little_u16(const unsigned char *source) {
+    return (unsigned)source[0] | ((unsigned)source[1] << 8);
+}
+
+static uint32_t read_little_u32(const unsigned char *source) {
+    return (uint32_t)source[0] | ((uint32_t)source[1] << 8) |
+           ((uint32_t)source[2] << 16) | ((uint32_t)source[3] << 24);
+}
+
+static int load_wave_file(const char *path, unsigned char **file_data,
+                          size_t *file_size, WAVEFORMATEX **format,
+                          unsigned char **pcm_data, DWORD *pcm_size,
+                          unsigned char *format_storage,
+                          size_t format_storage_size) {
+    FILE *stream;
+    long length;
+    unsigned char *bytes;
+    size_t cursor;
+    const unsigned char *format_chunk = NULL;
+    size_t format_size = 0;
+    unsigned char *data_chunk = NULL;
+    size_t data_size = 0;
+    if (!path || !file_data || !file_size || !format || !pcm_data ||
+        !pcm_size || !format_storage ||
+        format_storage_size < sizeof(WAVEFORMATEX))
+        return 0;
+    stream = fopen(path, "rb");
+    if (!stream) return 0;
+    if (fseek(stream, 0, SEEK_END) != 0 ||
+        (length = ftell(stream)) < 44 || length > 64L * 1024L * 1024L ||
+        fseek(stream, 0, SEEK_SET) != 0) {
+        fclose(stream);
+        return 0;
+    }
+    bytes = (unsigned char *)malloc((size_t)length);
+    if (!bytes) {
+        fclose(stream);
+        return 0;
+    }
+    if (fread(bytes, 1, (size_t)length, stream) != (size_t)length) {
+        fclose(stream);
+        free(bytes);
+        return 0;
+    }
+    fclose(stream);
+    if (memcmp(bytes, "RIFF", 4) != 0 ||
+        memcmp(bytes + 8, "WAVE", 4) != 0) {
+        free(bytes);
+        return 0;
+    }
+    cursor = 12;
+    while (cursor + 8 <= (size_t)length) {
+        const uint32_t chunk_size = read_little_u32(bytes + cursor + 4);
+        const size_t chunk_data = cursor + 8;
+        const size_t padded_size = (size_t)chunk_size + (chunk_size & 1u);
+        if (chunk_data > (size_t)length ||
+            padded_size > (size_t)length - chunk_data)
+            break;
+        if (memcmp(bytes + cursor, "fmt ", 4) == 0 && !format_chunk) {
+            format_chunk = bytes + chunk_data;
+            format_size = chunk_size;
+        } else if (memcmp(bytes + cursor, "data", 4) == 0 && !data_chunk) {
+            data_chunk = bytes + chunk_data;
+            data_size = chunk_size;
+        }
+        cursor = chunk_data + padded_size;
+    }
+    if (!format_chunk || format_size < 16 || format_size > 64 ||
+        !data_chunk || !data_size || data_size > MAXDWORD) {
+        free(bytes);
+        return 0;
+    }
+    memset(format_storage, 0, format_storage_size);
+    memcpy(format_storage, format_chunk,
+           format_size < format_storage_size
+               ? format_size
+               : format_storage_size);
+    *format = (WAVEFORMATEX *)format_storage;
+    if (format_size == 16) {
+        (*format)->cbSize = 0;
+    } else if (format_size < 18 ||
+               (size_t)(*format)->cbSize + 18u > format_size) {
+        free(bytes);
+        return 0;
+    }
+    if ((*format)->nChannels == 0 || (*format)->nSamplesPerSec == 0 ||
+        (*format)->nBlockAlign == 0 ||
+        (read_little_u16(format_chunk) != WAVE_FORMAT_PCM &&
+         read_little_u16(format_chunk) != GD_WAVE_FORMAT_IEEE_FLOAT &&
+         read_little_u16(format_chunk) != GD_WAVE_FORMAT_EXTENSIBLE)) {
+        free(bytes);
+        return 0;
+    }
+    *file_data = bytes;
+    *file_size = (size_t)length;
+    *pcm_data = data_chunk;
+    *pcm_size = (DWORD)data_size;
+    return 1;
+}
+
+static void set_waveout_volume(EffectSlot *slot, float volume) {
+    const DWORD channel = (DWORD)(clamp_volume(volume) * 65535.0f + 0.5f);
+    if (slot && slot->output)
+        waveOutSetVolume(slot->output, channel | (channel << 16));
+}
+
 static EffectSlot *open_effect_slot(const char *path, int report_error) {
     EffectSlot *slot = reusable_effect_slot(path);
+    unsigned char format_storage[64];
+    WAVEFORMATEX *format = NULL;
+    unsigned char *pcm_data = NULL;
+    DWORD pcm_size = 0;
+    MMRESULT status;
+    char error_text[256] = "unknown waveOut error";
     if (slot) return slot;
     slot = &g_effects[g_next_effect_slot++ % MAX_EFFECT_SLOTS];
     close_effect_slot(slot);
-    if (!mci_open_path(path, "waveaudio", slot->alias, report_error))
+    if (!load_wave_file(path, &slot->wave_file, &slot->wave_file_size,
+                        &format, &pcm_data, &pcm_size, format_storage,
+                        sizeof(format_storage))) {
+        if (report_error)
+            runtime_log("Audio waveOut: invalid or unsupported WAV file %s",
+                        path);
         return NULL;
+    }
+    status = waveOutOpen(&slot->output, WAVE_MAPPER, format, 0, 0,
+                         CALLBACK_NULL);
+    if (status != MMSYSERR_NOERROR) {
+        if (report_error) {
+            waveOutGetErrorTextA(status, error_text, sizeof(error_text));
+            runtime_log("Audio waveOut open error %u: %s | %s",
+                        (unsigned)status, error_text, path);
+        }
+        close_effect_slot(slot);
+        return NULL;
+    }
+    memset(&slot->header, 0, sizeof(slot->header));
+    slot->header.lpData = (LPSTR)pcm_data;
+    slot->header.dwBufferLength = pcm_size;
+    status = waveOutPrepareHeader(
+        slot->output, &slot->header, sizeof(slot->header));
+    if (status != MMSYSERR_NOERROR) {
+        if (report_error) {
+            waveOutGetErrorTextA(status, error_text, sizeof(error_text));
+            runtime_log("Audio waveOut prepare error %u: %s | %s",
+                        (unsigned)status, error_text, path);
+        }
+        close_effect_slot(slot);
+        return NULL;
+    }
     slot->open = 1;
     slot->identifier = 0;
     slot->paused = 0;
+    slot->loop = 0;
     slot->volume = 1.0f;
     snprintf(slot->path, sizeof(slot->path), "%s", path);
+    if (InterlockedCompareExchange(&g_waveout_backend_logged, 1, 0) == 0)
+        runtime_log(
+            "RESULT: DYNARMIC_WAVEOUT_EFFECT_BACKEND_ACTIVE overlapping-slots=%u",
+            MAX_EFFECT_SLOTS);
     return slot;
 }
 
@@ -869,7 +1026,6 @@ static EffectSlot *find_effect(unsigned identifier) {
 }
 
 void audio_initialize(const char *executable_directory) {
-    unsigned index;
     snprintf(g_audio_directory, sizeof(g_audio_directory), "%s\\audio",
              executable_directory ? executable_directory : ".");
     snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
@@ -885,17 +1041,15 @@ void audio_initialize(const char *executable_directory) {
     InterlockedExchange(&g_effect_queue_overflow_logged, 0);
     InterlockedExchange(&g_short_path_logged, 0);
     InterlockedExchange(&g_effect_cache_hit_logged, 0);
+    InterlockedExchange(&g_waveout_backend_logged, 0);
     memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
     g_effect_asset_cache_count = 0;
     memset(g_effects, 0, sizeof(g_effects));
-    for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        snprintf(g_effects[index].alias, sizeof(g_effects[index].alias),
-                 "gd18_fx_%u", index);
-    }
     initialize_output_meter();
     initialize_effect_worker();
-    runtime_log("Windows MCI audio bridge initialized; APK cache: %s",
-                g_audio_cache_directory);
+    runtime_log(
+        "Windows audio bridge initialized; music=MCI effects=waveOut APK cache: %s",
+        g_audio_cache_directory);
 }
 
 void audio_set_writable_directory(const char *writable_directory) {
@@ -1131,22 +1285,18 @@ static int effect_queue_pop(EffectCommand *command) {
 
 static void preload_effect_now(const char *path) {
     char resolved[MAX_PATH * 2];
-    EffectSlot *slot;
     if (!audio_asset_path(path, 1, resolved, sizeof(resolved))) return;
-    slot = open_effect_slot(resolved, 0);
-    if (slot) {
-        set_alias_volume(slot->alias, g_effects_volume);
-        runtime_log("Audio effect decoder preloaded: %s",
-                    file_name_part(path));
-    }
+    runtime_log("Audio effect prepared in decoded cache: %s",
+                file_name_part(path));
 }
 
 static unsigned play_effect_now(const char *path, int loop,
                                 float pitch, float pan, float gain,
                                 unsigned identifier) {
     char resolved[MAX_PATH * 2];
-    char command[96];
     EffectSlot *slot;
+    MMRESULT status;
+    char error_text[256] = "unknown waveOut error";
     (void)pitch;
     (void)pan;
     if (!identifier) identifier = next_effect_identifier();
@@ -1155,18 +1305,23 @@ static unsigned play_effect_now(const char *path, int loop,
     if (!slot) return 0;
     slot->identifier = identifier;
     slot->paused = 0;
+    slot->loop = loop != 0;
     slot->volume = clamp_volume(gain);
-    set_alias_volume(slot->alias, g_effects_volume * slot->volume);
-    snprintf(command, sizeof(command), "seek %s to start", slot->alias);
-    mci_command(command, NULL, 0, 0);
-    snprintf(command, sizeof(command), "play %s from 0%s", slot->alias,
-             loop ? " repeat" : "");
-    if (!mci_command(command, NULL, 0, 1)) {
+    slot->header.dwFlags &= WHDR_PREPARED;
+    slot->header.dwLoops = loop ? MAXDWORD : 0;
+    if (loop)
+        slot->header.dwFlags |= WHDR_BEGINLOOP | WHDR_ENDLOOP;
+    set_waveout_volume(slot, g_effects_volume * slot->volume);
+    status = waveOutWrite(slot->output, &slot->header, sizeof(slot->header));
+    if (status != MMSYSERR_NOERROR) {
+        waveOutGetErrorTextA(status, error_text, sizeof(error_text));
+        runtime_log("Audio waveOut write error %u: %s | %s",
+                    (unsigned)status, error_text, resolved);
         park_effect_slot(slot);
         return 0;
     }
     if (InterlockedIncrement(&g_effect_log_count) <= 64) {
-        runtime_log("Audio effect playing async: %s (id=%u, loop=%s)",
+        runtime_log("Audio effect playing via waveOut: %s (id=%u, loop=%s)",
                     file_name_part(path), identifier, loop ? "yes" : "no");
     }
     return identifier;
@@ -1176,23 +1331,19 @@ static void set_effect_volume_now(unsigned identifier, float volume) {
     EffectSlot *slot = find_effect(identifier);
     if (!slot) return;
     slot->volume = clamp_volume(volume);
-    set_alias_volume(slot->alias, g_effects_volume * slot->volume);
+    set_waveout_volume(slot, g_effects_volume * slot->volume);
 }
 
 static void pause_effect_now(unsigned identifier) {
     EffectSlot *slot = find_effect(identifier);
-    char command[80];
     if (!slot) return;
-    snprintf(command, sizeof(command), "pause %s", slot->alias);
-    if (mci_command(command, NULL, 0, 0)) slot->paused = 1;
+    if (waveOutPause(slot->output) == MMSYSERR_NOERROR) slot->paused = 1;
 }
 
 static void resume_effect_now(unsigned identifier) {
     EffectSlot *slot = find_effect(identifier);
-    char command[80];
     if (!slot || !slot->paused) return;
-    snprintf(command, sizeof(command), "resume %s", slot->alias);
-    if (mci_command(command, NULL, 0, 0)) slot->paused = 0;
+    if (waveOutRestart(slot->output) == MMSYSERR_NOERROR) slot->paused = 0;
 }
 
 static void stop_effect_now(unsigned identifier) {
@@ -1203,10 +1354,9 @@ static void pause_all_effects_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         EffectSlot *slot = &g_effects[index];
-        char command[80];
         if (!slot->open || !slot->identifier) continue;
-        snprintf(command, sizeof(command), "pause %s", slot->alias);
-        if (mci_command(command, NULL, 0, 0)) slot->paused = 1;
+        if (waveOutPause(slot->output) == MMSYSERR_NOERROR)
+            slot->paused = 1;
     }
 }
 
@@ -1214,10 +1364,9 @@ static void resume_all_effects_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         EffectSlot *slot = &g_effects[index];
-        char command[80];
         if (!slot->open || !slot->identifier || !slot->paused) continue;
-        snprintf(command, sizeof(command), "resume %s", slot->alias);
-        if (mci_command(command, NULL, 0, 0)) slot->paused = 0;
+        if (waveOutRestart(slot->output) == MMSYSERR_NOERROR)
+            slot->paused = 0;
     }
 }
 
@@ -1244,8 +1393,9 @@ static void apply_master_effect_volume_now(void) {
     unsigned index;
     for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
         if (g_effects[index].open) {
-            set_alias_volume(g_effects[index].alias,
-                             g_effects_volume * g_effects[index].volume);
+            set_waveout_volume(
+                &g_effects[index],
+                g_effects_volume * g_effects[index].volume);
         }
     }
 }
@@ -1398,18 +1548,10 @@ unsigned audio_play_effect(const char *path, int loop) {
 
 int audio_is_effect_playing(unsigned identifier) {
     EffectSlot *slot;
-    char command[80];
-    char mode[32] = {0};
     int playing = 0;
     AcquireSRWLockExclusive(&g_effect_state_lock);
     slot = find_effect(identifier);
-    if (slot) {
-        snprintf(command, sizeof(command), "status %s mode", slot->alias);
-        if (mci_command(command, mode, sizeof(mode), 0)) {
-            playing = _stricmp(mode, "playing") == 0 ||
-                      _stricmp(mode, "paused") == 0;
-        }
-    }
+    if (slot) playing = effect_slot_playing(slot);
     ReleaseSRWLockExclusive(&g_effect_state_lock);
     return playing;
 }
@@ -1485,4 +1627,3 @@ void audio_set_effects_volume(float volume) {
     command.type = EFFECT_COMMAND_APPLY_MASTER_VOLUME;
     if (!effect_queue_push(&command)) process_effect_command(&command);
 }
-

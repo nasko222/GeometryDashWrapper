@@ -1,43 +1,47 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup12
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup13
 
 Scope
 - Separate Dynarmic ARMv7 branch for the supplied Geometry Dash 2.2 betas.
 - Stable Dynarmic Test14-fix1 source for Geometry Dash 1.0-1.4 was not modified.
 - Release and source archives contain no APK or extracted game native library.
 
-Runtime regression addressed
-- Bringup11 installed six companion editor hooks before editor creation.
-- The supplied log then exhausted 500,000,000 guest ticks in
-  __vmi_class_type_info::__do_upcast while LevelEditorLayer::create was active.
-- Bringup12 removes the complete ApplyHooks path and restores Bringup9's
-  targeted LevelEditorLayer::create + LevelEditorLayerExt::initH sequence.
-- Bringup11 also replaced valid non-empty level setups with catalog data.
-- Bringup12 preserves valid guest setups and uses the APK catalog/latest inflate
-  only to recover an empty or unreadable setup.
-- The Bringup11 COW-release experiment was removed from the repair path.
+Runtime changes
+- Guest C-string operations now have a mapped-memory-bounded 64 MiB ceiling.
+  The former 1 MiB ceiling truncated Press Start (1,241,094 decoded bytes) and
+  Knock Em Out (1,091,308 decoded bytes).
+- LevelEditorLayer and PlayLayer each receive only their companion
+  updateVisibility helper. Complete ApplyHooks groups remain disabled.
+- Space/Up queue button 1 directly; left/right retain buttons 2/3.
+- WAV effects use a 48-slot waveOut backend. Music remains on MCI.
+- Valid non-empty level setups and the targeted editor initH path are preserved.
 
 Validation performed
 - C++20 syntax check: -Wall -Wextra -Werror, passed.
+- Windows audio C compile: -Wall -Wextra -Werror, passed.
 - Windows cross-compile: Zig 0.14.1, PE32+ x86-64, passed.
 - Windows executable SHA-256:
-  ea036ac046c01304aac3832967714e82b53fde78ce213e6bfc930796ef6482d1
+  6ad0532d072c986fb4782dc2b582ed171f4ee0b98e6f3b3bf594c8f2ba34f601
+- Required PE imports include WINMM.dll.
 - Newer beta static audit:
   constructors=349 imports=391 relocations=103102
   PlayLayer->GJGameLevel=0x334 GJGameLevel->levelID=0x110
-  companion initH=0x18034671, ApplyHooks disabled
+  editor visibility pointers=1 calls=0
+  platformer visibility pointers=1 calls=0
+  companion initH=0x18034671; complete ApplyHooks disabled
 - Earlier beta static audit:
   constructors=327 imports=366 relocations=91437
   PlayLayer->GJGameLevel=0x284 GJGameLevel->levelID=0x104
+  companion libgame absent; targeted companion hooks skipped
 
 Build identity
-- Output: dist-arm-wrapper-v22beta-bringup12
+- Output: dist-arm-wrapper-v22beta-bringup13
 - Dynarmic commit: a41c380246d3d9f9874f0f792d234dc0cc17c180
 - Builder revision:
-  dynarmic-x64-builder23-v22beta-armv7-bringup12-targeted-editor-safe-level-recovery
+  dynarmic-x64-builder24-v22beta-armv7-bringup13-large-level-visual-jump-waveout
 
 Runtime boundary
-- Linux static validation cannot reproduce Windows gameplay.
-- This build is deliberately a Bringup9 behavioral recovery, not a claim that
-  every 2.2 beta level is fixed before runtime testing.
-- Test the editor first, then Power Trip, Knock Em Out, Press Start, and repeated
-  level switching. Attach gd-v22beta-selected.log on any failure.
+- Linux static validation cannot reproduce Windows gameplay, input, rendering,
+  or audio devices.
+- Test editor rendering, platformer jump/overlay, sound effects, then Power
+  Trip, Knock Em Out, Press Start, and repeated level switching.
+- Attach gd-v22beta-selected.log on any failure.
