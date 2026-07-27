@@ -1,38 +1,23 @@
-# Building Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup8
+# Building Geometry Dash ARM Wrapper 0.9.4-arm-v22beta-bringup9
 
-## Windows x64
-
-No APK is included. Pass the beta APK explicitly:
+From a fresh extracted folder, run:
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\Games\geometry-dash-2.2-beta.apk"
+BUILD_V22BETA_X64.cmd "D:\path\to\your-beta.apk"
 ```
 
 Output:
 
 ```text
-dist-arm-wrapper-v22beta-bringup8\
+dist-arm-wrapper-v22beta-bringup9\
 ```
 
-Run:
+Launch:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup8\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup9\RUN_V22_SELECTED_APK.cmd
 ```
 
-Use the normal wrench-and-hammer button from an entry in My Levels. Bringup8 patches that exact `EditLevelLayer::onEdit` callback. F2 is no longer intercepted.
+The selected APK must remain external to the source archive. A newer beta containing `lib/armeabi-v7a/libgame.so` is required for the companion editor initializer. Earlier APKs without that module still receive the level-settings fallback but cannot use the full companion editor initialization.
 
-The build script prepares pinned portable versions of Zig 0.14.1, CMake 3.31.10, Ninja 1.13.2, Boost 1.84.0, and Dynarmic commit `a41c380246d3d9f9874f0f792d234dc0cc17c180`.
-
-The external APK is copied only into the generated local distribution directory. It is never part of the source archive.
-
-## Raw-library probe
-
-Building without an APK uses the included raw `libcocos2dcpp.so` and creates a probe-only launcher:
-
-```bat
-BUILD_V22BETA_X64.cmd
-dist-arm-wrapper-v22beta-bringup8\RUN_V22_RAW_SO_PROBE.cmd
-```
-
-Raw mode validates mapping, relocation, constructors, `JNI_OnLoad`, ARMv7 instructions, exclusive memory and import coverage. Assets and interactive gameplay require a complete APK.
+Test normal gameplay first, then open My Levels and press the wrench-and-hammer button on a level entry. F2 is not intercepted.

@@ -99,6 +99,7 @@ constexpr ArchVersion DynarmicArmv7ArchVersion() {
 }
 
 constexpr u32 kGameBase = 0x10000000u;
+constexpr u32 kV22CompanionBase = 0x18000000u;
 constexpr u32 kSmokeBase = 0x0F000000u;
 constexpr u32 kV22ThunkBase = 0x10F00000u;
 constexpr u32 kObjectBase = 0x20000000u;
@@ -1029,6 +1030,10 @@ struct ElfRuntime {
     u32 v22_string_append_bytes = 0;
     u32 v22_empty_string_data = 0;
     u32 v22_prepare_setup_address = 0;
+    u32 v22_level_settings_from_string = 0;
+    u32 v22_companion_editor_init = 0;
+    u32 v22_companion_image_min = 0;
+    u32 v22_companion_image_max = 0;
     u32 v22_level_editor_create = 0;
     u32 v22_scene_create = 0;
     u32 v22_node_add_child = 0;
@@ -1272,6 +1277,21 @@ static std::vector<u32> FindThumbBlCallSites(const ElfRuntime& runtime,
     return result;
 }
 
+static std::vector<u32> FindThumbBlCallSitesInRange(
+    ProbeEnvironment& env, u32 begin, u32 size, u32 target_address) {
+    std::vector<u32> result;
+    begin &= ~1u;
+    const u32 target = target_address & ~1u;
+    if (size < 4u) return result;
+    const u32 end = begin + size;
+    for (u32 address = begin; address <= end - 4u; address += 2u) {
+        const auto decoded = DecodeThumbBlTarget(
+            address, env.MemoryRead16(address), env.MemoryRead16(address + 2u));
+        if (decoded && (*decoded & ~1u) == target) result.push_back(address);
+    }
+    return result;
+}
+
 static bool DiscoverV22GuestStringBuilder(ElfRuntime& runtime,
                                           ProbeEnvironment& env,
                                           const SymbolRecord& function) {
@@ -1359,6 +1379,33 @@ static std::size_t InstallV22PrepareLevelBridge(ElfRuntime& runtime,
     WriteV22ThumbImportThunk(env, thunk, destination);
     WriteThumbBl(env, call_sites.front(), thunk);
     runtime.v22_prepare_setup_address = prepare->address;
+    return call_sites.size();
+}
+
+static std::size_t InstallV22LevelSettingsParserBridge(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    static constexpr const char* kPrepare =
+        "_ZN9PlayLayer29prepareCreateObjectsFromSetupESs";
+    static constexpr const char* kParser =
+        "_ZN19LevelSettingsObject16objectFromStringESs";
+    const SymbolRecord* prepare = FindSymbol(runtime, kPrepare);
+    const SymbolRecord* parser = FindSymbol(runtime, kParser);
+    if (!prepare || !parser) return 0u;
+    const std::vector<u32> call_sites = FindThumbBlCallSitesInRange(
+        env, prepare->address, prepare->size, parser->address);
+    if (call_sites.size() != 1u) {
+        std::ostringstream error;
+        error << "expected one LevelSettingsObject parser call in PlayLayer, found "
+              << call_sites.size();
+        throw std::runtime_error(error.str());
+    }
+    EnsureV22ThunkPage(env);
+    const u32 destination = EnsureImport(
+        runtime, env, "__dynarmic_v22_level_settings_from_string");
+    const u32 thunk = kV22ThunkBase + 0x20u;
+    WriteV22ThumbImportThunk(env, thunk, destination);
+    WriteThumbBl(env, call_sites.front(), thunk);
+    runtime.v22_level_settings_from_string = parser->address;
     return call_sites.size();
 }
 
@@ -1554,6 +1601,194 @@ static std::size_t InstallSimpleAudioEffectHooks(ElfRuntime& runtime,
         ++installed;
     }
     return installed;
+}
+
+static ElfRuntime MapAndRelocateV22CompanionElf(
+    const std::vector<u8>& elf, ProbeEnvironment& env,
+    ElfRuntime& primary, u32 load_base = kV22CompanionBase) {
+    const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
+    if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 ||
+        header.ident[4] != 1 || header.ident[5] != 1 ||
+        header.type != kEtDyn || header.machine != kEmArm)
+        throw std::runtime_error("companion libgame.so is not ARM ELF32 ET_DYN");
+    if (header.phentsize != sizeof(Elf32Phdr) ||
+        header.shentsize != sizeof(Elf32Shdr) ||
+        static_cast<u64>(header.phoff) +
+                static_cast<u64>(header.phnum) * sizeof(Elf32Phdr) > elf.size() ||
+        static_cast<u64>(header.shoff) +
+                static_cast<u64>(header.shnum) * sizeof(Elf32Shdr) > elf.size())
+        throw std::runtime_error("companion ELF tables are invalid");
+
+    ElfRuntime companion{};
+    companion.entry = load_base + header.entry;
+    u32 min_vaddr = std::numeric_limits<u32>::max();
+    u32 max_vaddr = 0u;
+    std::vector<Elf32Phdr> phdrs;
+    for (u16 i = 0; i < header.phnum; ++i) {
+        const Elf32Phdr ph = ReadPod<Elf32Phdr>(
+            elf, header.phoff + static_cast<std::size_t>(i) * sizeof(Elf32Phdr));
+        phdrs.push_back(ph);
+        if (ph.type != kPtLoad || ph.memsz == 0u) continue;
+        if (static_cast<u64>(ph.offset) + ph.filesz > elf.size() ||
+            ph.filesz > ph.memsz)
+            throw std::runtime_error("invalid companion PT_LOAD segment");
+        ++companion.load_segments;
+        if (ph.flags & 1u) ++companion.executable_segments;
+        min_vaddr = std::min(min_vaddr, AlignDown(ph.vaddr, kPageSize));
+        max_vaddr = std::max(max_vaddr,
+                             AlignUp(ph.vaddr + ph.memsz, kPageSize));
+    }
+    if (!companion.load_segments || max_vaddr <= min_vaddr)
+        throw std::runtime_error("companion ELF has no loadable image");
+    companion.image_min = load_base + min_vaddr;
+    companion.image_max = load_base + max_vaddr;
+    if (companion.image_max >= kObjectBase)
+        throw std::runtime_error("companion ELF overlaps wrapper memory regions");
+    env.Map(companion.image_min,
+            static_cast<std::size_t>(companion.image_max - companion.image_min),
+            true);
+    for (const Elf32Phdr& ph : phdrs) {
+        if (ph.type == kPtLoad && ph.filesz)
+            env.CopyIn(load_base + ph.vaddr, elf.data() + ph.offset, ph.filesz);
+    }
+
+    std::vector<Elf32Shdr> sections;
+    sections.reserve(header.shnum);
+    for (u16 i = 0; i < header.shnum; ++i)
+        sections.push_back(ReadPod<Elf32Shdr>(
+            elf, header.shoff + static_cast<std::size_t>(i) * sizeof(Elf32Shdr)));
+    if (header.shstrndx >= sections.size())
+        throw std::runtime_error("invalid companion section-name table");
+    const Elf32Shdr& shstr = sections[header.shstrndx];
+
+    for (const Elf32Shdr& section : sections) {
+        if (section.type != kShtDynsym) continue;
+        if (section.entsize != sizeof(Elf32Sym) || section.link >= sections.size())
+            throw std::runtime_error("invalid companion .dynsym metadata");
+        const Elf32Shdr& strings = sections[section.link];
+        companion.dynsym_count = section.size / sizeof(Elf32Sym);
+        for (std::size_t i = 0; i < companion.dynsym_count; ++i) {
+            const Elf32Sym symbol = ReadPod<Elf32Sym>(
+                elf, section.offset + i * sizeof(Elf32Sym));
+            if (symbol.shndx == kShnUndef && symbol.name) {
+                ++companion.undefined_symbols;
+                continue;
+            }
+            if (symbol.shndx == kShnUndef || !symbol.value) continue;
+            const std::string name = StringFromTable(elf, strings, symbol.name);
+            if (!name.empty())
+                companion.symbols.push_back(
+                    SymbolRecord{name, load_base + symbol.value, symbol.size});
+        }
+    }
+    std::sort(companion.symbols.begin(), companion.symbols.end(),
+              [](const SymbolRecord& lhs, const SymbolRecord& rhs) {
+                  if (lhs.address != rhs.address) return lhs.address < rhs.address;
+                  return lhs.size > rhs.size;
+              });
+
+    auto resolve_primary = [&](const std::string& name) -> u32 {
+        if (const SymbolRecord* symbol = FindSymbol(primary, name))
+            return symbol->address;
+        return 0u;
+    };
+
+    for (const Elf32Shdr& section : sections) {
+        if (section.type == kShtRela)
+            throw std::runtime_error("companion ELF uses unsupported RELA");
+        if (section.type != kShtRel) continue;
+        if (section.entsize != sizeof(Elf32Rel) || section.link >= sections.size())
+            throw std::runtime_error("invalid companion REL metadata");
+        const Elf32Shdr& symbols_section = sections[section.link];
+        if (symbols_section.entsize != sizeof(Elf32Sym) ||
+            symbols_section.link >= sections.size())
+            throw std::runtime_error("invalid companion relocation symbols");
+        const Elf32Shdr& strings = sections[symbols_section.link];
+        const std::size_t symbol_count =
+            symbols_section.size / sizeof(Elf32Sym);
+        const std::size_t count = section.size / sizeof(Elf32Rel);
+        companion.relocation_count += count;
+        for (std::size_t rel_index = 0; rel_index < count; ++rel_index) {
+            const Elf32Rel rel = ReadPod<Elf32Rel>(
+                elf, section.offset + rel_index * sizeof(Elf32Rel));
+            const u32 symbol_index = rel.info >> 8u;
+            const u32 type = rel.info & 0xFFu;
+            const u32 where = load_base + rel.offset;
+            const u32 addend = env.MemoryRead32(where);
+            u32 value = 0u;
+            std::string name;
+            if (symbol_index) {
+                if (symbol_index >= symbol_count)
+                    throw std::runtime_error(
+                        "companion relocation symbol index is outside table");
+                const Elf32Sym symbol = ReadPod<Elf32Sym>(
+                    elf, symbols_section.offset +
+                             static_cast<std::size_t>(symbol_index) *
+                                 sizeof(Elf32Sym));
+                name = StringFromTable(elf, strings, symbol.name);
+                if (symbol.shndx != kShnUndef) {
+                    value = load_base + symbol.value;
+                } else if ((value = resolve_primary(name)) != 0u) {
+                    // Resolve Cocos/game code and imported data against the
+                    // already relocated primary libcocos2dcpp.so image.
+                } else if (IsImportedObjectName(name, symbol.info & 0x0Fu)) {
+                    value = EnsureObject(primary, env, name);
+                } else {
+                    value = EnsureImport(primary, env, name);
+                }
+            }
+            switch (type) {
+            case kRArmNone: break;
+            case kRArmAbs32: env.MemoryWrite32(where, value + addend); break;
+            case kRArmGlobDat:
+            case kRArmJumpSlot: env.MemoryWrite32(where, value); break;
+            case kRArmRelative:
+                env.MemoryWrite32(where, load_base + addend);
+                ++companion.relative_relocations;
+                break;
+            default: {
+                std::ostringstream error;
+                error << "unsupported companion ARM relocation " << type
+                      << " at 0x" << std::hex << rel.offset << " (" << name
+                      << ")";
+                throw std::runtime_error(error.str());
+            }
+            }
+            if (type == kRArmAbs32 || type == kRArmGlobDat ||
+                type == kRArmJumpSlot)
+                ++companion.imported_relocations;
+        }
+    }
+
+    for (const Elf32Shdr& section : sections) {
+        const std::string name = SectionName(elf, shstr, section.name);
+        if (section.type != kShtInitArray && name != ".init_array") continue;
+        if (section.size % 4u)
+            throw std::runtime_error("invalid companion .init_array size");
+        const std::size_t count = section.size / 4u;
+        companion.constructors.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+            companion.constructors.push_back(env.MemoryRead32(
+                load_base + section.addr + static_cast<u32>(i * 4u)));
+        break;
+    }
+
+    const SymbolRecord* editor_init = FindSymbol(
+        companion, "_ZN19LevelEditorLayerExt5initHEP11GJGameLevel");
+    if (!editor_init)
+        throw std::runtime_error(
+            "companion libgame.so lacks LevelEditorLayerExt::initH");
+    primary.v22_companion_editor_init = editor_init->address;
+    primary.v22_companion_image_min = companion.image_min;
+    primary.v22_companion_image_max = companion.image_max;
+    primary.symbols.insert(primary.symbols.end(), companion.symbols.begin(),
+                           companion.symbols.end());
+    std::sort(primary.symbols.begin(), primary.symbols.end(),
+              [](const SymbolRecord& lhs, const SymbolRecord& rhs) {
+                  if (lhs.address != rhs.address) return lhs.address < rhs.address;
+                  return lhs.size > rhs.size;
+              });
+    return companion;
 }
 
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
@@ -1860,7 +2095,7 @@ public:
         closed_ = false;
         active_ = true;
         instance_ = GetModuleHandleA(nullptr);
-        const char* class_name = "GeometryDashV22BetaBringup8Window";
+        const char* class_name = "GeometryDashV22BetaBringup9Window";
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_OWNDC;
@@ -1872,7 +2107,7 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bring-up 1",
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash 2.2 Beta ARMv7 - Bringup9",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   rectangle.right - rectangle.left,
@@ -2310,6 +2545,16 @@ public:
             log_ << "RESULT: DYNARMIC_V22_INFLATE_TOTALS success="
                  << v22_decompress_successes_ << " failures="
                  << v22_decompress_failures_ << '\n';
+            log_.flush();
+        }
+        if (v22_level_settings_native_successes_ ||
+            v22_level_settings_native_failures_ ||
+            v22_level_settings_fallback_successes_) {
+            log_ << "RESULT: DYNARMIC_V22_LEVEL_SETTINGS_TOTALS native_ok="
+                 << v22_level_settings_native_successes_
+                 << " native_null=" << v22_level_settings_native_failures_
+                 << " fallback_ok=" << v22_level_settings_fallback_successes_
+                 << '\n';
             log_.flush();
         }
         if (apk_memory_read_calls_) {
@@ -2797,6 +3042,29 @@ private:
             return output.str();
         }
         if (address == kReturnStub) return "host-return-stub";
+        if (runtime_.v22_companion_image_min &&
+            address >= runtime_.v22_companion_image_min &&
+            address < runtime_.v22_companion_image_max) {
+            const auto found = std::upper_bound(
+                runtime_.symbols.begin(), runtime_.symbols.end(), address,
+                [](u32 value, const SymbolRecord& symbol) {
+                    return value < symbol.address;
+                });
+            if (found != runtime_.symbols.begin()) {
+                const SymbolRecord& symbol = *std::prev(found);
+                if (symbol.address >= runtime_.v22_companion_image_min) {
+                    const u32 offset = address - symbol.address;
+                    output << symbol.name;
+                    if (offset) output << "+0x" << std::hex << offset;
+                    output << " [libgame+0x" << std::hex
+                           << (address - kV22CompanionBase) << ']';
+                    return output.str();
+                }
+            }
+            output << "libgame+0x" << std::hex
+                   << (address - kV22CompanionBase);
+            return output.str();
+        }
         if (address >= runtime_.image_min && address < runtime_.image_max) {
             const auto found = std::upper_bound(
                 runtime_.symbols.begin(), runtime_.symbols.end(), address,
@@ -3837,6 +4105,89 @@ private:
         return ok;
     }
 
+    static std::string SanitizeV22LevelSettingsHeader(
+        const std::string& original) {
+        const std::size_t begin = original.find("kS38,");
+        if (begin == std::string::npos) return {};
+        const std::size_t tail = original.find(",kA13,", begin + 5u);
+        if (tail == std::string::npos) return {};
+        std::string sanitized = original.substr(0u, begin);
+        if (!sanitized.empty() && sanitized.back() == ',') sanitized.pop_back();
+        if (!sanitized.empty()) sanitized.push_back(',');
+        sanitized.append(original.substr(tail + 1u));
+        return sanitized;
+    }
+
+    bool HostV22LevelSettingsFromString(u32& result) {
+        result = 0u;
+        if (!runtime_.v22_level_settings_from_string)
+            return Fail("V22 LevelSettingsObject parser target is unavailable");
+        const u32 original_object = cpu_.Regs()[0];
+        std::string original;
+        if (!ReadGuestCowStringObject(original_object, original, 4u * 1024u * 1024u))
+            return Fail("V22 level settings argument is not a valid guest std::string");
+        if (!RunNestedPreservingState(runtime_.v22_level_settings_from_string,
+                                      {original_object}, result,
+                                      "V22 LevelSettingsObject::objectFromString"))
+            return false;
+        if (result) {
+            ++v22_level_settings_native_successes_;
+            return true;
+        }
+
+        ++v22_level_settings_native_failures_;
+        std::string sanitized = SanitizeV22LevelSettingsHeader(original);
+        const char* mode = "strip-kS38";
+        if (sanitized.empty()) {
+            sanitized =
+                "kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,kA25,0,"
+                "kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,kA4,0,kA8,0,kA10,0";
+            mode = "minimal-default";
+        }
+        const u32 temporary = Allocate(4u);
+        if (!temporary) return Fail("V22 could not allocate fallback settings string");
+        env_.MemoryWrite32(temporary, runtime_.v22_empty_string_data);
+        if (!BuildGuestStringFromBytes(temporary, sanitized))
+            return Fail("V22 could not build sanitized level settings string");
+        u32 retry = 0u;
+        if (!RunNestedPreservingState(runtime_.v22_level_settings_from_string,
+                                      {temporary}, retry,
+                                      "V22 sanitized LevelSettingsObject::objectFromString"))
+            return false;
+        if (!retry && std::string(mode) != "minimal-default") {
+            const std::string minimal =
+                "kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,kA25,0,"
+                "kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,kA4,0,kA8,0,kA10,0";
+            const u32 second = Allocate(4u);
+            if (!second) return Fail("V22 could not allocate minimal settings string");
+            env_.MemoryWrite32(second, runtime_.v22_empty_string_data);
+            if (!BuildGuestStringFromBytes(second, minimal))
+                return Fail("V22 could not build minimal settings string");
+            if (!RunNestedPreservingState(
+                    runtime_.v22_level_settings_from_string, {second}, retry,
+                    "V22 minimal LevelSettingsObject::objectFromString"))
+                return false;
+            mode = "minimal-default";
+            sanitized = minimal;
+        }
+        if (!retry) {
+            log_ << "ERROR: V22 level settings fallback rejected original="
+                 << original.size() << " sanitized=" << sanitized.size() << '\n';
+            log_.flush();
+            result = 0u;
+            return true;
+        }
+        result = retry;
+        ++v22_level_settings_fallback_successes_;
+        log_ << "WARNING: V22 level settings parser fallback mode=" << mode
+             << " original=" << original.size()
+             << " sanitized=" << sanitized.size()
+             << " object=0x" << std::hex << result << std::dec
+             << " fallback=" << v22_level_settings_fallback_successes_ << '\n';
+        log_.flush();
+        return true;
+    }
+
     bool HostV22PrepareLevelSetup() {
         if (!runtime_.v22_prepare_setup_address)
             return Fail("V22 PlayLayer setup target is unavailable");
@@ -3924,6 +4275,21 @@ private:
                                       "V22 LevelEditorLayer::create") ||
             !editor)
             return false;
+        if (!runtime_.v22_companion_editor_init)
+            return Fail("V22 companion LevelEditorLayerExt::initH is unavailable");
+        u32 companion_init_result = 0u;
+        if (!RunNestedPreservingState(runtime_.v22_companion_editor_init,
+                                      {editor, level}, companion_init_result,
+                                      "V22 companion LevelEditorLayerExt::initH",
+                                      3000000000u))
+            return false;
+        if (!companion_init_result)
+            return Fail("V22 companion editor initialization returned false");
+        log_ << "RESULT: DYNARMIC_V22_COMPANION_EDITOR_INIT_OK editor=0x"
+             << std::hex << editor << " level=0x" << level
+             << " init=0x" << runtime_.v22_companion_editor_init
+             << std::dec << '\n';
+        log_.flush();
         if (!RunNestedPreservingState(runtime_.v22_scene_create, {}, scene,
                                       "V22 CCScene::create") || !scene)
             return false;
@@ -6088,6 +6454,11 @@ private:
         };
         // These dominate APK/level loading. Keep them ahead of the large generic
         // import chain and avoid temporary allocations on every SVC crossing.
+        if (name == "__dynarmic_v22_level_settings_from_string") {
+            u32 value = 0u;
+            if (!HostV22LevelSettingsFromString(value)) return false;
+            return finish_hot(value);
+        }
         if (name == "__dynarmic_v22_prepare_level_setup")
             return HostV22PrepareLevelSetup();
         if (name == "__dynarmic_v22_edit_level_onEdit") {
@@ -6747,6 +7118,9 @@ private:
     u64 v22_decompress_log_count_=0;
     u64 v22_level_payload_caches_=0;
     u64 v22_level_setup_repairs_=0;
+    u64 v22_level_settings_native_successes_=0;
+    u64 v22_level_settings_native_failures_=0;
+    u64 v22_level_settings_fallback_successes_=0;
     u64 v22_editor_entries_=0;
     std::string v22_last_level_setup_;
     u32 v22_editor_callback_address_=0;
@@ -7123,7 +7497,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper v22beta-bringup8 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper v22beta-bringup9 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7377,8 +7751,8 @@ int main(int argc,char** argv) {
         log_file.flush();
     };
     try {
-        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup8");
-        emit("Milestone: PlayLayer level-string handoff repair and real wrench-and-hammer EditLevelLayer editor entry");
+        emit("Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup9");
+        emit("Milestone: selective level-settings parser recovery and companion libgame editor initialization");
         emit("Log file: " + log_path);
         if (profile_enabled) {
             emit("Frame profile CSV: " + profile_path);
@@ -7390,7 +7764,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_HOST_PROFILE " + HostSystemProfile());
         if(sizeof(void*)!=8)
             throw std::runtime_error(
-                "V22BetaBringup8 must be compiled as a 64-bit executable");
+                "V22BetaBringup9 must be compiled as a 64-bit executable");
         if (!static_audit_only) {
             RunArmv7FeatureSmoke();
             emit("RESULT: DYNARMIC_X64_ARMV7_FEATURE_SMOKE_OK thumb2=1 vfpv3=1 neon=1 exclusive=1 guest=v7A host=x86_64");
@@ -7398,7 +7772,7 @@ int main(int argc,char** argv) {
             emit("RESULT: DYNARMIC_V22_STATIC_AUDIT_MODE execution=disabled");
         }
         emit("RESULT: DYNARMIC_GUEST_PAGE_LOOKUP_READY pages=1048576 typed-access=single-copy");
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP9_READY raw-so=1 apk-armv7=1 import-manifest=1 profile=1");
 
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
@@ -7472,6 +7846,10 @@ int main(int argc,char** argv) {
         }
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
+        ElfRuntime companion_runtime{};
+        if (!companion_libgame.empty())
+            companion_runtime = MapAndRelocateV22CompanionElf(
+                companion_libgame, env, runtime);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         if(zip_hooks!=1u)
             throw std::runtime_error(
@@ -7498,9 +7876,14 @@ int main(int argc,char** argv) {
         if (prepare_bridges != 1u)
             throw std::runtime_error(
                 "required PlayLayer level setup bridge was not installed");
-        const std::size_t edit_button_pointers =
-            InstallV22EditButtonBridge(runtime, env);
-        if (edit_button_pointers == 0u)
+        const std::size_t settings_parser_bridges =
+            InstallV22LevelSettingsParserBridge(runtime, env);
+        if (settings_parser_bridges != 1u)
+            throw std::runtime_error(
+                "required LevelSettingsObject parser bridge was not installed");
+        const std::size_t edit_button_pointers = companion_libgame.empty()
+            ? 0u : InstallV22EditButtonBridge(runtime, env);
+        if (!companion_libgame.empty() && edit_button_pointers == 0u)
             throw std::runtime_error(
                 "required EditLevelLayer::onEdit callback pointer was not found");
         {
@@ -7545,9 +7928,25 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " fallback=last-verified-kS-payload guest-string-builder=1");
-        emit("RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_READY pointers="+
-             std::to_string(edit_button_pointers)+
-             " source=EditLevelLayer::onEdit target=LevelEditorLayer::create");
+        emit("RESULT: DYNARMIC_V22_LEVEL_SETTINGS_FALLBACK_READY callsites="+
+             std::to_string(settings_parser_bridges)+
+             " mode=native-first+strip-kS38+minimal-default");
+        if (!companion_libgame.empty()) {
+            std::ostringstream line;
+            line << "RESULT: DYNARMIC_V22_COMPANION_EDITOR_RUNTIME_READY image=0x"
+                 << std::hex << companion_runtime.image_min << "-0x"
+                 << companion_runtime.image_max << " initH=0x"
+                 << runtime.v22_companion_editor_init << std::dec
+                 << " constructors=not-run targeted-init=1";
+            emit(line.str());
+        }
+        if (edit_button_pointers) {
+            emit("RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_READY pointers="+
+                 std::to_string(edit_button_pointers)+
+                 " source=EditLevelLayer::onEdit target=companion-initH+LevelEditorLayer::create");
+        } else {
+            emit("RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_UNAVAILABLE reason=companion-libgame-absent");
+        }
         emit("RESULT: DYNARMIC_V22_AUDIO_PATH mode=initial-host-FMOD-bridge imports="+
              std::to_string(std::count_if(
                  runtime.imports.begin(),runtime.imports.end(),
@@ -7701,7 +8100,7 @@ int main(int argc,char** argv) {
                             runtime.native_delete_backward);
                     break;
                 case HostEventType::OpenEditor:
-                    // Bringup8 incorrectly mapped F2 to My Levels. Bringup8
+                    // Bringup7 incorrectly mapped F2 to My Levels. Bringup9
                     // intentionally leaves F2 unused; the real wrench-and-
                     // hammer EditLevelLayer callback is patched instead.
                     break;
@@ -7863,7 +8262,7 @@ int main(int argc,char** argv) {
                 }
                 executor.ReportHeapStatus("periodic");
                 std::ostringstream title;
-                title<<"Geometry Dash 2.2 Beta ARMv7 - Bring-up 1 | "
+                title<<"Geometry Dash 2.2 Beta ARMv7 - Bringup9 | "
                      <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
                 executor.SetWindowTitle(title.str());
                 interval_start=now;
@@ -7913,11 +8312,11 @@ int main(int argc,char** argv) {
                 names<<' '<<name;
             emit(names.str());
         }
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_OK");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP9_OK");
         return 0;
     } catch(const std::exception& error){
         emit(std::string("ERROR: ")+error.what());
-        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP8_FAILED");
+        emit("RESULT: DYNARMIC_V22_BETA_BRINGUP9_FAILED");
         return 1;
     }
 }

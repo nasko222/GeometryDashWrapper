@@ -1,59 +1,77 @@
-# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup8
+# Geometry Dash ARM Wrapper — 2.2 beta ARMv7 Bringup9
 
-Separate ARMv7-A / Thumb-2 / VFPv3 / NEON bring-up branch. It does not replace the stable ARMv5 Test14-fix1 branch.
+Bringup9 continues the separate ARMv7-A/Thumb-2/VFPv3/NEON Geometry Dash 2.2 beta branch. It does not modify the stable ARMv5 test14-fix1 branch and it does not merge x86/ARM/ARMv7 selection yet.
 
-## Build with an external APK
+## What Bringup9 changes
 
-No APK is included in this source package.
+### Selective level-settings recovery
+
+Bringup8 proved that full level payload inflation works and that some levels, including Power Trip, already enter gameplay. A different level can still fail when the beta's own `LevelSettingsObject::objectFromString` rejects the first settings segment and returns null.
+
+Bringup9 hooks only that one parser call inside `PlayLayer::prepareCreateObjectsFromSetup`:
+
+1. Run the original parser with the original guest `std::string`.
+2. If it succeeds, change nothing.
+3. If it returns null, retry after removing only the beta-only `kS38` color-channel block.
+4. If that is still rejected, retry with minimal default level settings.
+
+The object list and gameplay payload are never replaced. A fallback may temporarily lose custom level colors, but it prevents a rejected settings header from crashing the entire level.
+
+### Real companion editor initialization
+
+The wrench-and-hammer bridge from Bringup8 successfully creates the editor scene and starts the fade transition. The crash in `LevelEditorLayer::draw` happens because the beta's main `LevelEditorLayer::init` is a disabled four-byte stub; important members such as the array at `+0x2BFC` remain null.
+
+When the selected APK contains `lib/armeabi-v7a/libgame.so`, Bringup9 maps and relocates that companion ARM module beside `libcocos2dcpp.so`. Undefined Cocos/game symbols resolve against the already loaded main library, while normal Android/libc/FM0D/OpenGL imports reuse the wrapper's host stubs.
+
+The wrapper then calls the companion's real:
+
+```text
+LevelEditorLayerExt::initH(GJGameLevel*)
+```
+
+on the editor object before attaching it to the new scene. The companion's Android Dobby/JNI hook installer is not executed; only the targeted editor initializer is used.
+
+## Build
 
 ```bat
-BUILD_V22BETA_X64.cmd "D:\path\to\your-2.2-beta.apk"
+BUILD_V22BETA_X64.cmd "D:\path\to\beta.apk"
 ```
 
 Run:
 
 ```bat
-dist-arm-wrapper-v22beta-bringup8\RUN_V22_SELECTED_APK.cmd
+dist-arm-wrapper-v22beta-bringup9\RUN_V22_SELECTED_APK.cmd
 ```
 
-## Bringup8 targets
+Use a fresh extracted source folder. The APK remains external and is copied only to the local generated distribution directory.
 
-### Official-level launch
+## Test order
 
-The host low-level inflater already produced the correct megabyte-scale object data, but the beta passed an empty COW `std::string` into `PlayLayer::prepareCreateObjectsFromSetup`.
+1. Start Power Trip or another level that already worked in Bringup8.
+2. Start Knock Em Out or the level that previously crashed after successful inflation.
+3. Open My Levels, select a level, and press the wrench-and-hammer button.
+4. If the editor opens, place an object, playtest, pause, and exit back to My Levels.
 
-Bringup8 patches the single direct callsite to that parser. If its string argument is empty, the wrapper rebuilds it from the last verified `kS...` level payload using the beta's own guest string byte builder, then tail-calls the original parser with its original return address and ABI intact.
-
-Expected markers:
+## Expected markers
 
 ```text
-RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites=1 ...
-[host] V22 PlayLayer setup repaired bytes=1241094 object=0x... data=0x... repair=1
+RESULT: DYNARMIC_V22_LEVEL_SETTINGS_FALLBACK_READY callsites=1 mode=native-first+strip-kS38+minimal-default
+RESULT: DYNARMIC_V22_COMPANION_EDITOR_RUNTIME_READY image=0x18000000-0x180a3000 initH=0x... constructors=not-run targeted-init=1
 ```
 
-### Wrench-and-hammer editor button
-
-F2 has been removed as an editor workaround. It only opened My Levels and did not address the broken editor button.
-
-Both beta engines export `EditLevelLayer::onEdit(CCObject*)` as a two-byte no-op. Bringup8 redirects the actual stored menu callback pointer to a host bridge that follows the companion `libgame.so` editor path:
-
-- read the current `GJGameLevel` from `EditLevelLayer`;
-- close active text input and verify the level name;
-- create the real `LevelEditorLayer`;
-- create a scene, add the editor layer, create a fade transition, and replace the current scene.
-
-Expected markers:
+Only a rejected level settings header should produce:
 
 ```text
-RESULT: DYNARMIC_V22_EDIT_BUTTON_BRIDGE_READY pointers=1 ...
-[host] V22 wrench-and-hammer editor button editLayer=0x... level=0x...
+WARNING: V22 level settings parser fallback mode=strip-kS38 ...
+```
+
+Editor initialization should produce:
+
+```text
+RESULT: DYNARMIC_V22_COMPANION_EDITOR_INIT_OK editor=0x... level=0x... init=0x...
 RESULT: DYNARMIC_V22_LEVEL_EDITOR_ENTERED source=wrench-hammer count=1
 ```
 
-## Retained fixes
+## Limits
 
-- ARM exclusive monitor and `LDREX/STREX` support.
-- FMOD 1.05.04-compatible host bridge and music pre-cache.
-- 60 Hz Android refresh-rate response.
-- Host APK member cache and text-input asset prewarm.
-- Optional `libgame.so` detection without executing Android Dobby on Windows.
+The Windows executable cannot be runtime-tested in this Linux packaging environment. Static loading, relocation, hook discovery, companion symbol resolution, and C++20 syntax validation are performed here; the Windows log remains the authoritative gameplay test.

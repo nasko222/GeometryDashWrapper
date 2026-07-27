@@ -1,5 +1,7 @@
-# Source contents — v22beta Bringup8
+# Source contents — v22beta Bringup9
 
-The archive contains the complete wrapper source tree, Windows build scripts, pinned dependency preparation, the raw ARMv7 `libcocos2dcpp.so` probe input, Bringup8 notes, and dual-beta static-audit results.
+The archive contains the complete wrapper source tree, Windows build scripts, pinned dependency preparation, the retained raw `libcocos2dcpp.so` probe input, Bringup9 notes, and static-audit results.
 
-No APK files are included. An APK passed to `BUILD_V22BETA_X64.cmd` is copied only into the generated local `dist-arm-wrapper-v22beta-bringup8` directory.
+No APK files are included. No extracted `libgame.so` is included. Both libraries are read from the user-selected external APK at runtime/build time.
+
+Historical wrapper changelog files are not included.

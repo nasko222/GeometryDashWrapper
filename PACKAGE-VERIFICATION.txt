@@ -1,17 +1,18 @@
-Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup8
+Geometry Dash ARM wrapper 0.9.4-arm-v22beta-bringup9
 
 Package policy:
 - complete source and pinned dependency tree retained
 - no APK files included
+- no extracted companion libgame.so included
 - no historical wrapper changelog files included
 - raw libcocos2dcpp.so probe retained
 
-Bringup8 validation:
-- portable C++20 syntax passed with Dynarmic interface stubs and -Wall -Wextra -Werror
-- a Linux static-audit executable built from the exact source
-- newer beta: one PlayLayer setup BL callsite and one EditLevelLayer::onEdit callback pointer patched
-- earlier beta: one PlayLayer setup BL callsite and one EditLevelLayer::onEdit callback pointer patched
-- both beta string builders and empty-string singletons discovered after relocation
-- both beta editor creation, scene, transition, and director symbols resolved
+Bringup9 validation:
+- portable C++20 syntax passed with Dynarmic interface stubs and warnings treated as errors
+- Linux static-audit executable built from the exact source
+- newer beta companion mapped at 0x18000000-0x180a3000
+- companion LevelEditorLayerExt::initH resolved at 0x18034671
+- newer beta: one LevelSettingsObject parser callsite and one EditLevelLayer callback pointer patched
+- earlier beta: one LevelSettingsObject parser callsite patched; editor bridge deliberately left unpatched because libgame.so is absent
 - APK count in source tree: zero
 - ZIP integrity and SHA-256 verified after packaging
