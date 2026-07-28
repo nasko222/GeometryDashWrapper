@@ -228,10 +228,19 @@ int gd_settings_rewrite_url(const char *input, char *output, size_t capacity) {
                        sizeof(endpoint), &query)) {
         return 0;
     }
-    scheme = server.scheme[0] ? server.scheme : original_scheme;
-    written = snprintf(output, capacity, "%s://%s%s/%s%s", scheme,
-                       server.host_header, server.base_path, endpoint,
-                       query ? query : "");
+    /* Song metadata is an official Boomlings service even when gameplay,
+     * accounts, comments, and levels are routed to a GDPS. Keep this endpoint
+     * independent so its CDN URL can be returned and downloaded normally. */
+    if (ascii_equal_ci(endpoint, "getGJSongInfo.php")) {
+        written = snprintf(output, capacity,
+                           "https://www.boomlings.com/database/%s%s",
+                           endpoint, query ? query : "");
+    } else {
+        scheme = server.scheme[0] ? server.scheme : original_scheme;
+        written = snprintf(output, capacity, "%s://%s%s/%s%s", scheme,
+                           server.host_header, server.base_path, endpoint,
+                           query ? query : "");
+    }
     if (written < 0 || (size_t)written >= capacity) {
         output[0] = 0;
         return -1;
@@ -346,6 +355,11 @@ int gd_settings_rewrite_http_request(const void *input, size_t input_size,
         tolower((unsigned char)endpoint_start[endpoint_size - 2]) != 'h' ||
         tolower((unsigned char)endpoint_start[endpoint_size - 1]) != 'p') {
         return 0;
+    }
+    if (endpoint_size == strlen("getGJSongInfo.php") &&
+        ascii_mem_contains_ci(endpoint_start, endpoint_size,
+                              "getGJSongInfo.php")) {
+        return 0; /* handled by the official-song transport */
     }
     query_size = query ? (size_t)(path_end - query) : 0;
     if (snprintf(new_path, sizeof(new_path), "%s/%.*s%.*s",

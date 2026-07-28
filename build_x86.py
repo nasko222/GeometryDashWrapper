@@ -193,6 +193,7 @@ def main() -> int:
         root / "src/shared/storage_win.c",
         root / "src/shared/net_compat_win.c",
         root / "src/shared/runtime_settings.c",
+        root / "src/shared/song_http_win.c",
         embedded_effects,
         root / "third_party/stb/stb_vorbis.c",
         *sorted((root / "third_party/zlib").glob("*.c")),
@@ -223,6 +224,7 @@ def main() -> int:
         "-lshell32",
         "-lwinmm",
         "-lole32",
+        "-lwinhttp",
     ]
     environment = os.environ.copy()
     environment["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")

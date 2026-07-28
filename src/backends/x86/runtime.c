@@ -24,6 +24,7 @@
 #include "build_info.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "song_http_win.h"
 #include "fmod_win.h"
 #include "storage_win.h"
 #include "zlib.h"
@@ -1505,6 +1506,7 @@ static void shim_freeaddrinfo(AndroidAddrInfo *result) {
 }
 
 static void socket_trace_reset(int descriptor);
+static void synthetic_http_reset(int descriptor);
 
 static int shim_socket(int family, int type, int protocol) {
     static LONG trace_count;
@@ -1526,6 +1528,7 @@ static int shim_socket(int family, int type, int protocol) {
        additional operation. */
     (void)GD_ANDROID_SOCK_CLOEXEC;
     socket_trace_reset((int)(uintptr_t)descriptor);
+    synthetic_http_reset((int)(uintptr_t)descriptor);
     {
         LONG trace = InterlockedIncrement(&trace_count);
         if (trace <= 64) {
@@ -1751,6 +1754,125 @@ static int shim_shutdown(int descriptor, int how) {
         return set_socket_error();
     }
     return 0;
+}
+
+#define SYNTHETIC_HTTP_SLOT_COUNT 64
+typedef struct {
+    int used;
+    int descriptor;
+    unsigned char *bytes;
+    size_t size;
+    size_t offset;
+    int eof_pending;
+} SyntheticHttpState;
+
+static SRWLOCK g_synthetic_http_lock = SRWLOCK_INIT;
+static SyntheticHttpState g_synthetic_http[SYNTHETIC_HTTP_SLOT_COUNT];
+
+static SyntheticHttpState *synthetic_http_state_locked(int descriptor,
+                                                        int create) {
+    SyntheticHttpState *empty = NULL;
+    unsigned index;
+    for (index = 0; index < SYNTHETIC_HTTP_SLOT_COUNT; ++index) {
+        SyntheticHttpState *state = &g_synthetic_http[index];
+        if (state->used && state->descriptor == descriptor) return state;
+        if (!state->used && !empty) empty = state;
+    }
+    if (!create) return NULL;
+    if (!empty) empty = &g_synthetic_http[(unsigned)descriptor %
+                                          SYNTHETIC_HTTP_SLOT_COUNT];
+    free(empty->bytes);
+    memset(empty, 0, sizeof(*empty));
+    empty->used = 1;
+    empty->descriptor = descriptor;
+    return empty;
+}
+
+static void synthetic_http_reset(int descriptor) {
+    AcquireSRWLockExclusive(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 0);
+        if (state) {
+            free(state->bytes);
+            memset(state, 0, sizeof(*state));
+        }
+    }
+    ReleaseSRWLockExclusive(&g_synthetic_http_lock);
+}
+
+static int synthetic_http_store(int descriptor, unsigned char *bytes,
+                                size_t size) {
+    int ok = 0;
+    AcquireSRWLockExclusive(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 1);
+        if (state) {
+            free(state->bytes);
+            state->bytes = bytes;
+            state->size = size;
+            state->offset = 0;
+            state->eof_pending = 1;
+            ok = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_synthetic_http_lock);
+    return ok;
+}
+
+static int synthetic_http_ready(int descriptor) {
+    int ready = 0;
+    AcquireSRWLockShared(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 0);
+        ready = state && (state->offset < state->size || state->eof_pending);
+    }
+    ReleaseSRWLockShared(&g_synthetic_http_lock);
+    return ready;
+}
+
+/* Returns 1 when handled, 0 when no synthetic response exists. */
+static int synthetic_http_recv(int descriptor, void *buffer, size_t length,
+                               int *result) {
+    int handled = 0;
+    AcquireSRWLockExclusive(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 0);
+        if (state) {
+            handled = 1;
+            if (state->offset < state->size) {
+                size_t count = state->size - state->offset;
+                if (count > length) count = length;
+                if (count) memcpy(buffer, state->bytes + state->offset, count);
+                state->offset += count;
+                *result = count > INT_MAX ? INT_MAX : (int)count;
+            } else {
+                *result = 0;
+                state->eof_pending = 0;
+                free(state->bytes);
+                memset(state, 0, sizeof(*state));
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_synthetic_http_lock);
+    return handled;
+}
+
+static int try_official_song_request(int descriptor, const void *buffer,
+                                     size_t length) {
+    unsigned char *response = NULL;
+    size_t response_size = 0;
+    int response_code = 0;
+    int handled = gd_song_http_handle_raw_request(
+        buffer, length, &response, &response_size, &response_code);
+    if (handled <= 0) return handled;
+    if (!synthetic_http_store(descriptor, response, response_size)) {
+        free(response);
+        return -1;
+    }
+    runtime_log("Network song metadata routed to official Boomlings HTTPS: "
+                "fd=%d status=%d response=%lu",
+                descriptor, response_code, (unsigned long)response_size);
+    return 1;
 }
 
 #define HTTP_TRACE_SLOT_COUNT 64
@@ -2020,6 +2142,13 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
     static LONG error_count;
     int result;
     if (length > INT_MAX) length = INT_MAX;
+    if (synthetic_http_recv(descriptor, buffer, length, &result)) {
+        if (result > 0) {
+            socket_trace_traffic(descriptor, buffer, (size_t)result, 0);
+            trace_http_response(descriptor, buffer, result);
+        }
+        return result;
+    }
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
                   (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
@@ -2090,7 +2219,19 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     static LONG error_count;
     int result;
     int rewritten = 0;
+    int song_request;
     if (length > INT_MAX) length = INT_MAX;
+    song_request = try_official_song_request(descriptor, buffer, length);
+    if (song_request > 0) {
+        socket_trace_traffic(descriptor, buffer, length, 1);
+        trace_http_request(descriptor, buffer, (int)length);
+        return (int)length;
+    }
+    if (song_request < 0) {
+        g_errno_value = 5;
+        WSASetLastError(WSAECONNABORTED);
+        return -1;
+    }
     result = send_rewritten_http_request(descriptor, buffer, length, flags,
                                          &rewritten);
     if (!rewritten) {
@@ -2159,6 +2300,24 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
                     memcpy(joined + offset, vectors[index].base,
                            vectors[index].length);
                     offset += vectors[index].length;
+                }
+            }
+            {
+                int song_request = try_official_song_request(
+                    descriptor, joined, total_length);
+                if (song_request > 0) {
+                    for (index = 0; index < vector_count; ++index) {
+                        socket_trace_traffic(descriptor, vectors[index].base,
+                                             vectors[index].length, 1);
+                    }
+                    free(joined);
+                    return total_length > INT_MAX ? INT_MAX : (int)total_length;
+                }
+                if (song_request < 0) {
+                    free(joined);
+                    g_errno_value = 5;
+                    WSASetLastError(WSAECONNABORTED);
+                    return -1;
                 }
             }
             rewrite_result = send_rewritten_http_request(
@@ -2307,6 +2466,15 @@ static int shim_poll(AndroidPollFd *descriptors, uint32_t count, int timeout) {
     }
     for (index = 0; index < count; ++index) {
         descriptors[index].returned_events = 0;
+        if (synthetic_http_ready(descriptors[index].descriptor)) {
+            if (descriptors[index].events &
+                (ANDROID_POLLIN | ANDROID_POLLRDNORM)) {
+                descriptors[index].returned_events =
+                    ANDROID_POLLIN | ANDROID_POLLRDNORM;
+                ++special_ready;
+            }
+            continue;
+        }
         if (descriptors[index].descriptor == ANDROID_RANDOM_FD &&
             InterlockedCompareExchange(&g_random_open_count, 0, 0) > 0) {
             if (descriptors[index].events &
@@ -2396,6 +2564,7 @@ static int shim_ioctl(int descriptor, unsigned long request, ...) {
 }
 
 static int shim_close(int descriptor) {
+    synthetic_http_reset(descriptor);
     if (descriptor == ANDROID_RANDOM_FD) {
         LONG count = InterlockedCompareExchange(&g_random_open_count, 0, 0);
         while (count > 0) {

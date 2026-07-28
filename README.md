@@ -1,18 +1,27 @@
-# Geometry Dash Wrapper 0.9.5-unified2
+# Geometry Dash Wrapper 0.9.5-unified2-fix2
 
-Unified2 keeps the three exact last known-good execution lines without Unicorn:
+Unified2 Fix2 repairs the two regressions introduced by the configurable launch
+hooks:
+
+- spin-off full-version bypass now follows the game's normal CreatorLayer scene
+  path instead of jumping directly into My Levels, which could leave the editor
+  background and ground uninitialized as a gray void;
+- custom-song metadata always uses official HTTPS Boomlings, independently of
+  the configured gameplay/GDPS server. The song CDN URL returned by Boomlings
+  remains untouched.
+
+The three execution lines remain:
 
 - **x86 native, default highest priority:** `0.9.3-alpha3`
 - **legacy ARM/Thumb through Dynarmic:** `0.9.4-arm-dynarmictest14-fix1`
 - **ARMv7 / Geometry Dash 2.2 through Dynarmic:** `0.9.4-milestone1`
 
-The package contains no APK, extracted proprietary game library, executable, or
-Unicorn dependency.
+There is no Unicorn backend or dependency.
 
 ## Editable launch settings
 
-Build the project, open `dist-unified/RUN_AUTO.cmd`, and edit the four values at
-the top:
+Build the project, then edit the four values at the top of
+`dist-unified/RUN_AUTO.cmd`:
 
 ```bat
 set "GDPS_SERVER=www.boomlings.com/database"
@@ -21,26 +30,29 @@ set "FULL_BYPASS=true"
 set "OVERRIDE_ARM=false"
 ```
 
-- `GDPS_SERVER` changes the recognized Geometry Dash PHP API base while
-  preserving endpoint names such as `getGJLevels21.php`. It accepts
-  `host/path`, `http://host/path`, or `https://host/path`.
-- `HACK_ICONS=true` makes exported icon and color unlock checks return true for
-  that run. It does not permanently write fake unlocks into the save.
-- `FULL_BYPASS=true` preserves Milestone1 behavior: spin-off full-version
-  creator buttons redirect to My Levels, and compatible creator gates report
-  available. Set it to `false` for authentic behavior.
-- `OVERRIDE_ARM=true` chooses a supported ARM backend when the same APK also
-  includes x86. With `false`, x86 remains the first choice.
+- `GDPS_SERVER` changes the Geometry Dash PHP API base for levels, accounts,
+  comments, gauntlets and similar game services. It accepts `host/path`,
+  `http://host/path`, or `https://host/path`.
+- `HACK_ICONS=true` makes supported icon-ownership checks return unlocked for
+  that run. Color ownership and save data are not modified.
+- `FULL_BYPASS=true` redirects the spin-off main-menu Full Version button to the
+  normal Creator button handler. It no longer patches CreatorLayer gates or
+  jumps directly into My Levels.
+- `OVERRIDE_ARM=true` chooses ARMv7, then legacy ARM, when the APK also contains
+  x86. With `false`, x86 remains first priority.
 
-ARMv7 uses the setting directly in the shared WinHTTP bridge. The x86 and
-legacy-ARM backends rewrite recognized plaintext Geometry Dash API requests and
-DNS targets while retaining their original bundled networking/TLS behavior.
-Song CDN and unrelated external hosts are not redirected.
+`getGJSongInfo.php` is deliberately excluded from GDPS routing and is sent to:
+
+```text
+https://www.boomlings.com/database/getGJSongInfo.php
+```
+
+The returned song/CDN download URL is not rewritten.
 
 ## Automatic backend selection
 
 Put one APK at `dist-unified/game.apk` and run `dist-unified/RUN_AUTO.cmd`, or
-pass an APK path to `RUN_AUTO.cmd`.
+pass an APK path to it.
 
 Normal priority:
 
@@ -48,36 +60,22 @@ Normal priority:
 2. legacy ARM: `lib/armeabi/libgame.so`
 3. ARMv7/2.2: `lib/armeabi-v7a/libcocos2dcpp.so`
 
-`OVERRIDE_ARM=true` changes only the first choice. It does not force ARM when
-the APK contains no supported ARM library.
-
 ## One save folder
 
-Every automatic and generated backend launcher runs from `dist-unified/` and
-uses:
+Every backend runs from `dist-unified/` and uses:
 
 ```text
 dist-unified/save/
 ```
 
-Because different Geometry Dash versions can reuse the same save-file names,
-back up `save/` before switching between substantially different APKs.
-
-## Source layout
-
-- `src/backends/x86/` — alpha3 native x86 loader/JNI/runtime.
-- `src/backends/arm_legacy/` — DynarmicTest14-fix1 ARMv5TE/Thumb backend.
-- `src/backends/armv7/` — Milestone1 ARMv7/Thumb-2 backend.
-- `src/shared/` — storage, audio, APK audio extraction, networking translation,
-  launch settings, and build metadata shared across backends.
-- `cmake/` — one build graph for both ARM generations and one Dynarmic checkout.
+Back up this folder before switching between substantially different game
+versions because some versions reuse the same save filenames.
 
 ## Build
 
 - `BUILD_X86.cmd` builds x86.
 - `BUILD_DYNARMIC.cmd` builds both Dynarmic backends.
-- `BUILD_ALL.cmd` builds all three and copies the configurable automatic
-  launcher into `dist-unified/`.
+- `BUILD_ALL.cmd` builds all three and creates the automatic launcher.
 
-Normal ARM launchers avoid full tracing. Use each backend's `RUN_DEBUG.cmd` only
-for regression logs. The old F2 editor shortcut remains completely removed.
+Normal ARM launchers avoid heavy tracing. Each ARM backend retains a separate
+`RUN_DEBUG.cmd`. The old F2 editor shortcut remains fully removed.

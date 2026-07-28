@@ -1890,8 +1890,6 @@ static std::size_t InstallV22ConfigurableIconUnlockHooks(
     static constexpr const char* symbols[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
-        "_ZN11GameManager15isColorUnlockedEib",
-        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
     };
     if (!gd_settings_hack_icons()) return 0u;
     std::size_t patched = 0u;
@@ -1903,33 +1901,22 @@ static std::size_t InstallV22ConfigurableIconUnlockHooks(
     return patched;
 }
 
-static std::size_t InstallV22CanPlayOnlineLevelsForceTrue(
-    ElfRuntime& runtime, ProbeEnvironment& env) {
-    static constexpr const char* kSymbol =
-        "_ZN12CreatorLayer19canPlayOnlineLevelsEv";
-    const SymbolRecord* target = FindSymbol(runtime, kSymbol);
-    if (!target || (target->address & 1u) == 0u || target->size < 4u)
-        return 0u;
-    const u32 address = target->address & ~1u;
-    if (address < runtime.image_min || address > runtime.image_max - 4u)
-        throw std::runtime_error(
-            "CreatorLayer::canPlayOnlineLevels is outside the image");
-    return PatchV22FunctionReturnTrue(env, runtime, *target) ? 1u : 0u;
-}
-
 static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
                                                  ProbeEnvironment& env) {
     static constexpr const char* kLocked =
-        "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE";
-    static constexpr const char* kEditor =
-        "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE";
+        "_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE";
+    static constexpr const char* kCreator =
+        "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE";
     const SymbolRecord* locked = FindSymbol(runtime, kLocked);
-    const SymbolRecord* editor = FindSymbol(runtime, kEditor);
-    if (!locked || !editor) return 0u;
+    const SymbolRecord* creator = FindSymbol(runtime, kCreator);
+    if (!locked || !creator) return 0u;
     const u32 destination = EnsureImport(
         runtime, env, "__dynarmic_v22_creator_editor_unlock");
+    // The supported late-beta MenuLayer::onFullVersion begins with the
+    // Thumb halfword 0xE368. Validate the exact ABI before replacing its
+    // entry with the argument-preserving host redirect.
     InstallThumbLiteralPcHookPreservingAllArguments(
-        env, runtime, *locked, 0xE92Du, destination);
+        env, runtime, *locked, 0xE368u, destination);
     return 1u;
 }
 
@@ -3183,9 +3170,9 @@ public:
         c_locale_address_ = AllocateString("C");
         tm_address_ = Allocate(sizeof(GuestTmLayout));
         time_zone_address_ = AllocateString("local");
-        if (const SymbolRecord* editor = FindSymbol(
-                runtime_, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"))
-            v22_editor_callback_address_ = editor->address;
+        if (const SymbolRecord* creator = FindSymbol(
+                runtime_, "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"))
+            v22_creator_callback_address_ = creator->address;
         if (const SymbolRecord* float_value = FindSymbol(
                 runtime_, "_ZNK7cocos2d8CCString10floatValueEv")) {
             v22_ccstring_float_value_ = float_value->address & ~1u;
@@ -9660,15 +9647,15 @@ private:
             return finish_hot(cpu_.Regs()[0]);
         }
         if (name == "__dynarmic_v22_creator_editor_unlock") {
-            if (!v22_editor_callback_address_)
-                return Fail("CreatorLayer editor callback address is unavailable");
-            ++v22_editor_unlock_calls_;
-            log_ << "[host] V22 creator full-version gate redirected to My Levels call="
-                 << v22_editor_unlock_calls_ << '\n';
+            if (!v22_creator_callback_address_)
+                return Fail("MenuLayer creator callback address is unavailable");
+            ++v22_creator_unlock_calls_;
+            log_ << "[host] V22 full-version button redirected through normal CreatorLayer path call="
+                 << v22_creator_unlock_calls_ << '\n';
             log_.flush();
-            cpu_.Regs()[15] = v22_editor_callback_address_ & ~1u;
+            cpu_.Regs()[15] = v22_creator_callback_address_ & ~1u;
             cpu_.SetCpsr((cpu_.Cpsr() & ~0x20u) |
-                         ((v22_editor_callback_address_ & 1u) ? 0x20u : 0u));
+                         ((v22_creator_callback_address_ & 1u) ? 0x20u : 0u));
             return true;
         }
         if (name == "__dynarmic_ziputils_ccInflateMemory") {
@@ -10479,8 +10466,8 @@ private:
     std::unordered_map<s32,std::string> v22_level_data_encoded_;
     std::unordered_map<s32,std::string> v22_level_data_decoded_;
     std::string v22_recent_music_path_;
-    u32 v22_editor_callback_address_=0;
-    u64 v22_editor_unlock_calls_=0;
+    u32 v22_creator_callback_address_=0;
+    u64 v22_creator_unlock_calls_=0;
     bool refresh_rate_bridge_logged_=false;
     std::deque<std::string> recent_events_;
     std::vector<std::string> active_calls_;
@@ -10873,7 +10860,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified2 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified2-fix2 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11353,8 +11340,6 @@ int main(int argc,char** argv) {
                 "required cocos2d ZipUtils::ccInflateMemory hook was not found");
         const std::size_t icon_unlock_hooks =
             InstallV22ConfigurableIconUnlockHooks(runtime, env);
-        const std::size_t can_play_unlocks = gd_settings_full_bypass()
-            ? InstallV22CanPlayOnlineLevelsForceTrue(runtime, env) : 0u;
         const std::size_t editor_redirects = gd_settings_full_bypass()
             ? InstallV22CreatorEditorUnlock(runtime, env) : 0u;
         const std::size_t prepare_bridges =
@@ -11436,14 +11421,10 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count="+
              std::to_string(inflate_hooks)+
              " codec=gzip+zlib+raw original-cpp-decompress=1 hidden-sret=guest-native");
-        emit("RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE enabled="+
-             std::string(gd_settings_full_bypass() ? "1" : "0")+
-             " count="+std::to_string(can_play_unlocks)+
-             " source=configurable-launch-setting");
-        emit("RESULT: DYNARMIC_V22_CREATOR_EDITOR_REDIRECT_FALLBACK enabled="+
+        emit("RESULT: DYNARMIC_V22_FULL_VERSION_CREATOR_REDIRECT enabled="+
              std::string(gd_settings_full_bypass() ? "1" : "0")+
              " count="+std::to_string(editor_redirects)+
-             " redirect=onOnlyFullVersion->onMyLevels");
+             " redirect=MenuLayer::onFullVersion->MenuLayer::onCreator");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
              std::string(gd_settings_server())+
              " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+

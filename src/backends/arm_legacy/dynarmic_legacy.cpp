@@ -59,6 +59,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "song_http_win.h"
 #include "build_info.h"
 }
 
@@ -1209,8 +1210,6 @@ static std::size_t InstallConfigurableIconUnlockHooks(
     static constexpr const char* symbols[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
-        "_ZN11GameManager15isColorUnlockedEib",
-        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
     };
     if (!gd_settings_hack_icons()) return 0u;
     std::size_t patched = 0u;
@@ -1224,21 +1223,22 @@ static std::size_t InstallConfigurableIconUnlockHooks(
 
 static std::size_t InstallConfigurableCreatorBypass(
     ElfRuntime& runtime, ProbeEnvironment& env) {
+    struct Pair { const char* full_version; const char* creator; };
+    static constexpr Pair pairs[] = {
+        {"_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE",
+         "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"},
+        {"_ZN9MenuLayer13onFullVersionEv",
+         "_ZN9MenuLayer9onCreatorEv"},
+    };
     if (!gd_settings_full_bypass()) return 0u;
-    std::size_t patched = 0u;
-    const SymbolRecord* locked = FindSymbol(
-        runtime,
-        "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE");
-    const SymbolRecord* editor = FindSymbol(
-        runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
-    const SymbolRecord* can_play = FindSymbol(
-        runtime, "_ZN12CreatorLayer19canPlayOnlineLevelsEv");
-    if (locked && editor &&
-        PatchArmFunctionTailJump(env, runtime, *locked, *editor))
-        ++patched;
-    if (can_play && PatchArmFunctionReturnTrue(env, runtime, *can_play))
-        ++patched;
-    return patched;
+    for (const Pair& pair : pairs) {
+        const SymbolRecord* locked = FindSymbol(runtime, pair.full_version);
+        const SymbolRecord* creator = FindSymbol(runtime, pair.creator);
+        if (locked && creator &&
+            PatchArmFunctionTailJump(env, runtime, *locked, *creator))
+            return 1u;
+    }
+    return 0u;
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -4547,6 +4547,34 @@ private:
             return static_cast<u32>(-1);
         }
 
+        unsigned char* song_response = nullptr;
+        std::size_t song_response_size = 0u;
+        int song_response_code = 0;
+        const int song_request = gd_song_http_handle_raw_request(
+            data, length, &song_response, &song_response_size,
+            &song_response_code);
+        if (song_request > 0) {
+            SyntheticHttpResponse response;
+            response.bytes.assign(song_response,
+                                  song_response + song_response_size);
+            std::free(song_response);
+            synthetic_http_[guest_fd] = std::move(response);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Song metadata routed to official Boomlings HTTPS fd="
+                     << guest_fd << " status=" << song_response_code
+                     << " response=" << song_response_size << '\n';
+            SetGuestErrno(0);
+            return length;
+        }
+        if (song_request < 0) {
+            std::free(song_response);
+            SetGuestErrno(5);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Official Boomlings song metadata request failed fd="
+                     << guest_fd << '\n';
+            return static_cast<u32>(-1);
+        }
+
         void* rewritten_buffer = nullptr;
         std::size_t rewritten_size = 0u;
         const int rewritten = gd_settings_rewrite_http_request(
@@ -4618,6 +4646,25 @@ private:
                      << std::hex << buffer << std::dec << " length=" << length
                      << (socket_value == INVALID_SOCKET ? " invalid-socket" : " invalid-guest-buffer") << '\n';
             return static_cast<u32>(-1);
+        }
+
+        const auto synthetic = synthetic_http_.find(guest_fd);
+        if (synthetic != synthetic_http_.end()) {
+            SyntheticHttpResponse& response = synthetic->second;
+            if (response.offset < response.bytes.size()) {
+                const std::size_t count = std::min<std::size_t>(
+                    length, response.bytes.size() - response.offset);
+                if (count) {
+                    std::memcpy(data, response.bytes.data() + response.offset,
+                                count);
+                    response.offset += count;
+                }
+                SetGuestErrno(0);
+                return static_cast<u32>(count);
+            }
+            synthetic_http_.erase(synthetic);
+            SetGuestErrno(0);
+            return 0u;
         }
 
         const int host_length = static_cast<int>(std::min<u32>(length, INT_MAX));
@@ -4810,12 +4857,26 @@ private:
         FD_ZERO(&writable);
         FD_ZERO(&exceptional);
         std::vector<SOCKET> host_sockets(count, INVALID_SOCKET);
+        std::vector<bool> synthetic_ready(count, false);
         u32 invalid_count = 0;
+        u32 synthetic_count = 0;
         bool have_valid_socket = false;
         for (u32 index = 0; index < count; ++index) {
             guest[index].revents = 0;
             if (guest[index].fd < 0) continue;
-            const SOCKET socket_value = FindHostSocket(static_cast<u32>(guest[index].fd));
+            const u32 guest_fd = static_cast<u32>(guest[index].fd);
+            const auto response = synthetic_http_.find(guest_fd);
+            if (response != synthetic_http_.end() &&
+                (response->second.offset < response->second.bytes.size() ||
+                 response->second.eof_pending)) {
+                if (guest[index].events & 0x0001) {
+                    guest[index].revents |= 0x0001;
+                    synthetic_ready[index] = true;
+                    ++synthetic_count;
+                }
+                continue;
+            }
+            const SOCKET socket_value = FindHostSocket(guest_fd);
             host_sockets[index] = socket_value;
             if (socket_value == INVALID_SOCKET) {
                 guest[index].revents = 0x0020; // Linux POLLNVAL
@@ -4831,7 +4892,11 @@ private:
 
         timeval timeval_value{};
         timeval* timeval_pointer = nullptr;
-        if (timeout >= 0) {
+        if (synthetic_count) {
+            timeval_value.tv_sec = 0;
+            timeval_value.tv_usec = 0;
+            timeval_pointer = &timeval_value;
+        } else if (timeout >= 0) {
             timeval_value.tv_sec = timeout / 1000;
             timeval_value.tv_usec = (timeout % 1000) * 1000;
             timeval_pointer = &timeval_value;
@@ -4841,12 +4906,13 @@ private:
         if (have_valid_socket) {
             selected = ::select(0, &readable, &writable, &exceptional, timeval_pointer);
             if (selected == SOCKET_ERROR) return SocketFailure();
-        } else if (timeout > 0) {
+        } else if (!synthetic_count && timeout > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
         }
 
-        u32 ready_count = invalid_count;
+        u32 ready_count = invalid_count + synthetic_count;
         for (u32 index = 0; index < count; ++index) {
+            if (synthetic_ready[index]) continue;
             const SOCKET socket_value = host_sockets[index];
             if (socket_value == INVALID_SOCKET) continue;
             std::int16_t revents = 0;
@@ -4904,6 +4970,7 @@ private:
         nonblocking_sockets_.erase(guest_fd);
         socket_send_logged_.erase(guest_fd);
         socket_receive_logged_.erase(guest_fd);
+        synthetic_http_.erase(guest_fd);
         return code == 0 ? 0u : SocketFailure();
     }
     u32 GuestGetAddrInfo(u32 node_address, u32 service_address, u32 hints_address, u32 result_address) {
@@ -5883,7 +5950,13 @@ private:
 #ifdef _WIN32
     bool winsock_initialized_=false;
     u32 next_socket_fd_=0x4000u;
+    struct SyntheticHttpResponse {
+        std::vector<u8> bytes;
+        std::size_t offset = 0u;
+        bool eof_pending = true;
+    };
     std::unordered_map<u32, SOCKET> sockets_;
+    std::unordered_map<u32, SyntheticHttpResponse> synthetic_http_;
     std::unordered_set<u32> nonblocking_sockets_;
     std::unordered_set<u32> socket_send_logged_;
     std::unordered_set<u32> socket_receive_logged_;
@@ -6229,7 +6302,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified2-fix2 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

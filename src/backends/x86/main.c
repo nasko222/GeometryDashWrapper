@@ -324,30 +324,46 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
-        "_ZN11GameManager15isColorUnlockedEib",
-        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+    };
+    static const struct {
+        const char *full_version;
+        const char *creator;
+    } creator_pairs[] = {
+        {
+            "_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE",
+            "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE",
+        },
+        {
+            "_ZN9MenuLayer13onFullVersionEv",
+            "_ZN9MenuLayer9onCreatorEv",
+        },
     };
     unsigned icon_patches = 0;
     unsigned full_patches = 0;
+    size_t index;
     if (gd_settings_hack_icons()) {
+        /* Patch icon ownership only. Player-color checks are deliberately left
+         * authentic because broad color-unlock patches can disturb editor
+         * background/ground state in old game builds. */
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
     }
     if (gd_settings_full_bypass()) {
-        void *locked = elf_image_find_export(
-            image,
-            "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE");
-        void *editor = elf_image_find_export(
-            image, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
-        void *can_play = elf_image_find_export(
-            image, "_ZN12CreatorLayer19canPlayOnlineLevelsEv");
-        if (locked && editor && patch_x86_tail_jump(locked, editor)) {
-            runtime_log("Launch hack: CreatorLayer full-version button redirected");
-            ++full_patches;
-        }
-        if (can_play && patch_x86_return_true(can_play)) {
-            runtime_log("Launch hack: CreatorLayer canPlayOnlineLevels forced true");
-            ++full_patches;
+        /* Follow the game's normal CreatorLayer construction path. Redirecting
+         * CreatorLayer::onOnlyFullVersion straight to My Levels skipped scene
+         * initialization in some versions and produced the gray editor void. */
+        for (index = 0;
+             index < sizeof(creator_pairs) / sizeof(creator_pairs[0]); ++index) {
+            void *locked = elf_image_find_export(
+                image, creator_pairs[index].full_version);
+            void *creator = elf_image_find_export(
+                image, creator_pairs[index].creator);
+            if (locked && creator && patch_x86_tail_jump(locked, creator)) {
+                runtime_log("Launch hack: MenuLayer full-version button redirected "
+                            "through normal CreatorLayer path");
+                ++full_patches;
+                break;
+            }
         }
     }
     runtime_log("Launch settings applied: server=%s hack-icons=%s patches=%u "

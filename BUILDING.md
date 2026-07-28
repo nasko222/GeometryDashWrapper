@@ -1,22 +1,15 @@
-# Building 0.9.5-unified2
+# Building 0.9.5-unified2-fix2
 
-Use 64-bit Windows 10/11 with Python 3 and Git for Windows. The command files
-download portable Zig, CMake, Ninja, Boost, and the pinned Dynarmic revision into
-`.build-tools/`; nothing is installed system-wide.
+Run on 64-bit Windows:
 
-## Build everything
+```bat
+BUILD_ALL.cmd
+```
 
-Run `BUILD_ALL.cmd`. It builds in this order:
-
-1. x86 native (`0.9.3-alpha3`)
-2. legacy ARM and ARMv7 against one Dynarmic build
-
-Output:
+The build creates:
 
 ```text
 dist-unified/
-  game.apk
-  save/
   x86/
   arm-legacy/
   armv7/
@@ -24,16 +17,13 @@ dist-unified/
   run_auto.py
 ```
 
-Open `dist-unified/RUN_AUTO.cmd` to configure `GDPS_SERVER`, `HACK_ICONS`,
-`FULL_BYPASS`, and `OVERRIDE_ARM`. Native x86 remains first priority unless
-`OVERRIDE_ARM=true` and the APK contains a supported ARM library.
+Put `game.apk` in `dist-unified/`, edit the four settings at the top of
+`RUN_AUTO.cmd`, and run it.
 
-## Individual builds
+The x86 build uses portable Zig 0.14.1. Both ARM builds use the same Dynarmic
+6.7.0 checkout through portable Zig, CMake and Ninja. No Unicorn source or
+runtime is used.
 
-- `BUILD_X86.cmd [optional-x86-apk]`
-- `BUILD_DYNARMIC.cmd`
-
-The generated backend-specific `RUN.cmd` files execute from the `dist-unified`
-root and therefore use the same `save/` folder and root `game.apk`. Direct
-backend launchers use safe defaults from the runtime: official Boomlings API,
-icon hack disabled, and full-version bypass enabled.
+Fix2 adds WinHTTP to the shared source list because x86 and legacy ARM route
+`getGJSongInfo.php` through official HTTPS Boomlings before returning the raw
+HTTP response to the guest networking library.

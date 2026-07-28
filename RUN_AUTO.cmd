@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 rem ================================================================
-rem Geometry Dash Wrapper 0.9.5-unified2 launch settings
+rem Geometry Dash Wrapper 0.9.5-unified2-fix2 launch settings
 rem Edit only the values on the right side.
 rem Booleans accept true or false.
 rem ================================================================

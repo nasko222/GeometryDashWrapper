@@ -29,6 +29,7 @@ set(GD_SHARED_SOURCES
     "${GD_ROOT}/src/shared/embedded_effects_stub.c"
     "${GD_ROOT}/src/shared/net_compat_win.c"
     "${GD_ROOT}/src/shared/runtime_settings.c"
+    "${GD_ROOT}/src/shared/song_http_win.c"
     "${GD_ROOT}/third_party/stb/stb_vorbis.c"
     "${GD_ROOT}/third_party/zlib/adler32.c"
     "${GD_ROOT}/third_party/zlib/compress.c"
