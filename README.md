@@ -1,73 +1,53 @@
-# Geometry Dash Wrapper 0.9.5-unified7-fix3-regression + Logging Hotfix 1
+# Geometry Dash Wrapper 0.9.5 — Unified7 Fix4 Native Stabilization
 
-Recovery build of the unified x86, legacy ARM and ARMv7/Dynarmic wrapper.
-The experimental EXE/DLL/CFG launcher from Unified6 is removed. The normal
-entry point is again `RUN_AUTO.cmd`, with the three backend EXEs stored under
-`x86`, `arm-legacy` and `armv7`.
+One wrapper source tree for:
 
-## Run settings
+- x86 Android Geometry Dash builds;
+- legacy ARM/Thumb builds through Dynarmic;
+- ARMv7/2.2 beta builds through Dynarmic.
 
-Edit `RUN_AUTO.cmd`:
+## Running
 
-```bat
-set "GDPS_SERVER=www.boomlings.com/database"
-set "HACK_ICONS=false"
-set "FULL_BYPASS=true"
-set "FORCE_HIGHEST_GRAPHICS=true"
-set "MUSIC_PULSE_MAX=0.30"
-```
+The distributed wrapper no longer requires Python.
 
-Place the APK at `dist-unified\game.apk` and launch `RUN_AUTO.cmd`.
-x86 is preferred when an x86 game library is present. The removed ARM override
-setting does not return.
+Use either launcher:
 
-## Logging Hotfix 1 changes
+- `RUN_AUTO_GDPS.cmd` — `naskogdps17.7m.pl/database`
+- `RUN_AUTO_BOOMLINGS.cmd` — `www.boomlings.com/database`
 
-- Drag an APK onto `RUN_AUTO.cmd`, or double-click it to use `game.apk`.
-- Every run is stored under `logs\YYYY-MM-DD\HH-MM-SS__package__vVERSION__backend`.
-- `run-info.txt` records the manifest package, version name/code, APK path and backend.
-- Previous run folders are never overwritten. Old root logs are preserved under
-  `logs\_old-root-files`.
-- No gameplay, editor, renderer, shader, HTTP, account, save, audio or input behavior
-  was changed in this logging hotfix.
+Double-click a launcher to use `game.apk`, or drag any APK onto it. The native
+`GeometryDashLauncher.exe` detects the APK architecture, package and version,
+selects the backend, applies the correct window title/icon, and creates a unique
+folder under `logs\YYYY-MM-DD\...`.
 
-## Unified7 Fix2 focused changes
+All supported versions continue to use the single portable `save\` directory.
+The launcher does not create per-version save profiles.
 
-- ARMv7 starts only the companion `ShaderFix` hook to restore black-mask shader
-  objects that were rendering solid white.
-- Editor viewport/scissor calls are no longer forcibly expanded, restoring
-  narrow overlays such as the song-position line. The first editor color clear
-  is promoted to a full default-framebuffer clear to remove the moving edge
-  residue.
-- Lite APKs missing all GauntletSheet resources receive a safe no-op gauntlet
-  callback instead of crashing before a network request.
-- The exact Geometry Dash 1.0.0 ARM library skips the forced-HD hook that caused
-  its `nativeInit` failure. Other old ARM versions keep the configured setting.
-- x86 Boomlings/configured-GDPS port-80 API traffic reaches the existing WinHTTP bridge
-  without waiting for a guest nonblocking connect, and old 2.11 receives account
-  server URLs as HTTP so it does not enter its crashing guest OpenSSL path.
-- The real SubZero icon fills the Windows icon canvas better. Meltdown icon
-  extraction also searches APK icon families outside `res/`.
-- 2.11 highest-graphics behavior and comments are unchanged.
+## Fix4 stabilization changes
 
-## Recovery changes
+- Replaces the runtime Python selector with a native Win32 C launcher.
+- Removes the Python dependency from the x86 build script as well.
+- Adds separate GDPS and Boomlings launch BAT files, both supporting APK drag-and-drop.
+- Captures x86 logs directly in the dated run folder. Previous launcher builds
+  missed x86 logs because that backend changed its working directory before
+  opening `gd-wrapper.log`.
+- ARMv7 companion hooks default to OFF, and the launcher no longer supplies the
+  malformed/rejected option that prevented every supplied 2.2-beta test from booting.
+- Keeps the direct desktop-GLSL compatibility path and restores guest ownership
+  of editor viewport/scissor/clear state; the experimental companion ShaderFix is removed.
+- Keeps the targeted desktop keyboard-offset suppression for x86 versions that
+  export the Android keyboard-movement callbacks.
+- Keeps the exact Geometry Dash 1.0 minizip/HD guards while leaving 1.01+ behavior unchanged.
+- Bundles real multi-resolution icons for Dash, Lite, World, SubZero and Meltdown.
+- Contains no `.gitignore` file.
 
-- Restores the old CMD launcher and backend EXE layout.
-- Removes per-package save profiles. Every supported version uses the single
-  portable `dist-unified\save` directory.
-- Restores the pre-Unified6 CCHttpResponse byte-vector layout and the older
-  callback budget/delivery behavior. Completed requests are delivered in request
-  order during the same pump pass.
-- Patches the actual Thumb block used by the attached Geometry Dash Lite build,
-  skipping the callback replacement and grey tint that route Creator buttons to
-  `onOnlyFullVersion`.
-- Earlier Unified7 recovery attempted in-frame viewport/scissor normalization;
-  Fix2 replaces that workaround with exact pass-through plus a targeted first
-  color-clear repair.
-- Includes real multi-resolution app icons extracted from game APK resources for
-  Geometry Dash, Lite, World and SubZero. Meltdown uses its APK's real icon
-  family; `icon.ico` or `icon.png` beside the launcher remains an explicit
-  override.
-- Window titles include Geometry Dash Lite, World, Meltdown and SubZero.
+The official 2.11 Boomlings login behavior is intentionally not spoofed because
+it also fails in the Android emulator. A GDPS may still support that old client.
 
-No APK or native Android `.so` file is included in the source archive.
+## Readability
+
+Start with `docs/CODE-TOUR-FOR-CSHARP-JAVA-DEVS.md`. The new launcher is heavily
+commented and deliberately organized around record-like structs and small helper
+functions. Existing emulator backends were not cosmetically mass-refactored:
+readability-only material is comments/documentation so it cannot alter behavior.
+Actual bug fixes naturally produce different backend binaries.

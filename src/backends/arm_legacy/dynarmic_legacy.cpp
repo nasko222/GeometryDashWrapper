@@ -6440,7 +6440,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified7-fix2-focused legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified7-fix4-native-stabilization legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6680,8 +6680,13 @@ int main(int argc,char** argv) {
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
-        const MinizipHookCounts minizip_hooks=
-            InstallHostMinizipHooks(runtime,env);
+        MinizipHookCounts minizip_hooks{};
+        if (legacy_gd_100) {
+            emit("RESULT: DYNARMIC_LEGACY_GD100_MINIZIP_GUARD "
+                 "host-acceleration=disabled guest-fallback=enabled");
+        } else {
+            minizip_hooks=InstallHostMinizipHooks(runtime,env);
+        }
         const std::size_t browser_hooks=
             InstallCcApplicationOpenUrlHook(runtime,env);
         const std::size_t audio_effect_hooks=

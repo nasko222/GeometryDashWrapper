@@ -1,26 +1,37 @@
-# Building Unified7 Recovery
+# Building on Windows
 
-On 64-bit Windows, run:
+Run:
 
 ```bat
 BUILD_ALL.cmd
 ```
 
-The build downloads or reuses the pinned Zig, CMake, Ninja, Boost and Dynarmic
-tools, then creates `dist-unified\` with:
+The build downloads pinned portable Zig, CMake and Ninja tools as needed. Python
+is not required for building or running this release.
 
-- `RUN_AUTO.cmd` and `run_auto.py`
-- `x86\GeometryDashWrapper.exe`
-- `arm-legacy\GeometryDashArmLegacy.exe`
-- `armv7\GeometryDashArmV7.exe`
-- `assets\icons\` with the real game icon resources
-- one flat `save\` directory
+Output:
 
-Copy a supported APK to `dist-unified\game.apk`, edit `RUN_AUTO.cmd`, and run it.
+```text
+dist-unified\
+  GeometryDashLauncher.exe
+  RUN_AUTO_GDPS.cmd
+  RUN_AUTO_BOOMLINGS.cmd
+  x86\GeometryDashWrapper.exe
+  arm-legacy\GeometryDashArmLegacy.exe
+  armv7\GeometryDashArmV7.exe
+  assets\icons\...
+  save\
+  logs\
+```
 
-## Logging-only launcher
+Individual builders:
 
-`RUN_AUTO.cmd` accepts a dropped APK path. The launcher creates one unique run
-directory under `dist-unified\logs` and stores all diagnostic output there.
-No backend rebuild is required when applying only `RUN_AUTO.cmd` and `run_auto.py`
-to an existing Fix2 distribution.
+```bat
+BUILD_X86.cmd
+BUILD_DYNARMIC.cmd
+BUILD_LAUNCHER.cmd
+```
+
+The ARM/Dynarmic source changed in Fix4, so do not reuse an old `armv7` or
+`arm-legacy` executable. `build_dynarmic.ps1` has a new builder revision and
+will reject an incompatible cached backend.

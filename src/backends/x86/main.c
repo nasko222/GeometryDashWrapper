@@ -304,9 +304,25 @@ static int patch_x86_return_void(void *target) {
 }
 
 typedef struct {
+    unsigned offset_markers;
     unsigned void_callbacks;
     unsigned bool_callbacks;
 } DesktopKeyboardPatchCounts;
+
+static int desktop_keyboard_marker_visitor(const char *name, void *address,
+                                           uint32_t size, void *opaque) {
+    DesktopKeyboardPatchCounts *counts =
+        (DesktopKeyboardPatchCounts *)opaque;
+    (void)address;
+    (void)size;
+    if (!name || !counts) return 1;
+    if (strstr(name, "forceOffset") != NULL ||
+        strstr(name, "textInputShouldOffset") != NULL ||
+        strstr(name, "doAnimationWhenKeyboardMove") != NULL) {
+        ++counts->offset_markers;
+    }
+    return 1;
+}
 
 static int desktop_keyboard_export_visitor(const char *name, void *address,
                                            uint32_t size, void *opaque) {
@@ -319,9 +335,8 @@ static int desktop_keyboard_export_visitor(const char *name, void *address,
             ++counts->bool_callbacks;
             runtime_log("Desktop keyboard: return false patched %s", name);
         }
-    } else if (strstr(name, "keyboardWillShow") != NULL ||
-               strstr(name, "keyboardWillHide") != NULL ||
-               strstr(name, "forceOffset") != NULL) {
+    } else if (strstr(name, "forceOffset") != NULL ||
+               strstr(name, "doAnimationWhenKeyboardMove") != NULL) {
         if (patch_x86_return_void(address)) {
             ++counts->void_callbacks;
             runtime_log("Desktop keyboard: no-op patched %s", name);
@@ -333,12 +348,25 @@ static int desktop_keyboard_export_visitor(const char *name, void *address,
 static void install_desktop_keyboard_offset_patches(const ElfImage *image) {
     DesktopKeyboardPatchCounts counts;
     memset(&counts, 0, sizeof(counts));
+    if (!elf_image_visit_exports(image, desktop_keyboard_marker_visitor,
+                                 &counts)) {
+        runtime_log("Desktop keyboard marker scan ended early");
+        return;
+    }
+    /* Early versions such as 1.6 do not expose the Android scene-offset
+       callbacks. Leave their keyboard path byte-identical instead of applying
+       a broad keyboardWillShow/Hide patch to every historical build. */
+    if (!counts.offset_markers) {
+        runtime_log("Desktop keyboard offset patches: not required");
+        return;
+    }
     if (!elf_image_visit_exports(image, desktop_keyboard_export_visitor,
                                  &counts)) {
         runtime_log("Desktop keyboard patch scan ended early");
     }
-    runtime_log("Desktop keyboard offset patches: void=%u bool=%u",
-                counts.void_callbacks, counts.bool_callbacks);
+    runtime_log("Desktop keyboard offset patches: markers=%u void=%u bool=%u",
+                counts.offset_markers, counts.void_callbacks,
+                counts.bool_callbacks);
 }
 
 static int patch_x86_tail_jump(void *source, void *destination) {
@@ -847,6 +875,9 @@ int main(int argc, char **argv) {
     NativeInitFunction native_init;
     char directory[MAX_PATH];
     char absolute_apk[MAX_PATH * 2];
+    char absolute_log[MAX_PATH * 4];
+    const char *requested_log = NULL;
+    const char *environment_log;
     void *apk_string;
     int result;
     int i;
@@ -855,10 +886,32 @@ int main(int argc, char **argv) {
     g_host.native_width = 1280;
     g_host.native_height = 720;
     g_host.window_active = 1;
+
+    /*
+     * Read the log destination before executable_directory() changes the
+     * process working directory. The native launcher passes an absolute path,
+     * but accepting a relative --log value from developers is useful too.
+     */
+    environment_log = getenv("GD_LOG_PATH");
+    if (environment_log && environment_log[0]) requested_log = environment_log;
+    for (i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--log=", 6) == 0 && argv[i][6]) {
+            requested_log = argv[i] + 6;
+        }
+    }
+    absolute_log[0] = 0;
+    if (requested_log && requested_log[0]) {
+        DWORD log_length = GetFullPathNameA(
+            requested_log, (DWORD)sizeof(absolute_log), absolute_log, NULL);
+        if (!log_length || log_length >= sizeof(absolute_log)) {
+            absolute_log[0] = 0;
+        }
+    }
+
     if (!executable_directory(directory, sizeof(directory))) {
         strcpy(directory, ".");
     }
-    runtime_initialize("gd-wrapper.log");
+    runtime_initialize(absolute_log[0] ? absolute_log : "gd-wrapper.log");
     jni_shim_initialize(directory);
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--relocate-only") == 0) {
@@ -869,7 +922,9 @@ int main(int argc, char **argv) {
             apk_path = argv[i] + 6;
         } else if (strncmp(argv[i], "--library=", 10) == 0) {
             library_path = argv[i] + 10;
-        } else {
+        } else if (strncmp(argv[i], "--log=", 6) == 0) {
+            /* Already handled before the working-directory change. */
+        } else if (argv[i][0] != '-') {
             library_path = argv[i];
         }
     }

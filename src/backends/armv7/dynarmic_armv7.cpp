@@ -3004,18 +3004,9 @@ public:
         return {width, height};
     }
 
-    void ResetFrameClipState() {
-        if (!context_ || !window_) return;
-        const auto [width, height] = ClientSize();
-        glDisable(GL_SCISSOR_TEST);
-        // Reset the stored box too. OpenGL preserves glScissor coordinates while
-        // the test is disabled, so a later glEnable(GL_SCISSOR_TEST) could bring
-        // back the editor-playtest crop even after the per-frame disable.
-        glScissor(0, 0, width, height);
-        glViewport(0, 0, width, height);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDepthMask(GL_TRUE);
-    }
+    // The Android game owns viewport, scissor, colour-mask and depth-mask state.
+    // Host-side resets broke editor overlays and left stale playtest regions.
+    void ResetFrameClipState() {}
     void Swap() { if (device_) SwapBuffers(device_); }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -6451,7 +6442,6 @@ private:
     }
 
     bool HostV22PlayVisibility(u32 play_layer) {
-        gl_.ResetFrameClipState();
         if (!LooksLikeGuestObject(runtime_, env_, play_layer))
             return Fail("V22 PlayLayer visibility received an invalid layer");
 
@@ -11308,7 +11298,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix3-regression debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix4-native-stabilization debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11600,7 +11590,9 @@ int main(int argc,char** argv) {
         std::string input_path="libcocos2dcpp.so";
         std::string import_manifest_path="gd-v22beta-imports.txt";
         std::string companion_libgame_path;
-        V22CompanionHookMode companion_hook_mode = V22CompanionHookMode::Safe;
+        // Desktop stabilization default: do not execute optional APK companion hooks.
+        // A user can still opt in explicitly with --companion-hooks=safe/all.
+        V22CompanionHookMode companion_hook_mode = V22CompanionHookMode::Off;
         bool probe_only=false;
         bool probe_only_explicit=false;
         int width=1280,height=720,max_frames=0;
@@ -11623,12 +11615,26 @@ int main(int argc,char** argv) {
             else if(argument.rfind("--companion-libgame=",0)==0)
                 companion_libgame_path=std::string(argument.substr(20));
             else if(argument.rfind("--companion-hooks=",0)==0) {
-                const std::string mode(argument.substr(18));
+                constexpr std::string_view prefix = "--companion-hooks=";
+                std::string mode(argument.substr(prefix.size()));
+                // Be tolerant of launchers that accidentally preserve whitespace
+                // or one layer of quote characters around an option value.
+                while (!mode.empty() &&
+                       (std::isspace(static_cast<unsigned char>(mode.front())) ||
+                        mode.front() == '\"' || mode.front() == '\'')) {
+                    mode.erase(mode.begin());
+                }
+                while (!mode.empty() &&
+                       (std::isspace(static_cast<unsigned char>(mode.back())) ||
+                        mode.back() == '\"' || mode.back() == '\'')) {
+                    mode.pop_back();
+                }
                 if (mode == "off") companion_hook_mode = V22CompanionHookMode::Off;
                 else if (mode == "safe") companion_hook_mode = V22CompanionHookMode::Safe;
                 else if (mode == "all") companion_hook_mode = V22CompanionHookMode::All;
                 else throw std::runtime_error(
-                    "--companion-hooks must be off, safe, or all");
+                    "--companion-hooks must be off, safe, or all; received '" +
+                    mode + "'");
             }
             else if(!argument.empty()&&argument[0]!='-')
                 input_path=std::string(argument);

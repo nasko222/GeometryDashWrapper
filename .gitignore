@@ -1,6 +1,7 @@
 .build-tools/
 build-cache/
 build-cache-windows/
+build-cache-launcher/
 build-dynarmic-x64/
 dist-unified/
 *.apk

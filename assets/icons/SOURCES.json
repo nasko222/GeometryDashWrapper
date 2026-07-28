@@ -86,5 +86,24 @@
       192,
       256
     ]
+  },
+  "geometry-dash-meltdown": {
+    "apk": "meltdown-test.apk (icon resources originally extracted from the supplied Meltdown APK)",
+    "source_members": [
+      "res/drawable-mdpi/icon.png",
+      "res/drawable-xhdpi/icon.png"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ]
   }
 }

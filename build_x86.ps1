@@ -63,21 +63,83 @@ if (-not (Test-Path -LiteralPath $ZigDirectory)) {
 }
 $ZigExe = Find-SingleFile -Directory $ZigDirectory -Name "zig.exe"
 
-$Python = Get-Command python.exe -ErrorAction SilentlyContinue
-if (-not $Python) { $Python = Get-Command python -ErrorAction SilentlyContinue }
-if (-not $Python) { throw "Python 3 was not found on PATH." }
-
-$Arguments = @(
-    (Join-Path $Root "build_x86.py"),
-    "--zig", $ZigExe,
-    "--out", $Output
-)
-if (-not [string]::IsNullOrWhiteSpace($Apk)) {
-    $ResolvedApk = (Resolve-Path -LiteralPath $Apk).Path
-    $Arguments += @("--apk", $ResolvedApk)
+function Invoke-External {
+    param([string]$FilePath, [string[]]$Arguments)
+    Write-Host "`n> $FilePath $($Arguments -join ' ')" -ForegroundColor DarkGray
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE`: $FilePath"
+    }
 }
 
-Write-Host "`n> $($Python.Source) $($Arguments -join ' ')" -ForegroundColor DarkGray
-& $Python.Source @Arguments
-if ($LASTEXITCODE -ne 0) { throw "x86 build failed with exit code $LASTEXITCODE" }
+$ResolvedApk = $null
+if (-not [string]::IsNullOrWhiteSpace($Apk)) {
+    $ResolvedApk = (Resolve-Path -LiteralPath $Apk).Path
+}
+
+# The previous builder delegated this source list to build_x86.py.  Keeping the
+# list directly in PowerShell removes the Python build dependency without
+# changing the compiler, target, optimization level, source order, or libraries.
+$ZlibSources = @(Get-ChildItem -LiteralPath (Join-Path $Root "third_party\zlib") -Filter "*.c" -File | Sort-Object Name | ForEach-Object { $_.FullName })
+$Sources = @(
+    (Join-Path $Root "src\backends\x86\main.c"),
+    (Join-Path $Root "src\backends\x86\loader.c"),
+    (Join-Path $Root "src\backends\x86\runtime.c"),
+    (Join-Path $Root "src\backends\x86\bionic_x86.S"),
+    (Join-Path $Root "src\backends\x86\jni_shim.c"),
+    (Join-Path $Root "src\shared\audio_win.c"),
+    (Join-Path $Root "src\backends\x86\fmod_win.c"),
+    (Join-Path $Root "src\shared\storage_win.c"),
+    (Join-Path $Root "src\shared\net_compat_win.c"),
+    (Join-Path $Root "src\shared\runtime_settings.c"),
+    (Join-Path $Root "src\shared\song_http_win.c"),
+    (Join-Path $Root "src\shared\window_icon_win.c"),
+    (Join-Path $Root "src\shared\embedded_effects_stub.c"),
+    (Join-Path $Root "third_party\stb\stb_vorbis.c")
+) + $ZlibSources
+
+New-Item -ItemType Directory -Force -Path $Output | Out-Null
+$Cache = Join-Path $Root "build-cache"
+New-Item -ItemType Directory -Force -Path $Cache | Out-Null
+$env:ZIG_GLOBAL_CACHE_DIR = Join-Path $Cache "global"
+$env:ZIG_LOCAL_CACHE_DIR = Join-Path $Cache "local"
+
+$Arguments = @(
+    "cc",
+    "-target", "x86-windows-gnu",
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Wno-cast-function-type",
+    "-Wno-deprecated-non-prototype",
+    "-mstackrealign",
+    "-I$Root\third_party\zlib",
+    "-I$Root\third_party\stb",
+    "-I$Root\src\shared",
+    "-I$Root\src\backends\x86",
+    "-o", (Join-Path $Output "GeometryDashWrapper.exe")
+) + $Sources + @(
+    "-lws2_32",
+    "-lopengl32",
+    "-lgdi32",
+    "-luser32",
+    "-lshell32",
+    "-lwinmm",
+    "-lole32",
+    "-lwinhttp"
+)
+Invoke-External -FilePath $ZigExe -Arguments $Arguments
+
+# Remove files from historical builders that no longer belong in the output.
+@("GeometryDash18Wrapper.exe", "GeometryDash18Wrapper.pdb", "libcocos2dcpp.so", "libgame.so") |
+    ForEach-Object { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Output $_) }
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Output "audio")
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Output "game.apk")
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Output "save")
+
+if ($ResolvedApk) {
+    Copy-Item -Force -LiteralPath $ResolvedApk -Destination (Join-Path (Split-Path -Parent $Output) "game.apk")
+}
+
 Write-Host "`nx86 backend ready: $Output" -ForegroundColor Green
