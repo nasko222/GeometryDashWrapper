@@ -815,11 +815,19 @@ void jni_shim_initialize(const char *executable_directory) {
 
     working_length = GetCurrentDirectoryA(
         (DWORD)sizeof(working_directory), working_directory);
-    storage_base = working_length > 0 &&
-                           working_length < (DWORD)sizeof(working_directory)
-                       ? working_directory
-                       : (executable_directory ? executable_directory : ".");
-    snprintf(storage_path, sizeof(storage_path), "%s/save/", storage_base);
+    {
+        const char *configured_save = getenv("GD_SAVE_DIR");
+        storage_base = configured_save && configured_save[0]
+                           ? configured_save
+                           : (working_length > 0 &&
+                                      working_length < (DWORD)sizeof(working_directory)
+                                  ? working_directory
+                                  : (executable_directory ? executable_directory : "."));
+    }
+    if (getenv("GD_SAVE_DIR") && getenv("GD_SAVE_DIR")[0])
+        snprintf(storage_path, sizeof(storage_path), "%s/", storage_base);
+    else
+        snprintf(storage_path, sizeof(storage_path), "%s/save/", storage_base);
     for (i = 0; storage_path[i]; ++i) {
         if (storage_path[i] == '\\') {
             storage_path[i] = '/';

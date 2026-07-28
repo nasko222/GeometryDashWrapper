@@ -852,10 +852,20 @@ static const char *translate_game_path(const char *path, char *translated,
                                                        : backslash ? backslash + 1
                                                                    : path;
     if (storage_is_game_file_name(name)) {
-        snprintf(translated, capacity, "save/%s", name);
+        const char *save_directory = getenv("GD_SAVE_DIR");
+        if (save_directory && save_directory[0])
+            snprintf(translated, capacity, "%s/%s", save_directory, name);
+        else
+            snprintf(translated, capacity, "save/%s", name);
         return translated;
     }
     if (strncmp(path, "/save/", 6) == 0 || strcmp(path, "/save") == 0) {
+        const char *save_directory = getenv("GD_SAVE_DIR");
+        if (save_directory && save_directory[0]) {
+            snprintf(translated, capacity, "%s/%s", save_directory,
+                     strncmp(path, "/save/", 6) == 0 ? path + 6 : "");
+            return translated;
+        }
         return path + 1;
     }
     if (path[0] == '/' && isalpha((unsigned char)path[1]) && path[2] == ':') {

@@ -1267,10 +1267,15 @@ static GraphicsPatchCounts InstallHighestGraphicsHooks(
             FindSymbol(runtime, "_ZN15PlatformToolbox4isHDEv")) {
         if (PatchArmFunctionReturnTrue(env, runtime, *symbol)) ++counts.hd;
     }
-    if (const SymbolRecord* symbol =
-            FindSymbol(runtime, "_ZN15PlatformToolbox17isLowMemoryDeviceEv")) {
-        if (PatchArmFunctionReturnFalse(env, runtime, *symbol))
-            ++counts.low_memory;
+    static constexpr const char* low_end_symbols[] = {
+        "_ZN15PlatformToolbox17isLowMemoryDeviceEv",
+        "_ZN16EveryplayToolbox14isLowEndDeviceEv",
+    };
+    for (const char* name : low_end_symbols) {
+        if (const SymbolRecord* symbol = FindSymbol(runtime, name)) {
+            if (PatchArmFunctionReturnFalse(env, runtime, *symbol))
+                ++counts.low_memory;
+        }
     }
     return counts;
 }
@@ -6435,7 +6440,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified4 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified5 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6649,8 +6654,11 @@ int main(int argc,char** argv) {
         }
         const std::filesystem::path absolute_apk=
             std::filesystem::absolute(apk_path);
-        const std::filesystem::path writable=
-            std::filesystem::absolute("save");
+        const char* configured_save = std::getenv("GD_SAVE_DIR");
+        const std::filesystem::path writable =
+            configured_save && *configured_save
+                ? std::filesystem::absolute(configured_save)
+                : std::filesystem::absolute("save");
         emit("Input APK: "+absolute_apk.string());
         const std::vector<u8> apk=ReadFile(absolute_apk.string());
         emit("APK bytes: "+std::to_string(apk.size()));
@@ -7015,10 +7023,10 @@ int main(int argc,char** argv) {
                     interval_cpu_start=cpu_now;
                 }
                 executor.ReportHeapStatus("periodic");
-                std::ostringstream title;
-                title<<"Geometry Dash ARM - Dynarmic x64 Test14-fix1 | "
-                     <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
-                executor.SetWindowTitle(title.str());
+                const char* configured_title = std::getenv("GD_GAME_TITLE");
+                executor.SetWindowTitle(
+                    configured_title && *configured_title
+                        ? configured_title : "Geometry Dash");
                 interval_start=now;
                 interval_frames=0;
                 interval_render_ms=0.0;

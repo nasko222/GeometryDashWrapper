@@ -1986,10 +1986,15 @@ static V22GraphicsPatchCounts InstallV22HighestGraphicsHooks(
             FindSymbol(runtime, "_ZN15PlatformToolbox4isHDEv")) {
         if (PatchV22FunctionReturnTrue(env, runtime, *symbol)) ++counts.hd;
     }
-    if (const SymbolRecord* symbol =
-            FindSymbol(runtime, "_ZN15PlatformToolbox17isLowMemoryDeviceEv")) {
-        if (PatchV22FunctionReturnFalse(env, runtime, *symbol))
-            ++counts.low_memory;
+    static constexpr const char* low_end_symbols[] = {
+        "_ZN15PlatformToolbox17isLowMemoryDeviceEv",
+        "_ZN16EveryplayToolbox14isLowEndDeviceEv",
+    };
+    for (const char* name : low_end_symbols) {
+        if (const SymbolRecord* symbol = FindSymbol(runtime, name)) {
+            if (PatchV22FunctionReturnFalse(env, runtime, *symbol))
+                ++counts.low_memory;
+        }
     }
     return counts;
 }
@@ -2788,7 +2793,10 @@ public:
             (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2);
         const int window_y = std::max(0,
             (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash - Unified ARMv7",
+        const char* configured_title = std::getenv("GD_GAME_TITLE");
+        const char* window_title = configured_title && *configured_title
+            ? configured_title : "Geometry Dash";
+        window_ = CreateWindowExA(0, class_name, window_title,
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
@@ -2889,6 +2897,10 @@ public:
         if (!context_ || !window_) return;
         const auto [width, height] = ClientSize();
         glDisable(GL_SCISSOR_TEST);
+        // Reset the stored box too. OpenGL preserves glScissor coordinates while
+        // the test is disabled, so a later glEnable(GL_SCISSOR_TEST) could bring
+        // back the editor-playtest crop even after the per-frame disable.
+        glScissor(0, 0, width, height);
         glViewport(0, 0, width, height);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_TRUE);
@@ -6318,6 +6330,7 @@ private:
     }
 
     bool HostV22PlayVisibility(u32 play_layer) {
+        gl_.ResetFrameClipState();
         if (!LooksLikeGuestObject(runtime_, env_, play_layer))
             return Fail("V22 PlayLayer visibility received an invalid layer");
 
@@ -8063,17 +8076,33 @@ private:
                 edges >= 2 && corner_anchored && spans_most_of_axis &&
                 area * 20 >= client_area * 7;
             const bool default_target = gl_framebuffer_binding_ == 0u;
+            const bool full_height_edge_crop =
+                height >= client_height - tolerance &&
+                width >= std::max(1, client_width / 4) &&
+                width < client_width - tolerance &&
+                (left || right);
+            const bool full_width_edge_crop =
+                width >= client_width - tolerance &&
+                height >= std::max(1, client_height / 4) &&
+                height < client_height - tolerance &&
+                (bottom || top);
+            const bool client_coordinate_target =
+                width <= client_width + tolerance &&
+                height <= client_height + tolerance &&
+                x >= -tolerance && y >= -tolerance;
             const bool large_edge_crop =
-                default_target && dimensions_valid && client_width > 0 &&
-                client_height > 0 && excludes_strip &&
-                (three_edge_crop || large_two_edge_crop);
+                dimensions_valid && client_width > 0 && client_height > 0 &&
+                excludes_strip &&
+                ((default_target && (three_edge_crop || large_two_edge_crop)) ||
+                 (client_coordinate_target &&
+                  (full_height_edge_crop || full_width_edge_crop)));
             if (large_edge_crop) {
                 if (edge_clip_normalization_logs_ < 24u) {
                     log_ << "[host] ARMv7 normalized persistent edge "
                          << (name == "glViewport" ? "viewport" : "scissor")
                          << " original=" << x << ',' << y << ' ' << width << 'x'
                          << height << " client=" << client_width << 'x'
-                         << client_height << '\n';
+                         << client_height << " framebuffer=" << gl_framebuffer_binding_ << '\n';
                     ++edge_clip_normalization_logs_;
                 }
                 x = 0;
@@ -11155,7 +11184,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified4 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified5 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11482,8 +11511,11 @@ int main(int argc,char** argv) {
         }
         const std::filesystem::path absolute_input=
             std::filesystem::absolute(input_path);
-        const std::filesystem::path writable=
-            std::filesystem::absolute("save");
+        const char* configured_save = std::getenv("GD_SAVE_DIR");
+        const std::filesystem::path writable =
+            configured_save && *configured_save
+                ? std::filesystem::absolute(configured_save)
+                : std::filesystem::absolute("save");
         emit("Input file: "+absolute_input.string());
         const std::vector<u8> input_bytes=ReadFile(absolute_input.string());
         emit("Input bytes: "+std::to_string(input_bytes.size()));
@@ -11741,7 +11773,7 @@ int main(int argc,char** argv) {
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=frame-reset+default-framebuffer-edge-scissor-viewport-normalization");
+             "state=scissor-box-full+frame-reset+edge-scissor-viewport-normalization");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -12287,10 +12319,10 @@ int main(int argc,char** argv) {
                     interval_cpu_start=cpu_now;
                 }
                 executor.ReportHeapStatus("periodic");
-                std::ostringstream title;
-                title<<"Geometry Dash ARMv7 - Unified ARMv7 | "
-                     <<std::fixed<<std::setprecision(1)<<fps<<" FPS";
-                executor.SetWindowTitle(title.str());
+                const char* configured_title = std::getenv("GD_GAME_TITLE");
+                executor.SetWindowTitle(
+                    configured_title && *configured_title
+                        ? configured_title : "Geometry Dash");
                 interval_start=now;
                 interval_frames=0;
                 interval_render_ms=0.0;

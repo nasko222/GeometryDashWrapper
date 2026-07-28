@@ -329,6 +329,50 @@ static unsigned patch_x86_return_true_exports(
     return patched;
 }
 
+
+static unsigned patch_x86_force_high_texture_quality(const ElfImage *image) {
+    unsigned char *target = (unsigned char *)elf_image_find_export(
+        image, "_ZN7cocos2d10CCDirector18updateContentScaleENS_14TextureQualityE");
+    size_t offset;
+    if (!target) return 0;
+    /* 2.11/World compare the requested TextureQuality against 2 before the
+       high-resolution branch. cmp eax,2 -> cmp eax,eax + nop makes that branch
+       deterministic without replacing the rest of CCDirector's setup. */
+    for (offset = 0; offset + 3 <= 64; ++offset) {
+        static const unsigned char replacement[3] = {0x39, 0xc0, 0x90};
+        if (target[offset] == 0x83 && target[offset + 1] == 0xf8 &&
+            target[offset + 2] == 0x02 &&
+            patch_x86_code(target + offset, replacement, sizeof(replacement))) {
+            runtime_log("Launch hack: forced highest CCDirector texture quality");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static unsigned patch_x86_world_creator_buttons(const ElfImage *image) {
+    unsigned char *target = (unsigned char *)elf_image_find_export(
+        image, "_ZN12CreatorLayer4initEv");
+    size_t offset;
+    if (!target) return 0;
+    /* Geometry Dash World first loads each button's real callback, then this
+       exact conditional swaps selected entries to onOnlyFullVersion and tints
+       their sprites dark. Make only that conditional unconditional so the real
+       callbacks and normal bright sprites survive. */
+    for (offset = 0; offset + 9 <= 2048; ++offset) {
+        if (target[offset] == 0x80 && target[offset + 1] == 0xbd &&
+            target[offset + 6] == 0x00 && target[offset + 7] == 0x74 &&
+            target[offset + 8] >= 0x10) {
+            const unsigned char jump = 0xeb;
+            if (patch_x86_code(target + offset + 7, &jump, 1)) {
+                runtime_log("Launch hack: enabled native Geometry Dash World Creator callbacks");
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
@@ -342,6 +386,7 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     };
     static const char *const low_memory_checks[] = {
         "_ZN15PlatformToolbox17isLowMemoryDeviceEv",
+        "_ZN16EveryplayToolbox14isLowEndDeviceEv",
     };
     static const char *const online_checks[] = {
         "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
@@ -367,6 +412,8 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     unsigned online_patches = 0;
     unsigned high_graphics_patches = 0;
     unsigned low_memory_patches = 0;
+    unsigned texture_quality_patches = 0;
+    unsigned world_creator_patches = 0;
     size_t index;
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
@@ -376,6 +423,7 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
         high_graphics_patches = patch_x86_return_true_exports(
             image, high_graphics_checks,
             sizeof(high_graphics_checks) / sizeof(high_graphics_checks[0]));
+        texture_quality_patches = patch_x86_force_high_texture_quality(image);
         for (index = 0;
              index < sizeof(low_memory_checks) / sizeof(low_memory_checks[0]);
              ++index) {
@@ -390,6 +438,7 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     if (gd_settings_full_bypass()) {
         online_patches = patch_x86_return_true_exports(
             image, online_checks, sizeof(online_checks) / sizeof(online_checks[0]));
+        world_creator_patches = patch_x86_world_creator_buttons(image);
         for (index = 0;
              index < sizeof(bypass_pairs) / sizeof(bypass_pairs[0]); ++index) {
             void *locked = elf_image_find_export(image, bypass_pairs[index].locked);
@@ -402,13 +451,15 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     }
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
-                "highest-graphics=%s hd=%u low-memory=%u music-pulse-max=%.3f",
+                "highest-graphics=%s hd=%u low-memory=%u texture-quality=%u "
+                "world-creator=%u music-pulse-max=%.3f",
                 gd_settings_server(),
                 gd_settings_hack_icons() ? "true" : "false", icon_patches,
                 gd_settings_full_bypass() ? "true" : "false", bypass_patches,
                 online_patches,
                 gd_settings_force_highest_graphics() ? "true" : "false",
                 high_graphics_patches, low_memory_patches,
+                texture_quality_patches, world_creator_patches,
                 gd_settings_music_pulse_max());
 }
 
@@ -628,12 +679,17 @@ static int create_opengl_window(int client_width, int client_height) {
         const int window_height = rectangle.bottom - rectangle.top;
         const int window_x = (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2;
         const int window_y = (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2;
+        {
+        const char *configured_title = getenv("GD_GAME_TITLE");
+        const char *window_title = configured_title && configured_title[0]
+                                       ? configured_title : "Geometry Dash";
         g_host.window = CreateWindowExA(
-        0, window_class.lpszClassName, "Geometry Dash Wrapper - Unified x86",
+        0, window_class.lpszClassName, window_title,
         WS_OVERLAPPEDWINDOW, window_x > 0 ? window_x : 0,
         window_y > 0 ? window_y : 0,
         window_width, window_height,
         NULL, NULL, window_class.hInstance, NULL);
+        }
     }
     if (!g_host.window) {
         runtime_log("ERROR: CreateWindow failed: %lu", (unsigned long)GetLastError());
