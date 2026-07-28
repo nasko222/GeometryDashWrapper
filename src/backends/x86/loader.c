@@ -503,6 +503,44 @@ void elf_image_unload(ElfImage *image) {
     memset(image, 0, sizeof(*image));
 }
 
+int elf_image_visit_exports(const ElfImage *image, ElfExportVisitor visitor,
+                            void *opaque) {
+    uint16_t i;
+    if (!image || !image->header || !visitor) return 0;
+    for (i = 0; i < image->header->e_shnum; ++i) {
+        const Elf32_Shdr *symbols_section = &image->section_headers[i];
+        const Elf32_Shdr *strings_section;
+        const Elf32_Sym *symbols;
+        const char *strings;
+        uint32_t count;
+        uint32_t index;
+        if (symbols_section->sh_type != SHT_DYNSYM ||
+            symbols_section->sh_entsize != sizeof(Elf32_Sym)) {
+            continue;
+        }
+        strings_section = section_at(image, symbols_section->sh_link);
+        if (!strings_section) continue;
+        symbols = (const Elf32_Sym *)(image->file_data + symbols_section->sh_offset);
+        strings = (const char *)(image->file_data + strings_section->sh_offset);
+        count = symbols_section->sh_size / sizeof(Elf32_Sym);
+        for (index = 0; index < count; ++index) {
+            const Elf32_Sym *symbol = &symbols[index];
+            const char *name;
+            if (symbol->st_shndx == SHN_UNDEF || symbol->st_value == 0 ||
+                symbol->st_name >= strings_section->sh_size) {
+                continue;
+            }
+            name = strings + symbol->st_name;
+            if (!*name) continue;
+            if (!visitor(name, image->base + symbol->st_value,
+                         symbol->st_size, opaque)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 void *elf_image_find_export(const ElfImage *image, const char *name) {
     uint16_t i;
     for (i = 0; i < image->header->e_shnum; ++i) {

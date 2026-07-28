@@ -424,32 +424,6 @@ static int method_is_safe_retry(const char *method, const char *url) {
            ascii_starts_ci(short_name, "login");
 }
 
-static int rewrite_account_url_for_legacy_tls(
-    const RawApiRequest *request, SongHttpAttempt *attempt) {
-    size_t begin = 0;
-    size_t tail;
-    if (!request || !attempt || !attempt->payload || !attempt->payload_size)
-        return 0;
-    if (!ascii_mem_contains_ci(request->original_url,
-                               strlen(request->original_url),
-                               "getAccountURL.php"))
-        return 0;
-    while (begin < attempt->payload_size &&
-           isspace((unsigned char)attempt->payload[begin]))
-        ++begin;
-    if (begin + 8u > attempt->payload_size ||
-        !ascii_span_equal_ci((const char *)attempt->payload + begin, 8u,
-                             "https://"))
-        return 0;
-    memcpy(attempt->payload + begin, "http://", 7u);
-    tail = attempt->payload_size - (begin + 8u);
-    if (tail)
-        memmove(attempt->payload + begin + 7u,
-                attempt->payload + begin + 8u, tail);
-    --attempt->payload_size;
-    return 1;
-}
-
 static int parse_api_request(const char *bytes, size_t size,
                              RawApiRequest *output) {
     const char *headers_end;
@@ -672,7 +646,6 @@ int gd_api_http_handle_raw_request(const void *request, size_t request_size,
             if (!parsed.safe_retry) break;
         }
         if (!have_response) goto cleanup;
-        (void)rewrite_account_url_for_legacy_tls(&parsed, &final_attempt);
         if (!make_raw_response(&final_attempt, response, response_size,
                                response_code)) goto cleanup;
         result = 1;

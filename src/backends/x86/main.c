@@ -298,6 +298,49 @@ static int patch_x86_return_false(void *target) {
     return patch_x86_code(target, code, sizeof(code));
 }
 
+static int patch_x86_return_void(void *target) {
+    static const unsigned char code[] = {0xc3}; /* ret */
+    return patch_x86_code(target, code, sizeof(code));
+}
+
+typedef struct {
+    unsigned void_callbacks;
+    unsigned bool_callbacks;
+} DesktopKeyboardPatchCounts;
+
+static int desktop_keyboard_export_visitor(const char *name, void *address,
+                                           uint32_t size, void *opaque) {
+    DesktopKeyboardPatchCounts *counts =
+        (DesktopKeyboardPatchCounts *)opaque;
+    (void)size;
+    if (!name || !address || !counts) return 1;
+    if (strstr(name, "textInputShouldOffset") != NULL) {
+        if (patch_x86_return_false(address)) {
+            ++counts->bool_callbacks;
+            runtime_log("Desktop keyboard: return false patched %s", name);
+        }
+    } else if (strstr(name, "keyboardWillShow") != NULL ||
+               strstr(name, "keyboardWillHide") != NULL ||
+               strstr(name, "forceOffset") != NULL) {
+        if (patch_x86_return_void(address)) {
+            ++counts->void_callbacks;
+            runtime_log("Desktop keyboard: no-op patched %s", name);
+        }
+    }
+    return 1;
+}
+
+static void install_desktop_keyboard_offset_patches(const ElfImage *image) {
+    DesktopKeyboardPatchCounts counts;
+    memset(&counts, 0, sizeof(counts));
+    if (!elf_image_visit_exports(image, desktop_keyboard_export_visitor,
+                                 &counts)) {
+        runtime_log("Desktop keyboard patch scan ended early");
+    }
+    runtime_log("Desktop keyboard offset patches: void=%u bool=%u",
+                counts.void_callbacks, counts.bool_callbacks);
+}
+
 static int patch_x86_tail_jump(void *source, void *destination) {
 #if defined(__i386__)
     unsigned char code[5];
@@ -839,6 +882,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     runtime_log("RESULT: ELF_RELOCATION_OK");
+    install_desktop_keyboard_offset_patches(&image);
     install_configurable_x86_hacks(&image);
     if (mode == 0) {
         elf_image_unload(&image);

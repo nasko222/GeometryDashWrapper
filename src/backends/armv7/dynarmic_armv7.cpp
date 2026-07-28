@@ -1087,7 +1087,6 @@ struct SymbolRecord {
 };
 enum class V22CompanionHookMode {
     Off,
-    ShaderOnly,
     Safe,
     All,
 };
@@ -1095,7 +1094,6 @@ enum class V22CompanionHookMode {
 static const char* V22CompanionHookModeName(V22CompanionHookMode mode) {
     switch (mode) {
     case V22CompanionHookMode::Off: return "off";
-    case V22CompanionHookMode::ShaderOnly: return "shader";
     case V22CompanionHookMode::Safe: return "safe";
     case V22CompanionHookMode::All: return "all";
     }
@@ -2646,6 +2644,59 @@ static std::pair<u32, u32> DoubleToWords(double value) {
     return {static_cast<u32>(bits), static_cast<u32>(bits >> 32)};
 }
 static float WordToFloat(u32 bits) { float value = 0; std::memcpy(&value, &bits, sizeof(value)); return value; }
+
+static bool DesktopShaderTokenBoundary(char value) {
+    return !(value == '_' ||
+             (value >= '0' && value <= '9') ||
+             (value >= 'A' && value <= 'Z') ||
+             (value >= 'a' && value <= 'z'));
+}
+
+static bool EraseDesktopShaderToken(std::string& text,
+                                    std::string_view token) {
+    bool changed = false;
+    if (token.empty() || text.size() < token.size()) return false;
+    for (std::size_t index = 0; index + token.size() <= text.size(); ++index) {
+        if ((index == 0 || DesktopShaderTokenBoundary(text[index - 1])) &&
+            (index + token.size() == text.size() ||
+             DesktopShaderTokenBoundary(text[index + token.size()])) &&
+            std::memcmp(text.data() + index, token.data(), token.size()) == 0) {
+            std::fill(text.begin() + static_cast<std::ptrdiff_t>(index),
+                      text.begin() + static_cast<std::ptrdiff_t>(index + token.size()),
+                      ' ');
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static bool EraseDesktopPrecisionStatements(std::string& text) {
+    constexpr std::string_view token = "precision";
+    bool changed = false;
+    for (std::size_t index = 0; index + token.size() <= text.size(); ++index) {
+        if ((index != 0 && !DesktopShaderTokenBoundary(text[index - 1])) ||
+            std::memcmp(text.data() + index, token.data(), token.size()) != 0) {
+            continue;
+        }
+        std::size_t end = index;
+        while (end < text.size() && text[end] != ';' && text[end] != '\n') ++end;
+        if (end < text.size() && text[end] == ';') ++end;
+        for (std::size_t cursor = index; cursor < end; ++cursor) {
+            if (text[cursor] != '\r' && text[cursor] != '\n') text[cursor] = ' ';
+        }
+        index = end ? end - 1u : end;
+        changed = true;
+    }
+    return changed;
+}
+
+static bool SanitizeDesktopGlsl(std::string& text) {
+    bool changed = EraseDesktopPrecisionStatements(text);
+    changed = EraseDesktopShaderToken(text, "lowp") || changed;
+    changed = EraseDesktopShaderToken(text, "mediump") || changed;
+    changed = EraseDesktopShaderToken(text, "highp") || changed;
+    return changed;
+}
 static u32 FloatToWord(float value) { u32 bits = 0; std::memcpy(&bits, &value, sizeof(bits)); return bits; }
 
 
@@ -3573,10 +3624,7 @@ public:
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
-    void ResetFrameClipState() {
-        editor_default_color_clear_seen_ = false;
-        gl_.ResetFrameClipState();
-    }
+    void ResetFrameClipState() {}
     void SwapBuffersHost() { gl_.Swap(); }
     void BeginGpuFrame(u64 frame) { gl_.BeginGpuFrame(frame); }
     void EndGpuFrame() { gl_.EndGpuFrame(); }
@@ -8006,16 +8054,83 @@ private:
             const GLsizei source_count = static_cast<GLsizei>(arguments[1]);
             if (source_count < 0 || source_count > 4096) return Fail("glShaderSource count outside limit");
             std::vector<u32> guest_strings(static_cast<std::size_t>(source_count));
-            std::vector<GLint> lengths(static_cast<std::size_t>(source_count), -1);
+            std::vector<GLint> guest_lengths(static_cast<std::size_t>(source_count), -1);
+            std::vector<GLint> host_lengths(static_cast<std::size_t>(source_count), 0);
             std::vector<std::string> source_storage(static_cast<std::size_t>(source_count));
             std::vector<const char*> pointers(static_cast<std::size_t>(source_count));
             if (source_count && !env_.ReadBytes(static_cast<u32>(arguments[2]), guest_strings.data(), guest_strings.size() * sizeof(u32))) return Fail("glShaderSource string array invalid");
-            if (arguments[3] && source_count) env_.ReadBytes(static_cast<u32>(arguments[3]), lengths.data(), lengths.size() * sizeof(GLint));
+            if (arguments[3] && source_count &&
+                !env_.ReadBytes(static_cast<u32>(arguments[3]), guest_lengths.data(),
+                                guest_lengths.size() * sizeof(GLint)))
+                return Fail("glShaderSource length array invalid");
+            bool sanitized = false;
             for (GLsizei i = 0; i < source_count; ++i) {
-                source_storage[static_cast<std::size_t>(i)] = ReadCString(guest_strings[static_cast<std::size_t>(i)]);
-                pointers[static_cast<std::size_t>(i)] = source_storage[static_cast<std::size_t>(i)].c_str();
+                const std::size_t index = static_cast<std::size_t>(i);
+                if (guest_lengths[index] >= 0) {
+                    const std::size_t size = static_cast<std::size_t>(guest_lengths[index]);
+                    if (size > 16u * 1024u * 1024u)
+                        return Fail("glShaderSource source outside limit");
+                    source_storage[index].resize(size);
+                    if (size && !env_.ReadBytes(guest_strings[index],
+                                                source_storage[index].data(), size))
+                        return Fail("glShaderSource source invalid");
+                } else {
+                    source_storage[index] = ReadCString(guest_strings[index]);
+                }
+                sanitized = SanitizeDesktopGlsl(source_storage[index]) || sanitized;
+                host_lengths[index] = static_cast<GLint>(source_storage[index].size());
+                pointers[index] = source_storage[index].data();
             }
-            reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]), source_count, pointers.data(), arguments[3] ? lengths.data() : nullptr);
+            if (sanitized && shader_sanitize_logs_ < 32u) {
+                log_ << "[host] ARMv7 desktop GLSL compatibility: removed GLES precision syntax shader="
+                     << arguments[0] << " strings=" << source_count << '\n';
+                ++shader_sanitize_logs_;
+            }
+            reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]),
+                                           source_count, pointers.data(),
+                                           host_lengths.data());
+        } else if (name == "glCompileShader") {
+            using CompileFn = void (APIENTRY*)(GLuint);
+            reinterpret_cast<CompileFn>(function)(static_cast<GLuint>(arguments[0]));
+            using GetFn = void (APIENTRY*)(GLuint, GLenum, GLint*);
+            using LogFn = void (APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+            void* get_address = gl_.Resolve("glGetShaderiv");
+            void* log_address = gl_.Resolve("glGetShaderInfoLog");
+            GLint compiled = 1;
+            if (get_address) {
+                reinterpret_cast<GetFn>(get_address)(static_cast<GLuint>(arguments[0]),
+                                                     0x8B81u, &compiled);
+            }
+            if (!compiled && log_address) {
+                std::array<char, 4096> message{};
+                GLsizei written = 0;
+                reinterpret_cast<LogFn>(log_address)(static_cast<GLuint>(arguments[0]),
+                                                     static_cast<GLsizei>(message.size() - 1u),
+                                                     &written, message.data());
+                log_ << "ERROR: ARMv7 desktop shader compile failed id="
+                     << arguments[0] << " log=" << message.data() << '\n';
+            }
+        } else if (name == "glLinkProgram") {
+            using LinkFn = void (APIENTRY*)(GLuint);
+            reinterpret_cast<LinkFn>(function)(static_cast<GLuint>(arguments[0]));
+            using GetFn = void (APIENTRY*)(GLuint, GLenum, GLint*);
+            using LogFn = void (APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+            void* get_address = gl_.Resolve("glGetProgramiv");
+            void* log_address = gl_.Resolve("glGetProgramInfoLog");
+            GLint linked = 1;
+            if (get_address) {
+                reinterpret_cast<GetFn>(get_address)(static_cast<GLuint>(arguments[0]),
+                                                     0x8B82u, &linked);
+            }
+            if (!linked && log_address) {
+                std::array<char, 4096> message{};
+                GLsizei written = 0;
+                reinterpret_cast<LogFn>(log_address)(static_cast<GLuint>(arguments[0]),
+                                                     static_cast<GLsizei>(message.size() - 1u),
+                                                     &written, message.data());
+                log_ << "ERROR: ARMv7 desktop program link failed id="
+                     << arguments[0] << " log=" << message.data() << '\n';
+            }
         } else if (name == "glBufferData") {
             using Fn = void (APIENTRY*)(GLenum, GLsizeiptr_, const void*, GLenum);
             const std::size_t size = static_cast<std::size_t>(arguments[1]);
@@ -8090,43 +8205,6 @@ private:
             reinterpret_cast<void (APIENTRY*)(GLfloat,GLfloat,GLfloat,GLfloat)>(function)(WordToFloat(static_cast<u32>(arguments[0])),WordToFloat(static_cast<u32>(arguments[1])),WordToFloat(static_cast<u32>(arguments[2])),WordToFloat(static_cast<u32>(arguments[3])));
         } else if (name == "glLineWidth") {
             reinterpret_cast<void (APIENTRY*)(GLfloat)>(function)(WordToFloat(static_cast<u32>(arguments[0])));
-        } else if (name == "glClear") {
-            using Fn = void (APIENTRY*)(GLbitfield);
-            const GLbitfield mask = static_cast<GLbitfield>(arguments[0]);
-            const bool editor_default_clear =
-                !editor_default_color_clear_seen_ &&
-                gl_framebuffer_binding_ == 0u && IsV22EditorSceneActive() &&
-                (mask & GL_COLOR_BUFFER_BIT) != 0u;
-            if ((mask & GL_COLOR_BUFFER_BIT) != 0u &&
-                gl_framebuffer_binding_ == 0u)
-                editor_default_color_clear_seen_ = true;
-            if (!editor_default_clear) {
-                reinterpret_cast<Fn>(function)(mask);
-            } else {
-                const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
-                GLint old_scissor[4] = {0, 0, 0, 0};
-                GLboolean old_color_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
-                glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
-                glGetBooleanv(GL_COLOR_WRITEMASK, old_color_mask);
-                if (scissor_enabled) glDisable(GL_SCISSOR_TEST);
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                reinterpret_cast<Fn>(function)(mask);
-                glColorMask(old_color_mask[0], old_color_mask[1],
-                            old_color_mask[2], old_color_mask[3]);
-                if (scissor_enabled) {
-                    glScissor(old_scissor[0], old_scissor[1],
-                              old_scissor[2], old_scissor[3]);
-                    glEnable(GL_SCISSOR_TEST);
-                }
-                if (editor_full_clear_logs_ < 32u) {
-                    log_ << "[host] ARMv7 editor default framebuffer full clear "
-                         << "saved-scissor=" << (scissor_enabled ? 1 : 0)
-                         << " box=" << old_scissor[0] << ',' << old_scissor[1]
-                         << ' ' << old_scissor[2] << 'x' << old_scissor[3]
-                         << '\n';
-                    ++editor_full_clear_logs_;
-                }
-            }
         } else if (name == "glUniform2fv" || name == "glUniform3fv" || name == "glUniform4fv") {
             using Fn = void (APIENTRY*)(GLint, GLsizei, const GLfloat*);
             const unsigned components = name == "glUniform2fv" ? 2u : name == "glUniform3fv" ? 3u : 4u;
@@ -10902,8 +10980,7 @@ private:
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
     u32 gl_framebuffer_binding_=0;
-    bool editor_default_color_clear_seen_=false;
-    u32 editor_full_clear_logs_=0;
+    u32 shader_sanitize_logs_=0;
     u32 edge_clip_normalization_logs_=0;
     u64 logged_guest_stdio_=0;
     bool audio_initialized_=false;
@@ -11231,7 +11308,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix2-focused debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix3-regression debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11548,11 +11625,10 @@ int main(int argc,char** argv) {
             else if(argument.rfind("--companion-hooks=",0)==0) {
                 const std::string mode(argument.substr(18));
                 if (mode == "off") companion_hook_mode = V22CompanionHookMode::Off;
-                else if (mode == "shader") companion_hook_mode = V22CompanionHookMode::ShaderOnly;
                 else if (mode == "safe") companion_hook_mode = V22CompanionHookMode::Safe;
                 else if (mode == "all") companion_hook_mode = V22CompanionHookMode::All;
                 else throw std::runtime_error(
-                    "--companion-hooks must be off, shader, safe, or all");
+                    "--companion-hooks must be off, safe, or all");
             }
             else if(!argument.empty()&&argument[0]!='-')
                 input_path=std::string(argument);
@@ -11834,7 +11910,7 @@ int main(int argc,char** argv) {
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=pre-frame-reset+exact-viewport-scissor+first-editor-color-clear-full");
+             "state=guest-owned-no-host-viewport-scissor-clear-rewrite");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -12036,46 +12112,35 @@ int main(int argc,char** argv) {
         if (!companion_libgame.empty() && late_beta_layout &&
             companion_hook_mode != V22CompanionHookMode::Off) {
             companion_runtime_initialized = true;
-            if (companion_hook_mode == V22CompanionHookMode::ShaderOnly) {
-                emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_SKIPPED "
-                     "mode=shader reason=single-stateless-ApplyHooks-only");
-            } else {
-                emit("Running " +
-                     std::to_string(companion_runtime.constructors.size()) +
-                     " companion libgame.so constructors through Dynarmic");
-                for (std::size_t index = 0;
-                     index < companion_runtime.constructors.size(); ++index) {
-                    const u32 entry = companion_runtime.constructors[index];
-                    if (entry == 0u ||
-                        entry == std::numeric_limits<u32>::max())
-                        continue;
-                    u32 ignored = 0u;
-                    if (!executor.RunFunction(
-                            entry, {}, &ignored,
-                            "companion constructor " +
-                                std::to_string(index + 1u),
-                            0u, std::chrono::milliseconds(30000))) {
-                        emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTOR_FAILED index=" +
-                             std::to_string(index + 1u) +
-                             " action=disable-companion-hooks");
-                        companion_runtime_initialized = false;
-                        break;
-                    }
-                }
-                if (companion_runtime_initialized) {
-                    emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_OK count=" +
-                         std::to_string(companion_runtime.constructors.size()));
+            emit("Running " +
+                 std::to_string(companion_runtime.constructors.size()) +
+                 " companion libgame.so constructors through Dynarmic");
+            for (std::size_t index = 0;
+                 index < companion_runtime.constructors.size(); ++index) {
+                const u32 entry = companion_runtime.constructors[index];
+                if (entry == 0u || entry == std::numeric_limits<u32>::max())
+                    continue;
+                u32 ignored = 0u;
+                if (!executor.RunFunction(
+                        entry, {}, &ignored,
+                        "companion constructor " +
+                            std::to_string(index + 1u),
+                        0u, std::chrono::milliseconds(30000))) {
+                    emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTOR_FAILED index=" +
+                         std::to_string(index + 1u) +
+                         " action=disable-companion-hooks");
+                    companion_runtime_initialized = false;
+                    break;
                 }
             }
             if (companion_runtime_initialized) {
+                emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_OK count=" +
+                     std::to_string(companion_runtime.constructors.size()));
                 std::size_t features_ok = 0u;
                 std::size_t features_failed = 0u;
                 std::size_t features_absent = 0u;
                 for (const V22CompanionFeatureSpec& feature :
                      kV22CompanionFeatures) {
-                    if (companion_hook_mode == V22CompanionHookMode::ShaderOnly &&
-                        std::strcmp(feature.label, "ShaderFix") != 0)
-                        continue;
                     if (companion_hook_mode == V22CompanionHookMode::Safe &&
                         !feature.safe)
                         continue;

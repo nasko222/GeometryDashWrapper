@@ -6,6 +6,9 @@
 
 #include "elf32.h"
 
+typedef int (*ElfExportVisitor)(const char *name, void *address,
+                                uint32_t size, void *opaque);
+
 typedef struct {
     unsigned char *file_data;
     size_t file_size;
@@ -27,6 +30,8 @@ int apk_extract_member(const char *apk_path, const char *member_name,
                        unsigned char **output, size_t *output_size);
 void elf_image_unload(ElfImage *image);
 void *elf_image_find_export(const ElfImage *image, const char *name);
+int elf_image_visit_exports(const ElfImage *image, ElfExportVisitor visitor,
+                            void *opaque);
 int elf_image_run_constructors(const ElfImage *image);
 
 #endif

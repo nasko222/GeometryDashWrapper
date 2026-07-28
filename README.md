@@ -1,4 +1,4 @@
-# Geometry Dash Wrapper 0.9.5-unified7-fix2-focused
+# Geometry Dash Wrapper 0.9.5-unified7-fix3-regression + Logging Hotfix 1
 
 Recovery build of the unified x86, legacy ARM and ARMv7/Dynarmic wrapper.
 The experimental EXE/DLL/CFG launcher from Unified6 is removed. The normal
@@ -20,6 +20,16 @@ set "MUSIC_PULSE_MAX=0.30"
 Place the APK at `dist-unified\game.apk` and launch `RUN_AUTO.cmd`.
 x86 is preferred when an x86 game library is present. The removed ARM override
 setting does not return.
+
+## Logging Hotfix 1 changes
+
+- Drag an APK onto `RUN_AUTO.cmd`, or double-click it to use `game.apk`.
+- Every run is stored under `logs\YYYY-MM-DD\HH-MM-SS__package__vVERSION__backend`.
+- `run-info.txt` records the manifest package, version name/code, APK path and backend.
+- Previous run folders are never overwritten. Old root logs are preserved under
+  `logs\_old-root-files`.
+- No gameplay, editor, renderer, shader, HTTP, account, save, audio or input behavior
+  was changed in this logging hotfix.
 
 ## Unified7 Fix2 focused changes
 

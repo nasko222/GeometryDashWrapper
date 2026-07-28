@@ -252,6 +252,7 @@ def main() -> int:
         '  exit /b 2\r\n'
         ')\r\n'
         'if not exist save mkdir save\r\n'
+        'for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul\r\n'
         '"%~dp0GeometryDashWrapper.exe" --apk=game.apk\r\n',
         encoding="ascii",
         newline="",
