@@ -1,63 +1,45 @@
-# Geometry Dash Wrapper 0.9.5-unified6
+# Geometry Dash Wrapper 0.9.5-unified7-recovery
 
-Unified wrapper for x86 Android game libraries, legacy ARM through Dynarmic,
-and ARMv7/2.2 through Dynarmic. There is no Unicorn backend.
+Recovery build of the unified x86, legacy ARM and ARMv7/Dynarmic wrapper.
+The experimental EXE/DLL/CFG launcher from Unified6 is removed. The normal
+entry point is again `RUN_AUTO.cmd`, with the three backend EXEs stored under
+`x86`, `arm-legacy` and `armv7`.
 
-## Running
+## Run settings
 
-1. Build with `BUILD_ALL.cmd` on Windows.
-2. Put the APK at `dist-unified\game.apk`.
-3. Edit `dist-unified\GeometryDash.cfg`.
-4. Open `dist-unified\GeometryDash.exe`.
+Edit `RUN_AUTO.cmd`:
 
-There is no launch BAT file. `GeometryDash.exe` reads the CFG, starts the Python
-auto-selector without a console flash when configured, then launches the matching
-private backend process module.
-
-```ini
-[launcher]
-apk = game.apk
-disable_windows_console = true
-debug = false
-
-[game]
-gdps_server = www.boomlings.com/database
-hack_icons = false
-full_bypass = true
-force_highest_graphics = true
-music_pulse_max = 0.30
+```bat
+set "GDPS_SERVER=www.boomlings.com/database"
+set "HACK_ICONS=false"
+set "FULL_BYPASS=true"
+set "FORCE_HIGHEST_GRAPHICS=true"
+set "MUSIC_PULSE_MAX=0.30"
 ```
 
-x86 is preferred when an x86 game library exists. Otherwise the launcher chooses
-legacy ARM or ARMv7. The removed ARM override does not return.
+Place the APK at `dist-unified\game.apk` and launch `RUN_AUTO.cmd`.
+x86 is preferred when an x86 game library is present. The removed ARM override
+setting does not return.
 
-## Unified6 changes
+## Recovery changes
 
-- Native HTTP response vectors reserve a trailing zero byte. This keeps valid
-  `std::vector<char>` begin/end semantics while also supporting comment parsers
-  that accidentally treat response data as a C string. Comment endpoints now log
-  a short sanitized response preview for the next test.
-- Geometry Dash World and Geometry Dash Lite preserve each Creator button's real
-  callback and enabled artwork instead of swapping selected buttons to
+- Restores the old CMD launcher and backend EXE layout.
+- Removes per-package save profiles. Every supported version uses the single
+  portable `dist-unified\save` directory.
+- Restores the pre-Unified6 CCHttpResponse byte-vector layout and the older
+  callback budget/delivery behavior. Completed requests are delivered in request
+  order during the same pump pass.
+- Patches the actual Thumb block used by the attached Geometry Dash Lite build,
+  skipping the callback replacement and grey tint that route Creator buttons to
   `onOnlyFullVersion`.
-- The editor black-strip workaround is now deliberately aggressive: default
-  framebuffer viewports are normalized to the full client area, large persistent
-  edge scissors are rejected, and clip state is reset both before and after each
-  rendered frame.
-- ARM now patches `CCDirector::updateContentScale(TextureQuality)` in addition to
-  the HD and low-memory checks. This is the final wrapper-side 2.11 high-texture
-  attempt; an APK that contains no larger textures cannot be upgraded by a flag.
-- Saves are flat again under `save\`. No package profiles, migration, or
-  `.last-package` marker are created.
-- Titles include Geometry Dash Lite in addition to Geometry Dash, World,
-  Meltdown, and SubZero.
-- Icons are fixed files under `assets\icons`, not extracted from the APK at
-  startup. Each ICO contains dedicated 16/20/24/32/40/48/64/128/256px entries,
-  and both the window and window class icons are updated.
-- Distribution layout is `GeometryDash.exe`, `GeometryDash.cfg`, `run_auto.py`,
-  `assets\icons`, and `backends\...\*.dll`. The backend files are executable PE
-  process modules with private DLL filenames so one x64 launcher can start both
-  32-bit and 64-bit backends without loading them into the same process.
+- During an active editor scene, non-full default-framebuffer `glViewport` and
+  `glScissor` calls are normalized immediately inside the render pass. This is
+  targeted at the scrolling right-side black region rather than applying another
+  blind pre/post-frame reset.
+- Includes real multi-resolution app icons extracted from game APK resources for
+  Geometry Dash, Lite, World and SubZero. Meltdown uses its APK's real icon
+  family; `icon.ico` or `icon.png` beside the launcher remains an explicit
+  override.
+- Window titles include Geometry Dash Lite, World, Meltdown and SubZero.
 
-The working 1.6 x86 network bridge, platformer controls, swing behavior, and icon
-unlock setting are retained.
+No APK or native Android `.so` file is included in the source archive.

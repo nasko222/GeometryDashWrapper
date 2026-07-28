@@ -1,1 +1,1 @@
-unified6-comments-lite-editor-launcher
+unified7-recovery-cmd-http-editor-lite

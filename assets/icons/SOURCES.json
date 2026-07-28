@@ -1,0 +1,90 @@
+{
+  "geometry-dash": {
+    "apk": "game.apk",
+    "source_members": [
+      "res/drawable-ldpi/icon.png",
+      "res/drawable-mdpi/icon.png",
+      "res/drawable-hdpi/icon.png",
+      "res/drawable-xhdpi/icon.png"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ]
+  },
+  "geometry-dash-lite": {
+    "apk": "game(5).apk",
+    "source_members": [
+      "res/Ul.png",
+      "res/kn.png",
+      "res/nf.png",
+      "res/4d.png",
+      "res/Fu.png",
+      "res/Ql.png"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ]
+  },
+  "geometry-dash-world": {
+    "apk": "game(4).apk",
+    "source_members": [
+      "res/drawable-ldpi-v4/icon.png",
+      "res/drawable-mdpi-v4/icon.png",
+      "res/drawable-hdpi-v4/icon.png",
+      "res/drawable-xhdpi-v4/icon.png",
+      "res/drawable-xxhdpi-v4/icon.png",
+      "res/drawable-xxxhdpi-v4/icon.png"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ]
+  },
+  "geometry-dash-subzero": {
+    "apk": "game-v22beta-selected-2022-subzero-icon-signed.apk",
+    "source_members": [
+      "res/drawable-ldpi/icon.png",
+      "res/drawable-mdpi/icon.png",
+      "res/drawable-hdpi/icon.png",
+      "res/drawable-xhdpi/icon.png"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ]
+  }
+}

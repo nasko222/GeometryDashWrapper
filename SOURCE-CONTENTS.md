@@ -1,10 +1,8 @@
-# Unified6 source contents
+# Source contents
 
-Complete buildable source for x86, legacy ARM Dynarmic, ARMv7 Dynarmic, and the
-native `GeometryDash.exe` launcher. Shared Windows audio, storage, networking,
-runtime settings, and fixed icon handling are under `src/shared`. Launcher source
-is under `src/launcher`; editable PNG and multi-resolution ICO assets are under
-`assets/icons`.
+This archive contains wrapper source, build scripts, pinned dependency metadata,
+third-party source needed by the build, launcher scripts, and real app-icon image
+resources.
 
-No APK, extracted game `.so`, compiled executable, compiled backend module, build
-cache, Unicorn backend, or F2 shortcut is included.
+It intentionally contains no APK, no extracted Android `.so`, no build cache,
+no compiled wrapper backend, and no user save data.

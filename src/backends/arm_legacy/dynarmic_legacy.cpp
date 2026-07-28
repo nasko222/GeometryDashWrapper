@@ -1225,37 +1225,6 @@ static std::size_t InstallConfigurableIconUnlockHooks(
     return patched;
 }
 
-static bool PatchCreatorLayerLockedButtons(
-    ProbeEnvironment& env, const ElfRuntime& runtime) {
-    const SymbolRecord* init = FindSymbol(runtime, "_ZN12CreatorLayer4initEv");
-    if (!init || (init->address & 1u) == 0u || init->size < 48u) return false;
-    const u32 base = init->address & ~1u;
-    const u32 scan_size = std::min<u32>(init->size, 4096u);
-    for (u32 offset = 0u; offset + 48u <= scan_size; offset += 2u) {
-        const u32 address = base + offset;
-        const u16 instruction = env.MemoryRead16(address);
-        if ((instruction & 0xFD07u) != 0xB105u) continue; // cbz r5
-        const u32 immediate =
-            ((((instruction >> 9u) & 1u) << 5u) |
-             ((instruction >> 3u) & 0x1Fu)) << 1u;
-        const u32 target = address + 4u + immediate;
-        if (target <= address || target > base + scan_size - 2u) continue;
-        bool gray_tint = false;
-        for (u32 probe = address + 2u; probe < target; probe += 2u) {
-            if (env.MemoryRead16(probe) == 0x228Cu) { gray_tint = true; break; }
-        }
-        if (!gray_tint) continue;
-        const s32 branch_bytes = static_cast<s32>(target) -
-                                 static_cast<s32>(address + 4u);
-        if ((branch_bytes & 1) != 0 || branch_bytes < -2048 ||
-            branch_bytes > 2046) continue;
-        env.MemoryWrite16(address, static_cast<u16>(
-            0xE000u | ((branch_bytes >> 1) & 0x07FFu)));
-        return true;
-    }
-    return false;
-}
-
 static std::size_t InstallConfigurableCreatorBypass(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     struct Pair { const char* locked; const char* unlocked; };
@@ -1282,45 +1251,12 @@ static std::size_t InstallConfigurableCreatorBypass(
             PatchArmFunctionTailJump(env, runtime, *locked, *unlocked))
             ++patched;
     }
-    if (PatchCreatorLayerLockedButtons(env, runtime)) ++patched;
     return patched;
-}
-
-static bool PatchHighestTextureQuality(
-    ProbeEnvironment& env, const ElfRuntime& runtime) {
-    const SymbolRecord* symbol = FindSymbol(
-        runtime, "_ZN7cocos2d10CCDirector18updateContentScaleENS_14TextureQualityE");
-    if (!symbol || symbol->size < 4u) return false;
-    const u32 base = symbol->address & ~1u;
-    if (symbol->address & 1u) {
-        const u32 scan_size = std::min<u32>(symbol->size, 64u);
-        for (u32 offset = 0u; offset + 2u <= scan_size; offset += 2u) {
-            const u16 instruction = env.MemoryRead16(base + offset);
-            if ((instruction & 0xF8FFu) != 0x2802u) continue;
-            const u16 reg = static_cast<u16>((instruction >> 8u) & 7u);
-            env.MemoryWrite16(base + offset, static_cast<u16>(
-                0x4280u | (reg << 3u) | reg));
-            return true;
-        }
-        return false;
-    }
-    const u32 scan_size = std::min<u32>(symbol->size, 64u);
-    for (u32 offset = 0u; offset + 4u <= scan_size; offset += 4u) {
-        const u32 instruction = env.MemoryRead32(base + offset);
-        if ((instruction & 0x0FFF0FFFu) != 0x03500002u) continue;
-        const u32 condition = instruction & 0xF0000000u;
-        const u32 reg = (instruction >> 16u) & 0xFu;
-        env.MemoryWrite32(base + offset, condition | 0x01500000u |
-                                         (reg << 16u) | reg);
-        return true;
-    }
-    return false;
 }
 
 struct GraphicsPatchCounts {
     std::size_t hd = 0u;
     std::size_t low_memory = 0u;
-    std::size_t texture_quality = 0u;
 };
 
 static GraphicsPatchCounts InstallHighestGraphicsHooks(
@@ -1341,7 +1277,6 @@ static GraphicsPatchCounts InstallHighestGraphicsHooks(
                 ++counts.low_memory;
         }
     }
-    if (PatchHighestTextureQuality(env, runtime)) ++counts.texture_quality;
     return counts;
 }
 
@@ -6505,7 +6440,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified6 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified7-recovery legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6795,8 +6730,6 @@ int main(int argc,char** argv) {
              " hd-hooks=" + std::to_string(graphics_patches.hd) +
              " low-memory-hooks=" +
              std::to_string(graphics_patches.low_memory) +
-             " texture-quality-hooks=" +
-             std::to_string(graphics_patches.texture_quality) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()));
         GuestExecutor executor(env,runtime,log_file);

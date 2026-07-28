@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder43-0.9.5-unified6-comments-lite-editor-launcher"
+$BuilderRevision = "dynarmic-x64-builder43-0.9.5-unified7-recovery"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -219,7 +219,7 @@ if ($RefreshTools) {
 }
 if ($Clean) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $BuildDir
-    $ArmOutputPaths = @((Join-Path $Output "backends\arm-legacy"), (Join-Path $Output "backends\armv7"))
+    $ArmOutputPaths = @((Join-Path $Output "arm-legacy"), (Join-Path $Output "armv7"))
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
 }
 if ($RefreshDynarmic) {
@@ -423,9 +423,6 @@ $ProbeSourcesToRefresh = @(
     (Join-Path $Root "src\shared\apk_extract_audio.c"),
     (Join-Path $Root "src\shared\embedded_effects_stub.c"),
     (Join-Path $Root "src\shared\net_compat_win.c"),
-    (Join-Path $Root "src\shared\runtime_settings.c"),
-    (Join-Path $Root "src\shared\window_icon_win.c"),
-    (Join-Path $Root "src\launcher\geometry_dash_launcher.c"),
     (Join-Path $Root "src\shared\build_info.h"),
     (Join-Path $Root "third_party\stb\stb_vorbis.c"),
     (Join-Path $Root "cmake\CMakeLists.txt")
@@ -448,46 +445,63 @@ $LegacyExe = $LegacyMatches[0].FullName
 $ArmV7Exe = $ArmV7Matches[0].FullName
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
-# Remove the pre-Unified6 backend layout so an incremental build cannot leave
-# runnable old EXEs or BAT launchers beside the new private backend modules.
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath @(
-    (Join-Path $Output "arm-legacy"),
-    (Join-Path $Output "armv7")
-)
-Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath @(
-    (Join-Path $Output "GeometryDashArmLegacy.exe"),
-    (Join-Path $Output "GeometryDashArmV7.exe"),
-    (Join-Path $Output "RUN_AUTO.cmd")
-)
-$BackendsOut = Join-Path $Output "backends"
-$LegacyOut = Join-Path $BackendsOut "arm-legacy"
-$ArmV7Out = Join-Path $BackendsOut "armv7"
+$LegacyOut = Join-Path $Output "arm-legacy"
+$ArmV7Out = Join-Path $Output "armv7"
 $ArmOutputPaths = @($LegacyOut, $ArmV7Out)
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
 New-Item -ItemType Directory -Force -Path $ArmOutputPaths | Out-Null
-# These are executable PE process modules with private .dll names. They stay
-# out-of-process because one x64 launcher must support both x86 and x64 guests.
-Copy-Item -Force $LegacyExe (Join-Path $LegacyOut "GeometryDashArmLegacy.dll")
-Copy-Item -Force $ArmV7Exe (Join-Path $ArmV7Out "GeometryDashArmV7.dll")
+Copy-Item -Force $LegacyExe (Join-Path $LegacyOut "GeometryDashArmLegacy.exe")
+Copy-Item -Force $ArmV7Exe (Join-Path $ArmV7Out "GeometryDashArmV7.exe")
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
-$LauncherSource = Join-Path $Root "src\launcher\geometry_dash_launcher.c"
-$LauncherExe = Join-Path $Output "GeometryDash.exe"
-Invoke-External -FilePath $ZigExe -Arguments @(
-    "cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2",
-    "-Wall", "-Wextra", "-mwindows", "-municode",
-    $LauncherSource, "-o", $LauncherExe, "-luser32"
+$LegacyRun = @'
+@echo off
+cd /d "%~dp0.."
+if not exist game.apk (
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
+  pause
+  exit /b 2
 )
-Copy-Item -Force (Join-Path $Root "run_auto.py") (Join-Path $Output "run_auto.py")
-Copy-Item -Force (Join-Path $Root "GeometryDash.cfg") (Join-Path $Output "GeometryDash.cfg")
-$IconSource = Join-Path $Root "assets\icons"
-$IconOutput = Join-Path $Output "assets\icons"
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $IconOutput
-New-Item -ItemType Directory -Force -Path $IconOutput | Out-Null
-Copy-Item -Force (Join-Path $IconSource "*") $IconOutput
-Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Output "RUN_AUTO.cmd")
-Get-ChildItem -LiteralPath $LegacyOut, $ArmV7Out -Filter "RUN*.cmd" -File `
-    -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+if not exist save mkdir save
+"%~dp0GeometryDashArmLegacy.exe" game.apk --log=gd-arm-legacy.log
+'@
+$LegacyDebug = @'
+@echo off
+cd /d "%~dp0.."
+if not exist game.apk (
+  echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
+  pause
+  exit /b 2
+)
+if not exist save mkdir save
+"%~dp0GeometryDashArmLegacy.exe" game.apk --debug-everything --dump-imports=gd-arm-legacy-imports.txt --log=gd-arm-legacy-debug.log --profile=gd-arm-legacy-profile.csv --profile-summary=gd-arm-legacy-profile-summary.txt
+'@
+$ArmV7Run = @'
+@echo off
+cd /d "%~dp0.."
+if not exist game.apk (
+  echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
+  pause
+  exit /b 2
+)
+if not exist save mkdir save
+"%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --log=gd-armv7.log
+'@
+$ArmV7Debug = @'
+@echo off
+cd /d "%~dp0.."
+if not exist game.apk (
+  echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
+  pause
+  exit /b 2
+)
+if not exist save mkdir save
+"%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
+'@
+[IO.File]::WriteAllText((Join-Path $LegacyOut "RUN.cmd"), $LegacyRun, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $LegacyOut "RUN_DEBUG.cmd"), $LegacyDebug, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN.cmd"), $ArmV7Run, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN_DEBUG.cmd"), $ArmV7Debug, [Text.Encoding]::ASCII)
 
 $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) {
@@ -503,4 +517,3 @@ if (Test-Path $BoostLicense) {
 Write-Host "`nUnified Dynarmic backends ready:" -ForegroundColor Green
 Write-Host "  $LegacyOut"
 Write-Host "  $ArmV7Out"
-Write-Host "Launcher: $LauncherExe"

@@ -1,0 +1,46 @@
+Geometry Dash Wrapper 0.9.5-unified7-recovery verification
+===========================================================
+
+Layout recovery
+- RUN_AUTO.cmd restored as the user-facing launcher: PASS
+- Backend names restored to x86/GeometryDashWrapper.exe,
+  arm-legacy/GeometryDashArmLegacy.exe and armv7/GeometryDashArmV7.exe: PASS
+- GeometryDash.exe / GeometryDash.cfg / DLL backend layout absent: PASS
+- One flat save directory selected by run_auto.py: PASS
+
+Attached Geometry Dash Lite audit
+- Input APK: game(5).apk, 72,167,785 bytes
+- ARMv7 library: lib/armeabi-v7a/libcocos2dcpp.so
+- CreatorLayer::init symbol: 0x002ea0c5, size 2360 bytes
+- Matching lock sequence inside CreatorLayer::init: 0x002ea386
+- Original conditional branch: BEQ 0xd012 to 0x002ea3b2
+- Locked-button block contains movs r3,#140 tint at 0x002ea3a2
+- Recovery patch: unconditional B 0xe012 to preserve original callbacks
+- Matching BEQ+tint blocks accepted by the patch inside the symbol: exactly 1
+
+HTTP recovery
+- Response-body/header vectors restored to exact byte length (begin/end/capacity).
+- Unified6 body+1 capacity and artificial trailing NUL behavior removed.
+- Fixed 1,000,000,000-tick callback budget restored.
+- All completed callbacks in a pump pass are delivered in request-id order.
+
+Editor render recovery
+- Active editor scene is detected from the live editor layer.
+- Non-full default-framebuffer glViewport and glScissor calls are normalized
+  immediately inside rendering, rather than only resetting state before/after a frame.
+- Song/editor overlays using their own non-default framebuffer remain untouched.
+
+Icon recovery
+- Bundled ICOs are built from actual multi-resolution APK icon PNG resources for
+  Geometry Dash, Geometry Dash Lite, Geometry Dash World and Geometry Dash SubZero.
+- No generated paint overlays are used.
+- Geometry Dash Meltdown falls back to the real icon family inside its supplied APK.
+
+Static validation
+- run_auto.py and build_x86.py Python compilation: PASS
+- ARMv7 C++20 syntax-only compilation: PASS (non-Windows unused-field warnings only)
+- Legacy ARM C++20 syntax-only compilation: PASS (pre-existing unused-field warnings only)
+- Attached Lite backend selection and bundled Lite icon selection: PASS
+- World x86 backend selection and bundled World icon selection: PASS
+- SubZero ARMv7 backend selection and bundled SubZero icon selection: PASS
+- Windows link and live gameplay test: NOT AVAILABLE in this environment
