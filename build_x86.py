@@ -194,6 +194,7 @@ def main() -> int:
         root / "src/shared/net_compat_win.c",
         root / "src/shared/runtime_settings.c",
         root / "src/shared/song_http_win.c",
+        root / "src/shared/window_icon_win.c",
         embedded_effects,
         root / "third_party/stb/stb_vorbis.c",
         *sorted((root / "third_party/zlib").glob("*.c")),

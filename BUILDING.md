@@ -1,4 +1,4 @@
-# Building 0.9.5-unified3
+# Building 0.9.5-unified4
 
 On 64-bit Windows, run:
 
@@ -31,3 +31,10 @@ BUILD_DYNARMIC.cmd
 
 The source package intentionally excludes APKs, extracted proprietary `.so`
 files, executables, DLLs, downloaded toolchains and build caches.
+
+
+## Launch settings
+
+Edit `RUN_AUTO.cmd`. Unified4 adds `FORCE_HIGHEST_GRAPHICS=true`. An optional
+`icon.png` may be placed beside the launcher or in `dist-unified`; otherwise
+`run_auto.py` chooses a suitable icon from `game.apk`.

@@ -1,4 +1,4 @@
-# Source contents — 0.9.5-unified3
+# Source contents — 0.9.5-unified4
 
 - `src/backends/x86/`: native x86 Android ELF loader/runtime based on
   `0.9.3-alpha3`.
@@ -13,3 +13,5 @@
 
 No Unicorn code, F2 editor hotkey, APK, extracted game library, generated EXE,
 DLL or build cache is included.
+
+- `src/shared/window_icon_win.*`: live Win32 icon application from the APK or optional `icon.png`.

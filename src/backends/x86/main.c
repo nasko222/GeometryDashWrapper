@@ -12,6 +12,7 @@
 #include "runtime.h"
 #include "build_info.h"
 #include "runtime_settings.h"
+#include "window_icon_win.h"
 
 typedef int (*JniOnLoadFunction)(void *java_vm, void *reserved);
 typedef void (*NativeSetApkPathFunction)(void *environment, void *object,
@@ -289,6 +290,14 @@ static int patch_x86_return_true(void *target) {
     return patch_x86_code(target, code, sizeof(code));
 }
 
+static int patch_x86_return_false(void *target) {
+    static const unsigned char code[] = {
+        0x31, 0xc0, /* xor eax, eax */
+        0xc3        /* ret */
+    };
+    return patch_x86_code(target, code, sizeof(code));
+}
+
 static int patch_x86_tail_jump(void *source, void *destination) {
 #if defined(__i386__)
     unsigned char code[5];
@@ -324,6 +333,15 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEi",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+        "_ZN11GameManager15isColorUnlockedEib",
+    };
+    static const char *const high_graphics_checks[] = {
+        "_ZN15PlatformToolbox4isHDEv",
+    };
+    static const char *const low_memory_checks[] = {
+        "_ZN15PlatformToolbox17isLowMemoryDeviceEv",
     };
     static const char *const online_checks[] = {
         "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
@@ -343,19 +361,31 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             "_ZN9MenuLayer9onCreatorEv",
             "MenuLayer full-version->Creator",
         },
-        {
-            "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
-            "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE",
-            "CreatorLayer full-version editor->My Levels",
-        },
     };
     unsigned icon_patches = 0;
     unsigned bypass_patches = 0;
     unsigned online_patches = 0;
+    unsigned high_graphics_patches = 0;
+    unsigned low_memory_patches = 0;
     size_t index;
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
+    }
+    if (gd_settings_force_highest_graphics()) {
+        high_graphics_patches = patch_x86_return_true_exports(
+            image, high_graphics_checks,
+            sizeof(high_graphics_checks) / sizeof(high_graphics_checks[0]));
+        for (index = 0;
+             index < sizeof(low_memory_checks) / sizeof(low_memory_checks[0]);
+             ++index) {
+            void *target = elf_image_find_export(image, low_memory_checks[index]);
+            if (target && patch_x86_return_false(target)) {
+                runtime_log("Launch hack: return false patched %s",
+                            low_memory_checks[index]);
+                ++low_memory_patches;
+            }
+        }
     }
     if (gd_settings_full_bypass()) {
         online_patches = patch_x86_return_true_exports(
@@ -370,12 +400,16 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             }
         }
     }
-    runtime_log("Launch settings applied: server=%s hack-icons=%s patches=%u "
-                "full-bypass=%s redirects=%u online-checks=%u music-pulse-max=%.3f",
+    runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
+                "full-bypass=%s redirects=%u online-checks=%u "
+                "highest-graphics=%s hd=%u low-memory=%u music-pulse-max=%.3f",
                 gd_settings_server(),
                 gd_settings_hack_icons() ? "true" : "false", icon_patches,
                 gd_settings_full_bypass() ? "true" : "false", bypass_patches,
-                online_patches, gd_settings_music_pulse_max());
+                online_patches,
+                gd_settings_force_highest_graphics() ? "true" : "false",
+                high_graphics_patches, low_memory_patches,
+                gd_settings_music_pulse_max());
 }
 
 static void pause_native_game(const char *reason) {
@@ -604,6 +638,9 @@ static int create_opengl_window(int client_width, int client_height) {
     if (!g_host.window) {
         runtime_log("ERROR: CreateWindow failed: %lu", (unsigned long)GetLastError());
         return 0;
+    }
+    if (gd_apply_window_icon(g_host.window)) {
+        runtime_log("Window icon applied from GD_WINDOW_ICON");
     }
 
     g_host.device = GetDC(g_host.window);

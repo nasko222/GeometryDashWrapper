@@ -1507,6 +1507,7 @@ static void shim_freeaddrinfo(AndroidAddrInfo *result) {
 
 static void socket_trace_reset(int descriptor);
 static void synthetic_http_reset(int descriptor);
+static void pending_http_reset(int descriptor);
 
 static int shim_socket(int family, int type, int protocol) {
     static LONG trace_count;
@@ -1529,6 +1530,7 @@ static int shim_socket(int family, int type, int protocol) {
     (void)GD_ANDROID_SOCK_CLOEXEC;
     socket_trace_reset((int)(uintptr_t)descriptor);
     synthetic_http_reset((int)(uintptr_t)descriptor);
+    pending_http_reset((int)(uintptr_t)descriptor);
     {
         LONG trace = InterlockedIncrement(&trace_count);
         if (trace <= 64) {
@@ -1855,6 +1857,124 @@ static int synthetic_http_recv(int descriptor, void *buffer, size_t length,
     }
     ReleaseSRWLockExclusive(&g_synthetic_http_lock);
     return handled;
+}
+
+#define PENDING_HTTP_SLOT_COUNT 32
+typedef struct {
+    int used;
+    int descriptor;
+    unsigned char *bytes;
+    size_t size;
+} PendingHttpState;
+
+static SRWLOCK g_pending_http_lock = SRWLOCK_INIT;
+static PendingHttpState g_pending_http[PENDING_HTTP_SLOT_COUNT];
+
+static PendingHttpState *pending_http_state_locked(int descriptor, int create) {
+    PendingHttpState *empty = NULL;
+    unsigned index;
+    for (index = 0; index < PENDING_HTTP_SLOT_COUNT; ++index) {
+        PendingHttpState *state = &g_pending_http[index];
+        if (state->used && state->descriptor == descriptor) return state;
+        if (!state->used && !empty) empty = state;
+    }
+    if (!create) return NULL;
+    if (!empty) empty = &g_pending_http[(unsigned)descriptor % PENDING_HTTP_SLOT_COUNT];
+    free(empty->bytes);
+    memset(empty, 0, sizeof(*empty));
+    empty->used = 1;
+    empty->descriptor = descriptor;
+    return empty;
+}
+
+static void pending_http_reset(int descriptor) {
+    AcquireSRWLockExclusive(&g_pending_http_lock);
+    {
+        PendingHttpState *state = pending_http_state_locked(descriptor, 0);
+        if (state) {
+            free(state->bytes);
+            memset(state, 0, sizeof(*state));
+        }
+    }
+    ReleaseSRWLockExclusive(&g_pending_http_lock);
+}
+
+/* Returns 1 with malloc-owned combined bytes when a pending fragment existed,
+ * 0 when the caller should use its original buffer, and -1 on allocation error. */
+static int pending_http_join(int descriptor, const void *buffer, size_t length,
+                             unsigned char **combined, size_t *combined_size) {
+    int result = 0;
+    if (!combined || !combined_size) return -1;
+    *combined = NULL;
+    *combined_size = 0;
+    AcquireSRWLockExclusive(&g_pending_http_lock);
+    {
+        PendingHttpState *state = pending_http_state_locked(descriptor, 0);
+        if (state) {
+            unsigned char *joined;
+            if (length > SIZE_MAX - state->size ||
+                state->size + length > 64u * 1024u * 1024u) {
+                result = -1;
+            } else {
+                joined = (unsigned char *)malloc(state->size + length);
+                if (!joined && state->size + length) {
+                    result = -1;
+                } else {
+                    if (state->size) memcpy(joined, state->bytes, state->size);
+                    if (length) memcpy(joined + state->size, buffer, length);
+                    *combined = joined;
+                    *combined_size = state->size + length;
+                    result = 1;
+                }
+            }
+            free(state->bytes);
+            memset(state, 0, sizeof(*state));
+        }
+    }
+    ReleaseSRWLockExclusive(&g_pending_http_lock);
+    return result;
+}
+
+static int pending_http_store(int descriptor, const void *buffer, size_t length) {
+    unsigned char *copy = NULL;
+    int ok = 0;
+    if (length > 64u * 1024u * 1024u) return 0;
+    if (length) {
+        copy = (unsigned char *)malloc(length);
+        if (!copy) return 0;
+        memcpy(copy, buffer, length);
+    }
+    AcquireSRWLockExclusive(&g_pending_http_lock);
+    {
+        PendingHttpState *state = pending_http_state_locked(descriptor, 1);
+        if (state) {
+            free(state->bytes);
+            state->bytes = copy;
+            state->size = length;
+            copy = NULL;
+            ok = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_pending_http_lock);
+    free(copy);
+    return ok;
+}
+
+static int try_api_request(int descriptor, const void *buffer, size_t length) {
+    unsigned char *response = NULL;
+    size_t response_size = 0;
+    int response_code = 0;
+    int handled = gd_api_http_handle_raw_request(
+        buffer, length, &response, &response_size, &response_code);
+    if (handled != 1) return handled;
+    if (!synthetic_http_store(descriptor, response, response_size)) {
+        free(response);
+        return -1;
+    }
+    runtime_log("Network legacy API completed through WinHTTP: "
+                "fd=%d status=%d response=%lu",
+                descriptor, response_code, (unsigned long)response_size);
+    return 1;
 }
 
 static int try_song_metadata_request(int descriptor, const void *buffer,
@@ -2220,29 +2340,75 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     int result;
     int rewritten = 0;
     int song_request;
+    int api_request;
+    int joined_result;
+    unsigned char *joined = NULL;
+    size_t request_length;
+    const void *request_buffer;
     if (length > INT_MAX) length = INT_MAX;
-    song_request = try_song_metadata_request(descriptor, buffer, length);
+    joined_result = pending_http_join(descriptor, buffer, length, &joined,
+                                      &request_length);
+    if (joined_result < 0) {
+        g_errno_value = 12;
+        WSASetLastError(WSAENOBUFS);
+        return -1;
+    }
+    request_buffer = joined_result > 0 ? joined : buffer;
+    if (joined_result <= 0) request_length = length;
+
+    song_request = try_song_metadata_request(
+        descriptor, request_buffer, request_length);
     if (song_request > 0) {
         socket_trace_traffic(descriptor, buffer, length, 1);
-        trace_http_request(descriptor, buffer, (int)length);
+        trace_http_request(descriptor, request_buffer,
+                           request_length > INT_MAX ? INT_MAX : (int)request_length);
+        free(joined);
         return (int)length;
     }
     if (song_request < 0) {
+        free(joined);
         g_errno_value = 5;
         WSASetLastError(WSAECONNABORTED);
         return -1;
     }
-    result = send_rewritten_http_request(descriptor, buffer, length, flags,
-                                         &rewritten);
+    api_request = try_api_request(descriptor, request_buffer, request_length);
+    if (api_request == 1) {
+        socket_trace_traffic(descriptor, buffer, length, 1);
+        trace_http_request(descriptor, request_buffer,
+                           request_length > INT_MAX ? INT_MAX : (int)request_length);
+        free(joined);
+        return (int)length;
+    }
+    if (api_request == 2) {
+        if (!pending_http_store(descriptor, request_buffer, request_length)) {
+            free(joined);
+            g_errno_value = 12;
+            WSASetLastError(WSAENOBUFS);
+            return -1;
+        }
+        free(joined);
+        return (int)length;
+    }
+    if (api_request < 0) {
+        free(joined);
+        g_errno_value = 5;
+        WSASetLastError(WSAECONNABORTED);
+        return -1;
+    }
+    result = send_rewritten_http_request(
+        descriptor, request_buffer, request_length, flags, &rewritten);
     if (!rewritten) {
         result = send((SOCKET)(uintptr_t)(uint32_t)descriptor,
-                      (const char *)buffer, (int)length,
+                      (const char *)request_buffer, (int)request_length,
                       flags & ~GD_ANDROID_MSG_NOSIGNAL);
     }
+    free(joined);
     if (result > 0) {
-        socket_trace_traffic(descriptor, buffer, (size_t)result, 1);
-        trace_http_request(descriptor, buffer, result);
-        return result;
+        socket_trace_traffic(descriptor, buffer,
+                             joined_result > 0 ? length : (size_t)result, 1);
+        trace_http_request(descriptor, buffer,
+                           joined_result > 0 ? (int)length : result);
+        return joined_result > 0 ? (int)length : result;
     }
     if (result == SOCKET_ERROR || (rewritten && result < 0)) {
         int windows_error = WSAGetLastError();
@@ -2305,6 +2471,7 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
             {
                 int song_request = try_song_metadata_request(
                     descriptor, joined, total_length);
+                int api_request;
                 if (song_request > 0) {
                     for (index = 0; index < vector_count; ++index) {
                         socket_trace_traffic(descriptor, vectors[index].base,
@@ -2314,6 +2481,31 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
                     return total_length > INT_MAX ? INT_MAX : (int)total_length;
                 }
                 if (song_request < 0) {
+                    free(joined);
+                    g_errno_value = 5;
+                    WSASetLastError(WSAECONNABORTED);
+                    return -1;
+                }
+                api_request = try_api_request(descriptor, joined, total_length);
+                if (api_request == 1) {
+                    for (index = 0; index < vector_count; ++index) {
+                        socket_trace_traffic(descriptor, vectors[index].base,
+                                             vectors[index].length, 1);
+                    }
+                    free(joined);
+                    return total_length > INT_MAX ? INT_MAX : (int)total_length;
+                }
+                if (api_request == 2) {
+                    if (!pending_http_store(descriptor, joined, total_length)) {
+                        free(joined);
+                        g_errno_value = 12;
+                        WSASetLastError(WSAENOBUFS);
+                        return -1;
+                    }
+                    free(joined);
+                    return total_length > INT_MAX ? INT_MAX : (int)total_length;
+                }
+                if (api_request < 0) {
                     free(joined);
                     g_errno_value = 5;
                     WSASetLastError(WSAECONNABORTED);
@@ -2565,6 +2757,7 @@ static int shim_ioctl(int descriptor, unsigned long request, ...) {
 
 static int shim_close(int descriptor) {
     synthetic_http_reset(descriptor);
+    pending_http_reset(descriptor);
     if (descriptor == ANDROID_RANDOM_FD) {
         LONG count = InterlockedCompareExchange(&g_random_open_count, 0, 0);
         while (count > 0) {

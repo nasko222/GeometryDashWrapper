@@ -20,6 +20,18 @@ int gd_song_http_handle_raw_request(const void *request, size_t request_size,
                                     size_t *response_size,
                                     int *response_code);
 
+/*
+ * Handles complete plaintext Geometry Dash PHP API requests through WinHTTP.
+ * This lets legacy ARM games reach current HTTPS Boomlings and configured
+ * GDPS endpoints even though their bundled libcurl opens a plaintext socket.
+ * Returns 1 with a malloc-owned raw HTTP response, 0 for unrelated traffic,
+ * 2 when a recognized request is incomplete, and -1 on transport failure.
+ */
+int gd_api_http_handle_raw_request(const void *request, size_t request_size,
+                                   unsigned char **response,
+                                   size_t *response_size,
+                                   int *response_code);
+
 #ifdef __cplusplus
 }
 #endif

@@ -68,6 +68,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "window_icon_win.h"
 #include "build_info.h"
 }
 
@@ -1885,6 +1886,18 @@ static bool PatchV22FunctionReturnTrue(
     return true;
 }
 
+static bool PatchV22FunctionReturnFalse(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& symbol) {
+    const u32 address = symbol.address & ~1u;
+    if ((symbol.address & 1u) == 0u || symbol.size < 4u ||
+        address < runtime.image_min || address > runtime.image_max - 4u)
+        return false;
+    env.MemoryWrite16(address + 0u, 0x2000u); // movs r0, #0
+    env.MemoryWrite16(address + 2u, 0x4770u); // bx lr
+    return true;
+}
+
 static bool PatchV22FunctionTailJump(
     ProbeEnvironment& env, const ElfRuntime& runtime,
     const SymbolRecord& source, const SymbolRecord& destination) {
@@ -1917,6 +1930,9 @@ static std::size_t InstallV22ConfigurableIconUnlockHooks(
     static constexpr const char* symbols[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEi",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+        "_ZN11GameManager15isColorUnlockedEib",
     };
     if (!gd_settings_hack_icons()) return 0u;
     std::size_t patched = 0u;
@@ -1936,8 +1952,6 @@ static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
          "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"},
         {"_ZN9MenuLayer13onFullVersionEv",
          "_ZN9MenuLayer9onCreatorEv"},
-        {"_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
-         "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"},
     };
     static constexpr const char* online_checks[] = {
         "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
@@ -1957,6 +1971,61 @@ static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
             ++patched;
     }
     return patched;
+}
+
+struct V22GraphicsPatchCounts {
+    std::size_t hd = 0u;
+    std::size_t low_memory = 0u;
+};
+
+static V22GraphicsPatchCounts InstallV22HighestGraphicsHooks(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    V22GraphicsPatchCounts counts{};
+    if (!gd_settings_force_highest_graphics()) return counts;
+    if (const SymbolRecord* symbol =
+            FindSymbol(runtime, "_ZN15PlatformToolbox4isHDEv")) {
+        if (PatchV22FunctionReturnTrue(env, runtime, *symbol)) ++counts.hd;
+    }
+    if (const SymbolRecord* symbol =
+            FindSymbol(runtime, "_ZN15PlatformToolbox17isLowMemoryDeviceEv")) {
+        if (PatchV22FunctionReturnFalse(env, runtime, *symbol))
+            ++counts.low_memory;
+    }
+    return counts;
+}
+
+static std::size_t InstallV22PlatformerSwingReopenPatch(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    const SymbolRecord* init = FindSymbol(
+        runtime,
+        "_ZN18LevelSettingsLayer4initEP19LevelSettingsObjectP16LevelEditorLayer");
+    if (!init || (init->address & 1u) == 0u) return 0u;
+    const u32 base = init->address & ~1u;
+    constexpr u32 kSwingStateOffset = 0x6B0u;
+    const u32 address = base + kSwingStateOffset;
+    if (init->size < kSwingStateOffset + 16u ||
+        address < runtime.image_min || address > runtime.image_max - 16u)
+        return 0u;
+
+    // Known late-beta initialization sequence for the second restricted mode
+    // button (swing): ldrb platformer; load virtual setter; xor 1; call.
+    // Keep the setter/call and force only its reconstructed enabled state to 1.
+    static constexpr u8 expected[] = {
+        0x92, 0xF8, 0x13, 0x11,
+        0xD3, 0xF8, 0xA4, 0x30,
+        0x81, 0xF0, 0x01, 0x01,
+        0x98, 0x47,
+    };
+    for (std::size_t index = 0; index < sizeof(expected); ++index) {
+        if (env.MemoryRead8(address + static_cast<u32>(index)) != expected[index])
+            return 0u;
+    }
+    env.MemoryWrite16(address + 0u, 0x2101u); // movs r1, #1
+    env.MemoryWrite16(address + 2u, 0xBF00u); // nop
+    // Keep ldr.w r3,[r3,#0xa4] at +4.
+    env.MemoryWrite16(address + 8u, 0xBF00u); // nop
+    env.MemoryWrite16(address + 10u, 0xBF00u); // nop
+    return 1u;
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -2724,6 +2793,9 @@ public:
                                   window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
         if (!window_) return Fail("CreateWindowExA failed");
+        if (gd_apply_window_icon(window_) && log_) {
+            *log_ << "Window icon applied from GD_WINDOW_ICON\n";
+        }
         device_ = GetDC(window_);
         if (!device_) return Fail("GetDC failed");
 
@@ -2801,16 +2873,21 @@ public:
         return result;
     }
 
-    void ResetFrameClipState() {
-        if (!context_ || !window_) return;
+    std::pair<int, int> ClientSize() const {
         RECT area{};
         int width = native_width_;
         int height = native_height_;
-        if (GetClientRect(window_, &area) && area.right > area.left &&
-            area.bottom > area.top) {
+        if (window_ && GetClientRect(window_, &area) &&
+            area.right > area.left && area.bottom > area.top) {
             width = area.right - area.left;
             height = area.bottom - area.top;
         }
+        return {width, height};
+    }
+
+    void ResetFrameClipState() {
+        if (!context_ || !window_) return;
+        const auto [width, height] = ClientSize();
         glDisable(GL_SCISSOR_TEST);
         glViewport(0, 0, width, height);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -3172,6 +3249,7 @@ public:
     void* Resolve(const char*) { return nullptr; }
     bool PumpMessages() { return false; }
     std::vector<HostEvent> TakeEvents() { return {}; }
+    std::pair<int, int> ClientSize() const { return {1280, 720}; }
     void ResetFrameClipState() {}
     void Swap() {}
     void BeginGpuFrame(u64) {}
@@ -7800,6 +7878,8 @@ private:
         if (name == "glDrawArrays" || name == "glDrawElements") {
             ++gl_draw_calls_;
             gl_draw_vertices_ += static_cast<u64>(arguments[1]);
+        } else if (name == "glBindFramebuffer") {
+            gl_framebuffer_binding_ = static_cast<u32>(arguments[1]);
         } else if (name == "glBufferData") {
             gl_buffer_upload_bytes_ += static_cast<u64>(arguments[1]);
         } else if (name == "glBufferSubData") {
@@ -7946,6 +8026,62 @@ private:
             const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * 16u * sizeof(GLfloat);
             const GLfloat* values = static_cast<const GLfloat*>(env_.HostPointer(static_cast<u32>(arguments[3]), bytes));
             reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), static_cast<GLboolean>(arguments[2]), values);
+        } else if (name == "glScissor" || name == "glViewport") {
+            using Fn = void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei);
+            GLint x = static_cast<GLint>(arguments[0]);
+            GLint y = static_cast<GLint>(arguments[1]);
+            GLsizei width = static_cast<GLsizei>(arguments[2]);
+            GLsizei height = static_cast<GLsizei>(arguments[3]);
+            const auto [client_width, client_height] = gl_.ClientSize();
+            const int tolerance = 2;
+            const bool dimensions_valid = width > 0 && height > 0;
+            const bool left = x <= tolerance;
+            const bool bottom = y <= tolerance;
+            const bool right = x + width >= client_width - tolerance;
+            const bool top = y + height >= client_height - tolerance;
+            const int edges = static_cast<int>(left) + static_cast<int>(right) +
+                              static_cast<int>(bottom) + static_cast<int>(top);
+            const long long area =
+                static_cast<long long>(std::max<GLsizei>(0, width)) *
+                static_cast<long long>(std::max<GLsizei>(0, height));
+            const long long client_area =
+                static_cast<long long>(std::max(1, client_width)) *
+                static_cast<long long>(std::max(1, client_height));
+            const bool excludes_strip =
+                width < client_width - tolerance ||
+                height < client_height - tolerance ||
+                x > tolerance || y > tolerance;
+            const bool three_edge_crop = edges >= 3 && area * 5 >= client_area;
+            const bool corner_anchored =
+                (left || right) && (bottom || top);
+            const bool spans_most_of_axis =
+                static_cast<long long>(std::max<GLsizei>(0, width)) * 4 >=
+                    static_cast<long long>(client_width) * 3 ||
+                static_cast<long long>(std::max<GLsizei>(0, height)) * 4 >=
+                    static_cast<long long>(client_height) * 3;
+            const bool large_two_edge_crop =
+                edges >= 2 && corner_anchored && spans_most_of_axis &&
+                area * 20 >= client_area * 7;
+            const bool default_target = gl_framebuffer_binding_ == 0u;
+            const bool large_edge_crop =
+                default_target && dimensions_valid && client_width > 0 &&
+                client_height > 0 && excludes_strip &&
+                (three_edge_crop || large_two_edge_crop);
+            if (large_edge_crop) {
+                if (edge_clip_normalization_logs_ < 24u) {
+                    log_ << "[host] ARMv7 normalized persistent edge "
+                         << (name == "glViewport" ? "viewport" : "scissor")
+                         << " original=" << x << ',' << y << ' ' << width << 'x'
+                         << height << " client=" << client_width << 'x'
+                         << client_height << '\n';
+                    ++edge_clip_normalization_logs_;
+                }
+                x = 0;
+                y = 0;
+                width = client_width;
+                height = client_height;
+            }
+            reinterpret_cast<Fn>(function)(x, y, width, height);
         } else if (name == "glBindBuffer") {
             if (arguments[0] == GL_ARRAY_BUFFER) gl_array_buffer_binding_ = static_cast<u32>(arguments[1]);
             if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER) gl_element_buffer_binding_ = static_cast<u32>(arguments[1]);
@@ -10691,6 +10827,8 @@ private:
     std::unordered_map<u32,u32> gl_string_cache_;
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
+    u32 gl_framebuffer_binding_=0;
+    u32 edge_clip_normalization_logs_=0;
     u64 logged_guest_stdio_=0;
     bool audio_initialized_=false;
     u32 touch_ids_=0;
@@ -11017,7 +11155,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified3 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified4 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11499,6 +11637,10 @@ int main(int argc,char** argv) {
             InstallV22ConfigurableIconUnlockHooks(runtime, env);
         const std::size_t editor_redirects = gd_settings_full_bypass()
             ? InstallV22CreatorEditorUnlock(runtime, env) : 0u;
+        const V22GraphicsPatchCounts graphics_patches =
+            InstallV22HighestGraphicsHooks(runtime, env);
+        const std::size_t swing_reopen_patches =
+            InstallV22PlatformerSwingReopenPatch(runtime, env);
         const std::size_t prepare_bridges =
             InstallV22PrepareLevelBridge(runtime, env);
         if (prepare_bridges != 1u)
@@ -11581,17 +11723,25 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_FULL_VERSION_BYPASS enabled="+
              std::string(gd_settings_full_bypass() ? "1" : "0")+
              " patches="+std::to_string(editor_redirects)+
-             " mode=best-effort-menu-creator+online-tabs+my-levels");
+             " mode=best-effort-menu-creator+online-capability-no-global-button-remap");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
              std::string(gd_settings_server())+
              " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+
-             " icon-hooks="+std::to_string(icon_unlock_hooks)+
+             " icon-color-hooks="+std::to_string(icon_unlock_hooks)+
              " full-bypass="+
              (gd_settings_full_bypass() ? "true" : "false")+
+             " highest-graphics="+
+             (gd_settings_force_highest_graphics() ? "true" : "false")+
+             " hd-hooks="+std::to_string(graphics_patches.hd)+
+             " low-memory-hooks="+
+             std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max()));
+        emit("RESULT: DYNARMIC_V22_PLATFORMER_SWING_REOPEN_PATCH count="+
+             std::to_string(swing_reopen_patches)+
+             " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=scissor-off+full-viewport+color-depth-write");
+             "state=frame-reset+default-framebuffer-edge-scissor-viewport-normalization");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"

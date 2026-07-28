@@ -59,6 +59,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "window_icon_win.h"
 #include "song_http_win.h"
 #include "build_info.h"
 }
@@ -1097,60 +1098,42 @@ static const SymbolRecord* FindSymbol(const ElfRuntime& runtime, const std::stri
     for (const SymbolRecord& symbol : runtime.symbols) if (symbol.name == name) return &symbol;
     return nullptr;
 }
-static void InstallThumbAbsoluteImportHookPreservingArguments(
+static bool TryInstallThumbAbsoluteImportHookPreservingArguments(
     ProbeEnvironment& env, const ElfRuntime& runtime, const SymbolRecord& symbol,
     u16 expected_first_halfword, u32 destination) {
-    if ((symbol.address & 1u) == 0u)
-        throw std::runtime_error("ZIP hook symbol is not marked as Thumb: " + symbol.name);
-    if (symbol.size < 8u)
-        throw std::runtime_error("ZIP hook symbol is too small: " + symbol.name);
+    if ((symbol.address & 1u) == 0u || symbol.size < 8u) return false;
     const u32 address = symbol.address & ~1u;
     if ((address & 3u) != 0u || address < runtime.image_min ||
         address > runtime.image_max - 8u)
-        throw std::runtime_error("ZIP hook target is outside the executable image: " + symbol.name);
-    const u16 original = env.MemoryRead16(address);
-    if (original != expected_first_halfword) {
-        std::ostringstream error;
-        error << "ZIP hook prologue mismatch for " << symbol.name
-              << ": expected 0x" << std::hex << expected_first_halfword
-              << " got 0x" << original;
-        throw std::runtime_error(error.str());
-    }
+        return false;
+    if (env.MemoryRead16(address) != expected_first_halfword) return false;
 
     // R3 is the fourth AAPCS argument and getFileDataFromZip uses it for the
-    // output-size pointer. Test9 incorrectly used R3 as the trampoline scratch
-    // register, replacing that pointer with the import-stub address and then
-    // writing the member size into executable memory. R0 is safe here: both
-    // hooked CCFileUtils methods ignore the `this` value in the host handler,
-    // and R0 is overwritten by the return value before control reaches the
-    // caller. R1-R3 therefore arrive at the host unchanged.
+    // output-size pointer. R0 is safe scratch; R1-R3 stay unchanged.
     env.MemoryWrite16(address + 0u, 0x4800u); // ldr r0, [pc, #0]
     env.MemoryWrite16(address + 2u, 0x4700u); // bx r0
     env.MemoryWrite32(address + 4u, destination);
+    return true;
 }
-static void InstallThumbInlineSvcHookPreservingArguments(
+static bool TryInstallThumbInlineSvcHookPreservingArguments(
     ProbeEnvironment& env, ElfRuntime& runtime, const SymbolRecord& symbol,
-    u16 expected_first_halfword, const std::string& import_name) {
-    if ((symbol.address & 1u) == 0u)
-        throw std::runtime_error("inline hook symbol is not marked as Thumb: " + symbol.name);
+    u16 expected_first_halfword, u16 alternate_first_halfword,
+    const std::string& import_name) {
+    if ((symbol.address & 1u) == 0u) return false;
     const u32 address = symbol.address & ~1u;
     if (symbol.size < 12u || (address & 3u) != 0u ||
         address < runtime.image_min || address > runtime.image_max - 12u)
-        throw std::runtime_error("inline hook target cannot hold Thumb-to-ARM SVC bridge: " + symbol.name);
+        return false;
     const u16 original = env.MemoryRead16(address);
-    if (original != expected_first_halfword) {
-        std::ostringstream error;
-        error << "inline hook prologue mismatch for " << symbol.name
-              << ": expected 0x" << std::hex << expected_first_halfword
-              << " got 0x" << original;
-        throw std::runtime_error(error.str());
-    }
+    if (original != expected_first_halfword &&
+        (!alternate_first_halfword || original != alternate_first_halfword))
+        return false;
     const u32 import_address = EnsureImport(runtime, env, import_name);
     ImportRecord* record = nullptr;
     for (ImportRecord& candidate : runtime.imports) {
         if (candidate.address == import_address) { record = &candidate; break; }
     }
-    if (!record) throw std::runtime_error("inline hook import record disappeared");
+    if (!record) return false;
     // Thumb `bx pc` enters ARM state at address+4 without modifying R0-R3.
     // The ARM SVC reaches the normal import dispatcher; address+8 is a real
     // ARM `bx lr`, so every AAPCS argument survives intact.
@@ -1159,6 +1142,7 @@ static void InstallThumbInlineSvcHookPreservingArguments(
     env.MemoryWrite32(address + 4u, 0xEF000000u | (record->svc & 0x00FFFFFFu));
     env.MemoryWrite32(address + 8u, 0xE12FFF1Eu); // bx lr
     record->inline_resume_address = address + 8u;
+    return true;
 }
 
 static bool PatchArmFunctionReturnTrue(
@@ -1174,6 +1158,23 @@ static bool PatchArmFunctionReturnTrue(
     }
     if (symbol.size < 8u || address > runtime.image_max - 8u) return false;
     env.MemoryWrite32(address + 0u, 0xE3A00001u); // mov r0, #1
+    env.MemoryWrite32(address + 4u, 0xE12FFF1Eu); // bx lr
+    return true;
+}
+
+static bool PatchArmFunctionReturnFalse(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& symbol) {
+    const u32 address = symbol.address & ~1u;
+    if (address < runtime.image_min || address >= runtime.image_max) return false;
+    if (symbol.address & 1u) {
+        if (symbol.size < 4u || address > runtime.image_max - 4u) return false;
+        env.MemoryWrite16(address + 0u, 0x2000u); // movs r0, #0
+        env.MemoryWrite16(address + 2u, 0x4770u); // bx lr
+        return true;
+    }
+    if (symbol.size < 8u || address > runtime.image_max - 8u) return false;
+    env.MemoryWrite32(address + 0u, 0xE3A00000u); // mov r0, #0
     env.MemoryWrite32(address + 4u, 0xE12FFF1Eu); // bx lr
     return true;
 }
@@ -1210,6 +1211,9 @@ static std::size_t InstallConfigurableIconUnlockHooks(
     static constexpr const char* symbols[] = {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEi",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+        "_ZN11GameManager15isColorUnlockedEib",
     };
     if (!gd_settings_hack_icons()) return 0u;
     std::size_t patched = 0u;
@@ -1229,8 +1233,6 @@ static std::size_t InstallConfigurableCreatorBypass(
          "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"},
         {"_ZN9MenuLayer13onFullVersionEv",
          "_ZN9MenuLayer9onCreatorEv"},
-        {"_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
-         "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"},
     };
     static constexpr const char* online_checks[] = {
         "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
@@ -1252,6 +1254,27 @@ static std::size_t InstallConfigurableCreatorBypass(
     return patched;
 }
 
+struct GraphicsPatchCounts {
+    std::size_t hd = 0u;
+    std::size_t low_memory = 0u;
+};
+
+static GraphicsPatchCounts InstallHighestGraphicsHooks(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    GraphicsPatchCounts counts{};
+    if (!gd_settings_force_highest_graphics()) return counts;
+    if (const SymbolRecord* symbol =
+            FindSymbol(runtime, "_ZN15PlatformToolbox4isHDEv")) {
+        if (PatchArmFunctionReturnTrue(env, runtime, *symbol)) ++counts.hd;
+    }
+    if (const SymbolRecord* symbol =
+            FindSymbol(runtime, "_ZN15PlatformToolbox17isLowMemoryDeviceEv")) {
+        if (PatchArmFunctionReturnFalse(env, runtime, *symbol))
+            ++counts.low_memory;
+    }
+    return counts;
+}
+
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
     struct Hook { const char* symbol; const char* import; u16 prologue; };
     static constexpr Hook hooks[] = {
@@ -1262,10 +1285,17 @@ static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironm
     for (const Hook& hook : hooks) {
         const SymbolRecord* target = FindSymbol(runtime, hook.symbol);
         if (!target) continue;
+        const u32 address = target->address & ~1u;
+        if ((target->address & 1u) == 0u || target->size < 8u ||
+            (address & 3u) != 0u || address < runtime.image_min ||
+            address > runtime.image_max - 8u ||
+            env.MemoryRead16(address) != hook.prologue) {
+            continue;
+        }
         const u32 destination = EnsureImport(runtime, env, hook.import);
-        InstallThumbAbsoluteImportHookPreservingArguments(
-            env, runtime, *target, hook.prologue, destination);
-        ++installed;
+        if (TryInstallThumbAbsoluteImportHookPreservingArguments(
+                env, runtime, *target, hook.prologue, destination))
+            ++installed;
     }
     return installed;
 }
@@ -1274,12 +1304,16 @@ static std::size_t InstallCcApplicationOpenUrlHook(ElfRuntime& runtime, ProbeEnv
     static constexpr const char* kSymbol = "_ZN7cocos2d13CCApplication7openURLEPKc";
     const SymbolRecord* target = FindSymbol(runtime, kSymbol);
     if (!target) return 0u;
+    const u32 address = target->address & ~1u;
+    if ((target->address & 1u) == 0u || target->size < 8u ||
+        (address & 3u) != 0u || address < runtime.image_min ||
+        address > runtime.image_max - 8u ||
+        env.MemoryRead16(address) != 0xB530u)
+        return 0u;
     const u32 destination = EnsureImport(runtime, env, "__dynarmic_ccapplication_openURL");
-    // CCApplication::openURL(this, url): R0 is `this`, R1 is the URL. The
-    // absolute hook uses R0 as scratch, preserving the URL in R1.
-    InstallThumbAbsoluteImportHookPreservingArguments(
-        env, runtime, *target, 0xB530u, destination);
-    return 1u;
+    // CCApplication::openURL(this, url): R0 is `this`, R1 is the URL.
+    return TryInstallThumbAbsoluteImportHookPreservingArguments(
+        env, runtime, *target, 0xB530u, destination) ? 1u : 0u;
 }
 
 static std::size_t InstallSimpleAudioEffectHooks(ElfRuntime& runtime,
@@ -1295,66 +1329,80 @@ static std::size_t InstallSimpleAudioEffectHooks(ElfRuntime& runtime,
     for (const Hook& hook : hooks) {
         const SymbolRecord* target = FindSymbol(runtime, hook.symbol);
         if (!target) continue;
+        const u32 address = target->address & ~1u;
+        if ((target->address & 1u) == 0u || target->size < 8u ||
+            (address & 3u) != 0u || address < runtime.image_min ||
+            address > runtime.image_max - 8u ||
+            env.MemoryRead16(address) != hook.prologue) {
+            continue;
+        }
         const u32 destination = EnsureImport(runtime, env, hook.import);
         // Both methods use R0 for `this`; R1-R3 and stack arguments contain
-        // the actual sound parameters. The common trampoline may therefore
-        // safely use R0 as scratch without corrupting the effect call.
-        InstallThumbAbsoluteImportHookPreservingArguments(
-            env, runtime, *target, hook.prologue, destination);
-        ++installed;
+        // the actual sound parameters.
+        if (TryInstallThumbAbsoluteImportHookPreservingArguments(
+                env, runtime, *target, hook.prologue, destination))
+            ++installed;
     }
     return installed;
 }
 
-static std::size_t InstallHostMinizipHooks(ElfRuntime& runtime,
+struct MinizipHookCounts {
+    std::size_t installed = 0u;
+    std::size_t skipped = 0u;
+};
+
+static MinizipHookCounts InstallHostMinizipHooks(ElfRuntime& runtime,
                                               ProbeEnvironment& env) {
-    struct Hook { const char* symbol; const char* import_name; u16 prologue; };
+    struct Hook { const char* symbol; const char* import_name; u16 prologue; u16 alternate; };
     static constexpr Hook hooks[] = {
-        {"_ZN7cocos2d18unzGetGlobalInfo64EPvPNS_19unz_global_info64_sE", "__dynarmic_unzGetGlobalInfo64", 0xB510u},
-        {"_ZN7cocos2d16unzGetGlobalInfoEPvPNS_17unz_global_info_sE", "__dynarmic_unzGetGlobalInfo", 0x2800u},
-        {"_ZN7cocos2d15unzGetFilePos64EPvPNS_16unz64_file_pos_sE", "__dynarmic_unzGetFilePos64", 0xB510u},
-        {"_ZN7cocos2d13unzGetFilePosEPvPNS_14unz_file_pos_sE", "__dynarmic_unzGetFilePos", 0xB530u},
-        {"_ZN7cocos2d29unzGetCurrentFileZStreamPos64EPv", "__dynarmic_unzGetCurrentFileZStreamPos64", 0xB510u},
-        {"_ZN7cocos2d7unztellEPv", "__dynarmic_unztell", 0x2800u},
-        {"_ZN7cocos2d9unztell64EPv", "__dynarmic_unztell64", 0xB510u},
-        {"_ZN7cocos2d6unzeofEPv", "__dynarmic_unzeof", 0x2800u},
-        {"_ZN7cocos2d14unzGetOffset64EPv", "__dynarmic_unzGetOffset64", 0xB510u},
-        {"_ZN7cocos2d12unzGetOffsetEPv", "__dynarmic_unzGetOffset", 0xB510u},
-        {"_ZN7cocos2d14unzSetOffset64EPvy", "__dynarmic_unzSetOffset64", 0xB530u},
-        {"_ZN7cocos2d12unzSetOffsetEPvm", "__dynarmic_unzSetOffset", 0xB510u},
-        {"_ZN7cocos2d16unzGoToFilePos64EPvPKNS_16unz64_file_pos_sE", "__dynarmic_unzGoToFilePos64", 0xB530u},
-        {"_ZN7cocos2d14unzGoToFilePosEPvPNS_14unz_file_pos_sE", "__dynarmic_unzGoToFilePos", 0xB500u},
-        {"_ZN7cocos2d15unzGoToNextFileEPv", "__dynarmic_unzGoToNextFile", 0xB570u},
-        {"_ZN7cocos2d16unzGoToFirstFileEPv", "__dynarmic_unzGoToFirstFile", 0xB530u},
-        {"_ZN7cocos2d21unzGetCurrentFileInfoEPvPNS_15unz_file_info_sEPcmS0_mS3_m", "__dynarmic_unzGetCurrentFileInfo", 0xB5F0u},
-        {"_ZN7cocos2d23unzGetCurrentFileInfo64EPvPNS_17unz_file_info64_sEPcmS0_mS3_m", "__dynarmic_unzGetCurrentFileInfo64", 0xB510u},
-        {"_ZN7cocos2d19unzGetGlobalCommentEPvPcm", "__dynarmic_unzGetGlobalComment", 0xB5F0u},
-        {"_ZN7cocos2d21unzGetLocalExtrafieldEPvS0_j", "__dynarmic_unzGetLocalExtrafield", 0xB5F0u},
-        {"_ZN7cocos2d19unzCloseCurrentFileEPv", "__dynarmic_unzCloseCurrentFile", 0xB5F8u},
-        {"_ZN7cocos2d8unzCloseEPv", "__dynarmic_unzClose", 0xB510u},
-        {"_ZN7cocos2d18unzReadCurrentFileEPvS0_j", "__dynarmic_unzReadCurrentFile", 0xB5F0u},
-        {"_ZN7cocos2d19unzOpenCurrentFile3EPvPiS1_iPKc", "__dynarmic_unzOpenCurrentFile3", 0xB5F0u},
-        {"_ZN7cocos2d19unzOpenCurrentFile2EPvPiS1_i", "__dynarmic_unzOpenCurrentFile2", 0xB510u},
-        {"_ZN7cocos2d26unzOpenCurrentFilePasswordEPvPKc", "__dynarmic_unzOpenCurrentFilePassword", 0xB500u},
-        {"_ZN7cocos2d18unzOpenCurrentFileEPv", "__dynarmic_unzOpenCurrentFile", 0xB500u},
-        {"_ZN7cocos2d9unzOpen64EPKv", "__dynarmic_unzOpen64", 0xB510u},
-        {"_ZN7cocos2d7unzOpenEPKc", "__dynarmic_unzOpen", 0xB510u},
-        {"_ZN7cocos2d11unzOpen2_64EPKvPNS_21zlib_filefunc64_def_sE", "__dynarmic_unzOpen2_64", 0xB570u},
-        {"_ZN7cocos2d8unzOpen2EPKcPNS_19zlib_filefunc_def_sE", "__dynarmic_unzOpen2", 0xB530u},
-        {"_ZN7cocos2d24unzStringFileNameCompareEPKcS1_i", "__dynarmic_unzStringFileNameCompare", 0xB570u},
-        {"_ZN7cocos2d13unzLocateFileEPvPKci", "__dynarmic_unzLocateFile", 0xB5F0u},
+        {"_ZN7cocos2d18unzGetGlobalInfo64EPvPNS_19unz_global_info64_sE", "__dynarmic_unzGetGlobalInfo64", 0xB510u, 0xB508u},
+        {"_ZN7cocos2d16unzGetGlobalInfoEPvPNS_17unz_global_info_sE", "__dynarmic_unzGetGlobalInfo", 0x2800u, 0u},
+        {"_ZN7cocos2d15unzGetFilePos64EPvPNS_16unz64_file_pos_sE", "__dynarmic_unzGetFilePos64", 0xB510u, 0u},
+        {"_ZN7cocos2d13unzGetFilePosEPvPNS_14unz_file_pos_sE", "__dynarmic_unzGetFilePos", 0xB530u, 0u},
+        {"_ZN7cocos2d29unzGetCurrentFileZStreamPos64EPv", "__dynarmic_unzGetCurrentFileZStreamPos64", 0xB510u, 0u},
+        {"_ZN7cocos2d7unztellEPv", "__dynarmic_unztell", 0x2800u, 0u},
+        {"_ZN7cocos2d9unztell64EPv", "__dynarmic_unztell64", 0xB510u, 0u},
+        {"_ZN7cocos2d6unzeofEPv", "__dynarmic_unzeof", 0x2800u, 0u},
+        {"_ZN7cocos2d14unzGetOffset64EPv", "__dynarmic_unzGetOffset64", 0xB510u, 0u},
+        {"_ZN7cocos2d12unzGetOffsetEPv", "__dynarmic_unzGetOffset", 0xB510u, 0u},
+        {"_ZN7cocos2d14unzSetOffset64EPvy", "__dynarmic_unzSetOffset64", 0xB530u, 0u},
+        {"_ZN7cocos2d12unzSetOffsetEPvm", "__dynarmic_unzSetOffset", 0xB510u, 0u},
+        {"_ZN7cocos2d16unzGoToFilePos64EPvPKNS_16unz64_file_pos_sE", "__dynarmic_unzGoToFilePos64", 0xB530u, 0u},
+        {"_ZN7cocos2d14unzGoToFilePosEPvPNS_14unz_file_pos_sE", "__dynarmic_unzGoToFilePos", 0xB500u, 0u},
+        {"_ZN7cocos2d15unzGoToNextFileEPv", "__dynarmic_unzGoToNextFile", 0xB570u, 0u},
+        {"_ZN7cocos2d16unzGoToFirstFileEPv", "__dynarmic_unzGoToFirstFile", 0xB530u, 0u},
+        {"_ZN7cocos2d21unzGetCurrentFileInfoEPvPNS_15unz_file_info_sEPcmS0_mS3_m", "__dynarmic_unzGetCurrentFileInfo", 0xB5F0u, 0u},
+        {"_ZN7cocos2d23unzGetCurrentFileInfo64EPvPNS_17unz_file_info64_sEPcmS0_mS3_m", "__dynarmic_unzGetCurrentFileInfo64", 0xB510u, 0u},
+        {"_ZN7cocos2d19unzGetGlobalCommentEPvPcm", "__dynarmic_unzGetGlobalComment", 0xB5F0u, 0u},
+        {"_ZN7cocos2d21unzGetLocalExtrafieldEPvS0_j", "__dynarmic_unzGetLocalExtrafield", 0xB5F0u, 0u},
+        {"_ZN7cocos2d19unzCloseCurrentFileEPv", "__dynarmic_unzCloseCurrentFile", 0xB5F8u, 0u},
+        {"_ZN7cocos2d8unzCloseEPv", "__dynarmic_unzClose", 0xB510u, 0u},
+        {"_ZN7cocos2d18unzReadCurrentFileEPvS0_j", "__dynarmic_unzReadCurrentFile", 0xB5F0u, 0u},
+        {"_ZN7cocos2d19unzOpenCurrentFile3EPvPiS1_iPKc", "__dynarmic_unzOpenCurrentFile3", 0xB5F0u, 0u},
+        {"_ZN7cocos2d19unzOpenCurrentFile2EPvPiS1_i", "__dynarmic_unzOpenCurrentFile2", 0xB510u, 0u},
+        {"_ZN7cocos2d26unzOpenCurrentFilePasswordEPvPKc", "__dynarmic_unzOpenCurrentFilePassword", 0xB500u, 0u},
+        {"_ZN7cocos2d18unzOpenCurrentFileEPv", "__dynarmic_unzOpenCurrentFile", 0xB500u, 0u},
+        {"_ZN7cocos2d9unzOpen64EPKv", "__dynarmic_unzOpen64", 0xB510u, 0u},
+        {"_ZN7cocos2d7unzOpenEPKc", "__dynarmic_unzOpen", 0xB510u, 0u},
+        {"_ZN7cocos2d11unzOpen2_64EPKvPNS_21zlib_filefunc64_def_sE", "__dynarmic_unzOpen2_64", 0xB570u, 0u},
+        {"_ZN7cocos2d8unzOpen2EPKcPNS_19zlib_filefunc_def_sE", "__dynarmic_unzOpen2", 0xB530u, 0u},
+        {"_ZN7cocos2d24unzStringFileNameCompareEPKcS1_i", "__dynarmic_unzStringFileNameCompare", 0xB570u, 0u},
+        {"_ZN7cocos2d13unzLocateFileEPvPKci", "__dynarmic_unzLocateFile", 0xB5F0u, 0u},
     };
-    std::size_t installed = 0;
+    MinizipHookCounts counts{};
     for (const Hook& hook : hooks) {
         const SymbolRecord* target = FindSymbol(runtime, hook.symbol);
         if (!target) continue;
-        InstallThumbInlineSvcHookPreservingArguments(
-            env, runtime, *target, hook.prologue, hook.import_name);
-        ++installed;
+        if (TryInstallThumbInlineSvcHookPreservingArguments(
+                env, runtime, *target, hook.prologue, hook.alternate,
+                hook.import_name)) {
+            ++counts.installed;
+        } else {
+            ++counts.skipped;
+        }
     }
-    return installed;
+    return counts;
 }
-
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
@@ -1681,6 +1729,9 @@ public:
                                   window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
         if (!window_) return Fail("CreateWindowExA failed");
+        if (gd_apply_window_icon(window_) && log_) {
+            *log_ << "Window icon applied from GD_WINDOW_ICON\n";
+        }
         device_ = GetDC(window_);
         if (!device_) return Fail("GetDC failed");
 
@@ -4562,11 +4613,30 @@ private:
             return static_cast<u32>(-1);
         }
 
+        // libcurl may split one HTTP request across multiple send() calls.
+        // Keep only recognized incomplete PHP requests; unrelated traffic still
+        // follows the original guest socket path immediately.
+        std::vector<u8> combined_request;
+        const auto pending_request = pending_http_requests_.find(guest_fd);
+        if (pending_request != pending_http_requests_.end()) {
+            combined_request = std::move(pending_request->second);
+            pending_http_requests_.erase(pending_request);
+            if (combined_request.size() > 64u * 1024u * 1024u - length) {
+                SetGuestErrno(90);
+                return static_cast<u32>(-1);
+            }
+            combined_request.insert(combined_request.end(), data, data + length);
+        }
+        const char* request_data = combined_request.empty()
+            ? data : reinterpret_cast<const char*>(combined_request.data());
+        const std::size_t request_size = combined_request.empty()
+            ? static_cast<std::size_t>(length) : combined_request.size();
+
         unsigned char* song_response = nullptr;
         std::size_t song_response_size = 0u;
         int song_response_code = 0;
         const int song_request = gd_song_http_handle_raw_request(
-            data, length, &song_response, &song_response_size,
+            request_data, request_size, &song_response, &song_response_size,
             &song_response_code);
         if (song_request > 0) {
             SyntheticHttpResponse response;
@@ -4590,20 +4660,65 @@ private:
             return static_cast<u32>(-1);
         }
 
+        unsigned char* api_response = nullptr;
+        std::size_t api_response_size = 0u;
+        int api_response_code = 0;
+        const int api_request = gd_api_http_handle_raw_request(
+            request_data, request_size, &api_response, &api_response_size,
+            &api_response_code);
+        if (api_request == 1) {
+            SyntheticHttpResponse response;
+            response.bytes.assign(api_response,
+                                  api_response + api_response_size);
+            std::free(api_response);
+            synthetic_http_[guest_fd] = std::move(response);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Legacy API completed through WinHTTP fd="
+                     << guest_fd << " status=" << api_response_code
+                     << " response=" << api_response_size << '\n';
+            SetGuestErrno(0);
+            return length;
+        }
+        if (api_request < 0) {
+            std::free(api_response);
+            SetGuestErrno(5);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Legacy API WinHTTP request failed fd="
+                     << guest_fd << '\n';
+            return static_cast<u32>(-1);
+        }
+        if (api_request == 2) {
+            pending_http_requests_[guest_fd].assign(
+                reinterpret_cast<const u8*>(request_data),
+                reinterpret_cast<const u8*>(request_data) + request_size);
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Legacy API request buffered across sends fd="
+                     << guest_fd << " bytes=" << request_size << '\n';
+            SetGuestErrno(0);
+            return length;
+        }
+
+        // If a previously buffered request stopped looking like a Geometry Dash
+        // PHP request, flush the complete accumulated payload through the
+        // original socket instead of losing its first fragment.
+        const char* socket_request_data = request_data;
+        const std::size_t socket_request_size = request_size;
         void* rewritten_buffer = nullptr;
         std::size_t rewritten_size = 0u;
         const int rewritten = gd_settings_rewrite_http_request(
-            data, length, &rewritten_buffer, &rewritten_size);
+            socket_request_data, socket_request_size,
+            &rewritten_buffer, &rewritten_size);
         ScopeExit release_rewrite([&] {
             if (rewritten_buffer) std::free(rewritten_buffer);
         });
         const char* send_data = rewritten > 0
-            ? static_cast<const char*>(rewritten_buffer) : data;
-        const std::size_t send_size = rewritten > 0 ? rewritten_size : length;
+            ? static_cast<const char*>(rewritten_buffer) : socket_request_data;
+        const std::size_t send_size = rewritten > 0
+            ? rewritten_size : socket_request_size;
         if (rewritten > 0 && network_log_count_++ < 128u)
             log_ << "[host] GDPS request rewrite server="
-                 << gd_settings_server() << " bytes=" << length << "->"
-                 << send_size << '\n';
+                 << gd_settings_server() << " bytes="
+                 << socket_request_size << "->" << send_size << '\n';
 
         std::size_t sent = 0u;
         int error = 0;
@@ -4648,7 +4763,8 @@ private:
             log_ << "[host] Socket first send fd=" << guest_fd << " bytes="
                  << (rewritten > 0 ? length : sent) << '\n';
         SetGuestErrno(0);
-        return static_cast<u32>(rewritten > 0 ? length : sent);
+        return static_cast<u32>(
+            (!combined_request.empty() || rewritten > 0) ? length : sent);
     }
 
     u32 GuestReceive(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
@@ -4986,6 +5102,7 @@ private:
         socket_send_logged_.erase(guest_fd);
         socket_receive_logged_.erase(guest_fd);
         synthetic_http_.erase(guest_fd);
+        pending_http_requests_.erase(guest_fd);
         return code == 0 ? 0u : SocketFailure();
     }
     u32 GuestGetAddrInfo(u32 node_address, u32 service_address, u32 hints_address, u32 result_address) {
@@ -5972,6 +6089,7 @@ private:
     };
     std::unordered_map<u32, SOCKET> sockets_;
     std::unordered_map<u32, SyntheticHttpResponse> synthetic_http_;
+    std::unordered_map<u32, std::vector<u8>> pending_http_requests_;
     std::unordered_set<u32> nonblocking_sockets_;
     std::unordered_set<u32> socket_send_logged_;
     std::unordered_set<u32> socket_receive_logged_;
@@ -6317,7 +6435,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified3 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified4 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6543,24 +6661,18 @@ int main(int argc,char** argv) {
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
-        const std::size_t minizip_hooks=InstallHostMinizipHooks(runtime,env);
-        if(zip_hooks!=2u)
-            throw std::runtime_error(
-                "required cocos2d ZIP hooks were not found");
+        const MinizipHookCounts minizip_hooks=
+            InstallHostMinizipHooks(runtime,env);
         const std::size_t browser_hooks=
             InstallCcApplicationOpenUrlHook(runtime,env);
-        if(browser_hooks!=1u)
-            throw std::runtime_error(
-                "required cocos2d openURL hook was not found");
         const std::size_t audio_effect_hooks=
             InstallSimpleAudioEffectHooks(runtime,env);
-        if(audio_effect_hooks!=2u)
-            throw std::runtime_error(
-                "required SimpleAudioEngine effect hooks were not found");
         const std::size_t icon_unlock_hooks =
             InstallConfigurableIconUnlockHooks(runtime, env);
         const std::size_t creator_bypass_hooks =
             InstallConfigurableCreatorBypass(runtime, env);
+        const GraphicsPatchCounts graphics_patches =
+            InstallHighestGraphicsHooks(runtime, env);
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6588,14 +6700,16 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_RELOCATION_OK");
         emit("RESULT: DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count="+
              std::to_string(zip_hooks)+
-             " scratch=r0 args=r1-r3-preserved");
-        emit("RESULT: DYNARMIC_HOST_MINIZIP_HOOKS_READY count="+
-             std::to_string(minizip_hooks)+" expected=33");
+             " policy=capability-based guest-fallback=enabled");
+        emit("RESULT: DYNARMIC_HOST_MINIZIP_HOOKS_READY installed="+
+             std::to_string(minizip_hooks.installed)+" skipped="+
+             std::to_string(minizip_hooks.skipped)+
+             " policy=capability-based-optional-acceleration");
         emit("RESULT: DYNARMIC_CCAPPLICATION_OPENURL_HOOK_READY count="+
-             std::to_string(browser_hooks));
+             std::to_string(browser_hooks)+" guest-fallback=enabled");
         emit("RESULT: DYNARMIC_SIMPLEAUDIO_EFFECT_HOOKS_READY count="+
              std::to_string(audio_effect_hooks)+
-             " play=direct-host preload=direct-host async-worker=1");
+             " play=direct-host-when-compatible guest-fallback=enabled");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server=" +
              std::string(gd_settings_server()) +
              " hack-icons=" + (gd_settings_hack_icons() ? "true" : "false") +
@@ -6603,6 +6717,11 @@ int main(int argc,char** argv) {
              " full-bypass=" +
              (gd_settings_full_bypass() ? "true" : "false") +
              " bypass-hooks=" + std::to_string(creator_bypass_hooks) +
+             " highest-graphics=" +
+             (gd_settings_force_highest_graphics() ? "true" : "false") +
+             " hd-hooks=" + std::to_string(graphics_patches.hd) +
+             " low-memory-hooks=" +
+             std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()));
         GuestExecutor executor(env,runtime,log_file);

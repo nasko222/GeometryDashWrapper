@@ -134,6 +134,10 @@ int gd_settings_full_bypass(void) {
     return gd_setting_bool("FULL_BYPASS", 1);
 }
 
+int gd_settings_force_highest_graphics(void) {
+    return gd_setting_bool("FORCE_HIGHEST_GRAPHICS", 1);
+}
+
 float gd_settings_music_pulse_max(void) {
     return gd_setting_float("MUSIC_PULSE_MAX", 0.30f, 0.0f, 1.0f);
 }

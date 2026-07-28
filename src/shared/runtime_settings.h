@@ -12,6 +12,7 @@ int gd_setting_bool(const char *name, int default_value);
 float gd_setting_float(const char *name, float default_value, float minimum, float maximum);
 int gd_settings_hack_icons(void);
 int gd_settings_full_bypass(void);
+int gd_settings_force_highest_graphics(void);
 float gd_settings_music_pulse_max(void);
 
 /* Returns the configured GDPS base, or the official default. */
