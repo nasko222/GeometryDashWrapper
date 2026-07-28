@@ -9,15 +9,23 @@ extern "C" {
 
 /* Boolean environment settings accept true/false, yes/no, on/off, and 1/0. */
 int gd_setting_bool(const char *name, int default_value);
+float gd_setting_float(const char *name, float default_value, float minimum, float maximum);
 int gd_settings_hack_icons(void);
 int gd_settings_full_bypass(void);
+float gd_settings_music_pulse_max(void);
 
 /* Returns the configured GDPS base, or the official default. */
 const char *gd_settings_server(void);
 
+/* True when GDPS_SERVER is the official Boomlings /database endpoint. */
+int gd_settings_server_is_official(void);
+
+/* Exact official HTTPS endpoint used as a fallback for song metadata. */
+const char *gd_settings_official_song_url(void);
+
 /*
  * Rewrites a Geometry Dash PHP API URL onto GDPS_SERVER while preserving the
- * endpoint filename and query. Returns 1 when output differs, 0 when the URL
+ * relative endpoint path (including subdirectories) and query. Returns 1 when output differs, 0 when the URL
  * is not a game API URL, and -1 when the output buffer is too small/invalid.
  */
 int gd_settings_rewrite_url(const char *input, char *output, size_t capacity);

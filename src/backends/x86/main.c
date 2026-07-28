@@ -325,52 +325,57 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
         "_ZN11GameManager14isIconUnlockedEi",
         "_ZN11GameManager14isIconUnlockedEi8IconType",
     };
+    static const char *const online_checks[] = {
+        "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
+    };
     static const struct {
-        const char *full_version;
-        const char *creator;
-    } creator_pairs[] = {
+        const char *locked;
+        const char *unlocked;
+        const char *description;
+    } bypass_pairs[] = {
         {
             "_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE",
             "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE",
+            "MenuLayer full-version->Creator",
         },
         {
             "_ZN9MenuLayer13onFullVersionEv",
             "_ZN9MenuLayer9onCreatorEv",
+            "MenuLayer full-version->Creator",
+        },
+        {
+            "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
+            "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE",
+            "CreatorLayer full-version editor->My Levels",
         },
     };
     unsigned icon_patches = 0;
-    unsigned full_patches = 0;
+    unsigned bypass_patches = 0;
+    unsigned online_patches = 0;
     size_t index;
     if (gd_settings_hack_icons()) {
-        /* Patch icon ownership only. Player-color checks are deliberately left
-         * authentic because broad color-unlock patches can disturb editor
-         * background/ground state in old game builds. */
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
     }
     if (gd_settings_full_bypass()) {
-        /* Follow the game's normal CreatorLayer construction path. Redirecting
-         * CreatorLayer::onOnlyFullVersion straight to My Levels skipped scene
-         * initialization in some versions and produced the gray editor void. */
+        online_patches = patch_x86_return_true_exports(
+            image, online_checks, sizeof(online_checks) / sizeof(online_checks[0]));
         for (index = 0;
-             index < sizeof(creator_pairs) / sizeof(creator_pairs[0]); ++index) {
-            void *locked = elf_image_find_export(
-                image, creator_pairs[index].full_version);
-            void *creator = elf_image_find_export(
-                image, creator_pairs[index].creator);
-            if (locked && creator && patch_x86_tail_jump(locked, creator)) {
-                runtime_log("Launch hack: MenuLayer full-version button redirected "
-                            "through normal CreatorLayer path");
-                ++full_patches;
-                break;
+             index < sizeof(bypass_pairs) / sizeof(bypass_pairs[0]); ++index) {
+            void *locked = elf_image_find_export(image, bypass_pairs[index].locked);
+            void *unlocked = elf_image_find_export(image, bypass_pairs[index].unlocked);
+            if (locked && unlocked && patch_x86_tail_jump(locked, unlocked)) {
+                runtime_log("Launch hack: %s", bypass_pairs[index].description);
+                ++bypass_patches;
             }
         }
     }
     runtime_log("Launch settings applied: server=%s hack-icons=%s patches=%u "
-                "full-bypass=%s patches=%u",
+                "full-bypass=%s redirects=%u online-checks=%u music-pulse-max=%.3f",
                 gd_settings_server(),
                 gd_settings_hack_icons() ? "true" : "false", icon_patches,
-                gd_settings_full_bypass() ? "true" : "false", full_patches);
+                gd_settings_full_bypass() ? "true" : "false", bypass_patches,
+                online_patches, gd_settings_music_pulse_max());
 }
 
 static void pause_native_game(const char *reason) {
@@ -584,11 +589,18 @@ static int create_opengl_window(int client_width, int client_height) {
     }
 
     AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-    g_host.window = CreateWindowExA(
-        0, window_class.lpszClassName, "Android x86 native compatibility wrapper",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        rectangle.right - rectangle.left, rectangle.bottom - rectangle.top,
+    {
+        const int window_width = rectangle.right - rectangle.left;
+        const int window_height = rectangle.bottom - rectangle.top;
+        const int window_x = (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2;
+        const int window_y = (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2;
+        g_host.window = CreateWindowExA(
+        0, window_class.lpszClassName, "Geometry Dash Wrapper - Unified x86",
+        WS_OVERLAPPEDWINDOW, window_x > 0 ? window_x : 0,
+        window_y > 0 ? window_y : 0,
+        window_width, window_height,
         NULL, NULL, window_class.hInstance, NULL);
+    }
     if (!g_host.window) {
         runtime_log("ERROR: CreateWindow failed: %lu", (unsigned long)GetLastError());
         return 0;

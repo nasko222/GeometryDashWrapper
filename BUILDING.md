@@ -1,29 +1,33 @@
-# Building 0.9.5-unified2-fix2
+# Building 0.9.5-unified3
 
-Run on 64-bit Windows:
+On 64-bit Windows, run:
 
 ```bat
 BUILD_ALL.cmd
 ```
 
-The build creates:
+The scripts download verified portable Zig 0.14.1, CMake and Ninja tools as
+needed. Git for Windows is used for the pinned Dynarmic source checkout. No
+Visual Studio, WSL or administrator installation is required.
+
+Output:
 
 ```text
 dist-unified/
-  x86/
-  arm-legacy/
-  armv7/
+  x86/GeometryDashWrapper.exe
+  arm-legacy/GeometryDashArmLegacy.exe
+  armv7/GeometryDashArmV7.exe
   RUN_AUTO.cmd
   run_auto.py
+  save/
 ```
 
-Put `game.apk` in `dist-unified/`, edit the four settings at the top of
-`RUN_AUTO.cmd`, and run it.
+Individual builds:
 
-The x86 build uses portable Zig 0.14.1. Both ARM builds use the same Dynarmic
-6.7.0 checkout through portable Zig, CMake and Ninja. No Unicorn source or
-runtime is used.
+```bat
+BUILD_X86.cmd
+BUILD_DYNARMIC.cmd
+```
 
-Fix2 adds WinHTTP to the shared source list because x86 and legacy ARM route
-`getGJSongInfo.php` through official HTTPS Boomlings before returning the raw
-HTTP response to the guest networking library.
+The source package intentionally excludes APKs, extracted proprietary `.so`
+files, executables, DLLs, downloaded toolchains and build caches.

@@ -1,81 +1,71 @@
-# Geometry Dash Wrapper 0.9.5-unified2-fix2
+# Geometry Dash Wrapper 0.9.5-unified3
 
-Unified2 Fix2 repairs the two regressions introduced by the configurable launch
-hooks:
+Unified3 keeps the three proven execution cores and fixes the launch/network/
+visual issues found while testing Unified2:
 
-- spin-off full-version bypass now follows the game's normal CreatorLayer scene
-  path instead of jumping directly into My Levels, which could leave the editor
-  background and ground uninitialized as a gray void;
-- custom-song metadata always uses official HTTPS Boomlings, independently of
-  the configured gameplay/GDPS server. The song CDN URL returned by Boomlings
-  remains untouched.
+- **x86 native, first priority:** `0.9.3-alpha3`
+- **legacy ARM/Thumb through Dynarmic:** `dynarmictest14-fix1`
+- **ARMv7 / 2.2 through Dynarmic:** `0.9.4-milestone1`
 
-The three execution lines remain:
+There is no Unicorn backend or dependency. F2 remains removed. All backends use
+one `dist-unified/save/` directory.
 
-- **x86 native, default highest priority:** `0.9.3-alpha3`
-- **legacy ARM/Thumb through Dynarmic:** `0.9.4-arm-dynarmictest14-fix1`
-- **ARMv7 / Geometry Dash 2.2 through Dynarmic:** `0.9.4-milestone1`
+## Launch settings
 
-There is no Unicorn backend or dependency.
-
-## Editable launch settings
-
-Build the project, then edit the four values at the top of
-`dist-unified/RUN_AUTO.cmd`:
+Edit the values at the top of `RUN_AUTO.cmd` before running:
 
 ```bat
 set "GDPS_SERVER=www.boomlings.com/database"
 set "HACK_ICONS=false"
 set "FULL_BYPASS=true"
+set "MUSIC_PULSE_MAX=0.30"
 set "OVERRIDE_ARM=false"
 ```
 
-- `GDPS_SERVER` changes the Geometry Dash PHP API base for levels, accounts,
-  comments, gauntlets and similar game services. It accepts `host/path`,
-  `http://host/path`, or `https://host/path`.
-- `HACK_ICONS=true` makes supported icon-ownership checks return unlocked for
-  that run. Color ownership and save data are not modified.
-- `FULL_BYPASS=true` redirects the spin-off main-menu Full Version button to the
-  normal Creator button handler. It no longer patches CreatorLayer gates or
-  jumps directly into My Levels.
-- `OVERRIDE_ARM=true` chooses ARMv7, then legacy ARM, when the APK also contains
-  x86. With `false`, x86 remains first priority.
+- `GDPS_SERVER` routes levels, accounts, comments, gauntlets and other game API
+  calls while preserving the complete relative endpoint path. For example,
+  `/database/accounts/loginGJAccount.php` remains under `/accounts/`.
+- `getGJSongInfo.php` first uses the configured GDPS, allowing private custom
+  song catalogues. If that endpoint is missing, returns `-1`, or emits HTML/PHP
+  proxy warnings, the wrapper retries official HTTPS Boomlings. The returned
+  CDN/song URL itself is never rewritten.
+- `HACK_ICONS=true` makes supported icon ownership checks return unlocked for
+  that run without writing fake unlocks to the save.
+- `FULL_BYPASS=true` applies only hooks that exist in the selected game. It
+  redirects the spin-off Full Version button through the normal Creator path,
+  enables `canPlayOnlineLevels`, and redirects the locked editor callback to My
+  Levels. Missing or differently compiled exports are skipped rather than
+  aborting startup. This is intended to unlock the editor, recent/search and
+  other Creator buttons in GD World/Lite-style builds.
+- `MUSIC_PULSE_MAX` caps the DSP value used by music-reactive/rave visuals. It
+  does not lower audio volume. Lower it (for example `0.20`) for weaker pulses.
+- `OVERRIDE_ARM=false` keeps x86 first. `true` prefers ARMv7, then legacy ARM,
+  when the APK contains multiple architectures.
 
-`getGJSongInfo.php` is deliberately excluded from GDPS routing and is sent to:
+## Unified3 fixes
 
-```text
-https://www.boomlings.com/database/getGJSongInfo.php
-```
+- Centers x86, legacy ARM and ARMv7 windows on the primary screen.
+- Removes the exact-prologue requirement that made GD Lite fail with
+  `expected 0xe368 got 0xb510` when Full Bypass was enabled.
+- Preserves nested GDPS endpoint paths, fixing account-login URLs.
+- Uses custom-song-first metadata routing with automatic official Boomlings
+  fallback for broken GDPS proxy scripts.
+- Delivers at most one completed ARMv7 HTTP callback per frame and gives large
+  level responses an adaptive callback budget, preventing the fixed
+  one-billion-tick crash seen while loading a gauntlet level under load.
+- Resets leaked OpenGL scissor/viewport/write state before every ARMv7 frame to
+  prevent stale black strips after editor playtest/scene transitions.
+- Maps and smooths the Windows audio meter into the configurable pulse cap so a
+  single loud peak cannot create screen-sized rave objects.
 
-The returned song/CDN download URL is not rewritten.
+## Build and run
 
-## Automatic backend selection
+Run `BUILD_ALL.cmd`. Put the APK at `dist-unified/game.apk`, then run
+`dist-unified/RUN_AUTO.cmd`.
 
-Put one APK at `dist-unified/game.apk` and run `dist-unified/RUN_AUTO.cmd`, or
-pass an APK path to it.
+Automatic priority is x86, legacy ARM, then ARMv7 unless `OVERRIDE_ARM=true`.
+`RUN_DEBUG.cmd` remains available under each ARM backend directory for focused
+logs/profiles.
 
-Normal priority:
-
-1. x86: `lib/x86/libcocos2dcpp.so` or `lib/x86/libgame.so`
-2. legacy ARM: `lib/armeabi/libgame.so`
-3. ARMv7/2.2: `lib/armeabi-v7a/libcocos2dcpp.so`
-
-## One save folder
-
-Every backend runs from `dist-unified/` and uses:
-
-```text
-dist-unified/save/
-```
-
-Back up this folder before switching between substantially different game
-versions because some versions reuse the same save filenames.
-
-## Build
-
-- `BUILD_X86.cmd` builds x86.
-- `BUILD_DYNARMIC.cmd` builds both Dynarmic backends.
-- `BUILD_ALL.cmd` builds all three and creates the automatic launcher.
-
-Normal ARM launchers avoid heavy tracing. Each ARM backend retains a separate
-`RUN_DEBUG.cmd`. The old F2 editor shortcut remains fully removed.
+Back up `dist-unified/save/` before switching between game versions that reuse
+the same save filenames.

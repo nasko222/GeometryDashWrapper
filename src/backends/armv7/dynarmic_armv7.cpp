@@ -1885,6 +1885,33 @@ static bool PatchV22FunctionReturnTrue(
     return true;
 }
 
+static bool PatchV22FunctionTailJump(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& source, const SymbolRecord& destination) {
+    const u32 address = source.address & ~1u;
+    const u32 target = destination.address;
+    if (address < runtime.image_min || address >= runtime.image_max) return false;
+    if (source.address & 1u) {
+        if ((address & 3u) == 0u) {
+            if (source.size < 8u || address > runtime.image_max - 8u) return false;
+            env.MemoryWrite16(address + 0u, 0x4B00u); // ldr r3, [pc, #0]
+            env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+            env.MemoryWrite32(address + 4u, target);
+            return true;
+        }
+        if (source.size < 10u || address > runtime.image_max - 10u) return false;
+        env.MemoryWrite16(address + 0u, 0x4B01u); // ldr r3, [pc, #4]
+        env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+        env.MemoryWrite16(address + 4u, 0x46C0u); // nop
+        env.MemoryWrite32(address + 6u, target);
+        return true;
+    }
+    if (source.size < 8u || address > runtime.image_max - 8u) return false;
+    env.MemoryWrite32(address + 0u, 0xE51FF004u); // ldr pc, [pc, #-4]
+    env.MemoryWrite32(address + 4u, target & ~1u);
+    return true;
+}
+
 static std::size_t InstallV22ConfigurableIconUnlockHooks(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     static constexpr const char* symbols[] = {
@@ -1903,21 +1930,33 @@ static std::size_t InstallV22ConfigurableIconUnlockHooks(
 
 static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
                                                  ProbeEnvironment& env) {
-    static constexpr const char* kLocked =
-        "_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE";
-    static constexpr const char* kCreator =
-        "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE";
-    const SymbolRecord* locked = FindSymbol(runtime, kLocked);
-    const SymbolRecord* creator = FindSymbol(runtime, kCreator);
-    if (!locked || !creator) return 0u;
-    const u32 destination = EnsureImport(
-        runtime, env, "__dynarmic_v22_creator_editor_unlock");
-    // The supported late-beta MenuLayer::onFullVersion begins with the
-    // Thumb halfword 0xE368. Validate the exact ABI before replacing its
-    // entry with the argument-preserving host redirect.
-    InstallThumbLiteralPcHookPreservingAllArguments(
-        env, runtime, *locked, 0xE368u, destination);
-    return 1u;
+    struct Pair { const char* locked; const char* unlocked; };
+    static constexpr Pair pairs[] = {
+        {"_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE",
+         "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"},
+        {"_ZN9MenuLayer13onFullVersionEv",
+         "_ZN9MenuLayer9onCreatorEv"},
+        {"_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
+         "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"},
+    };
+    static constexpr const char* online_checks[] = {
+        "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
+    };
+    if (!gd_settings_full_bypass()) return 0u;
+    std::size_t patched = 0u;
+    for (const char* name : online_checks) {
+        const SymbolRecord* symbol = FindSymbol(runtime, name);
+        if (symbol && PatchV22FunctionReturnTrue(env, runtime, *symbol))
+            ++patched;
+    }
+    for (const Pair& pair : pairs) {
+        const SymbolRecord* locked = FindSymbol(runtime, pair.locked);
+        const SymbolRecord* unlocked = FindSymbol(runtime, pair.unlocked);
+        if (locked && unlocked &&
+            PatchV22FunctionTailJump(env, runtime, *locked, *unlocked))
+            ++patched;
+    }
+    return patched;
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -2674,11 +2713,15 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARMv7 - Unified ARMv7",
+        const int window_width = rectangle.right - rectangle.left;
+        const int window_height = rectangle.bottom - rectangle.top;
+        const int window_x = std::max(0,
+            (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2);
+        const int window_y = std::max(0,
+            (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2);
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash - Unified ARMv7",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  CW_USEDEFAULT, CW_USEDEFAULT,
-                                  rectangle.right - rectangle.left,
-                                  rectangle.bottom - rectangle.top,
+                                  window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
         if (!window_) return Fail("CreateWindowExA failed");
         device_ = GetDC(window_);
@@ -2758,6 +2801,21 @@ public:
         return result;
     }
 
+    void ResetFrameClipState() {
+        if (!context_ || !window_) return;
+        RECT area{};
+        int width = native_width_;
+        int height = native_height_;
+        if (GetClientRect(window_, &area) && area.right > area.left &&
+            area.bottom > area.top) {
+            width = area.right - area.left;
+            height = area.bottom - area.top;
+        }
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, width, height);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+    }
     void Swap() { if (device_) SwapBuffers(device_); }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -3114,6 +3172,7 @@ public:
     void* Resolve(const char*) { return nullptr; }
     bool PumpMessages() { return false; }
     std::vector<HostEvent> TakeEvents() { return {}; }
+    void ResetFrameClipState() {}
     void Swap() {}
     void BeginGpuFrame(u64) {}
     void EndGpuFrame() {}
@@ -3364,6 +3423,7 @@ public:
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
+    void ResetFrameClipState() { gl_.ResetFrameClipState(); }
     void SwapBuffersHost() { gl_.Swap(); }
     void BeginGpuFrame(u64 frame) { gl_.BeginGpuFrame(frame); }
     void EndGpuFrame() { gl_.EndGpuFrame(); }
@@ -4025,6 +4085,59 @@ private:
                lower.compare(lower.size() - 4u, 4u, ".php") == 0;
     }
 
+    static bool NativeHttpLooksLikeSongInfoUrl(const std::string& url) {
+        std::string lower = url;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char value) {
+                           return static_cast<char>(std::tolower(value));
+                       });
+        const std::size_t query = lower.find('?');
+        if (query != std::string::npos) lower.resize(query);
+        return lower.size() >= std::strlen("getgjsonginfo.php") &&
+               lower.compare(lower.size() - std::strlen("getgjsonginfo.php"),
+                             std::strlen("getgjsonginfo.php"),
+                             "getgjsonginfo.php") == 0;
+    }
+
+    /* 0 = valid song record, 1 = ordinary -1 miss, 2 = malformed/error body. */
+    static int NativeHttpSongResponseState(const std::vector<u8>& body) {
+        std::size_t begin = 0;
+        std::size_t end = body.size();
+        while (begin < end &&
+               std::isspace(static_cast<unsigned char>(body[begin])))
+            ++begin;
+        while (end > begin &&
+               std::isspace(static_cast<unsigned char>(body[end - 1u])))
+            --end;
+        if (begin == end) return 2;
+        if (end - begin == 2u && body[begin] == '-' &&
+            body[begin + 1u] == '1')
+            return 1;
+        if (body[begin] == '<') return 2;
+        const std::size_t sample_size =
+            std::min<std::size_t>(end - begin, 8192u);
+        std::string sample(
+            reinterpret_cast<const char*>(body.data() + begin), sample_size);
+        std::transform(sample.begin(), sample.end(), sample.begin(),
+                       [](unsigned char value) {
+                           return static_cast<char>(std::tolower(value));
+                       });
+        if (sample.find("file_get_contents") != std::string::npos ||
+            sample.find("warning") != std::string::npos ||
+            sample.find("403 forbidden") != std::string::npos ||
+            sample.find("<!doctype html") != std::string::npos ||
+            sample.find("<html") != std::string::npos)
+            return 2;
+        return 0;
+    }
+
+    static void NativeHttpAppendUniqueAttempt(
+            std::vector<std::string>& attempts, const std::string& url) {
+        if (url.empty()) return;
+        if (std::find(attempts.begin(), attempts.end(), url) == attempts.end())
+            attempts.push_back(url);
+    }
+
     static bool NativeHttpLooksLikeHtmlResponse(
             const std::vector<u8>& body) {
         if (body.empty()) return false;
@@ -4369,9 +4482,29 @@ private:
         }
 
         std::vector<std::string> attempts;
+        const bool song_info_request =
+            NativeHttpLooksLikeSongInfoUrl(job.url) ||
+            NativeHttpLooksLikeSongInfoUrl(configured_url);
         if (NativeHttpIsPlainHttpUrl(configured_url)) {
-            attempts.push_back(NativeHttpHttpsVariant(configured_url));
-            attempts.push_back(configured_url);
+            NativeHttpAppendUniqueAttempt(
+                attempts, NativeHttpHttpsVariant(configured_url));
+            NativeHttpAppendUniqueAttempt(attempts, configured_url);
+        } else {
+            NativeHttpAppendUniqueAttempt(attempts, configured_url);
+        }
+        if (song_info_request) {
+            NativeHttpAppendUniqueAttempt(
+                attempts, gd_settings_official_song_url());
+            std::ostringstream policy;
+            policy << "stage=url-policy original=\""
+                   << SanitizeLogText(job.url) << "\" attempts=";
+            for (std::size_t index = 0; index < attempts.size(); ++index) {
+                if (index) policy << " -> ";
+                policy << '\"' << SanitizeLogText(attempts[index]) << '\"';
+            }
+            policy << " reason=custom-song-first+official-https-fallback";
+            trace(policy.str());
+        } else if (attempts.size() > 1u) {
             trace("stage=url-policy original=\"" +
                   SanitizeLogText(job.url) +
                   "\" primary=\"" +
@@ -4380,7 +4513,6 @@ private:
                   SanitizeLogText(attempts.back()) +
                   "\" reason=generic-https-first-preserve-configured-host");
         } else {
-            attempts.push_back(configured_url);
             trace("stage=url-policy original=\"" +
                   SanitizeLogText(job.url) +
                   "\" primary=\"" + SanitizeLogText(configured_url) +
@@ -4394,23 +4526,37 @@ private:
         for (std::size_t index = 0; index < attempts.size(); ++index) {
             NativeHttpResult attempt = ExecuteNativeHttpAttempt(
                 job, attempts[index], index, attempts.size());
+            const bool has_fallback = index + 1u < attempts.size();
             const bool html_api_response =
                 attempt.transport_success &&
                 NativeHttpLooksLikeApiUrl(attempts[index]) &&
                 NativeHttpLooksLikeHtmlResponse(
                     attempt.response_body);
-            if (html_api_response) {
+            const int song_response_state =
+                song_info_request && attempt.transport_success
+                    ? NativeHttpSongResponseState(attempt.response_body)
+                    : 0;
+            if (html_api_response || song_response_state == 2 ||
+                (song_response_state == 1 && has_fallback)) {
                 attempt.transport_success = false;
-                attempt.error =
-                    "HTML/block page returned by API endpoint";
+                if (song_response_state == 1)
+                    attempt.error = "custom song endpoint returned -1";
+                else if (song_info_request)
+                    attempt.error =
+                        "invalid HTML/PHP response from song endpoint";
+                else
+                    attempt.error =
+                        "HTML/block page returned by API endpoint";
                 trace("attempt=" + std::to_string(index + 1u) +
-                      " rejected reason=html-api-response");
+                      " rejected reason=" +
+                      (song_info_request
+                           ? "invalid-song-response"
+                           : "html-api-response"));
             }
 
             final_result = std::move(attempt);
             if (final_result.transport_success) break;
 
-            const bool has_fallback = index + 1u < attempts.size();
             if (!has_fallback) break;
 
             const bool retry_safe =
@@ -4687,12 +4833,20 @@ private:
                 selector = env_.MemoryRead32(vtable + selector);
             }
             u32 ignored = 0u;
+            const u64 payload_bytes =
+                static_cast<u64>(result.response_body.size()) +
+                static_cast<u64>(result.response_headers.size());
+            const u64 adaptive_budget = std::min<u64>(
+                64000000000ull, 4000000000ull + payload_bytes * 16384ull);
+            log_ << "[host] Unified ARMv7 native HTTP callback id="
+                 << result.id << " payload=" << payload_bytes
+                 << " tick-budget=" << adaptive_budget << '\n';
             if (!selector || !RunNestedPreservingState(
                                  selector,
                                  {adjusted_target, result.client, response},
                                  ignored,
                                  "native HTTP response callback",
-                                 1000000000u)) {
+                                 adaptive_budget)) {
                 ReleaseGuestObject(response,
                                    "native HTTP callback failure response cleanup");
                 return false;
@@ -4713,7 +4867,10 @@ private:
         {
             std::lock_guard<std::mutex> lock(native_http_mutex_);
             trace.swap(native_http_trace_);
-            ready.swap(native_http_results_);
+            if (!native_http_results_.empty()) {
+                ready.push_back(std::move(native_http_results_.front()));
+                native_http_results_.pop_front();
+            }
         }
         for (const std::string& line : trace) log_ << line << '\n';
         if (!trace.empty()) log_.flush();
@@ -10860,7 +11017,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified2-fix2 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified3 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11421,16 +11578,20 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count="+
              std::to_string(inflate_hooks)+
              " codec=gzip+zlib+raw original-cpp-decompress=1 hidden-sret=guest-native");
-        emit("RESULT: DYNARMIC_V22_FULL_VERSION_CREATOR_REDIRECT enabled="+
+        emit("RESULT: DYNARMIC_V22_FULL_VERSION_BYPASS enabled="+
              std::string(gd_settings_full_bypass() ? "1" : "0")+
-             " count="+std::to_string(editor_redirects)+
-             " redirect=MenuLayer::onFullVersion->MenuLayer::onCreator");
+             " patches="+std::to_string(editor_redirects)+
+             " mode=best-effort-menu-creator+online-tabs+my-levels");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
              std::string(gd_settings_server())+
              " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+
              " icon-hooks="+std::to_string(icon_unlock_hooks)+
              " full-bypass="+
-             (gd_settings_full_bypass() ? "true" : "false"));
+             (gd_settings_full_bypass() ? "true" : "false")+
+             " music-pulse-max="+
+             std::to_string(gd_settings_music_pulse_max()));
+        emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
+             "state=scissor-off+full-viewport+color-depth-write");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -11854,6 +12015,7 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
+            executor.ResetFrameClipState();
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,

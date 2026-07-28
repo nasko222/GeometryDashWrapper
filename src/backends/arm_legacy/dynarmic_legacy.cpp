@@ -1223,22 +1223,33 @@ static std::size_t InstallConfigurableIconUnlockHooks(
 
 static std::size_t InstallConfigurableCreatorBypass(
     ElfRuntime& runtime, ProbeEnvironment& env) {
-    struct Pair { const char* full_version; const char* creator; };
+    struct Pair { const char* locked; const char* unlocked; };
     static constexpr Pair pairs[] = {
         {"_ZN9MenuLayer13onFullVersionEPN7cocos2d8CCObjectE",
          "_ZN9MenuLayer9onCreatorEPN7cocos2d8CCObjectE"},
         {"_ZN9MenuLayer13onFullVersionEv",
          "_ZN9MenuLayer9onCreatorEv"},
+        {"_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE",
+         "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE"},
+    };
+    static constexpr const char* online_checks[] = {
+        "_ZN12CreatorLayer19canPlayOnlineLevelsEv",
     };
     if (!gd_settings_full_bypass()) return 0u;
-    for (const Pair& pair : pairs) {
-        const SymbolRecord* locked = FindSymbol(runtime, pair.full_version);
-        const SymbolRecord* creator = FindSymbol(runtime, pair.creator);
-        if (locked && creator &&
-            PatchArmFunctionTailJump(env, runtime, *locked, *creator))
-            return 1u;
+    std::size_t patched = 0u;
+    for (const char* name : online_checks) {
+        const SymbolRecord* symbol = FindSymbol(runtime, name);
+        if (symbol && PatchArmFunctionReturnTrue(env, runtime, *symbol))
+            ++patched;
     }
-    return 0u;
+    for (const Pair& pair : pairs) {
+        const SymbolRecord* locked = FindSymbol(runtime, pair.locked);
+        const SymbolRecord* unlocked = FindSymbol(runtime, pair.unlocked);
+        if (locked && unlocked &&
+            PatchArmFunctionTailJump(env, runtime, *locked, *unlocked))
+            ++patched;
+    }
+    return patched;
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -1659,11 +1670,15 @@ public:
 
         RECT rectangle{0, 0, width, height};
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash ARM - Dynarmic x64 Test14-fix1",
+        const int window_width = rectangle.right - rectangle.left;
+        const int window_height = rectangle.bottom - rectangle.top;
+        const int window_x = std::max(0,
+            (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2);
+        const int window_y = std::max(0,
+            (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2);
+        window_ = CreateWindowExA(0, class_name, "Geometry Dash - Unified Legacy ARM",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  CW_USEDEFAULT, CW_USEDEFAULT,
-                                  rectangle.right - rectangle.left,
-                                  rectangle.bottom - rectangle.top,
+                                  window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
         if (!window_) return Fail("CreateWindowExA failed");
         device_ = GetDC(window_);
@@ -4560,7 +4575,7 @@ private:
             std::free(song_response);
             synthetic_http_[guest_fd] = std::move(response);
             if (network_log_count_++ < 128u)
-                log_ << "[host] Song metadata routed to official Boomlings HTTPS fd="
+                log_ << "[host] Song metadata completed through custom-first/official-fallback transport fd="
                      << guest_fd << " status=" << song_response_code
                      << " response=" << song_response_size << '\n';
             SetGuestErrno(0);
@@ -4570,7 +4585,7 @@ private:
             std::free(song_response);
             SetGuestErrno(5);
             if (network_log_count_++ < 128u)
-                log_ << "[host] Official Boomlings song metadata request failed fd="
+                log_ << "[host] Song metadata custom/official request failed fd="
                      << guest_fd << '\n';
             return static_cast<u32>(-1);
         }
@@ -6302,7 +6317,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified2-fix2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified3 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6587,7 +6602,9 @@ int main(int argc,char** argv) {
              " icon-hooks=" + std::to_string(icon_unlock_hooks) +
              " full-bypass=" +
              (gd_settings_full_bypass() ? "true" : "false") +
-             " bypass-hooks=" + std::to_string(creator_bypass_hooks));
+             " bypass-hooks=" + std::to_string(creator_bypass_hooks) +
+             " music-pulse-max=" +
+             std::to_string(gd_settings_music_pulse_max()));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+

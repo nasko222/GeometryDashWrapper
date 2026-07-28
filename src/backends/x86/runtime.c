@@ -1857,7 +1857,7 @@ static int synthetic_http_recv(int descriptor, void *buffer, size_t length,
     return handled;
 }
 
-static int try_official_song_request(int descriptor, const void *buffer,
+static int try_song_metadata_request(int descriptor, const void *buffer,
                                      size_t length) {
     unsigned char *response = NULL;
     size_t response_size = 0;
@@ -1869,7 +1869,7 @@ static int try_official_song_request(int descriptor, const void *buffer,
         free(response);
         return -1;
     }
-    runtime_log("Network song metadata routed to official Boomlings HTTPS: "
+    runtime_log("Network song metadata completed through custom-first/official-fallback transport: "
                 "fd=%d status=%d response=%lu",
                 descriptor, response_code, (unsigned long)response_size);
     return 1;
@@ -2221,7 +2221,7 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     int rewritten = 0;
     int song_request;
     if (length > INT_MAX) length = INT_MAX;
-    song_request = try_official_song_request(descriptor, buffer, length);
+    song_request = try_song_metadata_request(descriptor, buffer, length);
     if (song_request > 0) {
         socket_trace_traffic(descriptor, buffer, length, 1);
         trace_http_request(descriptor, buffer, (int)length);
@@ -2303,7 +2303,7 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
                 }
             }
             {
-                int song_request = try_official_song_request(
+                int song_request = try_song_metadata_request(
                     descriptor, joined, total_length);
                 if (song_request > 0) {
                     for (index = 0; index < vector_count; ++index) {

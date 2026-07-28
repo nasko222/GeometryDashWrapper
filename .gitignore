@@ -10,4 +10,4 @@ dist-unified/
 *.log
 *.csv
 __pycache__/
-games/1.7 beta/fuck.txt
+/games

@@ -16,6 +16,7 @@
 #include "embedded_effects.h"
 #include "loader.h"
 #include "runtime.h"
+#include "runtime_settings.h"
 #include "zlib.h"
 
 #define STB_VORBIS_HEADER_ONLY
@@ -80,6 +81,8 @@ static HANDLE g_output_meter_thread;
 static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
 static volatile LONG g_output_peak_logged;
+static float g_output_peak_smoothed;
+static float g_output_peak_max = 0.30f;
 static volatile LONG g_short_path_logged;
 static volatile LONG g_effect_cache_hit_logged;
 static volatile LONG g_waveout_backend_logged;
@@ -195,12 +198,29 @@ static DWORD WINAPI output_meter_thread(void *unused) {
                                                &peak_bits.floating))) {
             peak_bits.floating = 0.0f;
         }
-        peak_bits.floating = clamp_volume(peak_bits.floating);
+        {
+            const float raw = clamp_volume(peak_bits.floating);
+            const float noise_floor = 0.02f;
+            const float full_scale = 0.75f;
+            float normalized = 0.0f;
+            float mapped;
+            float smoothing;
+            if (raw > noise_floor)
+                normalized = (raw - noise_floor) / (full_scale - noise_floor);
+            normalized = clamp_volume(normalized);
+            mapped = normalized * g_output_peak_max;
+            /* Fast enough to react to a beat, slow enough to prevent one
+             * endpoint spike from making 2.2 music pulses fill the screen. */
+            smoothing = mapped > g_output_peak_smoothed ? 0.35f : 0.12f;
+            g_output_peak_smoothed +=
+                (mapped - g_output_peak_smoothed) * smoothing;
+            peak_bits.floating = clamp_volume(g_output_peak_smoothed);
+        }
         InterlockedExchange(&g_output_peak_bits, peak_bits.integer);
         if (peak_bits.floating > 0.001f &&
             InterlockedCompareExchange(&g_output_peak_logged, 1, 0) == 0) {
-            runtime_log("WASAPI FMOD metering: first nonzero peak %.3f",
-                        peak_bits.floating);
+            runtime_log("WASAPI FMOD metering: first mapped peak %.3f cap=%.3f",
+                        peak_bits.floating, g_output_peak_max);
         }
     }
     InterlockedExchange(&g_output_peak_bits, 0);
@@ -211,6 +231,10 @@ static DWORD WINAPI output_meter_thread(void *unused) {
 
 static void initialize_output_meter(void) {
     if (g_output_meter_thread) return;
+    g_output_peak_max = gd_settings_music_pulse_max();
+    g_output_peak_smoothed = 0.0f;
+    runtime_log("Music pulse meter mapping: floor=0.020 full-scale=0.750 cap=%.3f",
+                g_output_peak_max);
     g_output_meter_stop = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!g_output_meter_stop) {
         runtime_log("WASAPI metering: failed to create stop event");

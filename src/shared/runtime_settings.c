@@ -57,6 +57,26 @@ static int ascii_mem_contains_ci(const char *text, size_t text_size,
     return 0;
 }
 
+static const char *ascii_mem_find_ci(const char *text, size_t text_size,
+                                     const char *needle) {
+    size_t needle_size;
+    size_t offset;
+    if (!text || !needle || !*needle) return NULL;
+    needle_size = strlen(needle);
+    if (needle_size > text_size) return NULL;
+    for (offset = 0; offset + needle_size <= text_size; ++offset) {
+        size_t index;
+        for (index = 0; index < needle_size; ++index) {
+            if (tolower((unsigned char)text[offset + index]) !=
+                tolower((unsigned char)needle[index])) {
+                break;
+            }
+        }
+        if (index == needle_size) return text + offset;
+    }
+    return NULL;
+}
+
 static int ascii_starts_ci(const char *text, const char *prefix) {
     if (!text || !prefix) return 0;
     while (*prefix) {
@@ -85,6 +105,27 @@ int gd_setting_bool(const char *name, int default_value) {
     return default_value != 0;
 }
 
+float gd_setting_float(const char *name, float default_value,
+                       float minimum, float maximum) {
+    const char *value = name ? getenv(name) : NULL;
+    char *end = NULL;
+    float parsed;
+    if (minimum > maximum) {
+        const float temporary = minimum;
+        minimum = maximum;
+        maximum = temporary;
+    }
+    if (!value || !*value) parsed = default_value;
+    else {
+        parsed = strtof(value, &end);
+        if (end == value || *end != 0 || parsed != parsed)
+            parsed = default_value;
+    }
+    if (parsed < minimum) parsed = minimum;
+    if (parsed > maximum) parsed = maximum;
+    return parsed;
+}
+
 int gd_settings_hack_icons(void) {
     return gd_setting_bool("HACK_ICONS", 0);
 }
@@ -93,9 +134,17 @@ int gd_settings_full_bypass(void) {
     return gd_setting_bool("FULL_BYPASS", 1);
 }
 
+float gd_settings_music_pulse_max(void) {
+    return gd_setting_float("MUSIC_PULSE_MAX", 0.30f, 0.0f, 1.0f);
+}
+
 const char *gd_settings_server(void) {
     const char *value = getenv("GDPS_SERVER");
     return value && *value ? value : GD_DEFAULT_SERVER;
+}
+
+const char *gd_settings_official_song_url(void) {
+    return "https://www.boomlings.com/database/getGJSongInfo.php";
 }
 
 typedef struct {
@@ -136,8 +185,11 @@ static int parse_server_parts(GdServerParts *parts) {
     } else {
         strcpy(parts->base_path, "/database");
     }
-    snprintf(parts->host_header, sizeof(parts->host_header), "%s", cursor);
-    snprintf(parts->host, sizeof(parts->host), "%s", cursor);
+    if (strlen(cursor) >= sizeof(parts->host_header) ||
+        strlen(cursor) >= sizeof(parts->host))
+        return 0;
+    strcpy(parts->host_header, cursor);
+    strcpy(parts->host, cursor);
 
     /* Remove userinfo, then strip a numeric port for DNS resolution. */
     {
@@ -169,16 +221,45 @@ static int parse_server_parts(GdServerParts *parts) {
     return 1;
 }
 
+int gd_settings_server_is_official(void) {
+    GdServerParts server;
+    if (!parse_server_parts(&server)) return 0;
+    return (ascii_equal_ci(server.host, "www.boomlings.com") ||
+            ascii_equal_ci(server.host, "boomlings.com")) &&
+           ascii_equal_ci(server.base_path, "/database");
+}
+
+static const char *find_ascii_ci(const char *text, const char *needle) {
+    size_t needle_length;
+    const char *cursor;
+    if (!text || !needle || !*needle) return NULL;
+    needle_length = strlen(needle);
+    for (cursor = text; *cursor; ++cursor) {
+        size_t index;
+        for (index = 0; index < needle_length; ++index) {
+            if (!cursor[index] ||
+                tolower((unsigned char)cursor[index]) !=
+                    tolower((unsigned char)needle[index])) {
+                break;
+            }
+        }
+        if (index == needle_length) return cursor;
+    }
+    return NULL;
+}
+
 static int parse_api_url(const char *input, char *scheme, size_t scheme_size,
-                         char *host, size_t host_size, char *endpoint,
-                         size_t endpoint_size, const char **query) {
+                         char *host, size_t host_size, char *relative_path,
+                         size_t relative_size, const char **query) {
     const char *cursor;
     const char *host_end;
     const char *path;
-    const char *last_slash;
-    const char *query_start;
+    const char *database_marker;
+    const char *server_marker;
+    const char *relative_start;
+    const char *relative_end;
     size_t length;
-    if (!input || !scheme || !host || !endpoint || !query) return 0;
+    if (!input || !scheme || !host || !relative_path || !query) return 0;
     if (ascii_starts_ci(input, "https://")) {
         snprintf(scheme, scheme_size, "https");
         cursor = input + 8;
@@ -195,19 +276,31 @@ static int parse_api_url(const char *input, char *scheme, size_t scheme_size,
     memcpy(host, cursor, length);
     host[length] = 0;
     path = host_end;
-    query_start = strchr(path, '?');
-    *query = query_start;
-    last_slash = query_start ? query_start : path + strlen(path);
-    while (last_slash > path && last_slash[-1] != '/') --last_slash;
-    length = (size_t)((query_start ? query_start : path + strlen(path)) -
-                      last_slash);
-    if (!length || length >= endpoint_size) return 0;
-    memcpy(endpoint, last_slash, length);
-    endpoint[length] = 0;
-    if (length < 4 || !ascii_equal_ci(endpoint + length - 4, ".php")) return 0;
-    if (!ascii_contains_ci(path, "/database/") &&
-        !ascii_contains_ci(path, "/server/")) {
+    *query = strchr(path, '?');
+    database_marker = find_ascii_ci(path, "/database/");
+    server_marker = find_ascii_ci(path, "/server/");
+    if (database_marker && server_marker)
+        relative_start = database_marker < server_marker
+                             ? database_marker + strlen("/database/")
+                             : server_marker + strlen("/server/");
+    else if (database_marker)
+        relative_start = database_marker + strlen("/database/");
+    else if (server_marker)
+        relative_start = server_marker + strlen("/server/");
+    else
         return 0;
+    relative_end = *query ? *query : path + strlen(path);
+    if (relative_end <= relative_start) return 0;
+    length = (size_t)(relative_end - relative_start);
+    if (!length || length >= relative_size) return 0;
+    memcpy(relative_path, relative_start, length);
+    relative_path[length] = 0;
+    {
+        const char *filename = strrchr(relative_path, '/');
+        filename = filename ? filename + 1 : relative_path;
+        length = strlen(filename);
+        if (length < 4 || !ascii_equal_ci(filename + length - 4, ".php"))
+            return 0;
     }
     return 1;
 }
@@ -216,29 +309,34 @@ int gd_settings_rewrite_url(const char *input, char *output, size_t capacity) {
     GdServerParts server;
     char original_scheme[16];
     char original_host[512];
-    char endpoint[512];
+    char relative_path[1024];
     const char *query = NULL;
     const char *scheme;
+    const char *filename;
     int written;
     if (!output || !capacity) return -1;
     output[0] = 0;
     if (!parse_server_parts(&server) ||
         !parse_api_url(input, original_scheme, sizeof(original_scheme),
-                       original_host, sizeof(original_host), endpoint,
-                       sizeof(endpoint), &query)) {
+                       original_host, sizeof(original_host), relative_path,
+                       sizeof(relative_path), &query)) {
         return 0;
     }
-    /* Song metadata is an official Boomlings service even when gameplay,
-     * accounts, comments, and levels are routed to a GDPS. Keep this endpoint
-     * independent so its CDN URL can be returned and downloaded normally. */
-    if (ascii_equal_ci(endpoint, "getGJSongInfo.php")) {
-        written = snprintf(output, capacity,
-                           "https://www.boomlings.com/database/%s%s",
-                           endpoint, query ? query : "");
+    filename = strrchr(relative_path, '/');
+    filename = filename ? filename + 1 : relative_path;
+    /* A custom GDPS may provide its own song catalogue. Route song metadata to
+     * that server first; the transport layer validates the response and falls
+     * back to official HTTPS Boomlings when the custom endpoint is absent,
+     * returns -1, or emits an HTML/PHP proxy error. */
+    if (ascii_equal_ci(filename, "getGJSongInfo.php") &&
+        gd_settings_server_is_official()) {
+        written = snprintf(output, capacity, "%s%s",
+                           gd_settings_official_song_url(),
+                           query ? query : "");
     } else {
         scheme = server.scheme[0] ? server.scheme : original_scheme;
         written = snprintf(output, capacity, "%s://%s%s/%s%s", scheme,
-                           server.host_header, server.base_path, endpoint,
+                           server.host_header, server.base_path, relative_path,
                            query ? query : "");
     }
     if (written < 0 || (size_t)written >= capacity) {
@@ -295,13 +393,15 @@ int gd_settings_rewrite_http_request(const void *input, size_t input_size,
     const char *second_space;
     const char *query;
     const char *path_end;
-    const char *endpoint_start;
+    const char *relative_start;
+    const char *filename_start;
     const char *host_line = NULL;
     const char *host_line_end = NULL;
     GdServerParts server;
     char new_path[1536];
     size_t method_size;
-    size_t endpoint_size;
+    size_t relative_size;
+    size_t filename_size;
     size_t query_size;
     size_t new_path_size;
     size_t request_prefix_size;
@@ -345,25 +445,45 @@ int gd_settings_rewrite_http_request(const void *input, size_t input_size,
     }
     query = memchr(first_space + 1, '?',
                    (size_t)(path_end - first_space - 1));
-    endpoint_start = query ? query : path_end;
-    while (endpoint_start > first_space + 1 && endpoint_start[-1] != '/')
-        --endpoint_start;
-    endpoint_size = (size_t)((query ? query : path_end) - endpoint_start);
-    if (endpoint_size < 4 ||
-        tolower((unsigned char)endpoint_start[endpoint_size - 4]) != '.' ||
-        tolower((unsigned char)endpoint_start[endpoint_size - 3]) != 'p' ||
-        tolower((unsigned char)endpoint_start[endpoint_size - 2]) != 'h' ||
-        tolower((unsigned char)endpoint_start[endpoint_size - 1]) != 'p') {
+    {
+        const char *request_path = first_space + 1;
+        const size_t request_path_size =
+            (size_t)((query ? query : path_end) - request_path);
+        const char *database_marker = ascii_mem_find_ci(
+            request_path, request_path_size, "/database/");
+        const char *server_marker = ascii_mem_find_ci(
+            request_path, request_path_size, "/server/");
+        if (database_marker && server_marker)
+            relative_start = database_marker < server_marker
+                                 ? database_marker + strlen("/database/")
+                                 : server_marker + strlen("/server/");
+        else if (database_marker)
+            relative_start = database_marker + strlen("/database/");
+        else if (server_marker)
+            relative_start = server_marker + strlen("/server/");
+        else
+            return 0;
+    }
+    relative_size = (size_t)((query ? query : path_end) - relative_start);
+    filename_start = relative_start + relative_size;
+    while (filename_start > relative_start && filename_start[-1] != '/')
+        --filename_start;
+    filename_size = (size_t)(relative_start + relative_size - filename_start);
+    if (filename_size < 4 ||
+        tolower((unsigned char)filename_start[filename_size - 4]) != '.' ||
+        tolower((unsigned char)filename_start[filename_size - 3]) != 'p' ||
+        tolower((unsigned char)filename_start[filename_size - 2]) != 'h' ||
+        tolower((unsigned char)filename_start[filename_size - 1]) != 'p') {
         return 0;
     }
-    if (endpoint_size == strlen("getGJSongInfo.php") &&
-        ascii_mem_contains_ci(endpoint_start, endpoint_size,
+    if (filename_size == strlen("getGJSongInfo.php") &&
+        ascii_mem_contains_ci(filename_start, filename_size,
                               "getGJSongInfo.php")) {
-        return 0; /* handled by the official-song transport */
+        return 0; /* handled by the custom-first song transport */
     }
     query_size = query ? (size_t)(path_end - query) : 0;
     if (snprintf(new_path, sizeof(new_path), "%s/%.*s%.*s",
-                 server.base_path, (int)endpoint_size, endpoint_start,
+                 server.base_path, (int)relative_size, relative_start,
                  (int)query_size, query ? query : "") < 0) {
         return -1;
     }

@@ -8,8 +8,10 @@ extern "C" {
 #endif
 
 /*
- * Detects a complete plaintext HTTP getGJSongInfo.php request and performs it
- * through official HTTPS Boomlings. On success, returns 1 and provides a raw
+ * Detects a complete plaintext HTTP getGJSongInfo.php request. A configured
+ * GDPS song endpoint is tried first, then official HTTPS Boomlings is used when
+ * the custom response is missing, -1, HTML, or a PHP proxy error. On success,
+ * returns 1 and provides a raw
  * HTTP/1.1 response buffer allocated with malloc. Returns 0 for non-song
  * requests and -1 for a recognized song request that could not be completed.
  */
