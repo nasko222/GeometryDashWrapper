@@ -10,8 +10,10 @@
 ## Retained
 
 - all source required for the three wrapper backends;
+- shared storage, audio, APK-audio, network compatibility, and launch-settings
+  modules;
 - zlib and stb_vorbis source plus licenses;
-- the three small Dynarmic/Zig toolchain wrappers actually used by the build;
+- the Dynarmic/Zig toolchain wrappers used by the build;
 - concise current documentation and portable build scripts.
 
 ## Excluded
@@ -21,8 +23,11 @@
 - old bootstrap/performance/network-test notes, logs, audits, checksum reports,
   source-update bundles, generated executables, and build caches.
 
-## Unified1 fix1
+## Unified2 changes
 
-- fixes automatic detection of legacy APKs containing `lib/armeabi/libgame.so`;
-- makes x86 the documented and explicit first-priority architecture;
-- routes x86, legacy ARM, and ARMv7 to one root `dist-unified/save/` folder.
+- adds four editable root-BAT settings: GDPS server, icon unlock checks,
+  spin-off full-version bypass, and ARM-over-x86 override;
+- preserves x86 as the normal first-priority architecture;
+- shares settings parsing and API URL/request rewriting across the backends;
+- keeps one root `dist-unified/save/` folder;
+- keeps F2 removed and keeps normal/debug launch paths separate.

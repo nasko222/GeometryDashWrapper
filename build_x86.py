@@ -192,6 +192,7 @@ def main() -> int:
         root / "src/backends/x86/fmod_win.c",
         root / "src/shared/storage_win.c",
         root / "src/shared/net_compat_win.c",
+        root / "src/shared/runtime_settings.c",
         embedded_effects,
         root / "third_party/stb/stb_vorbis.c",
         *sorted((root / "third_party/zlib").glob("*.c")),

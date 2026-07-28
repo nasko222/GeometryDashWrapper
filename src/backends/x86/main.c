@@ -11,6 +11,7 @@
 #include "loader.h"
 #include "runtime.h"
 #include "build_info.h"
+#include "runtime_settings.h"
 
 typedef int (*JniOnLoadFunction)(void *java_vm, void *reserved);
 typedef void (*NativeSetApkPathFunction)(void *environment, void *object,
@@ -258,6 +259,102 @@ static void install_music_download_trace(const ElfImage *image) {
     } else {
         runtime_log("Song HTTP trace: skipped (unknown callback prologue)");
     }
+}
+
+static int patch_x86_code(void *target, const void *bytes, size_t size) {
+#if defined(__i386__)
+    DWORD old_protection;
+    DWORD ignored_protection;
+    if (!target || !bytes || !size ||
+        !VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &old_protection)) {
+        return 0;
+    }
+    memcpy(target, bytes, size);
+    FlushInstructionCache(GetCurrentProcess(), target, size);
+    VirtualProtect(target, size, old_protection, &ignored_protection);
+    return 1;
+#else
+    (void)target;
+    (void)bytes;
+    (void)size;
+    return 0;
+#endif
+}
+
+static int patch_x86_return_true(void *target) {
+    static const unsigned char code[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00, /* mov eax, 1 */
+        0xc3                          /* ret */
+    };
+    return patch_x86_code(target, code, sizeof(code));
+}
+
+static int patch_x86_tail_jump(void *source, void *destination) {
+#if defined(__i386__)
+    unsigned char code[5];
+    int32_t displacement;
+    if (!source || !destination) return 0;
+    code[0] = 0xe9;
+    displacement = (int32_t)((uintptr_t)destination -
+                             ((uintptr_t)source + sizeof(code)));
+    memcpy(code + 1, &displacement, sizeof(displacement));
+    return patch_x86_code(source, code, sizeof(code));
+#else
+    (void)source;
+    (void)destination;
+    return 0;
+#endif
+}
+
+static unsigned patch_x86_return_true_exports(
+    const ElfImage *image, const char *const *names, size_t count) {
+    unsigned patched = 0;
+    size_t index;
+    for (index = 0; index < count; ++index) {
+        void *target = elf_image_find_export(image, names[index]);
+        if (target && patch_x86_return_true(target)) {
+            runtime_log("Launch hack: return true patched %s", names[index]);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
+static void install_configurable_x86_hacks(const ElfImage *image) {
+    static const char *const icon_checks[] = {
+        "_ZN11GameManager14isIconUnlockedEi",
+        "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEib",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+    };
+    unsigned icon_patches = 0;
+    unsigned full_patches = 0;
+    if (gd_settings_hack_icons()) {
+        icon_patches = patch_x86_return_true_exports(
+            image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
+    }
+    if (gd_settings_full_bypass()) {
+        void *locked = elf_image_find_export(
+            image,
+            "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE");
+        void *editor = elf_image_find_export(
+            image, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
+        void *can_play = elf_image_find_export(
+            image, "_ZN12CreatorLayer19canPlayOnlineLevelsEv");
+        if (locked && editor && patch_x86_tail_jump(locked, editor)) {
+            runtime_log("Launch hack: CreatorLayer full-version button redirected");
+            ++full_patches;
+        }
+        if (can_play && patch_x86_return_true(can_play)) {
+            runtime_log("Launch hack: CreatorLayer canPlayOnlineLevels forced true");
+            ++full_patches;
+        }
+    }
+    runtime_log("Launch settings applied: server=%s hack-icons=%s patches=%u "
+                "full-bypass=%s patches=%u",
+                gd_settings_server(),
+                gd_settings_hack_icons() ? "true" : "false", icon_patches,
+                gd_settings_full_bypass() ? "true" : "false", full_patches);
 }
 
 static void pause_native_game(const char *reason) {
@@ -621,6 +718,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     runtime_log("RESULT: ELF_RELOCATION_OK");
+    install_configurable_x86_hacks(&image);
     if (mode == 0) {
         elf_image_unload(&image);
         runtime_shutdown();

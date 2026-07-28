@@ -23,6 +23,7 @@
 #include "runtime.h"
 #include "build_info.h"
 #include "net_compat_win.h"
+#include "runtime_settings.h"
 #include "fmod_win.h"
 #include "storage_win.h"
 #include "zlib.h"
@@ -1423,9 +1424,21 @@ static int shim_getaddrinfo(const char *node, const char *service,
         windows_hints.ai_socktype = hints->ai_socktype;
         windows_hints.ai_protocol = hints->ai_protocol;
     }
-    runtime_log("Network DNS: %s", node ? node : "<local>");
-    status = getaddrinfo(node, service, hints ? &windows_hints : NULL,
-                         &windows_result);
+    {
+        char override_host[512];
+        const char *lookup_node = node;
+        if (node && (!service || strcmp(service, "443") != 0) &&
+            gd_settings_override_dns_host(
+                node, override_host, sizeof(override_host))) {
+            lookup_node = override_host;
+            runtime_log("Network DNS override: %s -> %s", node, lookup_node);
+        } else {
+            runtime_log("Network DNS: %s", node ? node : "<local>");
+        }
+        status = getaddrinfo(lookup_node, service,
+                             hints ? &windows_hints : NULL,
+                             &windows_result);
+    }
     if (status != 0) {
         runtime_log("Network DNS failed: %d", status);
         return status;
@@ -2029,18 +2042,68 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
     return result;
 }
 
+static int send_rewritten_http_request(int descriptor, const void *buffer,
+                                       size_t length, int flags,
+                                       int *rewritten) {
+    void *replacement = NULL;
+    size_t replacement_size = 0;
+    size_t sent = 0;
+    int rewrite_result = gd_settings_rewrite_http_request(
+        buffer, length, &replacement, &replacement_size);
+    if (rewritten) *rewritten = 0;
+    if (rewrite_result <= 0) return 0;
+    if (rewritten) *rewritten = 1;
+    runtime_log("Network GDPS request rewrite: %s (%lu -> %lu bytes)",
+                gd_settings_server(), (unsigned long)length,
+                (unsigned long)replacement_size);
+    while (sent < replacement_size) {
+        int result = send((SOCKET)(uintptr_t)(uint32_t)descriptor,
+                          (const char *)replacement + sent,
+                          (int)(replacement_size - sent),
+                          flags & ~GD_ANDROID_MSG_NOSIGNAL);
+        if (result > 0) {
+            sent += (size_t)result;
+            continue;
+        }
+        if (result == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set writable;
+            struct timeval timeout;
+            SOCKET socket_value = (SOCKET)(uintptr_t)(uint32_t)descriptor;
+            FD_ZERO(&writable);
+            FD_SET(socket_value, &writable);
+            timeout.tv_sec = 15;
+            timeout.tv_usec = 0;
+            {
+                int ready = select(0, NULL, &writable, NULL, &timeout);
+                if (ready > 0) continue;
+                if (ready == 0) WSASetLastError(WSAETIMEDOUT);
+            }
+        }
+        free(replacement);
+        return -1;
+    }
+    free(replacement);
+    return (int)length;
+}
+
 static int shim_send(int descriptor, const void *buffer, size_t length, int flags) {
     static LONG error_count;
     int result;
+    int rewritten = 0;
     if (length > INT_MAX) length = INT_MAX;
-    result = send((SOCKET)(uintptr_t)(uint32_t)descriptor, (const char *)buffer,
-                  (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL);
+    result = send_rewritten_http_request(descriptor, buffer, length, flags,
+                                         &rewritten);
+    if (!rewritten) {
+        result = send((SOCKET)(uintptr_t)(uint32_t)descriptor,
+                      (const char *)buffer, (int)length,
+                      flags & ~GD_ANDROID_MSG_NOSIGNAL);
+    }
     if (result > 0) {
         socket_trace_traffic(descriptor, buffer, (size_t)result, 1);
         trace_http_request(descriptor, buffer, result);
         return result;
     }
-    if (result == SOCKET_ERROR) {
+    if (result == SOCKET_ERROR || (rewritten && result < 0)) {
         int windows_error = WSAGetLastError();
         int android_error = gd_net_wsa_error_to_android(windows_error);
         LONG trace = InterlockedIncrement(&error_count);
@@ -2066,34 +2129,79 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
     if (getsockopt((SOCKET)(uintptr_t)(uint32_t)descriptor, SOL_SOCKET,
                    SO_TYPE, (char *)&socket_type,
                    &socket_type_length) == 0) {
-        WSABUF *buffers;
-        DWORD sent = 0;
+        size_t total_length = 0;
+        int can_flatten = 1;
         int index;
-        int status;
-        buffers = (WSABUF *)calloc((size_t)vector_count, sizeof(*buffers));
-        if (!buffers && vector_count) {
-            g_errno_value = 12;
-            return -1;
-        }
+
+        /* HTTP libraries commonly split the request line, headers, and body
+         * across iovecs. Flatten a bounded request so the shared GDPS rewrite
+         * applies to writev just as it does to send(). */
         for (index = 0; index < vector_count; ++index) {
-            buffers[index].buf = (char *)vectors[index].base;
-            buffers[index].len = vectors[index].length;
+            size_t length = vectors[index].length;
+            if (length > SIZE_MAX - total_length) {
+                can_flatten = 0;
+                break;
+            }
+            total_length += length;
         }
-        status = WSASend((SOCKET)(uintptr_t)(uint32_t)descriptor, buffers,
-                         (DWORD)vector_count, &sent, 0, NULL, NULL);
-        free(buffers);
-        if (status == SOCKET_ERROR) return set_socket_error();
-        if (sent) {
-            size_t remaining = sent;
-            for (index = 0; index < vector_count && remaining; ++index) {
-                size_t count = vectors[index].length;
-                if (count > remaining) count = remaining;
-                socket_trace_traffic(descriptor, vectors[index].base, count,
-                                     1);
-                remaining -= count;
+        if (can_flatten && total_length <= 16u * 1024u * 1024u) {
+            unsigned char *joined = NULL;
+            size_t offset = 0;
+            int rewritten = 0;
+            int rewrite_result;
+            if (total_length) {
+                joined = (unsigned char *)malloc(total_length);
+                if (!joined) {
+                    g_errno_value = 12;
+                    return -1;
+                }
+                for (index = 0; index < vector_count; ++index) {
+                    memcpy(joined + offset, vectors[index].base,
+                           vectors[index].length);
+                    offset += vectors[index].length;
+                }
+            }
+            rewrite_result = send_rewritten_http_request(
+                descriptor, joined, total_length, 0, &rewritten);
+            free(joined);
+            if (rewritten) {
+                if (rewrite_result < 0) return set_socket_error();
+                for (index = 0; index < vector_count; ++index) {
+                    socket_trace_traffic(descriptor, vectors[index].base,
+                                         vectors[index].length, 1);
+                }
+                return rewrite_result;
             }
         }
-        return sent > INT_MAX ? INT_MAX : (int)sent;
+        {
+            WSABUF *buffers;
+            DWORD sent = 0;
+            int status;
+            buffers = (WSABUF *)calloc((size_t)vector_count, sizeof(*buffers));
+            if (!buffers && vector_count) {
+                g_errno_value = 12;
+                return -1;
+            }
+            for (index = 0; index < vector_count; ++index) {
+                buffers[index].buf = (char *)vectors[index].base;
+                buffers[index].len = vectors[index].length;
+            }
+            status = WSASend((SOCKET)(uintptr_t)(uint32_t)descriptor, buffers,
+                             (DWORD)vector_count, &sent, 0, NULL, NULL);
+            free(buffers);
+            if (status == SOCKET_ERROR) return set_socket_error();
+            if (sent) {
+                size_t remaining = sent;
+                for (index = 0; index < vector_count && remaining; ++index) {
+                    size_t count = vectors[index].length;
+                    if (count > remaining) count = remaining;
+                    socket_trace_traffic(descriptor, vectors[index].base,
+                                         count, 1);
+                    remaining -= count;
+                }
+            }
+            return sent > INT_MAX ? INT_MAX : (int)sent;
+        }
     }
     {
         int total = 0;
@@ -2125,7 +2233,8 @@ static int shim_recvfrom(int descriptor, void *buffer, size_t length, int flags,
     if (result == SOCKET_ERROR) return set_socket_error();
     if (address && address_length) {
         gd_net_sockaddr_from_host(address, address_length,
-                             (struct sockaddr *)&storage, windows_length);
+                                  (struct sockaddr *)&storage,
+                                  windows_length);
     }
     return result;
 }

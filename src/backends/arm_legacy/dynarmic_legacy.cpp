@@ -58,6 +58,7 @@ extern "C" {
 #include "storage_win.h"
 #include "audio_win.h"
 #include "net_compat_win.h"
+#include "runtime_settings.h"
 #include "build_info.h"
 }
 
@@ -1157,6 +1158,87 @@ static void InstallThumbInlineSvcHookPreservingArguments(
     env.MemoryWrite32(address + 4u, 0xEF000000u | (record->svc & 0x00FFFFFFu));
     env.MemoryWrite32(address + 8u, 0xE12FFF1Eu); // bx lr
     record->inline_resume_address = address + 8u;
+}
+
+static bool PatchArmFunctionReturnTrue(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& symbol) {
+    const u32 address = symbol.address & ~1u;
+    if (address < runtime.image_min || address >= runtime.image_max) return false;
+    if (symbol.address & 1u) {
+        if (symbol.size < 4u || address > runtime.image_max - 4u) return false;
+        env.MemoryWrite16(address + 0u, 0x2001u); // movs r0, #1
+        env.MemoryWrite16(address + 2u, 0x4770u); // bx lr
+        return true;
+    }
+    if (symbol.size < 8u || address > runtime.image_max - 8u) return false;
+    env.MemoryWrite32(address + 0u, 0xE3A00001u); // mov r0, #1
+    env.MemoryWrite32(address + 4u, 0xE12FFF1Eu); // bx lr
+    return true;
+}
+
+static bool PatchArmFunctionTailJump(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& source, const SymbolRecord& destination) {
+    const u32 address = source.address & ~1u;
+    const u32 target = destination.address;
+    if (address < runtime.image_min || address >= runtime.image_max) return false;
+    if (source.address & 1u) {
+        if ((address & 3u) == 0u) {
+            if (source.size < 8u || address > runtime.image_max - 8u) return false;
+            env.MemoryWrite16(address + 0u, 0x4B00u); // ldr r3, [pc, #0]
+            env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+            env.MemoryWrite32(address + 4u, target);
+            return true;
+        }
+        if (source.size < 10u || address > runtime.image_max - 10u) return false;
+        env.MemoryWrite16(address + 0u, 0x4B01u); // ldr r3, [pc, #4]
+        env.MemoryWrite16(address + 2u, 0x4718u); // bx r3
+        env.MemoryWrite16(address + 4u, 0x46C0u); // nop
+        env.MemoryWrite32(address + 6u, target);
+        return true;
+    }
+    if (source.size < 8u || address > runtime.image_max - 8u) return false;
+    env.MemoryWrite32(address + 0u, 0xE51FF004u); // ldr pc, [pc, #-4]
+    env.MemoryWrite32(address + 4u, target & ~1u);
+    return true;
+}
+
+static std::size_t InstallConfigurableIconUnlockHooks(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    static constexpr const char* symbols[] = {
+        "_ZN11GameManager14isIconUnlockedEi",
+        "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEib",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+    };
+    if (!gd_settings_hack_icons()) return 0u;
+    std::size_t patched = 0u;
+    for (const char* name : symbols) {
+        const SymbolRecord* symbol = FindSymbol(runtime, name);
+        if (symbol && PatchArmFunctionReturnTrue(env, runtime, *symbol))
+            ++patched;
+    }
+    return patched;
+}
+
+static std::size_t InstallConfigurableCreatorBypass(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    if (!gd_settings_full_bypass()) return 0u;
+    std::size_t patched = 0u;
+    const SymbolRecord* locked = FindSymbol(
+        runtime,
+        "_ZN12CreatorLayer17onOnlyFullVersionEPN7cocos2d8CCObjectE");
+    const SymbolRecord* editor = FindSymbol(
+        runtime, "_ZN12CreatorLayer10onMyLevelsEPN7cocos2d8CCObjectE");
+    const SymbolRecord* can_play = FindSymbol(
+        runtime, "_ZN12CreatorLayer19canPlayOnlineLevelsEv");
+    if (locked && editor &&
+        PatchArmFunctionTailJump(env, runtime, *locked, *editor))
+        ++patched;
+    if (can_play && PatchArmFunctionReturnTrue(env, runtime, *can_play))
+        ++patched;
+    return patched;
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -4465,46 +4547,67 @@ private:
             return static_cast<u32>(-1);
         }
 
-        const int host_length = static_cast<int>(std::min<u32>(length, INT_MAX));
-        int code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
-        int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
+        void* rewritten_buffer = nullptr;
+        std::size_t rewritten_size = 0u;
+        const int rewritten = gd_settings_rewrite_http_request(
+            data, length, &rewritten_buffer, &rewritten_size);
+        ScopeExit release_rewrite([&] {
+            if (rewritten_buffer) std::free(rewritten_buffer);
+        });
+        const char* send_data = rewritten > 0
+            ? static_cast<const char*>(rewritten_buffer) : data;
+        const std::size_t send_size = rewritten > 0 ? rewritten_size : length;
+        if (rewritten > 0 && network_log_count_++ < 128u)
+            log_ << "[host] GDPS request rewrite server="
+                 << gd_settings_server() << " bytes=" << length << "->"
+                 << send_size << '\n';
 
-        // A nonblocking socket can become temporarily unwritable after libcurl
-        // queues headers/body. Wait for Windows to report it writable and retry
-        // once rather than leaking WSAEWOULDBLOCK through the old Android curl.
-        if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
-            fd_set writable{};
-            fd_set exceptional{};
-            FD_ZERO(&writable);
-            FD_ZERO(&exceptional);
-            FD_SET(socket_value, &writable);
-            FD_SET(socket_value, &exceptional);
-            timeval timeout{};
-            timeout.tv_sec = 15;
-            const int ready = ::select(0, nullptr, &writable, &exceptional, &timeout);
-            if (ready > 0 && FD_ISSET(socket_value, &writable) && !FD_ISSET(socket_value, &exceptional)) {
-                code = ::send(socket_value, data, host_length, HostMessageFlags(flags));
-                error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
-            } else if (ready == 0) {
-                SetGuestErrno(11);
-                return static_cast<u32>(-1);
-            } else if (ready == SOCKET_ERROR) {
-                error = WSAGetLastError();
+        std::size_t sent = 0u;
+        int error = 0;
+        while (sent < send_size) {
+            const int chunk = static_cast<int>(std::min<std::size_t>(
+                send_size - sent, static_cast<std::size_t>(INT_MAX)));
+            int code = ::send(socket_value, send_data + sent, chunk,
+                              HostMessageFlags(flags));
+            if (code > 0) {
+                sent += static_cast<std::size_t>(code);
+                if (rewritten <= 0) break; // preserve normal POSIX partial-send behavior
+                continue;
             }
+            error = code == SOCKET_ERROR ? WSAGetLastError() : WSAECONNRESET;
+            if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
+                fd_set writable{};
+                fd_set exceptional{};
+                FD_ZERO(&writable);
+                FD_ZERO(&exceptional);
+                FD_SET(socket_value, &writable);
+                FD_SET(socket_value, &exceptional);
+                timeval timeout{};
+                timeout.tv_sec = 15;
+                const int ready = ::select(
+                    0, nullptr, &writable, &exceptional, &timeout);
+                if (ready > 0 && FD_ISSET(socket_value, &writable) &&
+                    !FD_ISSET(socket_value, &exceptional)) {
+                    continue;
+                }
+                if (ready == 0) error = WSAETIMEDOUT;
+                else if (ready == SOCKET_ERROR) error = WSAGetLastError();
+            }
+            SetGuestErrno(MapWsaError(error));
+            if (network_log_count_++ < 128u)
+                log_ << "[host] Socket send failed fd=" << guest_fd
+                     << " wsa=" << error << " errno=" << MapWsaError(error)
+                     << '\n';
+            return static_cast<u32>(-1);
         }
 
-        if (code >= 0) {
-            if (socket_send_logged_.insert(guest_fd).second)
-                log_ << "[host] Socket first send fd=" << guest_fd << " bytes=" << code << '\n';
-            SetGuestErrno(0);
-            return static_cast<u32>(code);
-        }
-        SetGuestErrno(MapWsaError(error));
-        if (network_log_count_++ < 128u)
-            log_ << "[host] Socket send failed fd=" << guest_fd << " wsa=" << error
-                 << " errno=" << MapWsaError(error) << '\n';
-        return static_cast<u32>(-1);
+        if (socket_send_logged_.insert(guest_fd).second)
+            log_ << "[host] Socket first send fd=" << guest_fd << " bytes="
+                 << (rewritten > 0 ? length : sent) << '\n';
+        SetGuestErrno(0);
+        return static_cast<u32>(rewritten > 0 ? length : sent);
     }
+
     u32 GuestReceive(u32 guest_fd, u32 buffer, u32 length, u32 flags) {
         const SOCKET socket_value = FindHostSocket(guest_fd);
         char* data = static_cast<char*>(env_.HostPointer(buffer, length));
@@ -4824,10 +4927,21 @@ private:
             hints = &host_hints;
         }
         addrinfo* host_results = nullptr;
-        const int code = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
-                                       service.empty() ? nullptr : service.c_str(), hints, &host_results);
+        char override_host[512]{};
+        const char* lookup_node = node.empty() ? nullptr : node.c_str();
+        if (lookup_node && service != "443" &&
+            gd_settings_override_dns_host(
+                lookup_node, override_host, sizeof(override_host))) {
+            lookup_node = override_host;
+        }
+        const int code = ::getaddrinfo(
+            lookup_node, service.empty() ? nullptr : service.c_str(), hints,
+            &host_results);
         if (network_log_count_++ < 64u) {
             log_ << "[host] DNS getaddrinfo node=" << (node.empty() ? "<null>" : node)
+                 << (lookup_node && lookup_node != node.c_str()
+                         ? std::string(" override=") + lookup_node
+                         : std::string())
                  << " service=" << (service.empty() ? "<null>" : service)
                  << " result=" << code << '\n';
         }
@@ -6115,7 +6229,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified1-fix1 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified2 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6355,6 +6469,10 @@ int main(int argc,char** argv) {
         if(audio_effect_hooks!=2u)
             throw std::runtime_error(
                 "required SimpleAudioEngine effect hooks were not found");
+        const std::size_t icon_unlock_hooks =
+            InstallConfigurableIconUnlockHooks(runtime, env);
+        const std::size_t creator_bypass_hooks =
+            InstallConfigurableCreatorBypass(runtime, env);
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6390,6 +6508,13 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_SIMPLEAUDIO_EFFECT_HOOKS_READY count="+
              std::to_string(audio_effect_hooks)+
              " play=direct-host preload=direct-host async-worker=1");
+        emit("RESULT: UNIFIED_LAUNCH_SETTINGS server=" +
+             std::string(gd_settings_server()) +
+             " hack-icons=" + (gd_settings_hack_icons() ? "true" : "false") +
+             " icon-hooks=" + std::to_string(icon_unlock_hooks) +
+             " full-bypass=" +
+             (gd_settings_full_bypass() ? "true" : "false") +
+             " bypass-hooks=" + std::to_string(creator_bypass_hooks));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+

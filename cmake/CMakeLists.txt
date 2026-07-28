@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashWrapperUnified1 LANGUAGES C CXX)
+project(GeometryDashWrapperUnified2 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -28,6 +28,7 @@ set(GD_SHARED_SOURCES
     "${GD_ROOT}/src/shared/apk_extract_audio.c"
     "${GD_ROOT}/src/shared/embedded_effects_stub.c"
     "${GD_ROOT}/src/shared/net_compat_win.c"
+    "${GD_ROOT}/src/shared/runtime_settings.c"
     "${GD_ROOT}/third_party/stb/stb_vorbis.c"
     "${GD_ROOT}/third_party/zlib/adler32.c"
     "${GD_ROOT}/third_party/zlib/compress.c"

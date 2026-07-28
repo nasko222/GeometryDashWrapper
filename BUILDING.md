@@ -1,4 +1,4 @@
-# Building 0.9.5-unified1-fix1
+# Building 0.9.5-unified2
 
 Use 64-bit Windows 10/11 with Python 3 and Git for Windows. The command files
 download portable Zig, CMake, Ninja, Boost, and the pinned Dynarmic revision into
@@ -24,14 +24,16 @@ dist-unified/
   run_auto.py
 ```
 
-Place the APK at `dist-unified/game.apk` and run `RUN_AUTO.cmd`. Native x86 is
-always selected first when the APK also includes ARM libraries.
+Open `dist-unified/RUN_AUTO.cmd` to configure `GDPS_SERVER`, `HACK_ICONS`,
+`FULL_BYPASS`, and `OVERRIDE_ARM`. Native x86 remains first priority unless
+`OVERRIDE_ARM=true` and the APK contains a supported ARM library.
 
 ## Individual builds
 
 - `BUILD_X86.cmd [optional-x86-apk]`
 - `BUILD_DYNARMIC.cmd`
 
-The generated backend-specific `RUN.cmd` files also execute from the
-`dist-unified` root and therefore use the same `save/` folder and root
-`game.apk`.
+The generated backend-specific `RUN.cmd` files execute from the `dist-unified`
+root and therefore use the same `save/` folder and root `game.apk`. Direct
+backend launchers use safe defaults from the runtime: official Boomlings API,
+icon hack disabled, and full-version bypass enabled.

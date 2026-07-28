@@ -67,6 +67,7 @@ extern "C" {
 #include "storage_win.h"
 #include "audio_win.h"
 #include "net_compat_win.h"
+#include "runtime_settings.h"
 #include "build_info.h"
 }
 
@@ -1872,6 +1873,36 @@ static std::size_t InstallV22InflateMemoryHook(ElfRuntime& runtime,
     return 1u;
 }
 
+static bool PatchV22FunctionReturnTrue(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& symbol) {
+    const u32 address = symbol.address & ~1u;
+    if ((symbol.address & 1u) == 0u || symbol.size < 4u ||
+        address < runtime.image_min || address > runtime.image_max - 4u)
+        return false;
+    env.MemoryWrite16(address + 0u, 0x2001u); // movs r0, #1
+    env.MemoryWrite16(address + 2u, 0x4770u); // bx lr
+    return true;
+}
+
+static std::size_t InstallV22ConfigurableIconUnlockHooks(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    static constexpr const char* symbols[] = {
+        "_ZN11GameManager14isIconUnlockedEi",
+        "_ZN11GameManager14isIconUnlockedEi8IconType",
+        "_ZN11GameManager15isColorUnlockedEib",
+        "_ZN11GameManager15isColorUnlockedEi10UnlockType",
+    };
+    if (!gd_settings_hack_icons()) return 0u;
+    std::size_t patched = 0u;
+    for (const char* name : symbols) {
+        const SymbolRecord* symbol = FindSymbol(runtime, name);
+        if (symbol && PatchV22FunctionReturnTrue(env, runtime, *symbol))
+            ++patched;
+    }
+    return patched;
+}
+
 static std::size_t InstallV22CanPlayOnlineLevelsForceTrue(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     static constexpr const char* kSymbol =
@@ -1883,12 +1914,7 @@ static std::size_t InstallV22CanPlayOnlineLevelsForceTrue(
     if (address < runtime.image_min || address > runtime.image_max - 4u)
         throw std::runtime_error(
             "CreatorLayer::canPlayOnlineLevels is outside the image");
-    // Exact behavior used by the APK's companion libgame.so hook:
-    //   movs r0,#1
-    //   bx   lr
-    env.MemoryWrite16(address + 0u, 0x2001u);
-    env.MemoryWrite16(address + 2u, 0x4770u);
-    return 1u;
+    return PatchV22FunctionReturnTrue(env, runtime, *target) ? 1u : 0u;
 }
 
 static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
@@ -4343,22 +4369,35 @@ private:
               std::to_string(job.body.size()) + " headers=" +
               std::to_string(job.headers.size()));
 
+        std::string configured_url = job.url;
+        std::array<char, 2048> rewritten_url{};
+        const int server_rewrite = gd_settings_rewrite_url(
+            job.url.c_str(), rewritten_url.data(), rewritten_url.size());
+        if (server_rewrite > 0) {
+            configured_url = rewritten_url.data();
+            trace("stage=server-policy original=\"" +
+                  SanitizeLogText(job.url) + "\" effective=\"" +
+                  SanitizeLogText(configured_url) + "\" base=\"" +
+                  SanitizeLogText(gd_settings_server()) + "\"");
+        }
+
         std::vector<std::string> attempts;
-        if (NativeHttpIsPlainHttpUrl(job.url)) {
-            attempts.push_back(NativeHttpHttpsVariant(job.url));
-            attempts.push_back(job.url);
+        if (NativeHttpIsPlainHttpUrl(configured_url)) {
+            attempts.push_back(NativeHttpHttpsVariant(configured_url));
+            attempts.push_back(configured_url);
             trace("stage=url-policy original=\"" +
                   SanitizeLogText(job.url) +
                   "\" primary=\"" +
                   SanitizeLogText(attempts.front()) +
                   "\" fallback=\"" +
                   SanitizeLogText(attempts.back()) +
-                  "\" reason=generic-https-first-preserve-host");
+                  "\" reason=generic-https-first-preserve-configured-host");
         } else {
-            attempts.push_back(job.url);
+            attempts.push_back(configured_url);
             trace("stage=url-policy original=\"" +
                   SanitizeLogText(job.url) +
-                  "\" primary=original reason=already-secure-or-non-http");
+                  "\" primary=\"" + SanitizeLogText(configured_url) +
+                  "\" reason=already-secure-or-non-http");
         }
 
         NativeHttpResult final_result;
@@ -10834,7 +10873,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified1-fix1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified2 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11312,13 +11351,12 @@ int main(int argc,char** argv) {
         if(inflate_hooks!=1u)
             throw std::runtime_error(
                 "required cocos2d ZipUtils::ccInflateMemory hook was not found");
-        const std::size_t can_play_unlocks =
-            InstallV22CanPlayOnlineLevelsForceTrue(runtime, env);
-        if (can_play_unlocks != 1u)
-            throw std::runtime_error(
-                "required CreatorLayer::canPlayOnlineLevels symbol was not found");
-        const std::size_t editor_redirects =
-            InstallV22CreatorEditorUnlock(runtime, env);
+        const std::size_t icon_unlock_hooks =
+            InstallV22ConfigurableIconUnlockHooks(runtime, env);
+        const std::size_t can_play_unlocks = gd_settings_full_bypass()
+            ? InstallV22CanPlayOnlineLevelsForceTrue(runtime, env) : 0u;
+        const std::size_t editor_redirects = gd_settings_full_bypass()
+            ? InstallV22CreatorEditorUnlock(runtime, env) : 0u;
         const std::size_t prepare_bridges =
             InstallV22PrepareLevelBridge(runtime, env);
         if (prepare_bridges != 1u)
@@ -11398,12 +11436,20 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_LOW_LEVEL_INFLATE_HOOK_READY count="+
              std::to_string(inflate_hooks)+
              " codec=gzip+zlib+raw original-cpp-decompress=1 hidden-sret=guest-native");
-        emit("RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE count="+
-             std::to_string(can_play_unlocks)+
-             " source=companion-libgame-compatible");
-        emit("RESULT: DYNARMIC_V22_CREATOR_EDITOR_REDIRECT_FALLBACK count="+
-             std::to_string(editor_redirects)+
+        emit("RESULT: DYNARMIC_V22_CAN_PLAY_ONLINE_LEVELS_FORCE_TRUE enabled="+
+             std::string(gd_settings_full_bypass() ? "1" : "0")+
+             " count="+std::to_string(can_play_unlocks)+
+             " source=configurable-launch-setting");
+        emit("RESULT: DYNARMIC_V22_CREATOR_EDITOR_REDIRECT_FALLBACK enabled="+
+             std::string(gd_settings_full_bypass() ? "1" : "0")+
+             " count="+std::to_string(editor_redirects)+
              " redirect=onOnlyFullVersion->onMyLevels");
+        emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
+             std::string(gd_settings_server())+
+             " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+
+             " icon-hooks="+std::to_string(icon_unlock_hooks)+
+             " full-bypass="+
+             (gd_settings_full_bypass() ? "true" : "false"));
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
