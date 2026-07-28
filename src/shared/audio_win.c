@@ -1050,15 +1050,27 @@ static EffectSlot *find_effect(unsigned identifier) {
 }
 
 void audio_initialize(const char *executable_directory) {
-    snprintf(g_audio_directory, sizeof(g_audio_directory), "%s\\audio",
-             executable_directory ? executable_directory : ".");
-    snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
-             "%s\\save\\audio-cache",
-             executable_directory ? executable_directory : ".");
-    snprintf(g_save_directory, sizeof(g_save_directory), "%s\\save",
-             executable_directory ? executable_directory : ".");
-    snprintf(g_apk_path, sizeof(g_apk_path), "%s\\game.apk",
-             executable_directory ? executable_directory : ".");
+    const char *configured_save = getenv("GD_SAVE_DIR");
+    const char *base = executable_directory ? executable_directory : ".";
+
+    snprintf(g_audio_directory, sizeof(g_audio_directory), "%s\\audio", base);
+
+    /*
+     * The native launcher selects a package/version/backend save profile.
+     * Honour it immediately instead of briefly creating x86\save or an ARM
+     * backend-local cache before audio_set_writable_directory() runs.
+     */
+    if (configured_save && configured_save[0]) {
+        snprintf(g_save_directory, sizeof(g_save_directory), "%s",
+                 configured_save);
+        snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
+                 "%s\\audio-cache", configured_save);
+    } else {
+        snprintf(g_save_directory, sizeof(g_save_directory), "%s\\save", base);
+        snprintf(g_audio_cache_directory, sizeof(g_audio_cache_directory),
+                 "%s\\save\\audio-cache", base);
+    }
+    snprintf(g_apk_path, sizeof(g_apk_path), "%s\\game.apk", base);
     CreateDirectoryA(g_audio_cache_directory, NULL);
     InterlockedExchange(&g_effect_log_count, 0);
     InterlockedExchange(&g_next_effect_identifier, 0);

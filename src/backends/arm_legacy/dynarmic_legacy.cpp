@@ -1179,6 +1179,41 @@ static bool PatchArmFunctionReturnFalse(
     return true;
 }
 
+static bool PatchArmFunctionReturnVoid(
+    ProbeEnvironment& env, const ElfRuntime& runtime,
+    const SymbolRecord& symbol) {
+    const u32 address = symbol.address & ~1u;
+    if (address < runtime.image_min || address >= runtime.image_max) return false;
+    if (symbol.address & 1u) {
+        if (symbol.size < 2u || address > runtime.image_max - 2u) return false;
+        env.MemoryWrite16(address, 0x4770u); // bx lr
+        return true;
+    }
+    if (symbol.size < 4u || address > runtime.image_max - 4u) return false;
+    env.MemoryWrite32(address, 0xE12FFF1Eu); // bx lr
+    return true;
+}
+
+static std::size_t InstallLegacyPauseButtonPatch(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    static constexpr std::array<std::string_view, 2> names = {
+        "_ZN7UILayer7onPauseEv",
+        "_ZN7UILayer7onPauseEPN7cocos2d8CCObjectE",
+    };
+    std::size_t patched = 0u;
+    if (!gd_settings_disable_pause_button()) return 0u;
+    for (const SymbolRecord& symbol : runtime.symbols) {
+        for (std::string_view name : names) {
+            if (symbol.name == name &&
+                PatchArmFunctionReturnVoid(env, runtime, symbol)) {
+                ++patched;
+                break;
+            }
+        }
+    }
+    return patched;
+}
+
 static bool PatchArmFunctionTailJump(
     ProbeEnvironment& env, const ElfRuntime& runtime,
     const SymbolRecord& source, const SymbolRecord& destination) {
@@ -1729,7 +1764,10 @@ public:
             (GetSystemMetrics(SM_CXSCREEN) - window_width) / 2);
         const int window_y = std::max(0,
             (GetSystemMetrics(SM_CYSCREEN) - window_height) / 2);
-        window_ = CreateWindowExA(0, class_name, "Geometry Dash - Unified Legacy ARM",
+        const char* configured_title = std::getenv("GD_GAME_TITLE");
+        const char* window_title = configured_title && *configured_title
+            ? configured_title : "Geometry Dash";
+        window_ = CreateWindowExA(0, class_name, window_title,
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                   window_x, window_y, window_width, window_height,
                                   nullptr, nullptr, instance_, this);
@@ -6440,7 +6478,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified7-fix4-native-stabilization legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified7-fix5-stabilization legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6698,6 +6736,8 @@ int main(int argc,char** argv) {
         const GraphicsPatchCounts graphics_patches =
             InstallHighestGraphicsHooks(runtime, env,
                                         effective_highest_graphics);
+        const std::size_t pause_button_patches =
+            InstallLegacyPauseButtonPatch(runtime, env);
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6750,7 +6790,12 @@ int main(int argc,char** argv) {
              " low-memory-hooks=" +
              std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
-             std::to_string(gd_settings_music_pulse_max()));
+             std::to_string(gd_settings_music_pulse_max()) +
+             " disable-pause=" +
+             (gd_settings_disable_pause_button() ? "true" : "false") +
+             " pause-patches=" + std::to_string(pause_button_patches) +
+             " hide-cursor=" +
+             (gd_settings_hide_cursor_during_play() ? "true" : "false"));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+

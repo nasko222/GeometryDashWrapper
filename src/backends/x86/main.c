@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "jni_shim.h"
@@ -29,6 +30,7 @@ typedef void (*NativeInsertTextFunction)(void *environment, void *object,
                                          void *text);
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
+typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
 
 typedef struct {
     HWND window;
@@ -56,6 +58,14 @@ typedef struct {
     int native_paused;
     int window_active;
     int closing;
+    int vsync_enabled;
+    int hide_cursor_option;
+    int cursor_hidden;
+    int cursor_force_visible;
+    ULONGLONG cursor_hide_after;
+    ULONGLONG gameplay_cache_time;
+    int gameplay_cache_value;
+    GameManagerSharedStateFunction game_manager_shared_state;
 } GameHost;
 
 static GameHost g_host;
@@ -444,6 +454,24 @@ static unsigned patch_x86_world_creator_buttons(const ElfImage *image) {
     return 0;
 }
 
+static unsigned install_pc_pause_button_patch(const ElfImage *image) {
+    static const char *const names[] = {
+        "_ZN7UILayer7onPauseEv",
+        "_ZN7UILayer7onPauseEPN7cocos2d8CCObjectE",
+    };
+    unsigned patched = 0;
+    size_t index;
+    if (!gd_settings_disable_pause_button()) return 0;
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
+        void *target = elf_image_find_export(image, names[index]);
+        if (target && patch_x86_return_void(target)) {
+            runtime_log("PC gameplay: disabled touch pause callback %s", names[index]);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
 static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
@@ -485,6 +513,7 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     unsigned low_memory_patches = 0;
     unsigned texture_quality_patches = 0;
     unsigned world_creator_patches = 0;
+    unsigned pause_button_patches = 0;
     size_t index;
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
@@ -520,6 +549,11 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             }
         }
     }
+    pause_button_patches = install_pc_pause_button_patch(image);
+    runtime_log("PC gameplay settings: disable-pause=%s patches=%u hide-cursor=%s",
+                gd_settings_disable_pause_button() ? "true" : "false",
+                pause_button_patches,
+                gd_settings_hide_cursor_during_play() ? "true" : "false");
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
                 "highest-graphics=%s hd=%u low-memory=%u texture-quality=%u "
@@ -532,6 +566,99 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
                 high_graphics_patches, low_memory_patches,
                 texture_quality_patches, world_creator_patches,
                 gd_settings_music_pulse_max());
+}
+
+/*
+ * Detect a live PlayLayer without hard-coding a GameManager field offset.
+ * Android x86 builds use the Itanium C++ ABI: object[0] is a vtable,
+ * vtable[-1] is type_info, and type_info[1] points to the class name.
+ */
+static int memory_range_is_readable(const void *address, size_t size) {
+    MEMORY_BASIC_INFORMATION memory;
+    uintptr_t begin = (uintptr_t)address;
+    uintptr_t end;
+    if (!address || size == 0 || begin > UINTPTR_MAX - size) return 0;
+    end = begin + size;
+    while (begin < end) {
+        uintptr_t region_end;
+        if (!VirtualQuery((const void *)begin, &memory, sizeof(memory)) ||
+            memory.State != MEM_COMMIT ||
+            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
+        region_end = (uintptr_t)memory.BaseAddress + memory.RegionSize;
+        if (region_end <= begin) return 0;
+        begin = region_end < end ? region_end : end;
+    }
+    return 1;
+}
+
+static int object_type_contains(const void *object, const char *needle) {
+    const void *vtable;
+    const void *type_info;
+    const char *name;
+    size_t index;
+    if (!object || !needle ||
+        !memory_range_is_readable(object, sizeof(void *))) return 0;
+    vtable = *(const void *const *)object;
+    if (!vtable ||
+        !memory_range_is_readable((const unsigned char *)vtable - sizeof(void *),
+                                  sizeof(void *))) return 0;
+    type_info = *((const void *const *)vtable - 1);
+    if (!type_info ||
+        !memory_range_is_readable((const unsigned char *)type_info + sizeof(void *),
+                                  sizeof(void *))) return 0;
+    name = *(const char *const *)((const unsigned char *)type_info + sizeof(void *));
+    if (!name || !memory_range_is_readable(name, 1)) return 0;
+    for (index = 0; index < 96u; ++index) {
+        if (!memory_range_is_readable(name + index, 1)) return 0;
+        if (!name[index]) break;
+    }
+    if (index == 96u) return 0;
+    return strstr(name, needle) != NULL;
+}
+
+static int detect_gameplay_active(void) {
+    ULONGLONG now = GetTickCount64();
+    void *manager;
+    size_t offset;
+    if (!g_host.game_manager_shared_state) return 0;
+    if (now - g_host.gameplay_cache_time < 100u)
+        return g_host.gameplay_cache_value;
+    g_host.gameplay_cache_time = now;
+    g_host.gameplay_cache_value = 0;
+    manager = g_host.game_manager_shared_state();
+    if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
+    for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
+         offset += sizeof(void *)) {
+        void *candidate = *(void **)((unsigned char *)manager + offset);
+        if (object_type_contains(candidate, "PlayLayer")) {
+            g_host.gameplay_cache_value = 1;
+            break;
+        }
+    }
+    return g_host.gameplay_cache_value;
+}
+
+static void set_cursor_hidden(int hidden) {
+    hidden = hidden != 0;
+    if (g_host.cursor_hidden == hidden) return;
+    g_host.cursor_hidden = hidden;
+    if (g_host.window)
+        SetCursor(hidden ? NULL : LoadCursorA(NULL, IDC_ARROW));
+}
+
+static void refresh_cursor_visibility(void) {
+    int gameplay = detect_gameplay_active();
+    ULONGLONG now = GetTickCount64();
+    if (!gameplay) {
+        g_host.cursor_force_visible = 0;
+        g_host.cursor_hide_after = 0;
+    } else if (g_host.cursor_hide_after && now >= g_host.cursor_hide_after) {
+        g_host.cursor_force_visible = 0;
+        g_host.cursor_hide_after = 0;
+    }
+    set_cursor_hidden(g_host.hide_cursor_option && gameplay &&
+                      g_host.window_active && !jni_shim_text_input_active() &&
+                      !g_host.cursor_force_visible);
 }
 
 static void pause_native_game(const char *reason) {
@@ -656,11 +783,18 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (wparam) {
             resume_native_game("window activated");
         } else {
+            set_cursor_hidden(0);
             pause_native_game("window deactivated");
         }
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_SETCURSOR:
+        if (LOWORD(lparam) == HTCLIENT && g_host.cursor_hidden) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
     case WM_CHAR:
         if (wparam == '\b') {
             if (g_host.native_ready && g_host.delete_backward) {
@@ -675,6 +809,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         send_text_character(wparam);
         return 0;
     case WM_LBUTTONDOWN:
+        if (detect_gameplay_active()) {
+            g_host.cursor_force_visible = 0;
+            g_host.cursor_hide_after = 0;
+            set_cursor_hidden(g_host.hide_cursor_option);
+        }
         g_host.mouse_down = 1;
         SetFocus(window);
         SetCapture(window);
@@ -700,11 +839,19 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
+            g_host.cursor_force_visible = 1;
+            g_host.cursor_hide_after = 0;
+            set_cursor_hidden(0);
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
         }
         if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
             !jni_shim_text_input_active()) {
+            if (detect_gameplay_active()) {
+                g_host.cursor_force_visible = 0;
+                g_host.cursor_hide_after = 0;
+                set_cursor_hidden(g_host.hide_cursor_option);
+            }
             g_host.keyboard_down = 1;
             send_touch_begin((float)g_host.native_width * 0.5f,
                              (float)g_host.native_height * 0.5f);
@@ -794,8 +941,10 @@ static int create_opengl_window(int client_width, int client_height) {
     }
     swap_interval = (SwapIntervalFunction)wglGetProcAddress("wglSwapIntervalEXT");
     if (swap_interval) {
-        swap_interval(1);
+        g_host.vsync_enabled = swap_interval(1) != FALSE;
     }
+    runtime_log("Frame pacing: swap-interval=%s post-swap-sleep=disabled",
+                g_host.vsync_enabled ? "1" : "unavailable");
     runtime_log("OpenGL vendor: %s", glGetString(GL_VENDOR));
     runtime_log("OpenGL renderer: %s", glGetString(GL_RENDERER));
     runtime_log("OpenGL version: %s", glGetString(GL_VERSION));
@@ -855,7 +1004,10 @@ static int run_message_loop(void) {
         if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
-            Sleep(1);
+            refresh_cursor_visibility();
+            /* SwapBuffers already blocks on vblank when swap interval 1 works.
+               Sleeping again made smooth 60 Hz output feel closer to 50-58 FPS. */
+            if (!g_host.vsync_enabled) Sleep(1);
         } else {
             /* Do not alternate stale front/back buffers while the app is
                inactive. This also avoids advancing the game behind a pause. */
@@ -886,6 +1038,7 @@ int main(int argc, char **argv) {
     g_host.native_width = 1280;
     g_host.native_height = 720;
     g_host.window_active = 1;
+    g_host.hide_cursor_option = gd_settings_hide_cursor_during_play();
 
     /*
      * Read the log destination before executable_directory() changes the
@@ -937,6 +1090,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     runtime_log("RESULT: ELF_RELOCATION_OK");
+    g_host.game_manager_shared_state =
+        (GameManagerSharedStateFunction)elf_image_find_export(
+            &image, "_ZN11GameManager11sharedStateEv");
+    runtime_log("PC gameplay detection: GameManager::sharedState=%s",
+                g_host.game_manager_shared_state ? "ready" : "unavailable");
     install_desktop_keyboard_offset_patches(&image);
     install_configurable_x86_hacks(&image);
     if (mode == 0) {

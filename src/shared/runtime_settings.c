@@ -138,6 +138,14 @@ int gd_settings_force_highest_graphics(void) {
     return gd_setting_bool("FORCE_HIGHEST_GRAPHICS", 1);
 }
 
+int gd_settings_disable_pause_button(void) {
+    return gd_setting_bool("DISABLE_PAUSE_BUTTON", 1);
+}
+
+int gd_settings_hide_cursor_during_play(void) {
+    return gd_setting_bool("HIDE_CURSOR_DURING_PLAY", 1);
+}
+
 float gd_settings_music_pulse_max(void) {
     return gd_setting_float("MUSIC_PULSE_MAX", 0.30f, 0.0f, 1.0f);
 }

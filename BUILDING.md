@@ -6,8 +6,8 @@ Run:
 BUILD_ALL.cmd
 ```
 
-The build downloads pinned portable Zig, CMake and Ninja tools as needed. Python
-is not required for building or running this release.
+The build downloads pinned portable Zig, CMake and Ninja tools as needed.
+Python is not required for building or running this release.
 
 Output:
 
@@ -20,8 +20,8 @@ dist-unified\
   arm-legacy\GeometryDashArmLegacy.exe
   armv7\GeometryDashArmV7.exe
   assets\icons\...
-  save\
-  logs\
+  save\<package>__v<version>__<backend>\
+  logs\YYYY-MM-DD\...
 ```
 
 Individual builders:
@@ -32,6 +32,6 @@ BUILD_DYNARMIC.cmd
 BUILD_LAUNCHER.cmd
 ```
 
-The ARM/Dynarmic source changed in Fix4, so do not reuse an old `armv7` or
-`arm-legacy` executable. `build_dynarmic.ps1` has a new builder revision and
-will reject an incompatible cached backend.
+All three backends and the launcher contain Fix5 changes. Run `BUILD_ALL.cmd`;
+do not reuse Fix4 executables. The Dynarmic builder revision was incremented so
+stale ARM outputs are rebuilt.

@@ -7,6 +7,8 @@ set "HACK_ICONS=false"
 set "FULL_BYPASS=true"
 set "FORCE_HIGHEST_GRAPHICS=true"
 set "MUSIC_PULSE_MAX=0.30"
+set "DISABLE_PAUSE_BUTTON=true"
+set "HIDE_CURSOR_DURING_PLAY=true"
 
 if not exist "GeometryDashLauncher.exe" (
   echo GeometryDashLauncher.exe is missing. Build the wrapper with BUILD_ALL.cmd.

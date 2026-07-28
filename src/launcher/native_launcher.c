@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.5-unified7-fix4-native-stabilization"
+#define LAUNCHER_VERSION "0.9.5-unified7-fix5-stabilization"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -626,6 +626,17 @@ static const wchar_t *BackendName(BackendKind backend) {
     return L"unknown";
 }
 
+/*
+ * Geometry Dash 2.11 commonly reports versionName 2.111.  Match the 2.11
+ * prefix so the launcher can choose the socket flow that this client expects.
+ */
+static int IsX86Version211(const LauncherContext *context) {
+    const char *version;
+    if (!context || context->backend != BACKEND_X86) return 0;
+    version = context->metadata.version_name;
+    return version && strncmp(version, "2.11", 4u) == 0;
+}
+
 static GameIdentity IdentifyGame(const char *package_name) {
     GameIdentity identity;
     identity.window_title = L"Geometry Dash";
@@ -707,6 +718,9 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t full_bypass[64];
     wchar_t highest[64];
     wchar_t pulse[64];
+    wchar_t disable_pause[64];
+    wchar_t hide_cursor[64];
+    wchar_t network_mode[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
     if (_wfopen_s(&file, path, L"wb, ccs=UTF-8") != 0 || !file) return 0;
@@ -727,6 +741,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     fwprintf(file, L"apk=%ls\n", context->apk_path);
     fwprintf(file, L"apk_bytes=%llu\n", context->apk_size);
     fwprintf(file, L"log_folder=%ls\n", context->run_directory);
+    fwprintf(file, L"save_folder=%ls\n", context->save_directory);
     fwprintf(file, L"gdps_server=%ls\n",
              GetSetting(L"GDPS_SERVER", L"www.boomlings.com/database",
                         server, ARRAY_COUNT(server)));
@@ -738,6 +753,16 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"FORCE_HIGHEST_GRAPHICS", L"true", highest, ARRAY_COUNT(highest)));
     fwprintf(file, L"music_pulse_max=%ls\n",
              GetSetting(L"MUSIC_PULSE_MAX", L"0.30", pulse, ARRAY_COUNT(pulse)));
+    fwprintf(file, L"disable_pause_button=%ls\n",
+             GetSetting(L"DISABLE_PAUSE_BUTTON", L"true", disable_pause,
+                        ARRAY_COUNT(disable_pause)));
+    fwprintf(file, L"hide_cursor_during_play=%ls\n",
+             GetSetting(L"HIDE_CURSOR_DURING_PLAY", L"true", hide_cursor,
+                        ARRAY_COUNT(hide_cursor)));
+    fwprintf(file, L"x86_api_connect_mode=%ls\n",
+             GetSetting(L"GD_X86_API_CONNECT_MODE",
+                        IsX86Version211(context) ? L"real" : L"synthetic",
+                        network_mode, ARRAY_COUNT(network_mode)));
     if (finished) {
         SYSTEMTIME finished_utc;
         GetSystemTime(&finished_utc);
@@ -964,11 +989,28 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
     context->identity = IdentifyGame(context->metadata.package_name);
     ApkArchiveClose(&archive);
 
-    if (!PathJoin(context->save_directory, ARRAY_COUNT(context->save_directory),
-                  context->base_directory, L"save") ||
-        !EnsureDirectory(context->save_directory)) {
-        fwprintf(stderr, L"ERROR: Could not create save directory.\n");
-        return 0;
+    {
+        wchar_t save_root[MAX_PATH * 4];
+        wchar_t package_component[MAX_UTF8_TEXT];
+        wchar_t version_component[MAX_UTF8_TEXT];
+        wchar_t profile_component[1024];
+        MakeSafeComponent(context->metadata.package_name, package_component,
+                          ARRAY_COUNT(package_component), L"unknown.package");
+        MakeSafeComponent(context->metadata.version_name, version_component,
+                          ARRAY_COUNT(version_component), L"unknown");
+        swprintf_s(profile_component, ARRAY_COUNT(profile_component),
+                   L"%ls__v%ls__%ls", package_component, version_component,
+                   BackendName(context->backend));
+        if (!PathJoin(save_root, ARRAY_COUNT(save_root),
+                      context->base_directory, L"save") ||
+            !EnsureDirectory(save_root) ||
+            !PathJoin(context->save_directory,
+                      ARRAY_COUNT(context->save_directory),
+                      save_root, profile_component) ||
+            !EnsureDirectory(context->save_directory)) {
+            fwprintf(stderr, L"ERROR: Could not create versioned save directory.\n");
+            return 0;
+        }
     }
     switch (context->backend) {
     case BACKEND_X86:
@@ -1021,6 +1063,15 @@ int wmain(int argc, wchar_t **argv) {
 
     SetEnvironmentVariableW(L"GD_SAVE_DIR", context.save_directory);
     SetEnvironmentVariableW(L"GD_GAME_TITLE", context.identity.window_title);
+    {
+        wchar_t version_wide[MAX_UTF8_TEXT];
+        if (Utf8ToWide(context.metadata.version_name, version_wide,
+                       ARRAY_COUNT(version_wide))) {
+            SetEnvironmentVariableW(L"GD_GAME_VERSION", version_wide);
+        }
+    }
+    SetEnvironmentVariableW(L"GD_X86_API_CONNECT_MODE",
+                            IsX86Version211(&context) ? L"real" : L"synthetic");
     SetEnvironmentVariableW(L"GD_LOG_PATH", context.log_path);
     if (FileExists(context.icon_path))
         SetEnvironmentVariableW(L"GD_WINDOW_ICON", context.icon_path);
@@ -1035,6 +1086,7 @@ int wmain(int argc, wchar_t **argv) {
             context.metadata.version_name, context.metadata.version_code);
     wprintf(L"Backend: %ls\n", BackendName(context.backend));
     wprintf(L"APK: %ls\n", context.apk_path);
+    wprintf(L"Saves: %ls\n", context.save_directory);
     wprintf(L"Logs: %ls\n", context.run_directory);
 
     exit_code = LaunchBackend(&context, launcher_error, ARRAY_COUNT(launcher_error));

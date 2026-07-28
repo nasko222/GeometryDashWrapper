@@ -1680,6 +1680,13 @@ static int shim_bind(int descriptor, const struct sockaddr *address, int length)
     return 0;
 }
 
+static int use_synthetic_api_connect(void) {
+    const char *mode = getenv("GD_X86_API_CONNECT_MODE");
+    if (!mode || !*mode) return 1;
+    return _stricmp(mode, "real") != 0 &&
+           _stricmp(mode, "pending") != 0;
+}
+
 static unsigned socket_address_port(const struct sockaddr *address,
                                     int length) {
     if (!address || length < (int)sizeof(address->sa_family)) return 0;
@@ -1717,7 +1724,7 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
        leave 2.11 account login spinning forever. Only addresses remembered from
        Boomlings/the configured GDPS DNS lookup use the synthetic-ready path, so
        unrelated port-80 song/CDN sockets keep their real Winsock connection. */
-    if (port == 80u &&
+    if (port == 80u && use_synthetic_api_connect() &&
         is_remembered_api_address(windows_address, windows_length)) {
         if (trace <= 64) {
             runtime_log("Network connect #%ld: fd=%d %s synthetic HTTP ready "

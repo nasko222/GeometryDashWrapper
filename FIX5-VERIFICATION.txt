@@ -1,0 +1,45 @@
+Geometry Dash Wrapper 0.9.5-unified7-fix5-stabilization verification
+==========================================================================
+
+- No .gitignore: PASS
+- No Python source/bytecode: PASS
+- No APK/SO/EXE/DLL in source: PASS
+- RUN_AUTO_GDPS.cmd server: PASS (naskogdps17.7m.pl/database)
+- RUN_AUTO_GDPS.cmd drag/drop: PASS
+- RUN_AUTO_GDPS.cmd pause default on: PASS
+- RUN_AUTO_GDPS.cmd cursor default on: PASS
+- RUN_AUTO_BOOMLINGS.cmd server: PASS (www.boomlings.com/database)
+- RUN_AUTO_BOOMLINGS.cmd drag/drop: PASS
+- RUN_AUTO_BOOMLINGS.cmd pause default on: PASS
+- RUN_AUTO_BOOMLINGS.cmd cursor default on: PASS
+- Versioned save profile format: PASS
+- Versioned save selected through GD_SAVE_DIR: PASS
+- 2.11 network mode is version selected: PASS
+- ARMv7 shader sanitizer removed: PASS
+- ARMv7 preserves guest shader lengths: PASS
+- x86 vsync result tracked: PASS
+- No sleep after successful vblank: PASS
+- x86 play-layer cursor detection: PASS
+- x86 pause callback patch: PASS
+- Legacy clean initial title: PASS
+- Legacy pause callback patch: PASS
+- ARMv7 pause callback patch: PASS
+- Audio cache honors GD_SAVE_DIR immediately: PASS
+- Version metadata: PASS
+
+Static compiler checks
+- ARMv7 C++20 source with local Dynarmic interface stubs: PASS
+- Legacy ARM C++20 source with local Dynarmic interface stubs: PASS
+- Native C launcher syntax with Win32 stubs: PASS (stub prototype warnings only)
+- x86 main C syntax with Win32/OpenGL stubs: PASS (stub return-type warnings only)
+
+Runtime status
+- A complete Windows build/gameplay run was not possible in this environment.
+- 2.2 beta startup, 2.11 networking, save isolation, frame pacing and the
+  gameplay options require testing on the user's Windows machine.
+- Icons were deliberately not changed; user-supplied PNGs are pending.
+- Cross-version cloud-save parsing is not claimed fixed.
+
+Source policy
+- No APK, extracted game library, executable, DLL, Python file, build cache,
+  .gitignore, or user save data is included.

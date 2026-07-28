@@ -13,6 +13,9 @@ float gd_setting_float(const char *name, float default_value, float minimum, flo
 int gd_settings_hack_icons(void);
 int gd_settings_full_bypass(void);
 int gd_settings_force_highest_graphics(void);
+/* PC-style gameplay options, configured by the launch BAT files. */
+int gd_settings_disable_pause_button(void);
+int gd_settings_hide_cursor_during_play(void);
 float gd_settings_music_pulse_max(void);
 
 /* Returns the configured GDPS base, or the official default. */

@@ -1509,6 +1509,26 @@ static bool PatchThumbReturnFalse(ProbeEnvironment& env,
     return true;
 }
 
+static std::size_t InstallV22PauseButtonPatch(ElfRuntime& runtime,
+                                               ProbeEnvironment& env) {
+    static constexpr std::array<std::string_view, 2> names = {
+        "_ZN7UILayer7onPauseEv",
+        "_ZN7UILayer7onPauseEPN7cocos2d8CCObjectE",
+    };
+    std::size_t patched = 0u;
+    if (!gd_settings_disable_pause_button()) return 0u;
+    for (const SymbolRecord& symbol : runtime.symbols) {
+        for (std::string_view name : names) {
+            if (symbol.name == name && PatchThumbReturnVoid(env, runtime, symbol)) {
+                ++patched;
+                break;
+            }
+        }
+    }
+    return patched;
+}
+
+
 static V22DesktopTextInputPatchCounts InstallV22DesktopTextInputPatches(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     V22DesktopTextInputPatchCounts counts;
@@ -2645,58 +2665,6 @@ static std::pair<u32, u32> DoubleToWords(double value) {
 }
 static float WordToFloat(u32 bits) { float value = 0; std::memcpy(&value, &bits, sizeof(value)); return value; }
 
-static bool DesktopShaderTokenBoundary(char value) {
-    return !(value == '_' ||
-             (value >= '0' && value <= '9') ||
-             (value >= 'A' && value <= 'Z') ||
-             (value >= 'a' && value <= 'z'));
-}
-
-static bool EraseDesktopShaderToken(std::string& text,
-                                    std::string_view token) {
-    bool changed = false;
-    if (token.empty() || text.size() < token.size()) return false;
-    for (std::size_t index = 0; index + token.size() <= text.size(); ++index) {
-        if ((index == 0 || DesktopShaderTokenBoundary(text[index - 1])) &&
-            (index + token.size() == text.size() ||
-             DesktopShaderTokenBoundary(text[index + token.size()])) &&
-            std::memcmp(text.data() + index, token.data(), token.size()) == 0) {
-            std::fill(text.begin() + static_cast<std::ptrdiff_t>(index),
-                      text.begin() + static_cast<std::ptrdiff_t>(index + token.size()),
-                      ' ');
-            changed = true;
-        }
-    }
-    return changed;
-}
-
-static bool EraseDesktopPrecisionStatements(std::string& text) {
-    constexpr std::string_view token = "precision";
-    bool changed = false;
-    for (std::size_t index = 0; index + token.size() <= text.size(); ++index) {
-        if ((index != 0 && !DesktopShaderTokenBoundary(text[index - 1])) ||
-            std::memcmp(text.data() + index, token.data(), token.size()) != 0) {
-            continue;
-        }
-        std::size_t end = index;
-        while (end < text.size() && text[end] != ';' && text[end] != '\n') ++end;
-        if (end < text.size() && text[end] == ';') ++end;
-        for (std::size_t cursor = index; cursor < end; ++cursor) {
-            if (text[cursor] != '\r' && text[cursor] != '\n') text[cursor] = ' ';
-        }
-        index = end ? end - 1u : end;
-        changed = true;
-    }
-    return changed;
-}
-
-static bool SanitizeDesktopGlsl(std::string& text) {
-    bool changed = EraseDesktopPrecisionStatements(text);
-    changed = EraseDesktopShaderToken(text, "lowp") || changed;
-    changed = EraseDesktopShaderToken(text, "mediump") || changed;
-    changed = EraseDesktopShaderToken(text, "highp") || changed;
-    return changed;
-}
 static u32 FloatToWord(float value) { u32 bits = 0; std::memcpy(&bits, &value, sizeof(bits)); return bits; }
 
 
@@ -8042,22 +8010,24 @@ private:
         } else if (name == "glShaderSource") {
             using Fn = void (APIENTRY*)(GLuint, GLsizei, const char* const*, const GLint*);
             const GLsizei source_count = static_cast<GLsizei>(arguments[1]);
-            if (source_count < 0 || source_count > 4096) return Fail("glShaderSource count outside limit");
+            if (source_count < 0 || source_count > 4096)
+                return Fail("glShaderSource count outside limit");
             std::vector<u32> guest_strings(static_cast<std::size_t>(source_count));
-            std::vector<GLint> guest_lengths(static_cast<std::size_t>(source_count), -1);
-            std::vector<GLint> host_lengths(static_cast<std::size_t>(source_count), 0);
+            std::vector<GLint> lengths(static_cast<std::size_t>(source_count), -1);
             std::vector<std::string> source_storage(static_cast<std::size_t>(source_count));
             std::vector<const char*> pointers(static_cast<std::size_t>(source_count));
-            if (source_count && !env_.ReadBytes(static_cast<u32>(arguments[2]), guest_strings.data(), guest_strings.size() * sizeof(u32))) return Fail("glShaderSource string array invalid");
+            if (source_count &&
+                !env_.ReadBytes(static_cast<u32>(arguments[2]), guest_strings.data(),
+                                guest_strings.size() * sizeof(u32)))
+                return Fail("glShaderSource string array invalid");
             if (arguments[3] && source_count &&
-                !env_.ReadBytes(static_cast<u32>(arguments[3]), guest_lengths.data(),
-                                guest_lengths.size() * sizeof(GLint)))
+                !env_.ReadBytes(static_cast<u32>(arguments[3]), lengths.data(),
+                                lengths.size() * sizeof(GLint)))
                 return Fail("glShaderSource length array invalid");
-            bool sanitized = false;
             for (GLsizei i = 0; i < source_count; ++i) {
                 const std::size_t index = static_cast<std::size_t>(i);
-                if (guest_lengths[index] >= 0) {
-                    const std::size_t size = static_cast<std::size_t>(guest_lengths[index]);
+                if (lengths[index] >= 0) {
+                    const std::size_t size = static_cast<std::size_t>(lengths[index]);
                     if (size > 16u * 1024u * 1024u)
                         return Fail("glShaderSource source outside limit");
                     source_storage[index].resize(size);
@@ -8067,18 +8037,13 @@ private:
                 } else {
                     source_storage[index] = ReadCString(guest_strings[index]);
                 }
-                sanitized = SanitizeDesktopGlsl(source_storage[index]) || sanitized;
-                host_lengths[index] = static_cast<GLint>(source_storage[index].size());
                 pointers[index] = source_storage[index].data();
             }
-            if (sanitized && shader_sanitize_logs_ < 32u) {
-                log_ << "[host] ARMv7 desktop GLSL compatibility: removed GLES precision syntax shader="
-                     << arguments[0] << " strings=" << source_count << '\n';
-                ++shader_sanitize_logs_;
-            }
+            /* Preserve the guest's GLES shader text byte-for-byte. Removing
+               precision declarations made the 2.2 beta abort during nativeInit. */
             reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]),
                                            source_count, pointers.data(),
-                                           host_lengths.data());
+                                           arguments[3] ? lengths.data() : nullptr);
         } else if (name == "glCompileShader") {
             using CompileFn = void (APIENTRY*)(GLuint);
             reinterpret_cast<CompileFn>(function)(static_cast<GLuint>(arguments[0]));
@@ -10970,7 +10935,6 @@ private:
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
     u32 gl_framebuffer_binding_=0;
-    u32 shader_sanitize_logs_=0;
     u32 edge_clip_normalization_logs_=0;
     u64 logged_guest_stdio_=0;
     bool audio_initialized_=false;
@@ -11298,7 +11262,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix4-native-stabilization debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix5-stabilization debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11824,6 +11788,8 @@ int main(int argc,char** argv) {
                 "required LevelSettingsObject parser bridge was not installed");
         const V22DesktopTextInputPatchCounts desktop_text_input =
             InstallV22DesktopTextInputPatches(runtime, env);
+        const std::size_t pause_button_patches =
+            InstallV22PauseButtonPatch(runtime, env);
 
         const bool late_beta_layout =
             runtime.v22_play_layer_level_offset == 820u &&
@@ -11911,7 +11877,12 @@ int main(int argc,char** argv) {
              " low-memory-hooks="+
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
-             std::to_string(gd_settings_music_pulse_max()));
+             std::to_string(gd_settings_music_pulse_max())+
+             " disable-pause="+
+             (gd_settings_disable_pause_button() ? "true" : "false")+
+             " pause-patches="+std::to_string(pause_button_patches)+
+             " hide-cursor="+
+             (gd_settings_hide_cursor_during_play() ? "true" : "false"));
         emit("RESULT: DYNARMIC_V22_PLATFORMER_SWING_REOPEN_PATCH count="+
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
