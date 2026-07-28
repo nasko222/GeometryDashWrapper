@@ -1260,9 +1260,9 @@ struct GraphicsPatchCounts {
 };
 
 static GraphicsPatchCounts InstallHighestGraphicsHooks(
-    ElfRuntime& runtime, ProbeEnvironment& env) {
+    ElfRuntime& runtime, ProbeEnvironment& env, bool enabled) {
     GraphicsPatchCounts counts{};
-    if (!gd_settings_force_highest_graphics()) return counts;
+    if (!enabled) return counts;
     if (const SymbolRecord* symbol =
             FindSymbol(runtime, "_ZN15PlatformToolbox4isHDEv")) {
         if (PatchArmFunctionReturnTrue(env, runtime, *symbol)) ++counts.hd;
@@ -6440,7 +6440,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified7-recovery legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-unified7-fix2-focused legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6666,6 +6666,17 @@ int main(int argc,char** argv) {
             ExtractZipMember(apk,"lib/armeabi/libgame.so");
         emit("Extracted lib/armeabi/libgame.so: "+
              std::to_string(libgame.size())+" bytes");
+        const u32 libgame_crc = static_cast<u32>(crc32(
+            0, reinterpret_cast<const Bytef*>(libgame.data()),
+            static_cast<uInt>(libgame.size())));
+        const bool legacy_gd_100 =
+            libgame.size() == 5551628u && libgame_crc == 0x60fa62f4u;
+        const bool effective_highest_graphics =
+            gd_settings_force_highest_graphics() && !legacy_gd_100;
+        if (legacy_gd_100 && gd_settings_force_highest_graphics()) {
+            emit("RESULT: DYNARMIC_LEGACY_GD100_HD_GUARD "
+                 "requested=1 effective=0 reason=nativeInit-CCSet-crash");
+        }
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
@@ -6680,7 +6691,8 @@ int main(int argc,char** argv) {
         const std::size_t creator_bypass_hooks =
             InstallConfigurableCreatorBypass(runtime, env);
         const GraphicsPatchCounts graphics_patches =
-            InstallHighestGraphicsHooks(runtime, env);
+            InstallHighestGraphicsHooks(runtime, env,
+                                        effective_highest_graphics);
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6725,8 +6737,10 @@ int main(int argc,char** argv) {
              " full-bypass=" +
              (gd_settings_full_bypass() ? "true" : "false") +
              " bypass-hooks=" + std::to_string(creator_bypass_hooks) +
-             " highest-graphics=" +
+             " highest-graphics-requested=" +
              (gd_settings_force_highest_graphics() ? "true" : "false") +
+             " highest-graphics-effective=" +
+             (effective_highest_graphics ? "true" : "false") +
              " hd-hooks=" + std::to_string(graphics_patches.hd) +
              " low-memory-hooks=" +
              std::to_string(graphics_patches.low_memory) +

@@ -1401,6 +1401,118 @@ static int set_socket_error(void) {
     return -1;
 }
 
+#define API_ADDRESS_SLOT_COUNT 32
+typedef struct {
+    int family;
+    unsigned char address[16];
+} ApiResolvedAddress;
+
+static SRWLOCK g_api_address_lock = SRWLOCK_INIT;
+static ApiResolvedAddress g_api_addresses[API_ADDRESS_SLOT_COUNT];
+static unsigned g_api_address_count;
+
+static int ascii_text_contains_ci(const char *text, const char *needle) {
+    size_t text_size;
+    size_t needle_size;
+    size_t offset;
+    if (!text || !needle || !*needle) return 0;
+    text_size = strlen(text);
+    needle_size = strlen(needle);
+    if (needle_size > text_size) return 0;
+    for (offset = 0; offset + needle_size <= text_size; ++offset) {
+        size_t index;
+        for (index = 0; index < needle_size; ++index) {
+            if (tolower((unsigned char)text[offset + index]) !=
+                tolower((unsigned char)needle[index]))
+                break;
+        }
+        if (index == needle_size) return 1;
+    }
+    return 0;
+}
+
+static int is_api_dns_name(const char *node, const char *lookup_node) {
+    const char *server = gd_settings_server();
+    if ((node && ascii_text_contains_ci(node, "boomlings.com")) ||
+        (lookup_node && ascii_text_contains_ci(lookup_node, "boomlings.com")))
+        return 1;
+    if (server && *server) {
+        if (node && ascii_text_contains_ci(server, node)) return 1;
+        if (lookup_node && ascii_text_contains_ci(server, lookup_node)) return 1;
+    }
+    return 0;
+}
+
+static void remember_api_address(const struct sockaddr *address, int length) {
+    ApiResolvedAddress candidate;
+    unsigned index;
+    memset(&candidate, 0, sizeof(candidate));
+    if (!address) return;
+    if (address->sa_family == AF_INET &&
+        length >= (int)sizeof(struct sockaddr_in)) {
+        candidate.family = AF_INET;
+        memcpy(candidate.address,
+               &((const struct sockaddr_in *)address)->sin_addr, 4u);
+    } else if (address->sa_family == AF_INET6 &&
+               length >= (int)sizeof(struct sockaddr_in6)) {
+        candidate.family = AF_INET6;
+        memcpy(candidate.address,
+               &((const struct sockaddr_in6 *)address)->sin6_addr, 16u);
+    } else {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_api_address_lock);
+    for (index = 0; index < g_api_address_count; ++index) {
+        const size_t bytes = candidate.family == AF_INET ? 4u : 16u;
+        if (g_api_addresses[index].family == candidate.family &&
+            memcmp(g_api_addresses[index].address, candidate.address, bytes) == 0) {
+            ReleaseSRWLockExclusive(&g_api_address_lock);
+            return;
+        }
+    }
+    if (g_api_address_count < API_ADDRESS_SLOT_COUNT) {
+        g_api_addresses[g_api_address_count++] = candidate;
+    } else {
+        g_api_addresses[g_api_address_count++ % API_ADDRESS_SLOT_COUNT] = candidate;
+        g_api_address_count = API_ADDRESS_SLOT_COUNT;
+    }
+    ReleaseSRWLockExclusive(&g_api_address_lock);
+}
+
+static int is_remembered_api_address(const struct sockaddr *address,
+                                     int length) {
+    unsigned char bytes[16];
+    size_t byte_count;
+    int family;
+    unsigned index;
+    int found = 0;
+    if (!address) return 0;
+    memset(bytes, 0, sizeof(bytes));
+    if (address->sa_family == AF_INET &&
+        length >= (int)sizeof(struct sockaddr_in)) {
+        family = AF_INET;
+        byte_count = 4u;
+        memcpy(bytes, &((const struct sockaddr_in *)address)->sin_addr, 4u);
+    } else if (address->sa_family == AF_INET6 &&
+               length >= (int)sizeof(struct sockaddr_in6)) {
+        family = AF_INET6;
+        byte_count = 16u;
+        memcpy(bytes, &((const struct sockaddr_in6 *)address)->sin6_addr, 16u);
+    } else {
+        return 0;
+    }
+    AcquireSRWLockShared(&g_api_address_lock);
+    for (index = 0; index < g_api_address_count; ++index) {
+        if (g_api_addresses[index].family == family &&
+            memcmp(g_api_addresses[index].address, bytes, byte_count) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_api_address_lock);
+    return found;
+}
+
 static void free_android_addrinfo(AndroidAddrInfo *entry) {
     while (entry) {
         AndroidAddrInfo *next = entry->ai_next;
@@ -1423,6 +1535,7 @@ static int shim_getaddrinfo(const char *node, const char *service,
     unsigned ipv4_count = 0;
     unsigned ipv6_count = 0;
     int first_family = 0;
+    int api_lookup = 0;
     int status;
     if (!result) {
         return EAI_FAIL;
@@ -1446,6 +1559,7 @@ static int shim_getaddrinfo(const char *node, const char *service,
         } else {
             runtime_log("Network DNS: %s", node ? node : "<local>");
         }
+        api_lookup = is_api_dns_name(node, lookup_node);
         status = getaddrinfo(lookup_node, service,
                              hints ? &windows_hints : NULL,
                              &windows_result);
@@ -1456,6 +1570,8 @@ static int shim_getaddrinfo(const char *node, const char *service,
     }
     for (cursor = windows_result; cursor; cursor = cursor->ai_next) {
         AndroidAddrInfo *entry = (AndroidAddrInfo *)calloc(1, sizeof(*entry));
+        if (api_lookup && cursor->ai_addr)
+            remember_api_address(cursor->ai_addr, (int)cursor->ai_addrlen);
         if (!entry) {
             free_android_addrinfo(head);
             freeaddrinfo(windows_result);
@@ -1564,6 +1680,21 @@ static int shim_bind(int descriptor, const struct sockaddr *address, int length)
     return 0;
 }
 
+static unsigned socket_address_port(const struct sockaddr *address,
+                                    int length) {
+    if (!address || length < (int)sizeof(address->sa_family)) return 0;
+    if (address->sa_family == AF_INET &&
+        length >= (int)sizeof(struct sockaddr_in)) {
+        return (unsigned)ntohs(((const struct sockaddr_in *)address)->sin_port);
+    }
+    if ((address->sa_family == GD_ANDROID_AF_INET6 ||
+         address->sa_family == AF_INET6) &&
+        length >= (int)sizeof(struct sockaddr_in6)) {
+        return (unsigned)ntohs(((const struct sockaddr_in6 *)address)->sin6_port);
+    }
+    return 0;
+}
+
 static int shim_connect(int descriptor, const struct sockaddr *address, int length) {
     static LONG trace_count;
     struct sockaddr_storage storage;
@@ -1579,6 +1710,22 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
                                    : "other";
     const struct sockaddr *windows_address =
         gd_net_sockaddr_to_host(address, length, &storage, &windows_length);
+    const unsigned port = socket_address_port(windows_address, windows_length);
+    /* Geometry Dash API traffic is plaintext HTTP in the guest and is handled
+       by gd_api_http_handle_raw_request through WinHTTP at send time. Requiring
+       the Android nonblocking socket to finish a real port-80 connect first can
+       leave 2.11 account login spinning forever. Only addresses remembered from
+       Boomlings/the configured GDPS DNS lookup use the synthetic-ready path, so
+       unrelated port-80 song/CDN sockets keep their real Winsock connection. */
+    if (port == 80u &&
+        is_remembered_api_address(windows_address, windows_length)) {
+        if (trace <= 64) {
+            runtime_log("Network connect #%ld: fd=%d %s synthetic HTTP ready "
+                        "(family=%d length=%d port=80)",
+                        (long)trace, descriptor, family, raw_family, length);
+        }
+        return 0;
+    }
     if (connect((SOCKET)(uintptr_t)(uint32_t)descriptor, windows_address,
                 windows_length) == SOCKET_ERROR) {
         int windows_error = WSAGetLastError();

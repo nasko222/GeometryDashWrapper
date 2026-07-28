@@ -6,12 +6,54 @@ import struct
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 
 root = Path(__file__).resolve().parent
 base = root / "dist-unified" if (root / "dist-unified").is_dir() else root
 apk = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else base / "game.apk"
 if not apk.is_file():
     raise SystemExit(f"APK not found: {apk}")
+
+
+RUNTIME_OUTPUT_PATTERNS = (
+    "gd-wrapper*.log",
+    "gd-arm*.log",
+    "gd-dynarmic*.log",
+    "gd-networktest*.log",
+    "gd-v22beta*.log",
+    "gd-arm*-imports*.txt",
+    "gd-v22beta-imports*.txt",
+    "gd-arm*-profile*.csv",
+    "gd-dynarmic-profile*.csv",
+    "gd-networktest*-profile*.csv",
+    "gd-arm*-profile-summary*.txt",
+    "gd-dynarmic-profile-summary*.txt",
+    "gd-networktest*-profile-summary*.txt",
+    "gd-run-info.txt",
+)
+
+
+def clear_previous_runtime_outputs(directory: Path) -> list[str]:
+    removed: list[str] = []
+    failures: list[str] = []
+    seen: set[Path] = set()
+    for pattern in RUNTIME_OUTPUT_PATTERNS:
+        for candidate in directory.glob(pattern):
+            if candidate in seen or not candidate.is_file():
+                continue
+            seen.add(candidate)
+            try:
+                candidate.unlink()
+                removed.append(candidate.name)
+            except OSError as exc:
+                failures.append(f"{candidate.name}: {exc}")
+    if failures:
+        details = "\n  ".join(failures)
+        raise SystemExit(
+            "Could not delete previous runtime logs. A wrapper process may still be "
+            f"running. Close it and retry:\n  {details}"
+        )
+    return sorted(removed)
 
 
 def setting_bool(name: str, default: bool = False) -> bool:
@@ -72,7 +114,7 @@ def choose_apk_icons(archive: zipfile.ZipFile) -> tuple[str, list[bytes]] | None
     candidates: list[tuple[int, str, bytes, tuple[int, int]]] = []
     for name in archive.namelist():
         lower = name.lower()
-        if not lower.endswith(".png") or not lower.startswith("res/"):
+        if not lower.endswith(".png"):
             continue
         basename = Path(lower).name
         if any(word in basename for word in rejected):
@@ -90,6 +132,7 @@ def choose_apk_icons(archive: zipfile.ZipFile) -> tuple[str, list[bytes]] | None
             continue
         width, height = size
         score = min(width, height) * 10
+        if lower.startswith("res/"): score += 12000
         if basename == "icon.png": score += 16000
         if basename.startswith("ic_launcher"): score += 20000
         if is_mipmap: score += 3000
@@ -119,7 +162,12 @@ def manifest_package(payload: bytes) -> str:
 
 def game_identity(package: str, names: set[str]) -> tuple[str, str]:
     value = package.lower()
-    if "subzero" in value or any("leveldatasubzero" in name.lower() for name in names):
+    basenames = {Path(name).name.lower() for name in names}
+
+    # Official and GDPS package names are the strongest signal. Full Geometry
+    # Dash APKs can also bundle World/Meltdown level-data files, so those asset
+    # names must not override an explicit geometryjump package.
+    if "subzero" in value:
         return "Geometry Dash SubZero", "geometry-dash-subzero"
     if "meltdown" in value and "world" not in value:
         return "Geometry Dash Meltdown", "geometry-dash-meltdown"
@@ -127,6 +175,13 @@ def game_identity(package: str, names: set[str]) -> tuple[str, str]:
         return "Geometry Dash World", "geometry-dash-world"
     if "lite" in value:
         return "Geometry Dash Lite", "geometry-dash-lite"
+    if value == "unknown.package" or "geometryjump" not in value:
+        if {"pressstart.mp3", "nockem.mp3", "powertrip.mp3"}.issubset(basenames):
+            return "Geometry Dash SubZero", "geometry-dash-subzero"
+        if {"thesevenseas.mp3", "vikingarena.mp3", "airbornerobots.mp3"}.issubset(basenames):
+            return "Geometry Dash Meltdown", "geometry-dash-meltdown"
+        if {"payload.mp3", "beastmode.mp3"}.issubset(basenames):
+            return "Geometry Dash World", "geometry-dash-world"
     return "Geometry Dash", "geometry-dash"
 
 
@@ -196,7 +251,7 @@ elif has_legacy_arm:
 elif has_armv7:
     backend = "armv7"
     exe = base / "armv7" / "GeometryDashArmV7.exe"
-    args = [str(exe), str(apk), "--companion-hooks=off", "--log=gd-armv7.log"]
+    args = [str(exe), str(apk), "--companion-hooks=shader", "--log=gd-armv7.log"]
 else:
     discovered = sorted(name for name in names if name.startswith("lib/") and name.endswith(".so"))
     details = ", ".join(discovered) if discovered else "no native .so files"
@@ -209,6 +264,26 @@ else:
 
 if not exe.is_file():
     raise SystemExit(f"Selected {backend}, but the backend is not built: {exe}")
+
+removed_outputs = clear_previous_runtime_outputs(base)
+if removed_outputs:
+    print("Deleted previous runtime outputs: " + ", ".join(removed_outputs))
+else:
+    print("Deleted previous runtime outputs: none found")
+
+run_info = base / "gd-run-info.txt"
+run_info.write_text(
+    "\n".join((
+        "Geometry Dash Wrapper unified7-fix2 run marker",
+        f"started_utc={datetime.now(timezone.utc).isoformat()}",
+        f"backend={backend}",
+        f"game_title={game_title}",
+        f"package={package}",
+        f"apk={apk}",
+        f"apk_bytes={apk.stat().st_size}",
+    )) + "\n",
+    encoding="utf-8",
+)
 
 print(f"Game: {game_title}")
 print(f"Package: {package}")

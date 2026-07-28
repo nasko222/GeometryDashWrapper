@@ -1087,6 +1087,7 @@ struct SymbolRecord {
 };
 enum class V22CompanionHookMode {
     Off,
+    ShaderOnly,
     Safe,
     All,
 };
@@ -1094,6 +1095,7 @@ enum class V22CompanionHookMode {
 static const char* V22CompanionHookModeName(V22CompanionHookMode mode) {
     switch (mode) {
     case V22CompanionHookMode::Off: return "off";
+    case V22CompanionHookMode::ShaderOnly: return "shader";
     case V22CompanionHookMode::Safe: return "safe";
     case V22CompanionHookMode::All: return "all";
     }
@@ -1988,6 +1990,17 @@ static std::size_t PatchV22CreatorLayerLockedButtons(
         ++patched;
     }
     return patched;
+}
+
+static std::size_t InstallV22MissingGauntletAssetGuard(
+    ElfRuntime& runtime, ProbeEnvironment& env, bool assets_present) {
+    if (assets_present) return 0u;
+    const SymbolRecord* callback = FindSymbol(
+        runtime, "_ZN12CreatorLayer11onGauntletsEPN7cocos2d8CCObjectE");
+    if (!callback) return 0u;
+    // Some Lite beta APKs expose gauntlet code but omit every GauntletSheet
+    // resource. Entering the layer then crashes before any HTTP request.
+    return PatchV22FunctionReturnFalse(env, runtime, *callback) ? 1u : 0u;
 }
 
 static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
@@ -3560,7 +3573,10 @@ public:
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
-    void ResetFrameClipState() { gl_.ResetFrameClipState(); }
+    void ResetFrameClipState() {
+        editor_default_color_clear_seen_ = false;
+        gl_.ResetFrameClipState();
+    }
     void SwapBuffersHost() { gl_.Swap(); }
     void BeginGpuFrame(u64 frame) { gl_.BeginGpuFrame(frame); }
     void EndGpuFrame() { gl_.EndGpuFrame(); }
@@ -8074,6 +8090,43 @@ private:
             reinterpret_cast<void (APIENTRY*)(GLfloat,GLfloat,GLfloat,GLfloat)>(function)(WordToFloat(static_cast<u32>(arguments[0])),WordToFloat(static_cast<u32>(arguments[1])),WordToFloat(static_cast<u32>(arguments[2])),WordToFloat(static_cast<u32>(arguments[3])));
         } else if (name == "glLineWidth") {
             reinterpret_cast<void (APIENTRY*)(GLfloat)>(function)(WordToFloat(static_cast<u32>(arguments[0])));
+        } else if (name == "glClear") {
+            using Fn = void (APIENTRY*)(GLbitfield);
+            const GLbitfield mask = static_cast<GLbitfield>(arguments[0]);
+            const bool editor_default_clear =
+                !editor_default_color_clear_seen_ &&
+                gl_framebuffer_binding_ == 0u && IsV22EditorSceneActive() &&
+                (mask & GL_COLOR_BUFFER_BIT) != 0u;
+            if ((mask & GL_COLOR_BUFFER_BIT) != 0u &&
+                gl_framebuffer_binding_ == 0u)
+                editor_default_color_clear_seen_ = true;
+            if (!editor_default_clear) {
+                reinterpret_cast<Fn>(function)(mask);
+            } else {
+                const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+                GLint old_scissor[4] = {0, 0, 0, 0};
+                GLboolean old_color_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+                glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+                glGetBooleanv(GL_COLOR_WRITEMASK, old_color_mask);
+                if (scissor_enabled) glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                reinterpret_cast<Fn>(function)(mask);
+                glColorMask(old_color_mask[0], old_color_mask[1],
+                            old_color_mask[2], old_color_mask[3]);
+                if (scissor_enabled) {
+                    glScissor(old_scissor[0], old_scissor[1],
+                              old_scissor[2], old_scissor[3]);
+                    glEnable(GL_SCISSOR_TEST);
+                }
+                if (editor_full_clear_logs_ < 32u) {
+                    log_ << "[host] ARMv7 editor default framebuffer full clear "
+                         << "saved-scissor=" << (scissor_enabled ? 1 : 0)
+                         << " box=" << old_scissor[0] << ',' << old_scissor[1]
+                         << ' ' << old_scissor[2] << 'x' << old_scissor[3]
+                         << '\n';
+                    ++editor_full_clear_logs_;
+                }
+            }
         } else if (name == "glUniform2fv" || name == "glUniform3fv" || name == "glUniform4fv") {
             using Fn = void (APIENTRY*)(GLint, GLsizei, const GLfloat*);
             const unsigned components = name == "glUniform2fv" ? 2u : name == "glUniform3fv" ? 3u : 4u;
@@ -8098,86 +8151,11 @@ private:
             reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), static_cast<GLboolean>(arguments[2]), values);
         } else if (name == "glScissor" || name == "glViewport") {
             using Fn = void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei);
-            GLint x = static_cast<GLint>(arguments[0]);
-            GLint y = static_cast<GLint>(arguments[1]);
-            GLsizei width = static_cast<GLsizei>(arguments[2]);
-            GLsizei height = static_cast<GLsizei>(arguments[3]);
-            const auto [client_width, client_height] = gl_.ClientSize();
-            const int tolerance = 2;
-            const bool dimensions_valid = width > 0 && height > 0;
-            const bool left = x <= tolerance;
-            const bool bottom = y <= tolerance;
-            const bool right = x + width >= client_width - tolerance;
-            const bool top = y + height >= client_height - tolerance;
-            const int edges = static_cast<int>(left) + static_cast<int>(right) +
-                              static_cast<int>(bottom) + static_cast<int>(top);
-            const long long area =
-                static_cast<long long>(std::max<GLsizei>(0, width)) *
-                static_cast<long long>(std::max<GLsizei>(0, height));
-            const long long client_area =
-                static_cast<long long>(std::max(1, client_width)) *
-                static_cast<long long>(std::max(1, client_height));
-            const bool excludes_strip =
-                width < client_width - tolerance ||
-                height < client_height - tolerance ||
-                x > tolerance || y > tolerance;
-            const bool three_edge_crop = edges >= 3 && area * 5 >= client_area;
-            const bool corner_anchored =
-                (left || right) && (bottom || top);
-            const bool spans_most_of_axis =
-                static_cast<long long>(std::max<GLsizei>(0, width)) * 4 >=
-                    static_cast<long long>(client_width) * 3 ||
-                static_cast<long long>(std::max<GLsizei>(0, height)) * 4 >=
-                    static_cast<long long>(client_height) * 3;
-            const bool large_two_edge_crop =
-                edges >= 2 && corner_anchored && spans_most_of_axis &&
-                area * 20 >= client_area * 7;
-            const bool default_target = gl_framebuffer_binding_ == 0u;
-            const bool editor_default_clip =
-                default_target && IsV22EditorSceneActive() && dimensions_valid &&
-                client_width > 0 && client_height > 0 &&
-                (x != 0 || y != 0 || width != client_width ||
-                 height != client_height);
-            const bool full_height_edge_crop =
-                height >= client_height - tolerance &&
-                width >= std::max(1, client_width / 4) &&
-                width < client_width - tolerance &&
-                (left || right);
-            const bool full_width_edge_crop =
-                width >= client_width - tolerance &&
-                height >= std::max(1, client_height / 4) &&
-                height < client_height - tolerance &&
-                (bottom || top);
-            const bool client_coordinate_target =
-                width <= client_width + tolerance &&
-                height <= client_height + tolerance &&
-                x >= -tolerance && y >= -tolerance;
-            const bool large_edge_crop =
-                dimensions_valid && client_width > 0 && client_height > 0 &&
-                excludes_strip &&
-                ((default_target && (three_edge_crop || large_two_edge_crop)) ||
-                 (client_coordinate_target &&
-                  (full_height_edge_crop || full_width_edge_crop)));
-            if (editor_default_clip || large_edge_crop) {
-                if (edge_clip_normalization_logs_ < 96u) {
-                    log_ << "[host] ARMv7 normalized "
-                         << (editor_default_clip
-                                 ? (name == "glScissor"
-                                        ? "editor default-framebuffer scissor"
-                                        : "editor default-framebuffer viewport")
-                                 : "persistent edge clip")
-                         << " original=" << x << ',' << y << ' ' << width << 'x'
-                         << height << " client=" << client_width << 'x'
-                         << client_height << " framebuffer="
-                         << gl_framebuffer_binding_ << '\n';
-                    ++edge_clip_normalization_logs_;
-                }
-                x = 0;
-                y = 0;
-                width = client_width;
-                height = client_height;
-            }
-            reinterpret_cast<Fn>(function)(x, y, width, height);
+            reinterpret_cast<Fn>(function)(
+                static_cast<GLint>(arguments[0]),
+                static_cast<GLint>(arguments[1]),
+                static_cast<GLsizei>(arguments[2]),
+                static_cast<GLsizei>(arguments[3]));
         } else if (name == "glBindBuffer") {
             if (arguments[0] == GL_ARRAY_BUFFER) gl_array_buffer_binding_ = static_cast<u32>(arguments[1]);
             if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER) gl_element_buffer_binding_ = static_cast<u32>(arguments[1]);
@@ -10924,6 +10902,8 @@ private:
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
     u32 gl_framebuffer_binding_=0;
+    bool editor_default_color_clear_seen_=false;
+    u32 editor_full_clear_logs_=0;
     u32 edge_clip_normalization_logs_=0;
     u64 logged_guest_stdio_=0;
     bool audio_initialized_=false;
@@ -11251,7 +11231,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified7-recovery debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix2-focused debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11568,10 +11548,11 @@ int main(int argc,char** argv) {
             else if(argument.rfind("--companion-hooks=",0)==0) {
                 const std::string mode(argument.substr(18));
                 if (mode == "off") companion_hook_mode = V22CompanionHookMode::Off;
+                else if (mode == "shader") companion_hook_mode = V22CompanionHookMode::ShaderOnly;
                 else if (mode == "safe") companion_hook_mode = V22CompanionHookMode::Safe;
                 else if (mode == "all") companion_hook_mode = V22CompanionHookMode::All;
                 else throw std::runtime_error(
-                    "--companion-hooks must be off, safe, or all");
+                    "--companion-hooks must be off, shader, safe, or all");
             }
             else if(!argument.empty()&&argument[0]!='-')
                 input_path=std::string(argument);
@@ -11595,6 +11576,7 @@ int main(int argc,char** argv) {
         bool companion_hooking_present = false;
         bool companion_dobby_present = false;
         bool legacy_gdkit_present = false;
+        bool gauntlet_assets_present = false;
         std::string library_member;
         if(input_is_apk){
             apk=input_bytes;
@@ -11641,6 +11623,11 @@ int main(int argc,char** argv) {
                 "lib/armeabi-v7a/libdobby.so");
             legacy_gdkit_present = has_apk_member(
                 "lib/armeabi-v7a/libgdkit.so");
+            gauntlet_assets_present =
+                (has_apk_member("assets/GauntletSheet.png") &&
+                 has_apk_member("assets/GauntletSheet.plist")) ||
+                (has_apk_member("assets/GauntletSheet-hd.png") &&
+                 has_apk_member("assets/GauntletSheet-hd.plist"));
             if (companion_libgame.empty()) {
                 std::filesystem::path sidecar;
                 if (!companion_libgame_path.empty())
@@ -11736,6 +11723,9 @@ int main(int argc,char** argv) {
             InstallV22ConfigurableIconUnlockHooks(runtime, env);
         const std::size_t editor_redirects = gd_settings_full_bypass()
             ? InstallV22CreatorEditorUnlock(runtime, env) : 0u;
+        const std::size_t gauntlet_asset_guards =
+            InstallV22MissingGauntletAssetGuard(
+                runtime, env, gauntlet_assets_present);
         const V22GraphicsPatchCounts graphics_patches =
             InstallV22HighestGraphicsHooks(runtime, env);
         const std::size_t swing_reopen_patches =
@@ -11823,6 +11813,10 @@ int main(int argc,char** argv) {
              std::string(gd_settings_full_bypass() ? "1" : "0")+
              " patches="+std::to_string(editor_redirects)+
              " mode=best-effort-menu-creator+online-capability-no-global-button-remap");
+        emit("RESULT: DYNARMIC_V22_GAUNTLET_ASSET_GUARD assets="+
+             std::string(gauntlet_assets_present ? "1" : "0")+
+             " callbacks="+std::to_string(gauntlet_asset_guards)+
+             " policy=missing-assets-safe-noop");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
              std::string(gd_settings_server())+
              " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+
@@ -11840,7 +11834,7 @@ int main(int argc,char** argv) {
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=scissor-box-full+frame-reset+edge-scissor-viewport-normalization");
+             "state=pre-frame-reset+exact-viewport-scissor+first-editor-color-clear-full");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -12042,35 +12036,46 @@ int main(int argc,char** argv) {
         if (!companion_libgame.empty() && late_beta_layout &&
             companion_hook_mode != V22CompanionHookMode::Off) {
             companion_runtime_initialized = true;
-            emit("Running " +
-                 std::to_string(companion_runtime.constructors.size()) +
-                 " companion libgame.so constructors through Dynarmic");
-            for (std::size_t index = 0;
-                 index < companion_runtime.constructors.size(); ++index) {
-                const u32 entry = companion_runtime.constructors[index];
-                if (entry == 0u || entry == std::numeric_limits<u32>::max())
-                    continue;
-                u32 ignored = 0u;
-                if (!executor.RunFunction(
-                        entry, {}, &ignored,
-                        "companion constructor " +
-                            std::to_string(index + 1u),
-                        0u, std::chrono::milliseconds(30000))) {
-                    emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTOR_FAILED index=" +
-                         std::to_string(index + 1u) +
-                         " action=disable-companion-hooks");
-                    companion_runtime_initialized = false;
-                    break;
+            if (companion_hook_mode == V22CompanionHookMode::ShaderOnly) {
+                emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_SKIPPED "
+                     "mode=shader reason=single-stateless-ApplyHooks-only");
+            } else {
+                emit("Running " +
+                     std::to_string(companion_runtime.constructors.size()) +
+                     " companion libgame.so constructors through Dynarmic");
+                for (std::size_t index = 0;
+                     index < companion_runtime.constructors.size(); ++index) {
+                    const u32 entry = companion_runtime.constructors[index];
+                    if (entry == 0u ||
+                        entry == std::numeric_limits<u32>::max())
+                        continue;
+                    u32 ignored = 0u;
+                    if (!executor.RunFunction(
+                            entry, {}, &ignored,
+                            "companion constructor " +
+                                std::to_string(index + 1u),
+                            0u, std::chrono::milliseconds(30000))) {
+                        emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTOR_FAILED index=" +
+                             std::to_string(index + 1u) +
+                             " action=disable-companion-hooks");
+                        companion_runtime_initialized = false;
+                        break;
+                    }
+                }
+                if (companion_runtime_initialized) {
+                    emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_OK count=" +
+                         std::to_string(companion_runtime.constructors.size()));
                 }
             }
             if (companion_runtime_initialized) {
-                emit("RESULT: DYNARMIC_V22_COMPANION_CONSTRUCTORS_OK count=" +
-                     std::to_string(companion_runtime.constructors.size()));
                 std::size_t features_ok = 0u;
                 std::size_t features_failed = 0u;
                 std::size_t features_absent = 0u;
                 for (const V22CompanionFeatureSpec& feature :
                      kV22CompanionFeatures) {
+                    if (companion_hook_mode == V22CompanionHookMode::ShaderOnly &&
+                        std::strcmp(feature.label, "ShaderFix") != 0)
+                        continue;
                     if (companion_hook_mode == V22CompanionHookMode::Safe &&
                         !feature.safe)
                         continue;

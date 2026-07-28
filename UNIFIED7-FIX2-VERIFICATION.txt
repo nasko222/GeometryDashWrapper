@@ -1,0 +1,70 @@
+Geometry Dash Wrapper 0.9.5-unified7-fix2-focused verification
+================================================================
+
+Scope
+- Comments code was not changed; logged-in comments were confirmed working.
+- Geometry Dash 2.11 highest-graphics behavior was not changed.
+- The CMD launcher and three-EXE backend layout remain unchanged.
+
+Legacy ARM Geometry Dash 1.0.0
+- Tested APK bytes: 17,856,216.
+- lib/armeabi/libgame.so bytes: 5,551,628.
+- libgame CRC32: 60fa62f4.
+- Unified7 failure was after the forced-HD path and ended in nativeInit at the
+  CCSet vtable region.
+- Fix2 disables only the highest-graphics hooks for this exact size+CRC pair.
+- ARM legacy C++20 syntax check: PASS.
+
+ARMv7 shader/editor
+- Selected beta companion libgame.so exports ShaderFix::ApplyHooks at Thumb
+  address 0x00037b0d, size 64.
+- run_auto.py selects --companion-hooks=shader.
+- Shader-only mode skips every companion constructor and every non-ShaderFix
+  ApplyHooks function.
+- glViewport/glScissor are passed through exactly.
+- First editor/default-framebuffer color clear is promoted to a full clear while
+  preserving/restoring scissor and color-mask state.
+- ARMv7 C++20 syntax check: PASS.
+
+Lite gauntlet safety
+- Attached Lite APK contains no GauntletSheet normal or HD PNG/plist resources.
+- It exports CreatorLayer::onGauntlets at Thumb address 0x002e958d, size 44.
+- Fix2 makes only that callback a safe no-op when all gauntlet-sheet asset pairs
+  are absent.
+- Selected full beta contains GauntletSheet-hd.png/plist, so the guard does not
+  disable its gauntlets.
+
+x86 2.11 accounts
+- Boomlings login log stopped after a pending port-80 connect, before the login
+  request was sent.
+- Fix2 remembers addresses resolved specifically for Boomlings/the configured
+  GDPS and makes only those port-80 API sockets synthetic-ready for the existing
+  WinHTTP request bridge. Unrelated port-80 song/CDN sockets retain real connect.
+- GDPS account-load log successfully returned getAccountURL.php, then entered
+  guest TLS/OpenSSL and access-violated before any account-sync response.
+- Fix2 rewrites only the guest-visible getAccountURL.php prefix from https:// to
+  http://; actual transport remains WinHTTP.
+- Account URL rewrite C unit test: PASS (https://example -> http://example).
+- API resolved-address registry unit test: PASS.
+- Shared WinHTTP source Windows-stub C11 syntax check: PASS.
+- Full x86 Windows backend was not compiled in this Linux environment.
+
+Icons and launcher
+- Package identity takes precedence over spin-off level data bundled in full GD.
+- Identity tests: full GD -> Geometry Dash; World -> Geometry Dash World; Lite ->
+  Geometry Dash Lite; selected SubZero -> Geometry Dash SubZero: PASS.
+- APK icon discovery accepts real icon families outside res/ while still heavily
+  preferring res/mipmap/icon.png candidates.
+- SubZero ICO contains 10 sizes from 16 through 256 and its 256px alpha content
+  now occupies approximately 241x241 instead of 188x188.
+- Python syntax checks for run_auto.py and build_x86.py: PASS.
+
+Packaging
+- Full source contains no APK, extracted .so, EXE, DLL, PYC, __pycache__, save
+  data, or build cache.
+- ZIP integrity: checked after packaging.
+
+Runtime status
+- These are source/static fixes. Actual Windows gameplay remains unverified here.
+- Once 2.11 reaches cloud data parsing, genuinely incompatible 2.2-beta account
+  data may still expose a separate version-parser problem.

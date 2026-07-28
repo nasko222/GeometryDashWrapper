@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder43-0.9.5-unified7-recovery"
+$BuilderRevision = "dynarmic-x64-builder44-0.9.5-unified7-fix2-focused"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -463,6 +463,7 @@ if not exist game.apk (
   exit /b 2
 )
 if not exist save mkdir save
+for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul
 "%~dp0GeometryDashArmLegacy.exe" game.apk --log=gd-arm-legacy.log
 '@
 $LegacyDebug = @'
@@ -474,6 +475,7 @@ if not exist game.apk (
   exit /b 2
 )
 if not exist save mkdir save
+for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul
 "%~dp0GeometryDashArmLegacy.exe" game.apk --debug-everything --dump-imports=gd-arm-legacy-imports.txt --log=gd-arm-legacy-debug.log --profile=gd-arm-legacy-profile.csv --profile-summary=gd-arm-legacy-profile-summary.txt
 '@
 $ArmV7Run = @'
@@ -485,6 +487,7 @@ if not exist game.apk (
   exit /b 2
 )
 if not exist save mkdir save
+for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul
 "%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --log=gd-armv7.log
 '@
 $ArmV7Debug = @'
@@ -496,6 +499,7 @@ if not exist game.apk (
   exit /b 2
 )
 if not exist save mkdir save
+for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul
 "%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
 '@
 [IO.File]::WriteAllText((Join-Path $LegacyOut "RUN.cmd"), $LegacyRun, [Text.Encoding]::ASCII)
