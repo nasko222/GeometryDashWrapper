@@ -1944,6 +1944,45 @@ static std::size_t InstallV22ConfigurableIconUnlockHooks(
     return patched;
 }
 
+static bool PatchV22CreatorLayerLockedButtons(
+    ProbeEnvironment& env, const ElfRuntime& runtime) {
+    const SymbolRecord* init = FindSymbol(runtime, "_ZN12CreatorLayer4initEv");
+    if (!init || (init->address & 1u) == 0u || init->size < 48u) return false;
+    const u32 base = init->address & ~1u;
+    const u32 scan_size = std::min<u32>(init->size, 4096u);
+    for (u32 offset = 0u; offset + 48u <= scan_size; offset += 2u) {
+        const u32 address = base + offset;
+        const u16 instruction = env.MemoryRead16(address);
+        // World/Lite preserve each real callback in a loop, then CBZ over a
+        // compact block that replaces selected entries with onOnlyFullVersion
+        // and tints their sprites. Turn that CBZ into an unconditional branch
+        // to the same target; the native callbacks and normal artwork survive.
+        if ((instruction & 0xFD07u) != 0xB105u) continue; // cbz r5, target
+        const u32 immediate =
+            ((((instruction >> 9u) & 1u) << 5u) |
+             ((instruction >> 3u) & 0x1Fu)) << 1u;
+        const u32 target = address + 4u + immediate;
+        if (target <= address || target > base + scan_size - 2u) continue;
+        bool gray_tint = false;
+        for (u32 probe = address + 2u; probe < target; probe += 2u) {
+            if (env.MemoryRead16(probe) == 0x228Cu) { // movs r2, #140
+                gray_tint = true;
+                break;
+            }
+        }
+        if (!gray_tint) continue;
+        const s32 branch_bytes = static_cast<s32>(target) -
+                                 static_cast<s32>(address + 4u);
+        if ((branch_bytes & 1) != 0 || branch_bytes < -2048 ||
+            branch_bytes > 2046)
+            continue;
+        env.MemoryWrite16(address, static_cast<u16>(
+            0xE000u | ((branch_bytes >> 1) & 0x07FFu)));
+        return true;
+    }
+    return false;
+}
+
 static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
                                                  ProbeEnvironment& env) {
     struct Pair { const char* locked; const char* unlocked; };
@@ -1970,12 +2009,47 @@ static std::size_t InstallV22CreatorEditorUnlock(ElfRuntime& runtime,
             PatchV22FunctionTailJump(env, runtime, *locked, *unlocked))
             ++patched;
     }
+    if (PatchV22CreatorLayerLockedButtons(env, runtime)) ++patched;
     return patched;
+}
+
+static bool PatchV22HighestTextureQuality(
+    ProbeEnvironment& env, const ElfRuntime& runtime) {
+    const SymbolRecord* symbol = FindSymbol(
+        runtime, "_ZN7cocos2d10CCDirector18updateContentScaleENS_14TextureQualityE");
+    if (!symbol || symbol->size < 4u) return false;
+    const u32 base = symbol->address & ~1u;
+    if (symbol->address & 1u) {
+        const u32 scan_size = std::min<u32>(symbol->size, 64u);
+        for (u32 offset = 0u; offset + 2u <= scan_size; offset += 2u) {
+            const u16 instruction = env.MemoryRead16(base + offset);
+            if ((instruction & 0xF8FFu) != 0x2802u) continue;
+            const u16 reg = static_cast<u16>((instruction >> 8u) & 7u);
+            // cmp rN,#2 -> cmp rN,rN, making the immediately following BEQ
+            // deterministic while retaining CCDirector's complete setup.
+            env.MemoryWrite16(base + offset, static_cast<u16>(
+                0x4280u | (reg << 3u) | reg));
+            return true;
+        }
+        return false;
+    }
+    const u32 scan_size = std::min<u32>(symbol->size, 64u);
+    for (u32 offset = 0u; offset + 4u <= scan_size; offset += 4u) {
+        const u32 instruction = env.MemoryRead32(base + offset);
+        if ((instruction & 0x0FFF0FFFu) != 0x03500002u) continue;
+        const u32 condition = instruction & 0xF0000000u;
+        const u32 reg = (instruction >> 16u) & 0xFu;
+        env.MemoryWrite32(base + offset, condition | 0x01500000u |
+                                         (reg << 16u) | reg);
+        return true;
+    }
+    return false;
 }
 
 struct V22GraphicsPatchCounts {
     std::size_t hd = 0u;
     std::size_t low_memory = 0u;
+    std::size_t texture_quality = 0u;
 };
 
 static V22GraphicsPatchCounts InstallV22HighestGraphicsHooks(
@@ -1996,6 +2070,8 @@ static V22GraphicsPatchCounts InstallV22HighestGraphicsHooks(
                 ++counts.low_memory;
         }
     }
+    if (PatchV22HighestTextureQuality(env, runtime))
+        ++counts.texture_quality;
     return counts;
 }
 
@@ -4836,23 +4912,41 @@ private:
         env_.MemoryWrite32(object + 4u, 0u);
         env_.MemoryWrite32(object + 8u, 0u);
         if (data.empty()) return true;
-        if (data.size() > std::numeric_limits<u32>::max()) return false;
-        const u32 memory = Allocate(static_cast<u32>(data.size()));
+        if (data.size() >= std::numeric_limits<u32>::max()) return false;
+        const u32 size = static_cast<u32>(data.size());
+        const u32 memory = Allocate(size + 1u);
         if (!memory || !env_.WriteBytes(memory, data.data(), data.size())) {
             if (memory) Free(memory);
             return false;
         }
+        env_.MemoryWrite8(memory + size, 0u);
         env_.MemoryWrite32(object, memory);
-        env_.MemoryWrite32(object + 4u,
-                           memory + static_cast<u32>(data.size()));
-        env_.MemoryWrite32(object + 8u,
-                           memory + static_cast<u32>(data.size()));
+        env_.MemoryWrite32(object + 4u, memory + size);
+        env_.MemoryWrite32(object + 8u, memory + size + 1u);
         return true;
     }
 
     bool BuildNativeHttpResponse(const NativeHttpResult& result,
                                  u32& response) {
         response = 0u;
+        if ((result.url.find("getGJAccountComments") != std::string::npos ||
+             result.url.find("getGJComments") != std::string::npos) &&
+            native_http_comment_preview_logs_ < 16u) {
+            const std::size_t preview_size =
+                std::min<std::size_t>(result.response_body.size(), 192u);
+            std::string preview;
+            if (preview_size) {
+                preview.assign(
+                    reinterpret_cast<const char*>(result.response_body.data()),
+                    preview_size);
+            }
+            log_ << "[host] ARMv7 comments response ABI body="
+                 << result.response_body.size()
+                 << " vector-capacity=body+1 nul-terminated=1 preview=\""
+                 << SanitizeLogText(preview) << "\"\n";
+            ++native_http_comment_preview_logs_;
+            log_.flush();
+        }
         if (!native_http_ccobject_ctor_ || !native_http_response_vtable_) {
             ReleaseGuestObject(result.request,
                                "native HTTP missing ABI request cleanup");
@@ -8090,10 +8184,17 @@ private:
                 width <= client_width + tolerance &&
                 height <= client_height + tolerance &&
                 x >= -tolerance && y >= -tolerance;
+            const bool default_viewport_crop =
+                name == "glViewport" && default_target && dimensions_valid &&
+                client_width > 0 && client_height > 0 && excludes_strip;
+            const bool aggressive_default_scissor_crop =
+                name == "glScissor" && default_target && dimensions_valid &&
+                excludes_strip && edges >= 2 && area * 10 >= client_area * 3;
             const bool large_edge_crop =
                 dimensions_valid && client_width > 0 && client_height > 0 &&
                 excludes_strip &&
-                ((default_target && (three_edge_crop || large_two_edge_crop)) ||
+                (default_viewport_crop || aggressive_default_scissor_crop ||
+                 (default_target && (three_edge_crop || large_two_edge_crop)) ||
                  (client_coordinate_target &&
                   (full_height_edge_crop || full_width_edge_crop)));
             if (large_edge_crop) {
@@ -10820,6 +10921,7 @@ private:
     u64 native_http_queued_count_=0;
     u64 native_http_completed_count_=0;
     u64 native_http_callback_count_=0;
+    u64 native_http_comment_preview_logs_=0;
     std::atomic<u64> native_http_active_count_{0};
 #ifdef _WIN32
     std::mutex native_http_mutex_;
@@ -11184,7 +11286,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified5 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-unified6 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11755,7 +11857,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_FULL_VERSION_BYPASS enabled="+
              std::string(gd_settings_full_bypass() ? "1" : "0")+
              " patches="+std::to_string(editor_redirects)+
-             " mode=best-effort-menu-creator+online-capability-no-global-button-remap");
+             " mode=menu-creator+online-capability+CreatorLayer-native-callback-preservation");
         emit("RESULT: UNIFIED_LAUNCH_SETTINGS server="+
              std::string(gd_settings_server())+
              " hack-icons="+(gd_settings_hack_icons() ? "true" : "false")+
@@ -11767,13 +11869,15 @@ int main(int argc,char** argv) {
              " hd-hooks="+std::to_string(graphics_patches.hd)+
              " low-memory-hooks="+
              std::to_string(graphics_patches.low_memory)+
+             " texture-quality-hooks="+
+             std::to_string(graphics_patches.texture_quality)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max()));
         emit("RESULT: DYNARMIC_V22_PLATFORMER_SWING_REOPEN_PATCH count="+
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=scissor-box-full+frame-reset+edge-scissor-viewport-normalization");
+             "state=pre-and-post-render-reset+default-viewport-full+aggressive-edge-scissor-normalization");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -12205,6 +12309,10 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
+            // nativeRender may leave an editor-playtest viewport/scissor active.
+            // Reset again before presenting so it cannot leak into the next
+            // frame or survive a scene transition.
+            executor.ResetFrameClipState();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

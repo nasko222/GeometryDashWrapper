@@ -158,7 +158,7 @@ def main() -> int:
         "--effects-apk", type=Path, action="append", default=[],
         help="Additional APK whose Ogg effects should be embedded in the same EXE; repeatable",
     )
-    parser.add_argument("--out", type=Path, default=Path("dist-unified-x86"))
+    parser.add_argument("--out", type=Path, default=Path("dist-unified/backends/x86"))
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -216,7 +216,7 @@ def main() -> int:
         f"-I{root / 'src/shared'}",
         f"-I{root / 'src/backends/x86'}",
         "-o",
-        str(output / "GeometryDashWrapper.exe"),
+        str(output / "GeometryDashX86.exe"),
         *(str(path) for path in sources),
         "-lws2_32",
         "-lopengl32",
@@ -232,32 +232,48 @@ def main() -> int:
     environment["ZIG_LOCAL_CACHE_DIR"] = str(cache / "local")
     subprocess.run(command, check=True, env=environment)
 
+    backend_exe = output / "GeometryDashX86.exe"
+    backend_module = output / "GeometryDashX86.dll"
+    backend_module.unlink(missing_ok=True)
+    backend_exe.replace(backend_module)
+
     (output / "GeometryDash18Wrapper.exe").unlink(missing_ok=True)
     (output / "GeometryDash18Wrapper.pdb").unlink(missing_ok=True)
     (output / "libcocos2dcpp.so").unlink(missing_ok=True)
     (output / "libgame.so").unlink(missing_ok=True)
     shutil.rmtree(output / "audio", ignore_errors=True)
+    for launch_script in output.glob("RUN*.cmd"):
+        launch_script.unlink(missing_ok=True)
 
-    (output / "game.apk").unlink(missing_ok=True)
-    shutil.rmtree(output / "save", ignore_errors=True)
+    unified = output.parent.parent
+    unified.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(unified / "arm-legacy", ignore_errors=True)
+    shutil.rmtree(unified / "armv7", ignore_errors=True)
+    for stale in (
+        "GeometryDashArmLegacy.exe", "GeometryDashArmV7.exe", "RUN_AUTO.cmd"
+    ):
+        (unified / stale).unlink(missing_ok=True)
+    (unified / "save").mkdir(exist_ok=True)
     if apk:
-        shutil.copy2(apk, output.parent / "game.apk")
+        shutil.copy2(apk, unified / "game.apk")
 
-    (output / "RUN.cmd").write_text(
-        '@echo off\r\n'
-        'cd /d "%~dp0.."\r\n'
-        'if not exist game.apk (\r\n'
-        '  echo Put a supported Geometry Dash APK in dist-unified as game.apk\r\n'
-        '  pause\r\n'
-        '  exit /b 2\r\n'
-        ')\r\n'
-        'if not exist save mkdir save\r\n'
-        '"%~dp0GeometryDashWrapper.exe" --apk=game.apk\r\n',
-        encoding="ascii",
-        newline="",
-    )
+    launcher = unified / "GeometryDash.exe"
+    launcher_command = [
+        str(zig), "cc", "-target", "x86_64-windows-gnu", "-std=c11",
+        "-O2", "-Wall", "-Wextra", "-mwindows", "-municode",
+        str(root / "src/launcher/geometry_dash_launcher.c"),
+        "-o", str(launcher), "-luser32",
+    ]
+    subprocess.run(launcher_command, check=True, env=environment)
+    shutil.copy2(root / "run_auto.py", unified / "run_auto.py")
+    shutil.copy2(root / "GeometryDash.cfg", unified / "GeometryDash.cfg")
+    icon_out = unified / "assets/icons"
+    shutil.rmtree(icon_out, ignore_errors=True)
+    shutil.copytree(root / "assets/icons", icon_out)
+    (unified / "RUN_AUTO.cmd").unlink(missing_ok=True)
 
-    print(output / "GeometryDashWrapper.exe")
+    print(backend_module)
+    print(launcher)
     return 0
 
 

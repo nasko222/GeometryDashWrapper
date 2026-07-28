@@ -35,6 +35,13 @@ int gd_apply_window_icon(void *native_window) {
     gd_small_icon = small_icon;
     SendMessageA(window, WM_SETICON, ICON_BIG, (LPARAM)gd_big_icon);
     SendMessageA(window, WM_SETICON, ICON_SMALL, (LPARAM)gd_small_icon);
+    // Some Windows shells read the class icon instead of WM_GETICON during
+    // taskbar regrouping or immediately after the OpenGL window is recreated.
+    // Keep both sources synchronized so Lite/World/SubZero cannot inherit a
+    // stale icon from the previous process.
+    SetClassLongPtrA(window, GCLP_HICON, (LONG_PTR)gd_big_icon);
+    SetClassLongPtrA(window, GCLP_HICONSM, (LONG_PTR)gd_small_icon);
+    SendMessageA(window, WM_SETTINGCHANGE, 0, 0);
     return 1;
 }
 #else

@@ -1,0 +1,23 @@
+Geometry Dash Wrapper 0.9.5-unified6 validation
+================================================
+
+PASS  Uploaded test logs inspected.
+      - Comments request returned HTTP 200 with 475 response bytes and callback.
+      - Lite test issued zero native HTTP requests.
+
+PASS  Python syntax: run_auto.py and build_x86.py.
+PASS  CFG parsing and game-title classification tests.
+PASS  C launcher strict syntax check (-Wall -Wextra -Werror).
+PASS  C launcher CFG parser and Windows command-line quoting unit tests.
+PASS  C launcher cross-compiled to a PE32+ Windows GUI executable without CRT.
+PASS  Launcher import audit: KERNEL32.dll + USER32.dll only.
+PASS  ARM and ARMv7 sources passed C++20 syntax checks with Dynarmic interface stubs.
+PASS  World ARMv7 signature audit:
+      CreatorLayer locked-button block: exactly 1 match.
+      CCDirector texture-quality comparison: exactly 1 match.
+PASS  Source archive scan: no APK, SO, EXE, DLL, PYC, or __pycache__ payloads.
+
+NOT RUN  Complete Windows backend build and in-game runtime test.
+NOT PROVEN  Comments parser behavior, World 1.0 gauntlet server behavior,
+            editor black-strip behavior, and 2.11 texture selection require the
+            user's Windows runtime test.

@@ -14,7 +14,7 @@ $Downloads = Join-Path $ToolsRoot "downloads"
 $ZigVersion = "0.14.1"
 $ZigDirectory = Join-Path $ToolsRoot "zig-$ZigVersion"
 $ZigArchive = Join-Path $Downloads "zig-x86_64-windows-$ZigVersion.zip"
-$Output = Join-Path $Root "dist-unified\x86"
+$Output = Join-Path $Root "dist-unified\backends\x86"
 
 function Get-CheckedFile {
     param([string]$Uri, [string]$Destination, [string]$Sha256)

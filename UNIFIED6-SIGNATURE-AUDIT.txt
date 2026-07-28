@@ -1,0 +1,10 @@
+Unified6 ARM patch signature audit
+==================================
+Input: user-supplied Geometry Dash World ARMv7 library
+CreatorLayer::init address=0x0027ac69 size=2096
+Creator locked-button matches=1
+  match address=0x0027aed0 cbz=0xb195 target=0x0027aef8 replacement-b=0xe012
+CCDirector::updateContentScale address=0x0039ef63 size=150
+Texture-quality cmp matches=1
+  match address=0x0039ef62 cmp-imm=0x2902 replacement-cmp-self=0x4289
+RESULT: PASS
