@@ -1,4 +1,4 @@
-# EnduranceTest1 Test Sheet
+# EnduranceTest2 Test Sheet
 
 Copy this file and mark results.
 
@@ -46,6 +46,7 @@ For a failed backup, search the run log for:
 ```text
 Network HTTP interim response
 Network HTTP request pending body
+Network HTTP pending body joined
 backupGJAccount
 Network legacy API completed through WinHTTP
 ```
@@ -73,6 +74,7 @@ Network legacy API completed through WinHTTP
 - [ ] Stopping playtest removes stale clip/black region
 - [ ] Pan and zoom remain correct
 - [ ] Objects render in editor and playtest
+- [ ] Editor opens without the exact-visibility freeze
 - [ ] Editor remains usable for 20 minutes
 - [ ] Pause/resume works during editor playtest
 

@@ -2474,7 +2474,12 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
      * the primary stub. This is slower than the approximation because it walks
      * all editor sections, but correctness is the priority in this branch.
      */
-    if (gd_settings_v22_exact_editor_visibility() &&
+    /* The first endurance build proved this full companion redirect can spend several
+       seconds in one editor frame and freeze the window. Keep the code for
+       forensic comparison, but never activate it in an endurance build. */
+    const bool exact_companion_visibility_is_safe = false;
+    if (exact_companion_visibility_is_safe &&
+        gd_settings_v22_exact_editor_visibility() &&
         companion_visibility && companion_original_slot &&
         runtime.v22_companion_editor_visibility ==
             companion_visibility->address &&
@@ -11479,7 +11484,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest2 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

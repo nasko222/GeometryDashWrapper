@@ -76,7 +76,7 @@ change the resulting binaries; a claim that those fixed binaries are identical
 to the broken build would be false.
 
 
-## EnduranceTest1 examples
+## Endurance branch examples
 
 ### Configuration switch
 

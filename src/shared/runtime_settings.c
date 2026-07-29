@@ -147,7 +147,7 @@ int gd_settings_hide_cursor_during_play(void) {
 }
 
 int gd_settings_v22_exact_editor_visibility(void) {
-    return gd_setting_bool("V22_EXACT_EDITOR_VISIBILITY", 1);
+    return gd_setting_bool("V22_EXACT_EDITOR_VISIBILITY", 0);
 }
 
 float gd_settings_music_pulse_max(void) {

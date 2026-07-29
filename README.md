@@ -1,8 +1,10 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest1
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest2
 
-`endurancetest1` is a correctness and long-session regression branch. It keeps
-the Fix6 x86 frame-pacing implementation unchanged and focuses on failures that
-appeared while moving repeatedly between Geometry Dash versions.
+`endurancetest` is the long-session and cross-version regression branch.
+EnduranceTest2 is a narrow correction over EnduranceTest1: it removes the
+freezing 2.2 editor experiment, repairs the old-client backup send state, and
+makes x86 cursor visibility follow the actual pause scene. The accepted Fix6
+x86 frame-pacing implementation is unchanged.
 
 ## Running
 
@@ -20,16 +22,15 @@ dated log folder.
 
 ## Default launch settings
 
-Both launchers expose these switches:
-
 ```bat
 set "DISABLE_PAUSE_BUTTON=true"
 set "HIDE_CURSOR_DURING_PLAY=true"
 set "VERSION_ISOLATED_SAVES=true"
-set "V22_EXACT_EDITOR_VISIBILITY=true"
+set "V22_EXACT_EDITOR_VISIBILITY=false"
 ```
 
-`VERSION_ISOLATED_SAVES=true` stores data by package, version and backend:
+`VERSION_ISOLATED_SAVES=true` stores all game state and caches by package,
+version and backend, for example:
 
 ```text
 save\com.robtopx.geometryjump__v1.93__x86\
@@ -40,31 +41,32 @@ save\com.robtopx.geometrydashsubzero__v2.2.12__armv7\
 Set it to `false` to use the old shared `save\` directory. Existing flat saves
 are left untouched and are never guessed or migrated automatically.
 
-`V22_EXACT_EDITOR_VISIBILITY=true` selects the late-beta companion's complete
-editor visibility routine. It is a correctness-first option and can cost more
-CPU than the Fix6 approximation. Set it to `false` to return to the Fix6 host
-approximation.
+`V22_EXACT_EDITOR_VISIBILITY` remains visible only for comparison with old
+logs. The exact companion redirect is hard-disabled in this endurance build
+because it caused multi-second editor frames and freezes. The faster Fix6 host
+visual path is always used.
 
-## EnduranceTest1 changes
+## EnduranceTest2 changes
 
-- Leaves the accepted Fix6 x86 pacing function byte-for-byte unchanged.
-- Keeps the cursor visible after Escape while a paused PlayLayer remains alive.
-  Definite gameplay keyboard input hides it again.
-- Hides the late-beta top-right pause item itself while preserving Escape and
-  the complete pause menu. The x86 path uses RTTI validation and is best-effort
-  across releases; legacy ARM keeps its safe top-right click block.
-- Adds an HTTP `100 Continue` compatibility reply for large legacy account/save
-  POSTs. This targets the 1.93 backup case where the client connected but never
-  transmitted a complete request to the GDPS.
-- Uses the supplied late-beta companion's exact `LevelEditorLayerExt::
-  updateVisibilityH` path by default, wiring its original-function slot to the
-  primary game implementation. This targets the missing song-position line,
-  missing BPM guidelines and stale right-side editor region while retaining
-  the object-colour repair already confirmed in Fix6.
-- Keeps version-isolated saves enabled by default.
-- Keeps native launch, APK drag-and-drop, dated logs, clean titles, supplied
-  icon families and separate Boomlings/GDPS launchers.
+- Keeps the accepted Fix6 x86 pacing function unchanged.
+- Walks the live Cocos scene graph on x86 so the cursor stays visible in pause
+  and options layers, then hides again after Resume.
+- Keeps the top-right pause-button behavior and Escape pause behavior unchanged.
+- Preserves a synthetic API socket's logical connected state after
+  `HTTP/1.1 100 Continue`, reports `POLLOUT`, and joins a following backup body
+  whether the old client sends it through `send` or `writev`.
+- Hard-disables the exact 2.2 companion visibility redirect that froze the
+  editor. The confirmed Fix6 object-color repair remains active.
+- Keeps version-isolated saves, native launch, APK drag-and-drop, dated logs,
+  clean titles, supplied icon families, and separate Boomlings/GDPS launchers.
 - Contains no Python files and no `.gitignore`.
+
+## Open editor issues
+
+The song-position line, BPM guidelines and moving right-side black region are
+not claimed fixed in this build. Disassembly showed that the freezing companion
+visibility routine never called `DrawGridLayer::updateTimeMarkers`, so it was
+the wrong path for those overlays. EnduranceTest2 removes the freeze first.
 
 ## Readability
 

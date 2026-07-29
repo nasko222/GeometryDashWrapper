@@ -1,4 +1,4 @@
-# Building EnduranceTest1 on Windows
+# Building EnduranceTest2 on Windows
 
 Run:
 
@@ -32,6 +32,6 @@ BUILD_DYNARMIC.cmd
 BUILD_LAUNCHER.cmd
 ```
 
-EnduranceTest1 changes x86 networking, x86/ARM cursor behavior, ARMv7 editor
+EnduranceTest2 changes x86 backup networking, x86 pause-cursor behavior, and the ARMv7 editor experiment
 behavior and the native launch metadata. Run `BUILD_ALL.cmd`; do not reuse Fix6
 executables. The x86 pacing implementation itself is unchanged.

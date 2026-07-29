@@ -1633,6 +1633,8 @@ static void shim_freeaddrinfo(AndroidAddrInfo *result) {
 
 static void socket_trace_reset(int descriptor);
 static void synthetic_http_reset(int descriptor);
+static void synthetic_http_mark_connected(int descriptor);
+static int synthetic_http_connected(int descriptor);
 static void pending_http_reset(int descriptor);
 
 static int shim_socket(int family, int type, int protocol) {
@@ -1726,6 +1728,7 @@ static int shim_connect(int descriptor, const struct sockaddr *address, int leng
        unrelated port-80 song/CDN sockets keep their real Winsock connection. */
     if (port == 80u && use_synthetic_api_connect() &&
         is_remembered_api_address(windows_address, windows_length)) {
+        synthetic_http_mark_connected(descriptor);
         if (trace <= 64) {
             runtime_log("Network connect #%ld: fd=%d %s synthetic HTTP ready "
                         "(family=%d length=%d port=80)",
@@ -1849,6 +1852,13 @@ static int shim_getsockopt(int descriptor, int level, int option,
         g_errno_value = 92;
         return -1;
     }
+    if (level == GD_ANDROID_SOL_SOCKET && option == 4 &&
+        synthetic_http_connected(descriptor) &&
+        *length >= (int)sizeof(int)) {
+        *(int *)value = 0;
+        *length = sizeof(int);
+        return 0;
+    }
     if (level == GD_ANDROID_SOL_SOCKET && (option == 20 || option == 21)) {
         DWORD milliseconds = 0;
         int windows_length = sizeof(milliseconds);
@@ -1926,6 +1936,7 @@ static int shim_shutdown(int descriptor, int how) {
 typedef struct {
     int used;
     int descriptor;
+    int connected;
     unsigned char *bytes;
     size_t size;
     size_t offset;
@@ -1964,6 +1975,32 @@ static void synthetic_http_reset(int descriptor) {
         }
     }
     ReleaseSRWLockExclusive(&g_synthetic_http_lock);
+}
+
+/*
+ * A synthetic API socket deliberately skips Winsock connect().  Keep that
+ * logical connection state separate from the currently queued response bytes.
+ * Old GD clients poll for POLLOUT after reading HTTP 100 Continue; losing this
+ * bit made the client wait forever instead of sending the account-save body.
+ */
+static void synthetic_http_mark_connected(int descriptor) {
+    AcquireSRWLockExclusive(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 1);
+        if (state) state->connected = 1;
+    }
+    ReleaseSRWLockExclusive(&g_synthetic_http_lock);
+}
+
+static int synthetic_http_connected(int descriptor) {
+    int connected = 0;
+    AcquireSRWLockShared(&g_synthetic_http_lock);
+    {
+        SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 0);
+        connected = state && state->connected;
+    }
+    ReleaseSRWLockShared(&g_synthetic_http_lock);
+    return connected;
 }
 
 static int synthetic_http_store_mode(int descriptor, unsigned char *bytes,
@@ -2017,18 +2054,21 @@ static int synthetic_http_recv(int descriptor, void *buffer, size_t length,
                 state->offset += count;
                 *result = count > INT_MAX ? INT_MAX : (int)count;
             } else if (state->eof_pending) {
+                /* Keep returning EOF until the guest closes this synthetic
+                   connection, just like a real socket after Connection: close. */
                 handled = 1;
                 *result = 0;
-                free(state->bytes);
-                memset(state, 0, sizeof(*state));
             } else {
                 /*
-                 * An HTTP 100 Continue response is an interim response, not
-                 * end-of-stream. Once its bytes are consumed, remove only the
-                 * synthetic packet and let the guest send the request body.
+                 * An HTTP 100 Continue response is interim, not EOF. Drop only
+                 * its packet bytes while preserving the synthetic connection;
+                 * the guest must still see POLLOUT and send the request body.
                  */
                 free(state->bytes);
-                memset(state, 0, sizeof(*state));
+                state->bytes = NULL;
+                state->size = 0;
+                state->offset = 0;
+                state->eof_pending = 0;
             }
         }
     }
@@ -2110,6 +2150,17 @@ static int pending_http_join(int descriptor, const void *buffer, size_t length,
     }
     ReleaseSRWLockExclusive(&g_pending_http_lock);
     return result;
+}
+
+static int pending_http_has(int descriptor) {
+    int present = 0;
+    AcquireSRWLockShared(&g_pending_http_lock);
+    {
+        PendingHttpState *state = pending_http_state_locked(descriptor, 0);
+        present = state && state->used;
+    }
+    ReleaseSRWLockShared(&g_pending_http_lock);
+    return present;
 }
 
 static int pending_http_store(int descriptor, const void *buffer, size_t length) {
@@ -2472,6 +2523,13 @@ static int shim_recv(int descriptor, void *buffer, size_t length, int flags) {
         }
         return result;
     }
+    if (synthetic_http_connected(descriptor)) {
+        /* The logical API connection has no Winsock peer. With no queued
+           response it behaves like a nonblocking socket with no readable data. */
+        g_errno_value = gd_net_wsa_error_to_android(WSAEWOULDBLOCK);
+        WSASetLastError(WSAEWOULDBLOCK);
+        return -1;
+    }
     result = recv((SOCKET)(uintptr_t)(uint32_t)descriptor, (char *)buffer,
                   (int)length, flags & ~GD_ANDROID_MSG_NOSIGNAL);
     if (result > 0) {
@@ -2558,6 +2616,13 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
     }
     request_buffer = joined_result > 0 ? joined : buffer;
     if (joined_result <= 0) request_length = length;
+    if (joined_result > 0) {
+        runtime_log(
+            "Network HTTP pending body joined: fd=%d body-chunk=%lu "
+            "complete-request=%lu",
+            descriptor, (unsigned long)length,
+            (unsigned long)request_length);
+    }
 
     song_request = try_song_metadata_request(
         descriptor, request_buffer, request_length);
@@ -2675,6 +2740,15 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
                            vectors[index].length);
                     offset += vectors[index].length;
                 }
+            }
+            /* A 1.93 backup may send its post-100 body through writev rather
+               than send. Reuse shim_send so the buffered headers are joined
+               and handed to the same WinHTTP API bridge. */
+            if (pending_http_has(descriptor)) {
+                int pending_result = shim_send(
+                    descriptor, joined, total_length, 0);
+                free(joined);
+                return pending_result;
             }
             {
                 int song_request = try_song_metadata_request(
@@ -2872,14 +2946,32 @@ static int shim_poll(AndroidPollFd *descriptors, uint32_t count, int timeout) {
     }
     for (index = 0; index < count; ++index) {
         descriptors[index].returned_events = 0;
-        if (synthetic_http_ready(descriptors[index].descriptor)) {
-            if (descriptors[index].events &
-                (ANDROID_POLLIN | ANDROID_POLLRDNORM)) {
-                descriptors[index].returned_events =
-                    ANDROID_POLLIN | ANDROID_POLLRDNORM;
-                ++special_ready;
+        {
+            const int synthetic_connected =
+                synthetic_http_connected(descriptors[index].descriptor);
+            const int synthetic_ready =
+                synthetic_http_ready(descriptors[index].descriptor);
+            if (synthetic_connected || synthetic_ready) {
+                short ready_events = 0;
+                if (synthetic_ready &&
+                    (descriptors[index].events &
+                     (ANDROID_POLLIN | ANDROID_POLLRDNORM |
+                      ANDROID_POLLRDBAND))) {
+                    ready_events |= ANDROID_POLLIN | ANDROID_POLLRDNORM;
+                }
+                if (synthetic_connected &&
+                    (descriptors[index].events &
+                     (ANDROID_POLLOUT | ANDROID_POLLWRNORM))) {
+                    ready_events |= ANDROID_POLLOUT | ANDROID_POLLWRNORM;
+                }
+                if (synthetic_connected &&
+                    (descriptors[index].events & ANDROID_POLLWRBAND)) {
+                    ready_events |= ANDROID_POLLOUT | ANDROID_POLLWRBAND;
+                }
+                descriptors[index].returned_events = ready_events;
+                if (ready_events) ++special_ready;
+                continue;
             }
-            continue;
         }
         if (descriptors[index].descriptor == ANDROID_RANDOM_FD &&
             InterlockedCompareExchange(&g_random_open_count, 0, 0) > 0) {

@@ -1,0 +1,73 @@
+Geometry Dash Wrapper 0.9.5-endurancetest2
+Verification and uploaded-log diagnosis
+
+UPLOADED LOG DIAGNOSIS
+
+1. Selected 2.2 beta editor freeze
+- Both uploaded ARMv7 runs report exact-editor-visibility=true.
+- Both runs installed visibility-mode=exact-companion.
+- The logs contain nativeRender/nativeTouches heartbeats extending into
+  multi-second calls with millions of guest imports.
+- This identifies the complete companion updateVisibilityH redirect as the
+  freeze source.
+- EnduranceTest2 hard-disables that redirect even if the environment variable
+  is accidentally set to true. Both launchers default it to false.
+- The faster Fix6 host object/color visibility bridge remains active.
+
+The exact companion routine did not call DrawGridLayer::updateTimeMarkers, so
+it was not a valid fix for the song-position line or BPM guideline overlays.
+The moving right-side black region, song line and BPM guidelines remain open;
+this build does not claim those three are fixed.
+
+2. Geometry Dash 1.93 backup failure
+- Login requests in the same logs reached the GDPS and completed through
+  WinHTTP with HTTP 200.
+- The failed backup received the synthetic HTTP/1.1 100 Continue response.
+- The wrapper buffered 187 bytes of request headers and then no request body
+  arrived; no backupGJAccount endpoint reached WinHTTP or the GDPS.
+- Therefore this captured failure occurred inside the wrapper's synthetic
+  socket state, before the server could accept or reject the backup.
+
+EnduranceTest2 keeps synthetic API sockets logically connected after an
+interim response, reports POLLOUT/POLLWRNORM, returns would-block rather than
+reading an unconnected Winsock socket, and joins a following body sent through
+either send or writev. New log line:
+
+  Network HTTP pending body joined
+
+A successful test should then show backupGJAccount and a WinHTTP completion.
+
+3. x86 cursor after Resume
+- EnduranceTest1 used a sticky cursor_force_visible flag set by Escape.
+- Resume did not clear it because PlayLayer remains alive beneath the pause
+  menu.
+- EnduranceTest2 resolves Cocos parent/children/CCArray functions and walks the
+  live scene graph for PauseLayer, EditorPauseLayer, options and alert layers.
+- The cursor remains visible while those overlays exist and is hidden after
+  three rendered frames without an overlay.
+
+PRESERVED BEHAVIOR
+
+- The accepted Fix6 x86 pace_x86_frame function is source-identical.
+- Version-isolated saves remain enabled by default and toggleable.
+- ARM/ARMv7 gameplay cursor code, pause-button handling, icons, titles, saves,
+  shader source and object-color repair were not changed in this pass.
+- No Python file and no .gitignore is included.
+
+VALIDATION
+
+- 40/40 focused source and diagnosis checks passed.
+- x86 main.c syntax check passed with the Win32 compatibility headers.
+- ARMv7 C++20 syntax check passed.
+- Legacy ARM C++20 syntax check passed.
+- Focused synthetic HTTP state/POLLOUT/EOF unit test compiled and passed.
+- x86 frame-pacing source comparison passed.
+- Source policy scan passed: no APK, Android .so, EXE, DLL, Python, build cache,
+  saves, logs, .git directory or .gitignore.
+
+LIMITATION
+
+A complete Windows backend build and gameplay test cannot be performed in this
+Linux container. Runtime confirmation is still required for 1.93 backup and
+x86 pause/resume cursor behavior. The remaining 2.2 editor overlays are known
+open issues, not claimed fixes.

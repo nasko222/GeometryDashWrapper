@@ -1,0 +1,8 @@
+Geometry Dash Wrapper EnduranceTest1 -> EnduranceTest2 source hotfix
+
+1. Copy the contents of this folder over the EnduranceTest1 source root.
+2. Delete the files listed in DELETE-OLD-FILES.txt.
+3. Run BUILD_ALL.cmd.
+
+All three backends and the native launcher carry the new version identifier.
+The x86 backend and ARMv7 backend contain functional source changes.

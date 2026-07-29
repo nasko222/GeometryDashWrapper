@@ -33,6 +33,11 @@ typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
 typedef void (__cdecl *CCNodeSetVisibleFunction)(void *node, int visible);
+typedef void *(__cdecl *CCNodeGetParentFunction)(void *node);
+typedef void *(__cdecl *CCNodeGetChildrenFunction)(void *node);
+typedef unsigned (__cdecl *CCArrayCountFunction)(void *array);
+typedef void *(__cdecl *CCArrayObjectAtIndexFunction)(void *array,
+                                                       unsigned index);
 
 typedef struct {
     HWND window;
@@ -66,12 +71,19 @@ typedef struct {
     int hide_cursor_option;
     int cursor_hidden;
     int cursor_force_visible;
+    int pause_overlay_seen;
+    unsigned pause_overlay_absent_frames;
+    ULONGLONG cursor_pause_grace_until;
     ULONGLONG gameplay_cache_time;
     int gameplay_cache_value;
     void *gameplay_layer;
     void *ui_layer;
     size_t pause_button_offset;
     CCNodeSetVisibleFunction node_set_visible;
+    CCNodeGetParentFunction node_get_parent;
+    CCNodeGetChildrenFunction node_get_children;
+    CCArrayCountFunction array_count;
+    CCArrayObjectAtIndexFunction array_object_at_index;
     int pause_button_hidden_logged;
     GameManagerSharedStateFunction game_manager_shared_state;
     LARGE_INTEGER frame_clock_frequency;
@@ -556,6 +568,19 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     g_host.pause_button_offset = discover_x86_pause_button_offset(image);
     g_host.node_set_visible = (CCNodeSetVisibleFunction)elf_image_find_export(
         image, "_ZN7cocos2d6CCNode10setVisibleEb");
+    g_host.node_get_parent = (CCNodeGetParentFunction)elf_image_find_export(
+        image, "_ZN7cocos2d6CCNode9getParentEv");
+    g_host.node_get_children = (CCNodeGetChildrenFunction)elf_image_find_export(
+        image, "_ZN7cocos2d6CCNode11getChildrenEv");
+    g_host.array_count = (CCArrayCountFunction)elf_image_find_export(
+        image, "_ZNK7cocos2d7CCArray5countEv");
+    if (!g_host.array_count) {
+        g_host.array_count = (CCArrayCountFunction)elf_image_find_export(
+            image, "_ZN7cocos2d7CCArray5countEv");
+    }
+    g_host.array_object_at_index =
+        (CCArrayObjectAtIndexFunction)elf_image_find_export(
+            image, "_ZN7cocos2d7CCArray13objectAtIndexEj");
     if (gd_settings_disable_pause_button()) {
         runtime_log(
             "PC pause visual discovery: field=0x%lx setVisible=%s",
@@ -706,6 +731,57 @@ static int detect_gameplay_active(void) {
     return g_host.gameplay_cache_value;
 }
 
+/*
+ * Walk the live Cocos scene graph instead of guessing whether Escape's pause
+ * layer is still open. This lets the cursor remain visible throughout pause
+ * menus and become hidden again immediately after Resume.
+ */
+static int gameplay_modal_type(const void *object) {
+    return object_type_contains(object, "PauseLayer") ||
+           object_type_contains(object, "OptionsLayer") ||
+           object_type_contains(object, "FLAlertLayer") ||
+           object_type_contains(object, "GJDropDownLayer");
+}
+
+static int scene_contains_gameplay_modal(void *node, unsigned depth,
+                                         unsigned *budget) {
+    void *children;
+    unsigned count;
+    unsigned index;
+    if (!node || !budget || !*budget || depth > 10u) return 0;
+    --*budget;
+    if (gameplay_modal_type(node)) return 1;
+    if (!g_host.node_get_children || !g_host.array_count ||
+        !g_host.array_object_at_index)
+        return 0;
+    children = g_host.node_get_children(node);
+    if (!children || !memory_range_is_readable(children, sizeof(void *)))
+        return 0;
+    count = g_host.array_count(children);
+    if (count > 2048u) count = 2048u;
+    for (index = 0; index < count && *budget; ++index) {
+        void *child = g_host.array_object_at_index(children, index);
+        if (scene_contains_gameplay_modal(child, depth + 1u, budget))
+            return 1;
+    }
+    return 0;
+}
+
+static int detect_pause_overlay_active(void) {
+    void *root = g_host.gameplay_layer;
+    unsigned parent_steps;
+    unsigned budget = 2048u;
+    if (!root || !g_host.node_get_parent) return 0;
+    for (parent_steps = 0; parent_steps < 16u; ++parent_steps) {
+        void *parent = g_host.node_get_parent(root);
+        if (!parent || parent == root ||
+            !memory_range_is_readable(parent, sizeof(void *)))
+            break;
+        root = parent;
+    }
+    return scene_contains_gameplay_modal(root, 0u, &budget);
+}
+
 static void hide_pause_button_visual(void) {
     void *pause_item;
     unsigned char *field;
@@ -742,12 +818,34 @@ static void set_cursor_hidden(int hidden) {
 }
 
 static void refresh_cursor_visibility(void) {
-    int gameplay = detect_gameplay_active();
+    const ULONGLONG now = GetTickCount64();
+    const int gameplay = detect_gameplay_active();
+    const int pause_overlay = gameplay && detect_pause_overlay_active();
     if (!gameplay) {
         g_host.cursor_force_visible = 0;
+        g_host.pause_overlay_seen = 0;
+        g_host.pause_overlay_absent_frames = 0u;
+        g_host.cursor_pause_grace_until = 0u;
         g_host.pause_button_hidden_logged = 0;
     } else {
         hide_pause_button_visual();
+        if (pause_overlay) {
+            g_host.cursor_force_visible = 1;
+            g_host.pause_overlay_seen = 1;
+            g_host.pause_overlay_absent_frames = 0u;
+        } else if (g_host.pause_overlay_seen) {
+            /* Require several consecutive rendered frames without a pause or
+               options overlay before deciding that Resume completed. */
+            if (++g_host.pause_overlay_absent_frames >= 3u) {
+                g_host.cursor_force_visible = 0;
+                g_host.pause_overlay_seen = 0;
+                g_host.pause_overlay_absent_frames = 0u;
+            }
+        } else if (g_host.cursor_force_visible &&
+                   now >= g_host.cursor_pause_grace_until) {
+            /* Fallback for releases whose pause layer is not discoverable. */
+            g_host.cursor_force_visible = 0;
+        }
     }
     set_cursor_hidden(g_host.hide_cursor_option && gameplay &&
                       g_host.window_active && !jni_shim_text_input_active() &&
@@ -1003,6 +1101,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
             g_host.cursor_force_visible = 1;
+            g_host.pause_overlay_seen = 0;
+            g_host.pause_overlay_absent_frames = 0u;
+            g_host.cursor_pause_grace_until = GetTickCount64() + 1500u;
             set_cursor_hidden(0);
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
