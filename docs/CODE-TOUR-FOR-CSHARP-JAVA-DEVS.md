@@ -74,3 +74,53 @@ It adds this documentation and comments, which are not machine instructions.
 Bug fixes such as the x86 log argument and ARMv7 startup correction necessarily
 change the resulting binaries; a claim that those fixed binaries are identical
 to the broken build would be false.
+
+
+## EnduranceTest1 examples
+
+### Configuration switch
+
+```c
+const int isolated =
+    GetBooleanSetting(L"VERSION_ISOLATED_SAVES", 1);
+```
+
+This is equivalent to `configuration.GetValue<bool>(..., true)` in .NET or a
+boolean system property with a default in Java. The BAT files supply the value;
+the native launcher owns the decision.
+
+### Blocking only one UI hit target
+
+The pause option does not monkey-patch `UILayer::onPause`. Each window host
+checks whether a mouse-down is inside the small upper-right gameplay rectangle.
+Only that one touch is discarded. Escape still reaches the game's normal
+Android Back handler and opens the real pause menu.
+
+### Frame deadline
+
+The x86 `pace_x86_frame` helper is a tiny fixed-step scheduler. Think of a
+`Stopwatch`/`System.nanoTime()` deadline loop: the game supplies its desired
+animation interval through JNI, `SwapBuffers` supplies vblank synchronization,
+and QPC fills only the remaining time. The render loop temporarily requests a
+1 ms Windows timer period so its coarse Sleep does not overshoot by a full
+default scheduler quantum.
+
+### ARMv7 exact editor path
+
+The late beta ships an optional companion `libgame.so` with a complete
+`LevelEditorLayerExt::updateVisibilityH` routine. The wrapper validates its
+symbol, executable range and original-function slot before redirecting the
+primary editor's calls. Conceptually this resembles assigning a delegate to a
+known interface slot and then calling the extension implementation.
+
+The older `HostV22EditorVisibility` adapter remains as the fallback selected by
+`V22_EXACT_EDITOR_VISIBILITY=false`.
+
+### Legacy HTTP 100 Continue
+
+Some old account clients send large backups in two phases: headers first, body
+after an `HTTP/1.1 100 Continue` reply. The x86 runtime keeps the partial request
+in a descriptor-keyed state table, emits the interim reply, then joins the body
+before sending the complete request through WinHTTP. This is similar to keeping
+a per-connection request builder in a C# dictionary, except C uses a fixed array
+and an SRW lock.

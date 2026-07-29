@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.5-unified7-fix5-stabilization"
+#define LAUNCHER_VERSION "0.9.5-endurancetest1"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -709,6 +709,24 @@ static const wchar_t *GetSetting(const wchar_t *name, const wchar_t *fallback,
     return buffer;
 }
 
+/*
+ * Environment switches use the same friendly values as .NET configuration:
+ * true/false, yes/no, on/off, and 1/0. Unknown non-empty values keep the
+ * supplied default instead of silently changing behaviour.
+ */
+static int GetBooleanSetting(const wchar_t *name, int fallback) {
+    wchar_t value[64];
+    DWORD length = GetEnvironmentVariableW(name, value, ARRAY_COUNT(value));
+    if (!length || length >= ARRAY_COUNT(value)) return fallback;
+    if (_wcsicmp(value, L"true") == 0 || _wcsicmp(value, L"yes") == 0 ||
+        _wcsicmp(value, L"on") == 0 || wcscmp(value, L"1") == 0)
+        return 1;
+    if (_wcsicmp(value, L"false") == 0 || _wcsicmp(value, L"no") == 0 ||
+        _wcsicmp(value, L"off") == 0 || wcscmp(value, L"0") == 0)
+        return 0;
+    return fallback;
+}
+
 static int WriteRunInfo(const LauncherContext *context, int finished,
                         DWORD exit_code, const wchar_t *launcher_error) {
     wchar_t path[MAX_PATH * 4];
@@ -720,6 +738,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t pulse[64];
     wchar_t disable_pause[64];
     wchar_t hide_cursor[64];
+    wchar_t isolated_saves[64];
     wchar_t network_mode[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
@@ -759,6 +778,9 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     fwprintf(file, L"hide_cursor_during_play=%ls\n",
              GetSetting(L"HIDE_CURSOR_DURING_PLAY", L"true", hide_cursor,
                         ARRAY_COUNT(hide_cursor)));
+    fwprintf(file, L"version_isolated_saves=%ls\n",
+             GetSetting(L"VERSION_ISOLATED_SAVES", L"true", isolated_saves,
+                        ARRAY_COUNT(isolated_saves)));
     fwprintf(file, L"x86_api_connect_mode=%ls\n",
              GetSetting(L"GD_X86_API_CONNECT_MODE",
                         IsX86Version211(context) ? L"real" : L"synthetic",
@@ -1001,15 +1023,26 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
         swprintf_s(profile_component, ARRAY_COUNT(profile_component),
                    L"%ls__v%ls__%ls", package_component, version_component,
                    BackendName(context->backend));
+        const int isolated_saves =
+            GetBooleanSetting(L"VERSION_ISOLATED_SAVES", 1);
         if (!PathJoin(save_root, ARRAY_COUNT(save_root),
                       context->base_directory, L"save") ||
-            !EnsureDirectory(save_root) ||
-            !PathJoin(context->save_directory,
-                      ARRAY_COUNT(context->save_directory),
-                      save_root, profile_component) ||
-            !EnsureDirectory(context->save_directory)) {
-            fwprintf(stderr, L"ERROR: Could not create versioned save directory.\n");
+            !EnsureDirectory(save_root)) {
+            fwprintf(stderr, L"ERROR: Could not create save directory.\n");
             return 0;
+        }
+        if (isolated_saves) {
+            if (!PathJoin(context->save_directory,
+                          ARRAY_COUNT(context->save_directory),
+                          save_root, profile_component) ||
+                !EnsureDirectory(context->save_directory)) {
+                fwprintf(stderr,
+                         L"ERROR: Could not create version-isolated save directory.\n");
+                return 0;
+            }
+        } else {
+            wcscpy_s(context->save_directory,
+                     ARRAY_COUNT(context->save_directory), save_root);
         }
     }
     switch (context->backend) {

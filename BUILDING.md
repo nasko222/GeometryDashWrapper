@@ -1,4 +1,4 @@
-# Building on Windows
+# Building EnduranceTest1 on Windows
 
 Run:
 
@@ -7,7 +7,7 @@ BUILD_ALL.cmd
 ```
 
 The build downloads pinned portable Zig, CMake and Ninja tools as needed.
-Python is not required for building or running this release.
+Python is not required.
 
 Output:
 
@@ -32,6 +32,6 @@ BUILD_DYNARMIC.cmd
 BUILD_LAUNCHER.cmd
 ```
 
-All three backends and the launcher contain Fix5 changes. Run `BUILD_ALL.cmd`;
-do not reuse Fix4 executables. The Dynarmic builder revision was incremented so
-stale ARM outputs are rebuilt.
+EnduranceTest1 changes x86 networking, x86/ARM cursor behavior, ARMv7 editor
+behavior and the native launch metadata. Run `BUILD_ALL.cmd`; do not reuse Fix6
+executables. The x86 pacing implementation itself is unchanged.

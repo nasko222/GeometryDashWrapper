@@ -1966,8 +1966,8 @@ static void synthetic_http_reset(int descriptor) {
     ReleaseSRWLockExclusive(&g_synthetic_http_lock);
 }
 
-static int synthetic_http_store(int descriptor, unsigned char *bytes,
-                                size_t size) {
+static int synthetic_http_store_mode(int descriptor, unsigned char *bytes,
+                                     size_t size, int eof_pending) {
     int ok = 0;
     AcquireSRWLockExclusive(&g_synthetic_http_lock);
     {
@@ -1977,12 +1977,17 @@ static int synthetic_http_store(int descriptor, unsigned char *bytes,
             state->bytes = bytes;
             state->size = size;
             state->offset = 0;
-            state->eof_pending = 1;
+            state->eof_pending = eof_pending != 0;
             ok = 1;
         }
     }
     ReleaseSRWLockExclusive(&g_synthetic_http_lock);
     return ok;
+}
+
+static int synthetic_http_store(int descriptor, unsigned char *bytes,
+                                size_t size) {
+    return synthetic_http_store_mode(descriptor, bytes, size, 1);
 }
 
 static int synthetic_http_ready(int descriptor) {
@@ -2004,16 +2009,24 @@ static int synthetic_http_recv(int descriptor, void *buffer, size_t length,
     {
         SyntheticHttpState *state = synthetic_http_state_locked(descriptor, 0);
         if (state) {
-            handled = 1;
             if (state->offset < state->size) {
                 size_t count = state->size - state->offset;
+                handled = 1;
                 if (count > length) count = length;
                 if (count) memcpy(buffer, state->bytes + state->offset, count);
                 state->offset += count;
                 *result = count > INT_MAX ? INT_MAX : (int)count;
-            } else {
+            } else if (state->eof_pending) {
+                handled = 1;
                 *result = 0;
-                state->eof_pending = 0;
+                free(state->bytes);
+                memset(state, 0, sizeof(*state));
+            } else {
+                /*
+                 * An HTTP 100 Continue response is an interim response, not
+                 * end-of-stream. Once its bytes are consumed, remove only the
+                 * synthetic packet and let the guest send the request body.
+                 */
                 free(state->bytes);
                 memset(state, 0, sizeof(*state));
             }
@@ -2267,6 +2280,32 @@ static int ascii_contains_case_insensitive(const unsigned char *bytes,
         if (index == needle_length) return 1;
     }
     return 0;
+}
+
+static int queue_http_continue_if_requested(int descriptor,
+                                            const void *buffer,
+                                            size_t length) {
+    static const char reply[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    unsigned char *copy;
+    if (!buffer || !length ||
+        !ascii_contains_case_insensitive(
+            (const unsigned char *)buffer, length,
+            "expect: 100-continue")) {
+        return 1;
+    }
+    copy = (unsigned char *)malloc(sizeof(reply) - 1u);
+    if (!copy) return 0;
+    memcpy(copy, reply, sizeof(reply) - 1u);
+    if (!synthetic_http_store_mode(
+            descriptor, copy, sizeof(reply) - 1u, 0)) {
+        free(copy);
+        return 0;
+    }
+    runtime_log(
+        "Network HTTP interim response: fd=%d 100 Continue "
+        "(large account/save POST body may now follow)",
+        descriptor);
+    return 1;
 }
 
 static const char *classify_http_body(const unsigned char *bytes,
@@ -2544,12 +2583,17 @@ static int shim_send(int descriptor, const void *buffer, size_t length, int flag
         return (int)length;
     }
     if (api_request == 2) {
-        if (!pending_http_store(descriptor, request_buffer, request_length)) {
+        if (!pending_http_store(descriptor, request_buffer, request_length) ||
+            (joined_result <= 0 &&
+             !queue_http_continue_if_requested(
+                 descriptor, request_buffer, request_length))) {
             free(joined);
             g_errno_value = 12;
             WSASetLastError(WSAENOBUFS);
             return -1;
         }
+        runtime_log("Network HTTP request pending body: fd=%d buffered=%lu",
+                    descriptor, (unsigned long)request_length);
         free(joined);
         return (int)length;
     }
@@ -2660,12 +2704,18 @@ static int shim_writev(int descriptor, const AndroidIovec *vectors,
                     return total_length > INT_MAX ? INT_MAX : (int)total_length;
                 }
                 if (api_request == 2) {
-                    if (!pending_http_store(descriptor, joined, total_length)) {
+                    if (!pending_http_store(descriptor, joined, total_length) ||
+                        !queue_http_continue_if_requested(
+                            descriptor, joined, total_length)) {
                         free(joined);
                         g_errno_value = 12;
                         WSASetLastError(WSAENOBUFS);
                         return -1;
                     }
+                    runtime_log(
+                        "Network HTTP writev request pending body: "
+                        "fd=%d buffered=%lu",
+                        descriptor, (unsigned long)total_length);
                     free(joined);
                     return total_length > INT_MAX ? INT_MAX : (int)total_length;
                 }

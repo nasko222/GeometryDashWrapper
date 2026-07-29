@@ -994,6 +994,7 @@ struct ElfRuntime {
     u32 native_delete_backward = 0;
     u32 native_pause = 0;
     u32 native_resume = 0;
+    u32 game_manager_shared_state = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -1177,41 +1178,6 @@ static bool PatchArmFunctionReturnFalse(
     env.MemoryWrite32(address + 0u, 0xE3A00000u); // mov r0, #0
     env.MemoryWrite32(address + 4u, 0xE12FFF1Eu); // bx lr
     return true;
-}
-
-static bool PatchArmFunctionReturnVoid(
-    ProbeEnvironment& env, const ElfRuntime& runtime,
-    const SymbolRecord& symbol) {
-    const u32 address = symbol.address & ~1u;
-    if (address < runtime.image_min || address >= runtime.image_max) return false;
-    if (symbol.address & 1u) {
-        if (symbol.size < 2u || address > runtime.image_max - 2u) return false;
-        env.MemoryWrite16(address, 0x4770u); // bx lr
-        return true;
-    }
-    if (symbol.size < 4u || address > runtime.image_max - 4u) return false;
-    env.MemoryWrite32(address, 0xE12FFF1Eu); // bx lr
-    return true;
-}
-
-static std::size_t InstallLegacyPauseButtonPatch(
-    ElfRuntime& runtime, ProbeEnvironment& env) {
-    static constexpr std::array<std::string_view, 2> names = {
-        "_ZN7UILayer7onPauseEv",
-        "_ZN7UILayer7onPauseEPN7cocos2d8CCObjectE",
-    };
-    std::size_t patched = 0u;
-    if (!gd_settings_disable_pause_button()) return 0u;
-    for (const SymbolRecord& symbol : runtime.symbols) {
-        for (std::string_view name : names) {
-            if (symbol.name == name &&
-                PatchArmFunctionReturnVoid(env, runtime, symbol)) {
-                ++patched;
-                break;
-            }
-        }
-    }
-    return patched;
 }
 
 static bool PatchArmFunctionTailJump(
@@ -1514,6 +1480,8 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeDeleteBackward") runtime.native_delete_backward = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause") runtime.native_pause = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
+            else if (name == "_ZN11GameManager11sharedStateEv")
+                runtime.game_manager_shared_state = address;
         }
     }
 
@@ -1745,6 +1713,10 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
+        disable_pause_button_option_ =
+            gd_settings_disable_pause_button();
+        hide_cursor_option_ =
+            gd_settings_hide_cursor_during_play();
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnifiedLegacyArmWindow";
         WNDCLASSEXA wc{};
@@ -1891,8 +1863,20 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
+
+    void SetGameplayActive(bool active) {
+        if (!active) {
+            cursor_force_visible_ = false;
+            pause_touch_blocked_ = false;
+        }
+        gameplay_active_ = active;
+        UpdateCursorVisibility();
+    }
+
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
+        if (active) cursor_force_visible_ = true;
+        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::TouchEnd,
@@ -1985,6 +1969,22 @@ private:
         gpu_results_.clear();
     }
 
+    bool PauseButtonHit(float x, float y) const {
+        return disable_pause_button_option_ && gameplay_active_ &&
+               x >= static_cast<float>(native_width_) * 0.86f &&
+               y <= static_cast<float>(native_height_) * 0.22f;
+    }
+
+    void UpdateCursorVisibility() {
+        const bool hidden =
+            hide_cursor_option_ && gameplay_active_ && active_ &&
+            !text_input_active_ && !cursor_force_visible_;
+        if (cursor_hidden_ == hidden) return;
+        cursor_hidden_ = hidden;
+        if (window_)
+            SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
+    }
+
     void Queue(HostEvent event) {
         if (event.type == HostEventType::TouchMove && !events_.empty() &&
             events_.back().type == HostEventType::TouchMove) {
@@ -2037,17 +2037,39 @@ private:
             const bool becoming_active = wparam != 0;
             if (self->active_ != becoming_active) {
                 self->active_ = becoming_active;
+                if (!becoming_active) self->cursor_force_visible_ = true;
+                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
-            self->mouse_down_ = true;
             SetFocus(window);
+            if (self->PauseButtonHit(x, y)) {
+                self->pause_touch_blocked_ = true;
+                return 0;
+            }
+            self->pause_touch_blocked_ = false;
+            /*
+             * PlayLayer remains alive behind the pause menu. Keep the cursor
+             * sticky-visible after Escape instead of hiding it on clicks made
+             * inside the pause menu. A definite gameplay key press clears it.
+             */
+            if (self->gameplay_active_ &&
+                !self->cursor_force_visible_) {
+                self->UpdateCursorVisibility();
+            }
+            self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
             return 0;
@@ -2059,6 +2081,10 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
+            if (self->pause_touch_blocked_) {
+                self->pause_touch_blocked_ = false;
+                return 0;
+            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -2068,6 +2094,7 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
+            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -2075,11 +2102,15 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
+                self->cursor_force_visible_ = true;
+                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
+                self->cursor_force_visible_ = false;
+                self->UpdateCursorVisibility();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::TouchBegin,
                                       static_cast<float>(self->native_width_) * 0.5f,
@@ -2129,6 +2160,12 @@ private:
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
     bool text_input_active_ = false;
+    bool disable_pause_button_option_ = true;
+    bool pause_touch_blocked_ = false;
+    bool hide_cursor_option_ = true;
+    bool gameplay_active_ = false;
+    bool cursor_hidden_ = false;
+    bool cursor_force_visible_ = false;
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -2162,6 +2199,7 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
+    void SetGameplayActive(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -2309,6 +2347,41 @@ public:
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+
+    void RefreshDesktopGameplayState() {
+        const auto now = std::chrono::steady_clock::now();
+        if (gameplay_check_at_.time_since_epoch().count() != 0 &&
+            now - gameplay_check_at_ < std::chrono::milliseconds(100)) {
+            gl_.SetGameplayActive(gameplay_active_cache_);
+            return;
+        }
+        gameplay_check_at_ = now;
+        gameplay_active_cache_ = false;
+        if (!runtime_.game_manager_shared_state) {
+            gl_.SetGameplayActive(false);
+            return;
+        }
+
+        u32 manager = 0u;
+        if (!RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                         "GameManager::sharedState gameplay detection",
+                         100000000u,
+                         std::chrono::milliseconds(5000)) ||
+            !manager || !env_.IsMapped(manager, 0x600u)) {
+            gl_.SetGameplayActive(false);
+            return;
+        }
+
+        for (u32 offset = 0x40u; offset + 4u <= 0x600u; offset += 4u) {
+            const u32 candidate = env_.MemoryRead32(manager + offset);
+            if (GuestObjectTypeContains(candidate, "PlayLayer")) {
+                gameplay_active_cache_ = true;
+                break;
+            }
+        }
+        gl_.SetGameplayActive(gameplay_active_cache_);
+    }
+
     bool TerminationRequested() const { return termination_requested_; }
     void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
     void FlushDiagnostics() { log_.flush(); }
@@ -3154,6 +3227,17 @@ private:
         std::string text;
         if (!env_.ReadCString(address, text, maximum)) return {};
         return text;
+    }
+
+    bool GuestObjectTypeContains(u32 object, const char* needle) const {
+        if (!object || !needle || !env_.IsMapped(object, 4u)) return false;
+        const u32 vtable = env_.MemoryRead32(object);
+        if (vtable < 4u || !env_.IsMapped(vtable - 4u, 4u)) return false;
+        const u32 type_info = env_.MemoryRead32(vtable - 4u);
+        if (!type_info || !env_.IsMapped(type_info + 4u, 4u)) return false;
+        const u32 name_address = env_.MemoryRead32(type_info + 4u);
+        const std::string name = ReadCString(name_address, 96u);
+        return !name.empty() && name.find(needle) != std::string::npos;
     }
     u32 ArgWord(unsigned index) {
         if (index < 4u) return cpu_.Regs()[index];
@@ -6147,6 +6231,8 @@ private:
     u64 apk_memory_read_bytes_ = 0;
     bool text_input_active_ = false;
     bool termination_requested_ = false;
+    std::chrono::steady_clock::time_point gameplay_check_at_{};
+    bool gameplay_active_cache_ = false;
     WinGlHost gl_;
     double frame_interval_=1.0/60.0;
     std::unordered_map<u32,u32> gl_string_cache_;
@@ -6478,7 +6564,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-unified7-fix5-stabilization legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-endurancetest1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6736,8 +6822,6 @@ int main(int argc,char** argv) {
         const GraphicsPatchCounts graphics_patches =
             InstallHighestGraphicsHooks(runtime, env,
                                         effective_highest_graphics);
-        const std::size_t pause_button_patches =
-            InstallLegacyPauseButtonPatch(runtime, env);
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -6791,9 +6875,9 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()) +
-             " disable-pause=" +
-             (gd_settings_disable_pause_button() ? "true" : "false") +
-             " pause-patches=" + std::to_string(pause_button_patches) +
+             " top-right-pause-touch=" +
+             (gd_settings_disable_pause_button() ? "blocked" : "normal") +
+             " escape-pause=preserved" +
              " hide-cursor=" +
              (gd_settings_hide_cursor_during_play() ? "true" : "false"));
         GuestExecutor executor(env,runtime,log_file);
@@ -6973,6 +7057,7 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
+            executor.RefreshDesktopGameplayState();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

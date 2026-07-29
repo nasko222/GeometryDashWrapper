@@ -1159,14 +1159,19 @@ struct ElfRuntime {
     u32 v22_game_level_id_offset = 0;
     u32 v22_game_level_vtable = 0;
     u32 v22_companion_editor_init = 0;
+    u32 v22_companion_editor_visibility = 0;
+    u32 v22_companion_editor_visibility_original_slot = 0;
     bool v22_companion_editor_init_enabled = false;
+    bool v22_companion_editor_visibility_enabled = false;
     u32 v22_game_object_add_main_sprite = 0;
     u32 v22_game_object_has_secondary_color = 0;
     u32 v22_game_object_add_color_sprite = 0;
     u32 v22_game_object_activate = 0;
     u32 v22_game_object_set_opacity = 0;
     u32 v22_ccsprite_set_opacity = 0;
+    u32 v22_gjbase_pre_update_visibility = 0;
     u32 v22_level_editor_update_object_colors = 0;
+    u32 v22_ccarray_add_object = 0;
     u32 v22_ccarray_remove_all_objects = 0;
     u32 v22_gjbase_process_area_visual_actions = 0;
     u32 v22_level_editor_sort_batchnode_children = 0;
@@ -1508,26 +1513,6 @@ static bool PatchThumbReturnFalse(ProbeEnvironment& env,
     env.MemoryWrite16(address + 2u, 0x4770u); // bx lr
     return true;
 }
-
-static std::size_t InstallV22PauseButtonPatch(ElfRuntime& runtime,
-                                               ProbeEnvironment& env) {
-    static constexpr std::array<std::string_view, 2> names = {
-        "_ZN7UILayer7onPauseEv",
-        "_ZN7UILayer7onPauseEPN7cocos2d8CCObjectE",
-    };
-    std::size_t patched = 0u;
-    if (!gd_settings_disable_pause_button()) return 0u;
-    for (const SymbolRecord& symbol : runtime.symbols) {
-        for (std::string_view name : names) {
-            if (symbol.name == name && PatchThumbReturnVoid(env, runtime, symbol)) {
-                ++patched;
-                break;
-            }
-        }
-    }
-    return patched;
-}
-
 
 static V22DesktopTextInputPatchCounts InstallV22DesktopTextInputPatches(
     ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -2350,6 +2335,10 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
 
     const SymbolRecord* editor_init = FindSymbol(
         companion, "_ZN19LevelEditorLayerExt5initHEP11GJGameLevel");
+    const SymbolRecord* editor_visibility = FindSymbol(
+        companion, "_ZN19LevelEditorLayerExt17updateVisibilityHEf");
+    const SymbolRecord* editor_visibility_original = FindSymbol(
+        companion, "_ZN19LevelEditorLayerExt17updateVisibilityOE");
     // libgame.so is an optional beta-specific extension, not the executable's
     // primary game image. Several legitimate 2.2 betas ship a different
     // companion ABI (including one with no LevelEditorLayerExt::initH at all).
@@ -2357,6 +2346,10 @@ static ElfRuntime MapAndRelocateV22CompanionElf(
     // never make an otherwise runnable APK fail at startup.
     primary.v22_companion_editor_init =
         editor_init ? editor_init->address : 0u;
+    primary.v22_companion_editor_visibility =
+        editor_visibility ? editor_visibility->address : 0u;
+    primary.v22_companion_editor_visibility_original_slot =
+        editor_visibility_original ? editor_visibility_original->address : 0u;
     primary.v22_companion_image_min = companion.image_min;
     primary.v22_companion_image_max = companion.image_max;
     primary.v22_companion_executable_min = executable_min;
@@ -2428,6 +2421,7 @@ static bool HasCompatibleV22CompanionEditorInitializer(
 struct V22VisualHookCounts {
     std::pair<std::size_t, std::size_t> editor_visibility;
     std::pair<std::size_t, std::size_t> play_visibility;
+    bool exact_companion_editor = false;
 };
 
 static V22VisualHookCounts InstallV22SafeVisualHooks(
@@ -2448,48 +2442,91 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN10GameObject10setOpacityEh");
     const SymbolRecord* sprite_opacity = FindSymbol(
         runtime, "_ZN7cocos2d8CCSprite10setOpacityEh");
+    const SymbolRecord* pre_update_visibility = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer19preUpdateVisibilityEf");
     const SymbolRecord* update_object_colors = FindSymbol(
         runtime, "_ZN16LevelEditorLayer18updateObjectColorsEPN7cocos2d7CCArrayE");
+    const SymbolRecord* add_object = FindSymbol(
+        runtime, "_ZN7cocos2d7CCArray9addObjectEPNS_8CCObjectE");
     const SymbolRecord* remove_all_objects = FindSymbol(
         runtime, "_ZN7cocos2d7CCArray16removeAllObjectsEv");
     const SymbolRecord* process_area_visual_actions = FindSymbol(
         runtime, "_ZN15GJBaseGameLayer24processAreaVisualActionsEv");
     const SymbolRecord* sort_batchnode_children = FindSymbol(
         runtime, "_ZN16LevelEditorLayer21sortBatchnodeChildrenEf");
-    if (!editor_visibility || !play_visibility || !add_main_sprite ||
-        !has_secondary_color || !add_color_sprite || !activate_object ||
-        !game_object_opacity || !sprite_opacity || !update_object_colors ||
-        !remove_all_objects || !process_area_visual_actions ||
-        !sort_batchnode_children)
+    if (!editor_visibility || !play_visibility)
         throw std::runtime_error(
-            "safe V22 visual bridge symbols are unavailable");
+            "V22 primary visibility symbols are unavailable");
 
-    runtime.v22_game_object_add_main_sprite = add_main_sprite->address;
-    runtime.v22_game_object_has_secondary_color =
-        has_secondary_color->address;
-    runtime.v22_game_object_add_color_sprite = add_color_sprite->address;
-    runtime.v22_game_object_activate = activate_object->address;
-    runtime.v22_game_object_set_opacity = game_object_opacity->address;
-    runtime.v22_ccsprite_set_opacity = sprite_opacity->address;
-    runtime.v22_level_editor_update_object_colors =
-        update_object_colors->address;
-    runtime.v22_ccarray_remove_all_objects = remove_all_objects->address;
-    runtime.v22_gjbase_process_area_visual_actions =
-        process_area_visual_actions->address;
-    runtime.v22_level_editor_sort_batchnode_children =
-        sort_batchnode_children->address;
+    std::pair<std::size_t, std::size_t> editor_visibility_counts{};
+    bool exact_companion_editor = false;
+    const SymbolRecord* companion_visibility = FindSymbol(
+        runtime, "_ZN19LevelEditorLayerExt17updateVisibilityHEf");
+    const SymbolRecord* companion_original_slot = FindSymbol(
+        runtime, "_ZN19LevelEditorLayerExt17updateVisibilityOE");
 
-    // Bringup13 redirected these functions into companion libgame.so. Its
-    // editor helper walks all 10,000 editor sections in emulated ARM every
-    // frame, while its platformer helper lazily constructs GDPSManager and
-    // reaches an unsafe emulator-detection path. Keep the proven companion
-    // initH editor bootstrap, but route visibility through small host bridges
-    // that call only primary libcocos2dcpp.so functions.
-    const u32 editor_host = EnsureImport(
-        runtime, env, "__dynarmic_v22_editor_visibility");
-    const auto editor_visibility_counts = RedirectV22FunctionReferences(
-        runtime, env, *editor_visibility, editor_host,
-        kV22ThunkBase + 0x40u);
+    /*
+     * The late beta's primary LevelEditorLayer::updateVisibility is only a
+     * two-byte stub. Fix6 replaced it with a compact host approximation, which
+     * restored object colors but omitted the song marker, BPM guidelines and
+     * some clip/camera cleanup. For the endurance branch, prefer the complete
+     * ABI-validated companion helper and wire its "original" function slot to
+     * the primary stub. This is slower than the approximation because it walks
+     * all editor sections, but correctness is the priority in this branch.
+     */
+    if (gd_settings_v22_exact_editor_visibility() &&
+        companion_visibility && companion_original_slot &&
+        runtime.v22_companion_editor_visibility ==
+            companion_visibility->address &&
+        runtime.v22_companion_editor_visibility_original_slot ==
+            companion_original_slot->address &&
+        companion_visibility->size >= 128u &&
+        companion_original_slot->size >= 4u &&
+        env.IsMapped(companion_visibility->address & ~1u,
+                     companion_visibility->size) &&
+        env.IsMapped(companion_original_slot->address, 4u)) {
+        env.MemoryWrite32(companion_original_slot->address,
+                          editor_visibility->address);
+        editor_visibility_counts = RedirectV22FunctionReferences(
+            runtime, env, *editor_visibility,
+            companion_visibility->address,
+            kV22ThunkBase + 0x40u);
+        exact_companion_editor = true;
+        runtime.v22_companion_editor_visibility_enabled = true;
+    } else {
+        if (!add_main_sprite || !has_secondary_color || !add_color_sprite ||
+            !activate_object || !game_object_opacity || !sprite_opacity ||
+            !pre_update_visibility || !update_object_colors || !add_object ||
+            !remove_all_objects || !process_area_visual_actions ||
+            !sort_batchnode_children)
+            throw std::runtime_error(
+                "safe V22 host visual bridge symbols are unavailable");
+
+        runtime.v22_game_object_add_main_sprite = add_main_sprite->address;
+        runtime.v22_game_object_has_secondary_color =
+            has_secondary_color->address;
+        runtime.v22_game_object_add_color_sprite = add_color_sprite->address;
+        runtime.v22_game_object_activate = activate_object->address;
+        runtime.v22_game_object_set_opacity = game_object_opacity->address;
+        runtime.v22_ccsprite_set_opacity = sprite_opacity->address;
+        runtime.v22_gjbase_pre_update_visibility =
+            pre_update_visibility->address;
+        runtime.v22_level_editor_update_object_colors =
+            update_object_colors->address;
+        runtime.v22_ccarray_add_object = add_object->address;
+        runtime.v22_ccarray_remove_all_objects =
+            remove_all_objects->address;
+        runtime.v22_gjbase_process_area_visual_actions =
+            process_area_visual_actions->address;
+        runtime.v22_level_editor_sort_batchnode_children =
+            sort_batchnode_children->address;
+
+        const u32 editor_host = EnsureImport(
+            runtime, env, "__dynarmic_v22_editor_visibility");
+        editor_visibility_counts = RedirectV22FunctionReferences(
+            runtime, env, *editor_visibility, editor_host,
+            kV22ThunkBase + 0x40u);
+    }
 
     const u32 play_host = EnsureImport(
         runtime, env, "__dynarmic_v22_play_visibility");
@@ -2508,7 +2545,8 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         throw std::runtime_error(
             "safe V22 visual hooks did not find primary references");
     return V22VisualHookCounts{
-        editor_visibility_counts, play_visibility_counts};
+        editor_visibility_counts, play_visibility_counts,
+        exact_companion_editor};
 }
 
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
@@ -2853,6 +2891,10 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
+        disable_pause_button_option_ =
+            gd_settings_disable_pause_button();
+        hide_cursor_option_ =
+            gd_settings_hide_cursor_during_play();
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnified ARMv7Window";
         WNDCLASSEXA wc{};
@@ -3014,8 +3056,20 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
+
+    void SetGameplayActive(bool active) {
+        if (!active) {
+            cursor_force_visible_ = false;
+            pause_touch_blocked_ = false;
+        }
+        gameplay_active_ = active;
+        UpdateCursorVisibility();
+    }
+
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
+        if (active) cursor_force_visible_ = true;
+        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::PlatformButton,
@@ -3117,6 +3171,22 @@ private:
         gpu_results_.clear();
     }
 
+    bool PauseButtonHit(float x, float y) const {
+        return disable_pause_button_option_ && gameplay_active_ &&
+               x >= static_cast<float>(native_width_) * 0.86f &&
+               y <= static_cast<float>(native_height_) * 0.22f;
+    }
+
+    void UpdateCursorVisibility() {
+        const bool hidden =
+            hide_cursor_option_ && gameplay_active_ && active_ &&
+            !text_input_active_ && !cursor_force_visible_;
+        if (cursor_hidden_ == hidden) return;
+        cursor_hidden_ = hidden;
+        if (window_)
+            SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
+    }
+
     void Queue(HostEvent event) {
         if (event.type == HostEventType::TouchMove && !events_.empty() &&
             events_.back().type == HostEventType::TouchMove) {
@@ -3184,17 +3254,39 @@ private:
                     self->Queue(HostEvent{HostEventType::PlatformButton,
                                           0.0f, 0.0f, 1u, false});
                 }
+                if (!becoming_active) self->cursor_force_visible_ = true;
+                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
-            self->mouse_down_ = true;
             SetFocus(window);
+            if (self->PauseButtonHit(x, y)) {
+                self->pause_touch_blocked_ = true;
+                return 0;
+            }
+            self->pause_touch_blocked_ = false;
+            /*
+             * PlayLayer remains alive behind the pause menu. Keep the cursor
+             * sticky-visible after Escape instead of hiding it on clicks made
+             * inside the pause menu. A definite gameplay key press clears it.
+             */
+            if (self->gameplay_active_ &&
+                !self->cursor_force_visible_) {
+                self->UpdateCursorVisibility();
+            }
+            self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
             return 0;
@@ -3206,6 +3298,10 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
+            if (self->pause_touch_blocked_) {
+                self->pause_touch_blocked_ = false;
+                return 0;
+            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -3215,6 +3311,7 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
+            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -3222,12 +3319,16 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
+                self->cursor_force_visible_ = true;
+                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
             }
             if (!self->text_input_active_ &&
                 (wparam == 'A' || wparam == VK_LEFT) &&
                 !self->platform_left_down_) {
+                self->cursor_force_visible_ = false;
+                self->UpdateCursorVisibility();
                 self->platform_left_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 2u, true});
@@ -3236,6 +3337,8 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'D' || wparam == VK_RIGHT) &&
                 !self->platform_right_down_) {
+                self->cursor_force_visible_ = false;
+                self->UpdateCursorVisibility();
                 self->platform_right_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 3u, true});
@@ -3243,6 +3346,8 @@ private:
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
+                self->cursor_force_visible_ = false;
+                self->UpdateCursorVisibility();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 1u, true});
@@ -3306,6 +3411,12 @@ private:
     bool platform_left_down_ = false;
     bool platform_right_down_ = false;
     bool text_input_active_ = false;
+    bool disable_pause_button_option_ = true;
+    bool pause_touch_blocked_ = false;
+    bool hide_cursor_option_ = true;
+    bool gameplay_active_ = false;
+    bool cursor_hidden_ = false;
+    bool cursor_force_visible_ = false;
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -3341,6 +3452,7 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
+    void SetGameplayActive(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -3626,6 +3738,20 @@ public:
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+
+    void BeginDesktopGameplayFrame() {
+        v22_play_visibility_seen_this_frame_ = false;
+    }
+
+    void EndDesktopGameplayFrame() {
+        u32 editor = 0u;
+        const bool editor_playtest = IsV22EditorPlaytestActive(editor);
+        const bool gameplay =
+            v22_play_visibility_seen_this_frame_ || editor_playtest;
+        if (gameplay) HideV22PauseButtonVisual();
+        gl_.SetGameplayActive(gameplay);
+    }
+
     bool TerminationRequested() const { return termination_requested_; }
     void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
     void FlushDiagnostics() { log_.flush(); }
@@ -3823,6 +3949,44 @@ public:
         // cocos2d::enumKeyCodes intentionally mirrors these Windows/ASCII
         // values in this beta: Space=32, A=65, D=68.
         return button == 1u ? 32u : button == 2u ? 65u : 68u;
+    }
+
+    void HideV22PauseButtonVisual() {
+        if (!gd_settings_disable_pause_button() ||
+            !runtime_.v22_ui_layer_offset)
+            return;
+
+        u32 layer = 0u;
+        if (!ResolveV22ActiveGameLayer(layer) || !layer ||
+            !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u))
+            return;
+        const u32 ui_layer =
+            env_.MemoryRead32(layer + runtime_.v22_ui_layer_offset);
+        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
+            !env_.IsMapped(ui_layer + 0x1C0u, 4u))
+            return;
+
+        /*
+         * In this late-beta UILayer layout, +0x1C0 is the top-right pause
+         * CCMenuItemSpriteExtra created by UILayer::init. CCNode's visible
+         * byte is +234. Hiding the node removes the visual button while the
+         * untouched UILayer::onPause callback remains available to Escape.
+         */
+        const u32 pause_item = env_.MemoryRead32(ui_layer + 0x1C0u);
+        if (!LooksLikeGuestObject(runtime_, env_, pause_item) ||
+            !env_.IsMapped(pause_item + 234u, 1u))
+            return;
+        if (env_.MemoryRead8(pause_item + 234u) != 0u) {
+            env_.MemoryWrite8(pause_item + 234u, 0u);
+            if (!v22_pause_button_hidden_logged_) {
+                log_ << "RESULT: DYNARMIC_V22_PAUSE_BUTTON_VISUAL_HIDDEN "
+                     << "ui=0x" << std::hex << ui_layer
+                     << " item=0x" << pause_item << std::dec
+                     << " escape-pause=preserved\n";
+                log_.flush();
+                v22_pause_button_hidden_logged_ = true;
+            }
+        }
     }
 
     bool SendPlatformerButton(u32 button, bool pressed) {
@@ -6410,6 +6574,7 @@ private:
     }
 
     bool HostV22PlayVisibility(u32 play_layer) {
+        v22_play_visibility_seen_this_frame_ = true;
         if (!LooksLikeGuestObject(runtime_, env_, play_layer))
             return Fail("V22 PlayLayer visibility received an invalid layer");
 
@@ -6452,7 +6617,7 @@ private:
         return true;
     }
 
-    bool HostV22EditorVisibility(u32 editor_layer) {
+    bool HostV22EditorVisibility(u32 editor_layer, u32 delta_bits) {
         if (!LooksLikeGuestObject(runtime_, env_, editor_layer))
             return Fail("V22 editor visibility received an invalid layer");
         if (v22_editor_visual_layer_ != editor_layer) {
@@ -6462,7 +6627,26 @@ private:
         }
         ++v22_editor_visibility_passes_;
 
+        /*
+         * This is the ordering used by the beta's LevelEditorLayerExt helper.
+         * The older host replacement skipped preUpdateVisibility entirely,
+         * which left editor camera/clip state stale after playtesting and also
+         * prevented thin overlays such as the song-position line from being
+         * prepared for the frame.
+         */
+        u32 ignored = 0u;
+        if (!RunNestedPreservingState(
+                runtime_.v22_gjbase_pre_update_visibility,
+                {editor_layer, delta_bits}, ignored,
+                "V22 editor pre-update visibility", 250000000u))
+            return false;
+
         constexpr u32 kSectionArrayOffset = 840u;
+        constexpr u32 kColorArrayOffset = 11268u;
+        const u32 color_array =
+            env_.IsMapped(editor_layer + kColorArrayOffset, 4u)
+                ? env_.MemoryRead32(editor_layer + kColorArrayOffset)
+                : 0u;
         if (!env_.IsMapped(editor_layer + kSectionArrayOffset, 4u))
             return true;
         GuestCcArrayView sections;
@@ -6471,17 +6655,23 @@ private:
                 20000u, sections))
             return true;
 
-        // Companion updateVisibilityH iterates every one of the beta's 10,000
-        // editor sections in ARM code on every frame. Walk the same compact
-        // CCArray storage natively and perform expensive guest activation only
-        // once per object. The per-frame activation cap prevents a large level
-        // from turning first entry into another apparent freeze.
+        /*
+         * Keep the host-side section walk (it is much faster than emulating
+         * the companion's 10,000-section loop), but reproduce the missing
+         * colour queue and post-visibility calls. Base editor object textures
+         * are intentionally white; updateObjectColors is what turns saws,
+         * monsters and the playtest death X into their actual colours.
+         */
         constexpr u32 kMaximumObjectsPerSection = 100000u;
         constexpr u32 kMaximumObjectsScanned = 250000u;
         constexpr u32 kMaximumActivationsPerFrame = 32u;
+        constexpr u32 kMaximumColorObjectsPerFrame = 8192u;
         u32 objects_scanned = 0u;
         u32 newly_activated = 0u;
         u32 pending = 0u;
+        u32 color_queued = 0u;
+        u32 color_queue_truncated = 0u;
+
         for (u32 section_index = 0;
              section_index < sections.count &&
              objects_scanned < kMaximumObjectsScanned;
@@ -6493,6 +6683,7 @@ private:
             if (!ReadGuestCcArray(
                     section, kMaximumObjectsPerSection, objects))
                 continue;
+
             for (u32 object_index = 0;
                  object_index < objects.count &&
                  objects_scanned < kMaximumObjectsScanned;
@@ -6504,88 +6695,112 @@ private:
                     !env_.IsMapped(object + 1236u, 1u))
                     continue;
 
-                // CCNode::m_bVisible and GameObject's stored opacity. The
-                // primary methods below propagate the state to child sprites.
                 env_.MemoryWrite8(object + 234u, 1u);
-                if (v22_editor_visualized_objects_.contains(object))
-                    continue;
-                if (newly_activated >= kMaximumActivationsPerFrame) {
-                    ++pending;
-                    continue;
+                bool ready_for_colours =
+                    v22_editor_visualized_objects_.contains(object);
+                if (!ready_for_colours) {
+                    if (newly_activated >= kMaximumActivationsPerFrame) {
+                        ++pending;
+                        continue;
+                    }
+
+                    if (!RunNestedPreservingState(
+                            runtime_.v22_game_object_add_main_sprite,
+                            {object, 0u}, ignored,
+                            "V22 editor add main sprite", 100000000u))
+                        return false;
+                    u32 has_secondary = 0u;
+                    if (!RunNestedPreservingState(
+                            runtime_.v22_game_object_has_secondary_color,
+                            {object}, has_secondary,
+                            "V22 editor secondary-color query", 100000000u))
+                        return false;
+                    if (has_secondary &&
+                        !RunNestedPreservingState(
+                            runtime_.v22_game_object_add_color_sprite,
+                            {object, 1u}, ignored,
+                            "V22 editor add color sprite", 100000000u))
+                        return false;
+                    if (!RunNestedPreservingState(
+                            runtime_.v22_game_object_activate, {object}, ignored,
+                            "V22 editor activate object", 100000000u))
+                        return false;
+                    if (!RunNestedPreservingState(
+                            runtime_.v22_game_object_set_opacity,
+                            {object, 255u}, ignored,
+                            "V22 editor object opacity", 100000000u))
+                        return false;
+                    env_.MemoryWrite8(object + 234u, 1u);
+                    v22_editor_visualized_objects_.insert(object);
+                    ready_for_colours = true;
+                    ++newly_activated;
                 }
 
-                u32 ignored = 0u;
-                if (!RunNestedPreservingState(
-                        runtime_.v22_game_object_add_main_sprite,
-                        {object, 0u}, ignored,
-                        "V22 editor add main sprite", 100000000u))
-                    return false;
-                u32 has_secondary = 0u;
-                if (!RunNestedPreservingState(
-                        runtime_.v22_game_object_has_secondary_color,
-                        {object}, has_secondary,
-                        "V22 editor secondary-color query", 100000000u))
-                    return false;
-                if (has_secondary &&
-                    !RunNestedPreservingState(
-                        runtime_.v22_game_object_add_color_sprite,
-                        {object, 0u}, ignored,
-                        "V22 editor add color sprite", 100000000u))
-                    return false;
-                if (!RunNestedPreservingState(
-                        runtime_.v22_game_object_activate, {object}, ignored,
-                        "V22 editor activate object", 100000000u))
-                    return false;
-                if (!RunNestedPreservingState(
-                        runtime_.v22_game_object_set_opacity,
-                        {object, 255u}, ignored,
-                        "V22 editor object opacity", 100000000u))
-                    return false;
-                env_.MemoryWrite8(object + 234u, 1u);
-                v22_editor_visualized_objects_.insert(object);
-                ++newly_activated;
+                /*
+                 * LevelEditorLayerExt checks this byte before placing an object
+                 * in the editor colour queue. Preserve that rule and use the
+                 * real CCArray::addObject so retain/release ownership remains
+                 * correct when removeAllObjects runs below.
+                 */
+                if (ready_for_colours && color_array &&
+                    env_.IsMapped(object + 0x405u, 1u) &&
+                    env_.MemoryRead8(object + 0x405u) == 0u) {
+                    if (color_queued < kMaximumColorObjectsPerFrame) {
+                        if (!RunNestedPreservingState(
+                                runtime_.v22_ccarray_add_object,
+                                {color_array, object}, ignored,
+                                "V22 editor queue object colour", 100000000u))
+                            return false;
+                        ++color_queued;
+                    } else {
+                        ++color_queue_truncated;
+                    }
+                }
             }
         }
 
-        if (newly_activated) {
-            u32 ignored = 0u;
-            constexpr u32 kColorArrayOffset = 11268u;
-            const u32 color_array =
-                env_.IsMapped(editor_layer + kColorArrayOffset, 4u)
-                ? env_.MemoryRead32(editor_layer + kColorArrayOffset) : 0u;
-            if (color_array) {
-                if (!RunNestedPreservingState(
-                        runtime_.v22_level_editor_update_object_colors,
-                        {editor_layer, color_array}, ignored,
-                        "V22 editor update object colors", 250000000u))
-                    return false;
-                if (!RunNestedPreservingState(
-                        runtime_.v22_ccarray_remove_all_objects,
-                        {color_array}, ignored,
-                        "V22 editor clear color queue", 100000000u))
-                    return false;
-            }
+        /*
+         * These are frame-level operations in the companion implementation,
+         * not "new object" operations. Running them every pass fixes stale
+         * area visuals and batch ordering after Start/Stop in the editor.
+         */
+        if (color_array) {
             if (!RunNestedPreservingState(
-                    runtime_.v22_gjbase_process_area_visual_actions,
-                    {editor_layer}, ignored,
-                    "V22 editor process area visuals", 250000000u))
+                    runtime_.v22_level_editor_update_object_colors,
+                    {editor_layer, color_array}, ignored,
+                    "V22 editor update object colors", 250000000u))
                 return false;
             if (!RunNestedPreservingState(
-                    runtime_.v22_level_editor_sort_batchnode_children,
-                    {editor_layer, 0u}, ignored,
-                    "V22 editor sort batch nodes", 250000000u))
+                    runtime_.v22_ccarray_remove_all_objects,
+                    {color_array}, ignored,
+                    "V22 editor clear color queue", 100000000u))
                 return false;
         }
+        if (!RunNestedPreservingState(
+                runtime_.v22_gjbase_process_area_visual_actions,
+                {editor_layer}, ignored,
+                "V22 editor process area visuals", 250000000u))
+            return false;
+        if (!RunNestedPreservingState(
+                runtime_.v22_level_editor_sort_batchnode_children,
+                {editor_layer, 0u}, ignored,
+                "V22 editor sort batch nodes", 250000000u))
+            return false;
 
-        if (newly_activated || v22_editor_visibility_passes_ == 1u) {
+        if (newly_activated || color_queue_truncated ||
+            v22_editor_visibility_passes_ == 1u ||
+            (v22_editor_visibility_passes_ % 120u) == 0u) {
             log_ << "RESULT: DYNARMIC_V22_EDITOR_NATIVE_VISIBILITY "
                  << "editor=0x" << std::hex << editor_layer << std::dec
+                 << " preupdate=1"
                  << " sections=" << sections.count
                  << " scanned=" << objects_scanned
                  << " activated=" << newly_activated
-                 << " total="
-                 << v22_editor_visualized_objects_.size()
+                 << " total=" << v22_editor_visualized_objects_.size()
                  << " pending=" << pending
+                 << " color-queued=" << color_queued
+                 << " color-truncated=" << color_queue_truncated
+                 << " post-visuals=1"
                  << " pass=" << v22_editor_visibility_passes_ << '\n';
             log_.flush();
         }
@@ -10024,7 +10239,7 @@ private:
         if (name == "__dynarmic_v22_prepare_level_setup")
             return HostV22PrepareLevelSetup();
         if (name == "__dynarmic_v22_editor_visibility") {
-            if (!HostV22EditorVisibility(r0)) return false;
+            if (!HostV22EditorVisibility(r0, r1)) return false;
             return finish_hot(0u);
         }
         if (name == "__dynarmic_v22_play_visibility") {
@@ -10851,8 +11066,10 @@ private:
     u64 v22_editor_entries_=0;
     u32 v22_editor_visual_layer_=0;
     u64 v22_editor_visibility_passes_=0;
+    bool v22_pause_button_hidden_logged_=false;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_platformer_ui_logged_=0;
+    bool v22_play_visibility_seen_this_frame_=false;
     bool v22_mouse_platformer_jump_down_=false;
     u32 v22_mouse_platformer_touch_ui_=0;
     u64 v22_companion_hooks_installed_=0;
@@ -11262,7 +11479,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-unified7-fix5-stabilization debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -11788,8 +12005,6 @@ int main(int argc,char** argv) {
                 "required LevelSettingsObject parser bridge was not installed");
         const V22DesktopTextInputPatchCounts desktop_text_input =
             InstallV22DesktopTextInputPatches(runtime, env);
-        const std::size_t pause_button_patches =
-            InstallV22PauseButtonPatch(runtime, env);
 
         const bool late_beta_layout =
             runtime.v22_play_layer_level_offset == 820u &&
@@ -11878,11 +12093,14 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
-             " disable-pause="+
-             (gd_settings_disable_pause_button() ? "true" : "false")+
-             " pause-patches="+std::to_string(pause_button_patches)+
+             " top-right-pause-touch="+
+             (gd_settings_disable_pause_button() ? "blocked" : "normal")+
+             " escape-pause=preserved"+
              " hide-cursor="+
-             (gd_settings_hide_cursor_during_play() ? "true" : "false"));
+             (gd_settings_hide_cursor_during_play() ? "true" : "false")+
+             " exact-editor-visibility="+
+             (gd_settings_v22_exact_editor_visibility()
+                  ? "true" : "false"));
         emit("RESULT: DYNARMIC_V22_PLATFORMER_SWING_REOPEN_PATCH count="+
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
@@ -11923,8 +12141,12 @@ int main(int argc,char** argv) {
             if (runtime.v22_companion_editor_init_enabled) {
                 emit(
                     "RESULT: DYNARMIC_V22_EDITOR_NATIVE_VISUAL_HOOK_READY "
-                    "count=1 init-hook=disabled companion-visibility=disabled "
-                    "visibility-pointers=" +
+                    "count=1 init-hook=disabled visibility-mode=" +
+                    std::string(
+                        visual_hooks.exact_companion_editor
+                            ? "exact-companion"
+                            : "host-approximation") +
+                    " visibility-pointers=" +
                     std::to_string(visual_hooks.editor_visibility.first) +
                     " visibility-calls=" +
                     std::to_string(visual_hooks.editor_visibility.second));
@@ -12311,6 +12533,7 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
+            executor.BeginDesktopGameplayFrame();
             executor.ResetFrameClipState();
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
@@ -12319,6 +12542,7 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
+            executor.EndDesktopGameplayFrame();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

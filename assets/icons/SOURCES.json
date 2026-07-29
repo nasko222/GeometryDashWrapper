@@ -1,62 +1,28 @@
 {
-  "geometry-dash": {
-    "apk": "game.apk",
-    "source_members": [
-      "res/drawable-ldpi/icon.png",
-      "res/drawable-mdpi/icon.png",
-      "res/drawable-hdpi/icon.png",
-      "res/drawable-xhdpi/icon.png"
-    ],
-    "sizes": [
-      16,
-      24,
-      32,
-      48,
-      64,
-      72,
-      96,
-      128,
-      192,
-      256
-    ]
-  },
-  "geometry-dash-lite": {
-    "apk": "game(5).apk",
-    "source_members": [
-      "res/Ul.png",
-      "res/kn.png",
-      "res/nf.png",
-      "res/4d.png",
-      "res/Fu.png",
-      "res/Ql.png"
-    ],
-    "sizes": [
-      16,
-      24,
-      32,
-      48,
-      64,
-      72,
-      96,
-      128,
-      192,
-      256
-    ]
-  },
   "geometry-dash-world": {
-    "apk": "game(4).apk",
-    "source_members": [
-      "res/drawable-ldpi-v4/icon.png",
-      "res/drawable-mdpi-v4/icon.png",
-      "res/drawable-hdpi-v4/icon.png",
-      "res/drawable-xhdpi-v4/icon.png",
-      "res/drawable-xxhdpi-v4/icon.png",
-      "res/drawable-xxxhdpi-v4/icon.png"
+    "source": "user-supplied PNG in this conversation",
+    "source_file": "image(22).png",
+    "source_dimensions": [
+      1024,
+      1024
     ],
-    "sizes": [
+    "ico_sizes": [
       16,
+      20,
       24,
       32,
+      40,
+      48,
+      64,
+      128,
+      256
+    ],
+    "png_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
       48,
       64,
       72,
@@ -64,20 +30,33 @@
       128,
       192,
       256
-    ]
+    ],
+    "sha256": "4101ab761debe4f1491a2cee9ed025b33735f7d78e3fb3f517cce61b4bcf40e0"
   },
   "geometry-dash-subzero": {
-    "apk": "game-v22beta-selected-2022-subzero-icon-signed.apk",
-    "source_members": [
-      "res/drawable-ldpi/icon.png",
-      "res/drawable-mdpi/icon.png",
-      "res/drawable-hdpi/icon.png",
-      "res/drawable-xhdpi/icon.png"
+    "source": "user-supplied PNG in this conversation",
+    "source_file": "image(23).png",
+    "source_dimensions": [
+      512,
+      512
     ],
-    "sizes": [
+    "ico_sizes": [
       16,
+      20,
       24,
       32,
+      40,
+      48,
+      64,
+      128,
+      256
+    ],
+    "png_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
       48,
       64,
       72,
@@ -85,18 +64,33 @@
       128,
       192,
       256
-    ]
+    ],
+    "sha256": "92e0fe86ffc0e710cbf54ec419b0250b169a6fea9874f9b6e49ba958610f59f1"
   },
   "geometry-dash-meltdown": {
-    "apk": "meltdown-test.apk (icon resources originally extracted from the supplied Meltdown APK)",
-    "source_members": [
-      "res/drawable-mdpi/icon.png",
-      "res/drawable-xhdpi/icon.png"
+    "source": "user-supplied PNG in this conversation",
+    "source_file": "image(24).png",
+    "source_dimensions": [
+      512,
+      512
     ],
-    "sizes": [
+    "ico_sizes": [
       16,
+      20,
       24,
       32,
+      40,
+      48,
+      64,
+      128,
+      256
+    ],
+    "png_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
       48,
       64,
       72,
@@ -104,6 +98,75 @@
       128,
       192,
       256
-    ]
+    ],
+    "sha256": "7db3a907aa2558dabadd6c92b5e31e8f47350cfa0ce3d00ad8e6935479087adc"
+  },
+  "geometry-dash-lite": {
+    "source": "user-supplied PNG in this conversation",
+    "source_file": "image(25).png",
+    "source_dimensions": [
+      512,
+      512
+    ],
+    "ico_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
+      48,
+      64,
+      128,
+      256
+    ],
+    "png_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ],
+    "sha256": "6248ae966cc26f16c7b2f61dd65067c1d86ae823a923697fc85e93a77535445b"
+  },
+  "geometry-dash": {
+    "source": "user-supplied PNG in this conversation",
+    "source_file": "image(26).png",
+    "source_dimensions": [
+      512,
+      512
+    ],
+    "ico_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
+      48,
+      64,
+      128,
+      256
+    ],
+    "png_sizes": [
+      16,
+      20,
+      24,
+      32,
+      40,
+      48,
+      64,
+      72,
+      96,
+      128,
+      192,
+      256
+    ],
+    "sha256": "998e61df58d80edb0b775a0b6667448329ed6db5296b684c5be5b58d640706d8"
   }
 }
