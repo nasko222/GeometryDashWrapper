@@ -1,4 +1,4 @@
-# Building EnduranceTest2 on Windows
+# Building EnduranceTest3 on Windows
 
 Run:
 
@@ -32,6 +32,6 @@ BUILD_DYNARMIC.cmd
 BUILD_LAUNCHER.cmd
 ```
 
-EnduranceTest2 changes x86 backup networking, x86 pause-cursor behavior, and the ARMv7 editor experiment
-behavior and the native launch metadata. Run `BUILD_ALL.cmd`; do not reuse Fix6
-executables. The x86 pacing implementation itself is unchanged.
+EnduranceTest3 changes x86 host/input state, both ARM cursor paths, legacy pause
+visual handling, ARMv7 editor overlays, and build metadata. Run `BUILD_ALL.cmd`;
+do not reuse EnduranceTest2 executables.

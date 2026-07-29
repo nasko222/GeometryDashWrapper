@@ -32,12 +32,6 @@ typedef void (*NativeInsertTextFunction)(void *environment, void *object,
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
-typedef void (__cdecl *CCNodeSetVisibleFunction)(void *node, int visible);
-typedef void *(__cdecl *CCNodeGetParentFunction)(void *node);
-typedef void *(__cdecl *CCNodeGetChildrenFunction)(void *node);
-typedef unsigned (__cdecl *CCArrayCountFunction)(void *array);
-typedef void *(__cdecl *CCArrayObjectAtIndexFunction)(void *array,
-                                                       unsigned index);
 
 typedef struct {
     HWND window;
@@ -71,20 +65,10 @@ typedef struct {
     int hide_cursor_option;
     int cursor_hidden;
     int cursor_force_visible;
-    int pause_overlay_seen;
-    unsigned pause_overlay_absent_frames;
-    ULONGLONG cursor_pause_grace_until;
+    ULONGLONG cursor_hide_after;
     ULONGLONG gameplay_cache_time;
     int gameplay_cache_value;
-    void *gameplay_layer;
-    void *ui_layer;
-    size_t pause_button_offset;
-    CCNodeSetVisibleFunction node_set_visible;
-    CCNodeGetParentFunction node_get_parent;
-    CCNodeGetChildrenFunction node_get_children;
-    CCArrayCountFunction array_count;
-    CCArrayObjectAtIndexFunction array_object_at_index;
-    int pause_button_hidden_logged;
+    int editor_cache_value;
     GameManagerSharedStateFunction game_manager_shared_state;
     LARGE_INTEGER frame_clock_frequency;
     LONGLONG next_frame_deadline;
@@ -476,52 +460,6 @@ static unsigned patch_x86_world_creator_buttons(const ElfImage *image) {
     return 0;
 }
 
-/*
- * Find the UILayer field that receives the first CCMenuItemSpriteExtra created
- * by UILayer::init. In the verified 2.11 x86 binary this is +0x1A4; deriving
- * it from code is safer than pretending every release uses that exact offset.
- */
-static size_t discover_x86_pause_button_offset(const ElfImage *image) {
-    unsigned char *initializer = (unsigned char *)elf_image_find_export(
-        image, "_ZN7UILayer4initEv");
-    unsigned char *create_item = (unsigned char *)elf_image_find_export(
-        image,
-        "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_"
-        "PNS0_8CCObjectEMS3_FvS4_E");
-    size_t offset;
-    if (!initializer || !create_item) return 0u;
-
-    for (offset = 0u; offset + 5u < 1024u; ++offset) {
-        int32_t displacement;
-        unsigned char *call_target;
-        size_t after;
-        if (initializer[offset] != 0xE8u) continue;
-        memcpy(&displacement, initializer + offset + 1u,
-               sizeof(displacement));
-        call_target = initializer + offset + 5u + displacement;
-        if (call_target != create_item) continue;
-
-        /*
-         * GCC stores EAX (the returned menu item) into [this+disp32].
-         * Accept any non-ESP base register and a plausible object-field range.
-         */
-        for (after = offset + 5u;
-             after + 6u <= offset + 40u && after + 6u <= 1024u;
-             ++after) {
-            uint32_t field;
-            const unsigned char modrm = initializer[after + 1u];
-            if (initializer[after] != 0x89u ||
-                (modrm & 0xF8u) != 0x80u ||
-                (modrm & 0x07u) == 0x04u)
-                continue;
-            memcpy(&field, initializer + after + 2u, sizeof(field));
-            if (field >= 0x80u && field <= 0x800u) return field;
-        }
-        break;
-    }
-    return 0u;
-}
-
 static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
@@ -564,29 +502,6 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     unsigned texture_quality_patches = 0;
     unsigned world_creator_patches = 0;
     size_t index;
-
-    g_host.pause_button_offset = discover_x86_pause_button_offset(image);
-    g_host.node_set_visible = (CCNodeSetVisibleFunction)elf_image_find_export(
-        image, "_ZN7cocos2d6CCNode10setVisibleEb");
-    g_host.node_get_parent = (CCNodeGetParentFunction)elf_image_find_export(
-        image, "_ZN7cocos2d6CCNode9getParentEv");
-    g_host.node_get_children = (CCNodeGetChildrenFunction)elf_image_find_export(
-        image, "_ZN7cocos2d6CCNode11getChildrenEv");
-    g_host.array_count = (CCArrayCountFunction)elf_image_find_export(
-        image, "_ZNK7cocos2d7CCArray5countEv");
-    if (!g_host.array_count) {
-        g_host.array_count = (CCArrayCountFunction)elf_image_find_export(
-            image, "_ZN7cocos2d7CCArray5countEv");
-    }
-    g_host.array_object_at_index =
-        (CCArrayObjectAtIndexFunction)elf_image_find_export(
-            image, "_ZN7cocos2d7CCArray13objectAtIndexEj");
-    if (gd_settings_disable_pause_button()) {
-        runtime_log(
-            "PC pause visual discovery: field=0x%lx setVisible=%s",
-            (unsigned long)g_host.pause_button_offset,
-            g_host.node_set_visible ? "ready" : "missing");
-    }
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
@@ -621,9 +536,9 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             }
         }
     }
-    runtime_log("PC gameplay settings: top-right-pause-button=%s "
+    runtime_log("PC gameplay settings: top-right-pause-touch=%s "
                 "escape-pause=preserved hide-cursor=%s",
-                gd_settings_disable_pause_button() ? "hidden+touch-blocked" : "normal",
+                gd_settings_disable_pause_button() ? "blocked" : "normal",
                 gd_settings_hide_cursor_during_play() ? "true" : "false");
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
@@ -696,117 +611,18 @@ static int detect_gameplay_active(void) {
         return g_host.gameplay_cache_value;
     g_host.gameplay_cache_time = now;
     g_host.gameplay_cache_value = 0;
-    g_host.gameplay_layer = NULL;
-    g_host.ui_layer = NULL;
+    g_host.editor_cache_value = 0;
     manager = g_host.game_manager_shared_state();
     if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
     for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
          offset += sizeof(void *)) {
         void *candidate = *(void **)((unsigned char *)manager + offset);
-        if (object_type_contains(candidate, "PlayLayer")) {
-            size_t layer_offset;
+        if (object_type_contains(candidate, "LevelEditorLayer"))
+            g_host.editor_cache_value = 1;
+        if (object_type_contains(candidate, "PlayLayer"))
             g_host.gameplay_cache_value = 1;
-            g_host.gameplay_layer = candidate;
-
-            /*
-             * Android x86 is still a 32-bit Cocos build. Find the UILayer
-             * pointer by RTTI rather than pinning the PlayLayer member offset
-             * to one GD release.
-             */
-            for (layer_offset = 0x100u; layer_offset + sizeof(void *) <= 0x4000u;
-                 layer_offset += sizeof(void *)) {
-                void **slot = (void **)((unsigned char *)candidate +
-                                        layer_offset);
-                void *layer_candidate;
-                if (!memory_range_is_readable(slot, sizeof(void *))) continue;
-                layer_candidate = *slot;
-                if (object_type_contains(layer_candidate, "UILayer")) {
-                    g_host.ui_layer = layer_candidate;
-                    break;
-                }
-            }
-            break;
-        }
     }
     return g_host.gameplay_cache_value;
-}
-
-/*
- * Walk the live Cocos scene graph instead of guessing whether Escape's pause
- * layer is still open. This lets the cursor remain visible throughout pause
- * menus and become hidden again immediately after Resume.
- */
-static int gameplay_modal_type(const void *object) {
-    return object_type_contains(object, "PauseLayer") ||
-           object_type_contains(object, "OptionsLayer") ||
-           object_type_contains(object, "FLAlertLayer") ||
-           object_type_contains(object, "GJDropDownLayer");
-}
-
-static int scene_contains_gameplay_modal(void *node, unsigned depth,
-                                         unsigned *budget) {
-    void *children;
-    unsigned count;
-    unsigned index;
-    if (!node || !budget || !*budget || depth > 10u) return 0;
-    --*budget;
-    if (gameplay_modal_type(node)) return 1;
-    if (!g_host.node_get_children || !g_host.array_count ||
-        !g_host.array_object_at_index)
-        return 0;
-    children = g_host.node_get_children(node);
-    if (!children || !memory_range_is_readable(children, sizeof(void *)))
-        return 0;
-    count = g_host.array_count(children);
-    if (count > 2048u) count = 2048u;
-    for (index = 0; index < count && *budget; ++index) {
-        void *child = g_host.array_object_at_index(children, index);
-        if (scene_contains_gameplay_modal(child, depth + 1u, budget))
-            return 1;
-    }
-    return 0;
-}
-
-static int detect_pause_overlay_active(void) {
-    void *root = g_host.gameplay_layer;
-    unsigned parent_steps;
-    unsigned budget = 2048u;
-    if (!root || !g_host.node_get_parent) return 0;
-    for (parent_steps = 0; parent_steps < 16u; ++parent_steps) {
-        void *parent = g_host.node_get_parent(root);
-        if (!parent || parent == root ||
-            !memory_range_is_readable(parent, sizeof(void *)))
-            break;
-        root = parent;
-    }
-    return scene_contains_gameplay_modal(root, 0u, &budget);
-}
-
-static void hide_pause_button_visual(void) {
-    void *pause_item;
-    unsigned char *field;
-    if (!g_host.disable_pause_button_option ||
-        !g_host.gameplay_cache_value || !g_host.ui_layer ||
-        !g_host.pause_button_offset || !g_host.node_set_visible)
-        return;
-
-    field = (unsigned char *)g_host.ui_layer + g_host.pause_button_offset;
-    if (!memory_range_is_readable(field, sizeof(void *))) return;
-    pause_item = *(void **)field;
-    if (!object_type_contains(pause_item, "CCMenuItem")) return;
-
-    /*
-     * Call the game's own CCNode::setVisible(false). The CCNode visible-byte
-     * offset differs between x86 and ARM Cocos builds, so writing a guessed
-     * byte (as the first attempt did) could never be release-safe.
-     */
-    g_host.node_set_visible(pause_item, 0);
-    if (!g_host.pause_button_hidden_logged) {
-        runtime_log("PC gameplay: top-right pause button visual hidden "
-                    "at UILayer+0x%lx; Escape pause preserved",
-                    (unsigned long)g_host.pause_button_offset);
-        g_host.pause_button_hidden_logged = 1;
-    }
 }
 
 static void set_cursor_hidden(int hidden) {
@@ -818,37 +634,18 @@ static void set_cursor_hidden(int hidden) {
 }
 
 static void refresh_cursor_visibility(void) {
-    const ULONGLONG now = GetTickCount64();
-    const int gameplay = detect_gameplay_active();
-    const int pause_overlay = gameplay && detect_pause_overlay_active();
+    int gameplay = detect_gameplay_active();
+    ULONGLONG now = GetTickCount64();
     if (!gameplay) {
         g_host.cursor_force_visible = 0;
-        g_host.pause_overlay_seen = 0;
-        g_host.pause_overlay_absent_frames = 0u;
-        g_host.cursor_pause_grace_until = 0u;
-        g_host.pause_button_hidden_logged = 0;
-    } else {
-        hide_pause_button_visual();
-        if (pause_overlay) {
-            g_host.cursor_force_visible = 1;
-            g_host.pause_overlay_seen = 1;
-            g_host.pause_overlay_absent_frames = 0u;
-        } else if (g_host.pause_overlay_seen) {
-            /* Require several consecutive rendered frames without a pause or
-               options overlay before deciding that Resume completed. */
-            if (++g_host.pause_overlay_absent_frames >= 3u) {
-                g_host.cursor_force_visible = 0;
-                g_host.pause_overlay_seen = 0;
-                g_host.pause_overlay_absent_frames = 0u;
-            }
-        } else if (g_host.cursor_force_visible &&
-                   now >= g_host.cursor_pause_grace_until) {
-            /* Fallback for releases whose pause layer is not discoverable. */
-            g_host.cursor_force_visible = 0;
-        }
+        g_host.cursor_hide_after = 0;
+    } else if (g_host.cursor_hide_after && now >= g_host.cursor_hide_after) {
+        g_host.cursor_force_visible = 0;
+        g_host.cursor_hide_after = 0;
     }
     set_cursor_hidden(g_host.hide_cursor_option && gameplay &&
-                      g_host.window_active && !jni_shim_text_input_active() &&
+                      !g_host.editor_cache_value && g_host.window_active &&
+                      !jni_shim_text_input_active() &&
                       !g_host.cursor_force_visible);
 }
 
@@ -1057,12 +854,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         send_text_character(wparam);
         return 0;
     case WM_LBUTTONDOWN:
-        /*
-         * Escape makes the cursor sticky-visible for the pause menu. Do not
-         * hide it again merely because the paused PlayLayer still exists
-         * underneath that menu. A definite gameplay key press clears it.
-         */
-        if (detect_gameplay_active() && !g_host.cursor_force_visible) {
+        if (detect_gameplay_active()) {
+            g_host.cursor_force_visible = 0;
+            g_host.cursor_hide_after = 0;
             set_cursor_hidden(g_host.hide_cursor_option);
         }
         SetFocus(window);
@@ -1100,11 +894,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
-            g_host.cursor_force_visible = 1;
-            g_host.pause_overlay_seen = 0;
-            g_host.pause_overlay_absent_frames = 0u;
-            g_host.cursor_pause_grace_until = GetTickCount64() + 1500u;
-            set_cursor_hidden(0);
+            g_host.cursor_force_visible = !g_host.cursor_force_visible;
+            g_host.cursor_hide_after = 0;
+            set_cursor_hidden(g_host.cursor_force_visible ? 0 :
+                              (g_host.hide_cursor_option &&
+                               !g_host.editor_cache_value));
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
         }
@@ -1112,6 +906,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             !jni_shim_text_input_active()) {
             if (detect_gameplay_active()) {
                 g_host.cursor_force_visible = 0;
+                g_host.cursor_hide_after = 0;
                 set_cursor_hidden(g_host.hide_cursor_option);
             }
             g_host.keyboard_down = 1;

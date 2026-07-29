@@ -1864,12 +1864,13 @@ public:
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
 
-    void SetGameplayActive(bool active) {
+    void SetGameplayActive(bool active, bool editor_active = false) {
         if (!active) {
             cursor_force_visible_ = false;
             pause_touch_blocked_ = false;
         }
         gameplay_active_ = active;
+        editor_active_ = editor_active;
         UpdateCursorVisibility();
     }
 
@@ -1977,7 +1978,7 @@ private:
 
     void UpdateCursorVisibility() {
         const bool hidden =
-            hide_cursor_option_ && gameplay_active_ && active_ &&
+            hide_cursor_option_ && gameplay_active_ && !editor_active_ && active_ &&
             !text_input_active_ && !cursor_force_visible_;
         if (cursor_hidden_ == hidden) return;
         cursor_hidden_ = hidden;
@@ -2060,13 +2061,11 @@ private:
                 return 0;
             }
             self->pause_touch_blocked_ = false;
-            /*
-             * PlayLayer remains alive behind the pause menu. Keep the cursor
-             * sticky-visible after Escape instead of hiding it on clicks made
-             * inside the pause menu. A definite gameplay key press clears it.
-             */
-            if (self->gameplay_active_ &&
-                !self->cursor_force_visible_) {
+            /* A Resume click happens while PlayLayer is still alive.  Clear
+             * the temporary pause-menu cursor state on a real player click;
+             * editor scenes are excluded by editor_active_. */
+            if (self->gameplay_active_ && !self->editor_active_) {
+                self->cursor_force_visible_ = false;
                 self->UpdateCursorVisibility();
             }
             self->mouse_down_ = true;
@@ -2102,7 +2101,7 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
-                self->cursor_force_visible_ = true;
+                self->cursor_force_visible_ = !self->cursor_force_visible_;
                 self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -2164,6 +2163,7 @@ private:
     bool pause_touch_blocked_ = false;
     bool hide_cursor_option_ = true;
     bool gameplay_active_ = false;
+    bool editor_active_ = false;
     bool cursor_hidden_ = false;
     bool cursor_force_visible_ = false;
     int native_width_ = 1280;
@@ -2199,7 +2199,7 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
-    void SetGameplayActive(bool) {}
+    void SetGameplayActive(bool, bool = false) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -2352,13 +2352,14 @@ public:
         const auto now = std::chrono::steady_clock::now();
         if (gameplay_check_at_.time_since_epoch().count() != 0 &&
             now - gameplay_check_at_ < std::chrono::milliseconds(100)) {
-            gl_.SetGameplayActive(gameplay_active_cache_);
+            gl_.SetGameplayActive(gameplay_active_cache_, editor_active_cache_);
             return;
         }
         gameplay_check_at_ = now;
         gameplay_active_cache_ = false;
+        editor_active_cache_ = false;
         if (!runtime_.game_manager_shared_state) {
-            gl_.SetGameplayActive(false);
+            gl_.SetGameplayActive(false, false);
             return;
         }
 
@@ -2368,18 +2369,52 @@ public:
                          100000000u,
                          std::chrono::milliseconds(5000)) ||
             !manager || !env_.IsMapped(manager, 0x600u)) {
-            gl_.SetGameplayActive(false);
+            gl_.SetGameplayActive(false, false);
             return;
         }
 
         for (u32 offset = 0x40u; offset + 4u <= 0x600u; offset += 4u) {
             const u32 candidate = env_.MemoryRead32(manager + offset);
+            if (GuestObjectTypeContains(candidate, "LevelEditorLayer"))
+                editor_active_cache_ = true;
             if (GuestObjectTypeContains(candidate, "PlayLayer")) {
                 gameplay_active_cache_ = true;
-                break;
+                active_play_layer_ = candidate;
             }
         }
-        gl_.SetGameplayActive(gameplay_active_cache_);
+        HideLegacyPauseButtonVisual();
+        gl_.SetGameplayActive(gameplay_active_cache_, editor_active_cache_);
+    }
+
+    void HideLegacyPauseButtonVisual() {
+        if (!gd_settings_disable_pause_button() || !gameplay_active_cache_ ||
+            editor_active_cache_ || !active_play_layer_ ||
+            legacy_pause_hidden_for_layer_ == active_play_layer_) return;
+        const SymbolRecord* set_visible = FindSymbol(
+            runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
+        if (!set_visible) return;
+        for (u32 offset = 0x100u; offset < 0x3000u; offset += 4u) {
+            if (!env_.IsMapped(active_play_layer_ + offset, 4u)) continue;
+            const u32 ui = env_.MemoryRead32(active_play_layer_ + offset);
+            if (!GuestObjectTypeContains(ui, "UILayer")) continue;
+            for (u32 field : {0x1B8u, 0x1B4u}) {
+                if (!env_.IsMapped(ui + field, 4u)) continue;
+                const u32 node = env_.MemoryRead32(ui + field);
+                if (!GuestObjectTypeContains(node, "CCMenuItem") &&
+                    !GuestObjectTypeContains(node, "CCMenu")) continue;
+                u32 ignored = 0u;
+                if (RunFunction(set_visible->address, {node, 0u}, &ignored,
+                                "legacy hide top-right pause control",
+                                100000000u, std::chrono::milliseconds(1000))) {
+                    legacy_pause_hidden_for_layer_ = active_play_layer_;
+                    log_ << "RESULT: DYNARMIC_LEGACY_PAUSE_BUTTON_HIDDEN ui=0x"
+                         << std::hex << ui << " node=0x" << node
+                         << " field=0x" << field << std::dec << '\n';
+                    log_.flush();
+                }
+                return;
+            }
+        }
     }
 
     bool TerminationRequested() const { return termination_requested_; }
@@ -6233,6 +6268,9 @@ private:
     bool termination_requested_ = false;
     std::chrono::steady_clock::time_point gameplay_check_at_{};
     bool gameplay_active_cache_ = false;
+    bool editor_active_cache_ = false;
+    u32 active_play_layer_ = 0u;
+    u32 legacy_pause_hidden_for_layer_ = 0u;
     WinGlHost gl_;
     double frame_interval_=1.0/60.0;
     std::unordered_map<u32,u32> gl_string_cache_;
@@ -6564,7 +6602,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-endurancetest2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-endurancetest3 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

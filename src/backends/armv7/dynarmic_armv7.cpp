@@ -1175,6 +1175,10 @@ struct ElfRuntime {
     u32 v22_ccarray_remove_all_objects = 0;
     u32 v22_gjbase_process_area_visual_actions = 0;
     u32 v22_level_editor_sort_batchnode_children = 0;
+    u32 v22_level_editor_update_grid_layer = 0;
+    u32 v22_draw_grid_vtable = 0;
+    u32 v22_draw_grid_update_music_guide_time = 0;
+    u32 v22_draw_grid_update_time_markers = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
@@ -2454,6 +2458,14 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN15GJBaseGameLayer24processAreaVisualActionsEv");
     const SymbolRecord* sort_batchnode_children = FindSymbol(
         runtime, "_ZN16LevelEditorLayer21sortBatchnodeChildrenEf");
+    const SymbolRecord* update_grid_layer = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer15updateGridLayerEv");
+    const SymbolRecord* draw_grid_vtable = FindSymbol(
+        runtime, "_ZTV13DrawGridLayer");
+    const SymbolRecord* draw_grid_music = FindSymbol(
+        runtime, "_ZN13DrawGridLayer20updateMusicGuideTimeEf");
+    const SymbolRecord* draw_grid_markers = FindSymbol(
+        runtime, "_ZN13DrawGridLayer17updateTimeMarkersEv");
     if (!editor_visibility || !play_visibility)
         throw std::runtime_error(
             "V22 primary visibility symbols are unavailable");
@@ -2503,7 +2515,8 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             !activate_object || !game_object_opacity || !sprite_opacity ||
             !pre_update_visibility || !update_object_colors || !add_object ||
             !remove_all_objects || !process_area_visual_actions ||
-            !sort_batchnode_children)
+            !sort_batchnode_children || !update_grid_layer ||
+            !draw_grid_vtable || !draw_grid_music || !draw_grid_markers)
             throw std::runtime_error(
                 "safe V22 host visual bridge symbols are unavailable");
 
@@ -2525,6 +2538,10 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             process_area_visual_actions->address;
         runtime.v22_level_editor_sort_batchnode_children =
             sort_batchnode_children->address;
+        runtime.v22_level_editor_update_grid_layer = update_grid_layer->address;
+        runtime.v22_draw_grid_vtable = draw_grid_vtable->address;
+        runtime.v22_draw_grid_update_music_guide_time = draw_grid_music->address;
+        runtime.v22_draw_grid_update_time_markers = draw_grid_markers->address;
 
         const u32 editor_host = EnsureImport(
             runtime, env, "__dynarmic_v22_editor_visibility");
@@ -3282,13 +3299,11 @@ private:
                 return 0;
             }
             self->pause_touch_blocked_ = false;
-            /*
-             * PlayLayer remains alive behind the pause menu. Keep the cursor
-             * sticky-visible after Escape instead of hiding it on clicks made
-             * inside the pause menu. A definite gameplay key press clears it.
-             */
-            if (self->gameplay_active_ &&
-                !self->cursor_force_visible_) {
+            /* A Resume click occurs while PlayLayer is still alive.  Clear
+             * the temporary pause-menu state here.  Editor scenes report
+             * gameplay_active_=false, so their cursor remains visible. */
+            if (self->gameplay_active_) {
+                self->cursor_force_visible_ = false;
                 self->UpdateCursorVisibility();
             }
             self->mouse_down_ = true;
@@ -3324,7 +3339,7 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
-                self->cursor_force_visible_ = true;
+                self->cursor_force_visible_ = !self->cursor_force_visible_;
                 self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -3748,13 +3763,80 @@ public:
         v22_play_visibility_seen_this_frame_ = false;
     }
 
+    /*
+     * The beta does not call its editor timeline helpers continuously through
+     * the Android path used by the wrapper.  The old visibility-hook attempt
+     * only refreshed them when a visibility pass happened, so the song guide
+     * could appear and then freeze.  Drive only the tiny DrawGridLayer state
+     * updates once per rendered editor frame.  This is deliberately separate
+     * from the expensive exact companion visibility function that froze the
+     * editor in EnduranceTest1.
+     */
+    bool UpdateV22EditorOverlayFrame() {
+        if (!IsV22EditorSceneActive()) {
+            v22_editor_overlay_frames_ = 0u;
+            v22_editor_overlay_playtest_active_ = false;
+            return true;
+        }
+        const u32 editor = v22_editor_visual_layer_;
+        const u32 draw_grid = FindV22DrawGridLayer(editor);
+        ++v22_editor_overlay_frames_;
+
+        if (draw_grid && runtime_.v22_draw_grid_update_music_guide_time) {
+            const float song_time = audio_get_background_time();
+            if (song_time >= 0.0f && !RunFunction(
+                    runtime_.v22_draw_grid_update_music_guide_time,
+                    {draw_grid, FloatToWord(song_time)}, nullptr,
+                    "DrawGridLayer::updateMusicGuideTime per-frame", 0u,
+                    std::chrono::milliseconds(1000)))
+                return false;
+            if (song_time >= 0.0f &&
+                (v22_editor_overlay_frames_ == 1u ||
+                 (v22_editor_overlay_frames_ % 300u) == 0u)) {
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_SONG_GUIDE_FRAME time="
+                     << std::fixed << std::setprecision(3) << song_time
+                     << " frame=" << v22_editor_overlay_frames_ << '\n';
+                log_.flush();
+            }
+        }
+
+        if (draw_grid && runtime_.v22_draw_grid_update_time_markers &&
+            (v22_editor_overlay_frames_ == 1u ||
+             (v22_editor_overlay_frames_ % 60u) == 0u)) {
+            if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
+                             {draw_grid}, nullptr,
+                             "DrawGridLayer::updateTimeMarkers periodic", 0u,
+                             std::chrono::milliseconds(1000)))
+                return false;
+        }
+
+        u32 playtest_editor = 0u;
+        const bool playtest_active =
+            IsV22EditorPlaytestActive(playtest_editor);
+        if (v22_editor_overlay_frames_ == 1u ||
+            playtest_active != v22_editor_overlay_playtest_active_) {
+            if (runtime_.v22_level_editor_update_grid_layer &&
+                !RunFunction(runtime_.v22_level_editor_update_grid_layer,
+                             {editor}, nullptr,
+                             "LevelEditorLayer::updateGridLayer transition", 0u,
+                             std::chrono::milliseconds(2000)))
+                return false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_GRID_REFRESH active="
+                 << (playtest_active ? 1 : 0)
+                 << " frame=" << v22_editor_overlay_frames_ << '\n';
+            log_.flush();
+            v22_editor_overlay_playtest_active_ = playtest_active;
+        }
+        return true;
+    }
+
     void EndDesktopGameplayFrame() {
         u32 editor = 0u;
         const bool editor_playtest = IsV22EditorPlaytestActive(editor);
-        const bool gameplay =
-            v22_play_visibility_seen_this_frame_ || editor_playtest;
-        if (gameplay) HideV22PauseButtonVisual();
-        gl_.SetGameplayActive(gameplay);
+        const bool editor_scene = IsV22EditorSceneActive();
+        const bool gameplay = v22_play_visibility_seen_this_frame_ || editor_playtest;
+        if (gameplay && !editor_scene) HideV22PauseButtonVisual();
+        gl_.SetGameplayActive(gameplay && !editor_scene);
     }
 
     bool TerminationRequested() const { return termination_requested_; }
@@ -6622,6 +6704,26 @@ private:
         return true;
     }
 
+    u32 FindV22DrawGridLayer(u32 editor_layer) {
+        if (v22_draw_grid_layer_ && LooksLikeGuestObject(runtime_, env_, v22_draw_grid_layer_))
+            return v22_draw_grid_layer_;
+        const u32 expected = runtime_.v22_draw_grid_vtable + 8u;
+        for (u32 offset = 0x100u; offset < 0x4000u; offset += 4u) {
+            if (!env_.IsMapped(editor_layer + offset, 4u)) continue;
+            const u32 candidate = env_.MemoryRead32(editor_layer + offset);
+            if (!candidate || !env_.IsMapped(candidate, 4u)) continue;
+            if (env_.MemoryRead32(candidate) == expected) {
+                v22_draw_grid_layer_ = candidate;
+                log_ << "RESULT: DYNARMIC_V22_DRAW_GRID_FOUND editor=0x"
+                     << std::hex << editor_layer << " grid=0x" << candidate
+                     << " field=0x" << offset << std::dec << '\n';
+                log_.flush();
+                return candidate;
+            }
+        }
+        return 0u;
+    }
+
     bool HostV22EditorVisibility(u32 editor_layer, u32 delta_bits) {
         if (!LooksLikeGuestObject(runtime_, env_, editor_layer))
             return Fail("V22 editor visibility received an invalid layer");
@@ -6629,6 +6731,7 @@ private:
             v22_editor_visual_layer_ = editor_layer;
             v22_editor_visualized_objects_.clear();
             v22_editor_visibility_passes_ = 0u;
+            v22_draw_grid_layer_ = 0u;
         }
         ++v22_editor_visibility_passes_;
 
@@ -6791,6 +6894,10 @@ private:
                 {editor_layer, 0u}, ignored,
                 "V22 editor sort batch nodes", 250000000u))
             return false;
+
+        /* Timeline/BPM/grid state is updated once per rendered frame by
+         * UpdateV22EditorOverlayFrame().  Keeping it out of this nested import
+         * callback avoids intermittent updates and expensive re-entrant work. */
 
         if (newly_activated || color_queue_truncated ||
             v22_editor_visibility_passes_ == 1u ||
@@ -11070,7 +11177,10 @@ private:
     u64 v22_level_settings_fallback_successes_=0;
     u64 v22_editor_entries_=0;
     u32 v22_editor_visual_layer_=0;
+    u32 v22_draw_grid_layer_=0;
     u64 v22_editor_visibility_passes_=0;
+    u64 v22_editor_overlay_frames_=0;
+    bool v22_editor_overlay_playtest_active_=false;
     bool v22_pause_button_hidden_logged_=false;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_platformer_ui_logged_=0;
@@ -11484,7 +11594,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest2 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest3 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12540,6 +12650,8 @@ int main(int argc,char** argv) {
             const auto render_start=std::chrono::steady_clock::now();
             executor.BeginDesktopGameplayFrame();
             executor.ResetFrameClipState();
+            if(!executor.UpdateV22EditorOverlayFrame())
+                throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,

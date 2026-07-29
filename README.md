@@ -1,76 +1,64 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest2
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest3
 
-`endurancetest` is the long-session and cross-version regression branch.
-EnduranceTest2 is a narrow correction over EnduranceTest1: it removes the
-freezing 2.2 editor experiment, repairs the old-client backup send state, and
-makes x86 cursor visibility follow the actual pause scene. The accepted Fix6
-x86 frame-pacing implementation is unchanged.
+`endurancetest` is the cross-version stability branch. EnduranceTest3 is a
+narrow recovery from EnduranceTest2: it restores the accepted Fix6 x86 host
+loop, keeps the now-working old-client account backup transport, corrects
+cursor behavior by separating editors from player gameplay, hides verified
+legacy ARM pause controls, and moves the 2.2 editor timeline update into the
+actual per-frame render path.
 
 ## Running
 
-Python is not required to build or run the wrapper.
+Python is not required.
 
-Use either launcher:
+- `RUN_AUTO_GDPS.cmd` uses `naskogdps17.7m.pl/database`.
+- `RUN_AUTO_BOOMLINGS.cmd` uses `www.boomlings.com/database`.
 
-- `RUN_AUTO_GDPS.cmd` — `naskogdps17.7m.pl/database`
-- `RUN_AUTO_BOOMLINGS.cmd` — `www.boomlings.com/database`
+Double-click a launcher to use `game.apk`, or drag an APK onto either launcher.
+The native launcher selects the backend and creates the package/version/backend
+save profile and dated log folder.
 
-Double-click a launcher to use `game.apk`, or drag an APK onto it. The native
-`GeometryDashLauncher.exe` reads the APK package and version, selects the
-backend, applies the game title/icon, chooses the save profile and creates a
-dated log folder.
-
-## Default launch settings
+## Default settings
 
 ```bat
 set "DISABLE_PAUSE_BUTTON=true"
 set "HIDE_CURSOR_DURING_PLAY=true"
 set "VERSION_ISOLATED_SAVES=true"
-set "V22_EXACT_EDITOR_VISIBILITY=false"
 ```
 
-`VERSION_ISOLATED_SAVES=true` stores all game state and caches by package,
-version and backend, for example:
+Version-isolated saves remain toggleable and enabled by default. Setting
+`VERSION_ISOLATED_SAVES=false` restores the old flat `save\` root. Existing
+flat saves are not guessed or migrated automatically.
 
-```text
-save\com.robtopx.geometryjump__v1.93__x86\
-save\com.robtopx.geometryjump__v2.111__x86\
-save\com.robtopx.geometrydashsubzero__v2.2.12__armv7\
-```
+## EnduranceTest3 changes
 
-Set it to `false` to use the old shared `save\` directory. Existing flat saves
-are left untouched and are never guessed or migrated automatically.
-
-`V22_EXACT_EDITOR_VISIBILITY` remains visible only for comparison with old
-logs. The exact companion redirect is hard-disabled in this endurance build
-because it caused multi-second editor frames and freezes. The faster Fix6 host
-visual path is always used.
-
-## EnduranceTest2 changes
-
-- Keeps the accepted Fix6 x86 pacing function unchanged.
-- Walks the live Cocos scene graph on x86 so the cursor stays visible in pause
-  and options layers, then hides again after Resume.
-- Keeps the top-right pause-button behavior and Escape pause behavior unchanged.
-- Preserves a synthetic API socket's logical connected state after
-  `HTTP/1.1 100 Continue`, reports `POLLOUT`, and joins a following backup body
-  whether the old client sends it through `send` or `writev`.
-- Hard-disables the exact 2.2 companion visibility redirect that froze the
-  editor. The confirmed Fix6 object-color repair remains active.
-- Keeps version-isolated saves, native launch, APK drag-and-drop, dated logs,
-  clean titles, supplied icon families, and separate Boomlings/GDPS launchers.
+- Restores the Fix6 x86 `main.c` host loop and removes EnduranceTest1/2's
+  recursive Cocos scene traversal. That traversal ran inside the frame loop and
+  is the most likely source of the severe x86 regression and incorrect cube
+  animation state.
+- Keeps the Fix6 x86 frame-pacing function exactly unchanged.
+- Keeps EnduranceTest2's successful `100 Continue`/pending-body backup repair.
+- Keeps the cursor visible in editors. In player gameplay it hides again after
+  Resume, including legacy ARM and ARMv7.
+- Hides the verified legacy ARM top-right pause control through the game's own
+  `CCNode::setVisible(false)` method; Escape still opens the normal pause menu.
+- Keeps the confirmed 2.2 object-colour repair for sawblades, monsters and the
+  editor death X.
+- Drives `DrawGridLayer::updateMusicGuideTime` once per rendered editor frame,
+  periodically refreshes BPM/time markers, and refreshes the editor grid when
+  playtest starts or stops. This replaces the intermittent visibility-callback
+  update that made the song line appear but remain frozen.
+- The freezing exact companion visibility redirect remains disabled internally;
+  there is no launcher toggle for it.
 - Contains no Python files and no `.gitignore`.
 
-## Open editor issues
+## Still requiring runtime confirmation
 
-The song-position line, BPM guidelines and moving right-side black region are
-not claimed fixed in this build. Disassembly showed that the freezing companion
-visibility routine never called `DrawGridLayer::updateTimeMarkers`, so it was
-the wrong path for those overlays. EnduranceTest2 removes the freeze first.
+The 2.2 song line, BPM guides and moving right-side black region are targeted
+but not claimed fixed until tested on Windows. The grid refresh on playtest
+transitions is aimed at stale editor state after Stop, without restoring the
+exact companion routine that froze the editor.
 
-## Readability
+## Code guide
 
-Start with `docs/CODE-TOUR-FOR-CSHARP-JAVA-DEVS.md`. New code uses named
-helpers and comments that compare Win32/C concepts with C#/Java concepts. The
-established emulator cores are not cosmetically rewritten during an endurance
-branch because that would add unrelated regression risk.
+Start with `docs\CODE-TOUR-FOR-CSHARP-JAVA-DEVS.md`.

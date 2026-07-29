@@ -1,4 +1,4 @@
-# EnduranceTest2 Test Sheet
+# EnduranceTest3 Test Sheet
 
 Copy this file and mark results.
 
@@ -55,10 +55,12 @@ Network legacy API completed through WinHTTP
 
 - [ ] x86 pacing remains as smooth as Fix6
 - [ ] Cursor hides during x86 gameplay
-- [ ] Cursor is visible throughout the pause menu
+- [ ] Cursor is visible in the pause menu
 - [ ] Cursor hides again after returning to gameplay
 - [ ] ARMv7 cursor hides during gameplay
-- [ ] ARMv7 cursor remains visible in pause menu
+- [ ] ARMv7 cursor remains visible in pause menu and editor
+- [ ] Legacy ARM cursor hides again after Resume
+- [ ] Legacy ARM top-right pause graphic is absent in 1.0/1.01/1.4
 - [ ] Top-right pause graphic is absent in selected 2.2 beta
 - [ ] Escape opens the complete pause menu
 - [ ] Resume/restart/quit buttons still work
