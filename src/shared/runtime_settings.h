@@ -13,9 +13,6 @@ float gd_setting_float(const char *name, float default_value, float minimum, flo
 int gd_settings_hack_icons(void);
 int gd_settings_full_bypass(void);
 int gd_settings_force_highest_graphics(void);
-/* PC-style gameplay options, configured by the launch BAT files. */
-int gd_settings_disable_pause_button(void);
-int gd_settings_hide_cursor_during_play(void);
 /* Uses the beta companion's complete editor visibility pass. */
 int gd_settings_v22_exact_editor_visibility(void);
 float gd_settings_music_pulse_max(void);

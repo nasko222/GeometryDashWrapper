@@ -1,11 +1,9 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest3
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest4
 
-`endurancetest` is the cross-version stability branch. EnduranceTest3 is a
-narrow recovery from EnduranceTest2: it restores the accepted Fix6 x86 host
-loop, keeps the now-working old-client account backup transport, corrects
-cursor behavior by separating editors from player gameplay, hides verified
-legacy ARM pause controls, and moves the 2.2 editor timeline update into the
-actual per-frame render path.
+`endurancetest` is the cross-version stability branch. EnduranceTest4 removes
+the pause-button and cursor experiments completely, adds the original PC
+Practice Mode Z/X controls, fixes editor-session overlay reset, targets the
+2.2 right-side black region, and repairs legacy MCI music-volume replay.
 
 ## Running
 
@@ -18,11 +16,9 @@ Double-click a launcher to use `game.apk`, or drag an APK onto either launcher.
 The native launcher selects the backend and creates the package/version/backend
 save profile and dated log folder.
 
-## Default settings
+## Default setting
 
 ```bat
-set "DISABLE_PAUSE_BUTTON=true"
-set "HIDE_CURSOR_DURING_PLAY=true"
 set "VERSION_ISOLATED_SAVES=true"
 ```
 
@@ -30,34 +26,30 @@ Version-isolated saves remain toggleable and enabled by default. Setting
 `VERSION_ISOLATED_SAVES=false` restores the old flat `save\` root. Existing
 flat saves are not guessed or migrated automatically.
 
-## EnduranceTest3 changes
+## EnduranceTest4 changes
 
-- Restores the Fix6 x86 `main.c` host loop and removes EnduranceTest1/2's
-  recursive Cocos scene traversal. That traversal ran inside the frame loop and
-  is the most likely source of the severe x86 regression and incorrect cube
-  animation state.
-- Keeps the Fix6 x86 frame-pacing function exactly unchanged.
-- Keeps EnduranceTest2's successful `100 Continue`/pending-body backup repair.
-- Keeps the cursor visible in editors. In player gameplay it hides again after
-  Resume, including legacy ARM and ARMv7.
-- Hides the verified legacy ARM top-right pause control through the game's own
-  `CCNode::setVisible(false)` method; Escape still opens the normal pause menu.
-- Keeps the confirmed 2.2 object-colour repair for sawblades, monsters and the
-  editor death X.
-- Drives `DrawGridLayer::updateMusicGuideTime` once per rendered editor frame,
-  periodically refreshes BPM/time markers, and refreshes the editor grid when
-  playtest starts or stops. This replaces the intermittent visibility-callback
-  update that made the song line appear but remain frozen.
-- The freezing exact companion visibility redirect remains disabled internally;
-  there is no launcher toggle for it.
+- Removes all wrapper cursor hiding on x86, legacy ARM and ARMv7. The Windows
+  cursor is no longer modified by gameplay, pause, Resume or editor state.
+- Removes all wrapper pause-button hit blocking and visual hiding. The APK's
+  top-right pause control is native again; Escape still calls Android Back.
+- Adds Z to place and X to remove Practice Mode checkpoints by calling the
+  APK's own `UILayer::onCheck` and `UILayer::onDeleteCheck` callbacks.
+- Reapplies the stored music volume after MCI play/resume/seek operations,
+  targeting the 1.0–1.4 first-attempt/later-attempt volume mismatch.
+- Resets song-guide/BPM lifecycle counters whenever a different 2.2 editor
+  layer appears, so reopening the editor starts the overlay refresh at frame 1.
+- Clears stale OpenGL scissor state and restores the native viewport before
+  2.2 editor frames. This narrowly targets the moving right-side black region.
+- Keeps EnduranceTest3's x86 pacing, account backup transport, save isolation,
+  network handling and object-colour repair. No x86 optimisation was attempted.
 - Contains no Python files and no `.gitignore`.
 
-## Still requiring runtime confirmation
+## Runtime confirmation needed
 
-The 2.2 song line, BPM guides and moving right-side black region are targeted
-but not claimed fixed until tested on Windows. The grid refresh on playtest
-transitions is aimed at stale editor state after Stop, without restoring the
-exact companion routine that froze the editor.
+The black-region repair, repeated editor reopening, legacy volume consistency
+and Z/X callbacks still require a Windows/APK test. The editor death-X colour
+was not changed in this build because the uploaded logs do not establish the
+beta's intended colour.
 
 ## Code guide
 

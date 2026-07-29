@@ -32,6 +32,7 @@ typedef void (*NativeInsertTextFunction)(void *environment, void *object,
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
+typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 
 typedef struct {
     HWND window;
@@ -60,16 +61,13 @@ typedef struct {
     int window_active;
     int closing;
     int vsync_enabled;
-    int disable_pause_button_option;
-    int pause_touch_blocked;
-    int hide_cursor_option;
-    int cursor_hidden;
-    int cursor_force_visible;
-    ULONGLONG cursor_hide_after;
     ULONGLONG gameplay_cache_time;
     int gameplay_cache_value;
     int editor_cache_value;
+    void *active_play_layer;
     GameManagerSharedStateFunction game_manager_shared_state;
+    UiCheckpointFunction ui_on_check;
+    UiCheckpointFunction ui_on_delete_check;
     LARGE_INTEGER frame_clock_frequency;
     LONGLONG next_frame_deadline;
 } GameHost;
@@ -536,10 +534,7 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             }
         }
     }
-    runtime_log("PC gameplay settings: top-right-pause-touch=%s "
-                "escape-pause=preserved hide-cursor=%s",
-                gd_settings_disable_pause_button() ? "blocked" : "normal",
-                gd_settings_hide_cursor_during_play() ? "true" : "false");
+    runtime_log("PC desktop controls: native pause button and mouse cursor unchanged");
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
                 "highest-graphics=%s hd=%u low-memory=%u texture-quality=%u "
@@ -612,6 +607,7 @@ static int detect_gameplay_active(void) {
     g_host.gameplay_cache_time = now;
     g_host.gameplay_cache_value = 0;
     g_host.editor_cache_value = 0;
+    g_host.active_play_layer = NULL;
     manager = g_host.game_manager_shared_state();
     if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
     for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
@@ -619,49 +615,43 @@ static int detect_gameplay_active(void) {
         void *candidate = *(void **)((unsigned char *)manager + offset);
         if (object_type_contains(candidate, "LevelEditorLayer"))
             g_host.editor_cache_value = 1;
-        if (object_type_contains(candidate, "PlayLayer"))
+        if (object_type_contains(candidate, "PlayLayer")) {
             g_host.gameplay_cache_value = 1;
+            g_host.active_play_layer = candidate;
+        }
     }
     return g_host.gameplay_cache_value;
 }
 
-static void set_cursor_hidden(int hidden) {
-    hidden = hidden != 0;
-    if (g_host.cursor_hidden == hidden) return;
-    g_host.cursor_hidden = hidden;
-    if (g_host.window)
-        SetCursor(hidden ? NULL : LoadCursorA(NULL, IDC_ARROW));
-}
-
-static void refresh_cursor_visibility(void) {
-    int gameplay = detect_gameplay_active();
-    ULONGLONG now = GetTickCount64();
-    if (!gameplay) {
-        g_host.cursor_force_visible = 0;
-        g_host.cursor_hide_after = 0;
-    } else if (g_host.cursor_hide_after && now >= g_host.cursor_hide_after) {
-        g_host.cursor_force_visible = 0;
-        g_host.cursor_hide_after = 0;
+static void *find_active_ui_layer(void) {
+    size_t offset;
+    unsigned char *play_layer;
+    if (!detect_gameplay_active() || !g_host.active_play_layer) return NULL;
+    play_layer = (unsigned char *)g_host.active_play_layer;
+    for (offset = 0x100u; offset + sizeof(void *) <= 0x3000u;
+         offset += sizeof(void *)) {
+        void *candidate;
+        if (!memory_range_is_readable(play_layer + offset, sizeof(void *)))
+            continue;
+        candidate = *(void **)(play_layer + offset);
+        if (object_type_contains(candidate, "UILayer")) return candidate;
     }
-    set_cursor_hidden(g_host.hide_cursor_option && gameplay &&
-                      !g_host.editor_cache_value && g_host.window_active &&
-                      !jni_shim_text_input_active() &&
-                      !g_host.cursor_force_visible);
+    return NULL;
 }
 
-static int point_is_top_right_pause_button(float x, float y) {
-    if (!g_host.disable_pause_button_option ||
-        !detect_gameplay_active() ||
-        g_host.native_width <= 0 || g_host.native_height <= 0)
-        return 0;
-
-    /*
-     * The Android pause control is anchored in the upper-right corner. Block
-     * only that small touch target. UILayer::onPause remains untouched, so
-     * Escape and every real pause-menu action still work normally.
-     */
-    return x >= (float)g_host.native_width * 0.86f &&
-           y <= (float)g_host.native_height * 0.22f;
+static int send_practice_checkpoint_hotkey(int place) {
+    UiCheckpointFunction callback = place ? g_host.ui_on_check
+                                          : g_host.ui_on_delete_check;
+    void *ui_layer;
+    if (!callback) return 0;
+    ui_layer = find_active_ui_layer();
+    if (!ui_layer) return 0;
+    /* Call the same guarded callbacks as the mobile checkpoint buttons.
+       The game itself ignores them outside Practice Mode. */
+    callback(ui_layer, NULL);
+    runtime_log("Practice hotkey: %c -> UILayer::%s",
+                place ? 'Z' : 'X', place ? "onCheck" : "onDeleteCheck");
+    return 1;
 }
 
 static void pace_x86_frame(void) {
@@ -828,18 +818,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (wparam) {
             resume_native_game("window activated");
         } else {
-            set_cursor_hidden(0);
             pause_native_game("window deactivated");
         }
         return 0;
     case WM_ERASEBKGND:
         return 1;
-    case WM_SETCURSOR:
-        if (LOWORD(lparam) == HTCLIENT && g_host.cursor_hidden) {
-            SetCursor(NULL);
-            return TRUE;
-        }
-        break;
     case WM_CHAR:
         if (wparam == '\b') {
             if (g_host.native_ready && g_host.delete_backward) {
@@ -854,17 +837,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         send_text_character(wparam);
         return 0;
     case WM_LBUTTONDOWN:
-        if (detect_gameplay_active()) {
-            g_host.cursor_force_visible = 0;
-            g_host.cursor_hide_after = 0;
-            set_cursor_hidden(g_host.hide_cursor_option);
-        }
         SetFocus(window);
-        if (point_is_top_right_pause_button(x, y)) {
-            g_host.pause_touch_blocked = 1;
-            return 0;
-        }
-        g_host.pause_touch_blocked = 0;
         g_host.mouse_down = 1;
         SetCapture(window);
         send_touch_begin(x, y);
@@ -875,10 +848,6 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_LBUTTONUP:
-        if (g_host.pause_touch_blocked) {
-            g_host.pause_touch_blocked = 0;
-            return 0;
-        }
         if (g_host.mouse_down) {
             g_host.mouse_down = 0;
             ReleaseCapture();
@@ -886,7 +855,6 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_CAPTURECHANGED:
-        g_host.pause_touch_blocked = 0;
         if (g_host.mouse_down) {
             g_host.mouse_down = 0;
             send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
@@ -894,21 +862,16 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
-            g_host.cursor_force_visible = !g_host.cursor_force_visible;
-            g_host.cursor_hide_after = 0;
-            set_cursor_hidden(g_host.cursor_force_visible ? 0 :
-                              (g_host.hide_cursor_option &&
-                               !g_host.editor_cache_value));
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
+            return 0;
+        }
+        if (!(lparam & (1L << 30)) && !jni_shim_text_input_active() &&
+            (wparam == 'Z' || wparam == 'X') &&
+            send_practice_checkpoint_hotkey(wparam == 'Z')) {
             return 0;
         }
         if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
             !jni_shim_text_input_active()) {
-            if (detect_gameplay_active()) {
-                g_host.cursor_force_visible = 0;
-                g_host.cursor_hide_after = 0;
-                set_cursor_hidden(g_host.hide_cursor_option);
-            }
             g_host.keyboard_down = 1;
             send_touch_begin((float)g_host.native_width * 0.5f,
                              (float)g_host.native_height * 0.5f);
@@ -1071,7 +1034,6 @@ static int run_message_loop(void) {
         if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
-            refresh_cursor_visibility();
             /*
              * The game explicitly requests its animation interval through JNI.
              * Vsync alone follows the monitor (for example 144 Hz), while an
@@ -1113,9 +1075,6 @@ int main(int argc, char **argv) {
     g_host.native_width = 1280;
     g_host.native_height = 720;
     g_host.window_active = 1;
-    g_host.disable_pause_button_option =
-        gd_settings_disable_pause_button();
-    g_host.hide_cursor_option = gd_settings_hide_cursor_during_play();
 
     /*
      * Read the log destination before executable_directory() changes the
@@ -1170,8 +1129,15 @@ int main(int argc, char **argv) {
     g_host.game_manager_shared_state =
         (GameManagerSharedStateFunction)elf_image_find_export(
             &image, "_ZN11GameManager11sharedStateEv");
+    g_host.ui_on_check = (UiCheckpointFunction)elf_image_find_export(
+        &image, "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
+    g_host.ui_on_delete_check = (UiCheckpointFunction)elf_image_find_export(
+        &image, "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE");
     runtime_log("PC gameplay detection: GameManager::sharedState=%s",
                 g_host.game_manager_shared_state ? "ready" : "unavailable");
+    runtime_log("Practice Z/X callbacks: place=%s remove=%s",
+                g_host.ui_on_check ? "ready" : "unavailable",
+                g_host.ui_on_delete_check ? "ready" : "unavailable");
     install_desktop_keyboard_offset_patches(&image);
     install_configurable_x86_hacks(&image);
     if (mode == 0) {

@@ -1,4 +1,4 @@
-# Building EnduranceTest3 on Windows
+# Building EnduranceTest4 on Windows
 
 Run:
 
@@ -32,6 +32,6 @@ BUILD_DYNARMIC.cmd
 BUILD_LAUNCHER.cmd
 ```
 
-EnduranceTest3 changes x86 host/input state, both ARM cursor paths, legacy pause
-visual handling, ARMv7 editor overlays, and build metadata. Run `BUILD_ALL.cmd`;
-do not reuse EnduranceTest2 executables.
+EnduranceTest4 changes input and desktop state on every backend, shared audio,
+ARMv7 editor rendering, and build metadata. Run `BUILD_ALL.cmd`; do not reuse
+EnduranceTest3 executables.

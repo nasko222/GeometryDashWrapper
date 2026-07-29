@@ -1,6 +1,6 @@
 # Source contents
 
-This archive contains the complete EnduranceTest3 wrapper source, native
+This archive contains the complete EnduranceTest4 wrapper source, native
 launcher, PowerShell/CMD build scripts, pinned dependency metadata, zlib/stb
 source, the five supplied game icon families, documentation and the
 C#/Java-oriented code tour.

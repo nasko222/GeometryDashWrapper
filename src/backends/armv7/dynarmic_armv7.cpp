@@ -1182,6 +1182,8 @@ struct ElfRuntime {
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
+    u32 v22_ui_on_check = 0;
+    u32 v22_ui_on_delete_check = 0;
     u32 v22_ui_layer_offset = 0;
     u32 v22_editor_playtest_state_offset = 0;
     u32 v22_companion_image_min = 0;
@@ -1853,6 +1855,10 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
         resolve("_ZN7UILayer7keyDownEN7cocos2d12enumKeyCodesE");
     runtime.v22_ui_key_up =
         resolve("_ZN7UILayer5keyUpEN7cocos2d12enumKeyCodesE");
+    runtime.v22_ui_on_check = resolve(
+        "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
+    runtime.v22_ui_on_delete_check = resolve(
+        "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE");
 
     // These offsets belong to the 9,578,364-byte late-beta ARM image. They are
     // enabled from its independently discovered PlayLayer/GJGameLevel layout,
@@ -2865,6 +2871,7 @@ enum class HostEventType {
     KeyDown,
     TextInput,
     DeleteBackward,
+    PracticeCheckpoint,
     PlatformButton,
     Pause,
     Resume
@@ -2913,10 +2920,6 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
-        disable_pause_button_option_ =
-            gd_settings_disable_pause_button();
-        hide_cursor_option_ =
-            gd_settings_hide_cursor_during_play();
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnified ARMv7Window";
         WNDCLASSEXA wc{};
@@ -3036,9 +3039,30 @@ public:
         return {width, height};
     }
 
-    // The Android game owns viewport, scissor, colour-mask and depth-mask state.
-    // Host-side resets broke editor overlays and left stale playtest regions.
-    void ResetFrameClipState() {}
+    // Reset the stale playtest clip that produces the moving right-side void.
+    // This is intentionally editor-only and leaves colour/depth masks alone.
+    void ResetFrameClipState(bool editor_active) {
+        if (!editor_active || !context_) return;
+        GLint viewport[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        const bool scissor_enabled = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+        const bool viewport_stale = viewport[0] != 0 || viewport[1] != 0 ||
+            viewport[2] != native_width_ || viewport[3] != native_height_;
+        if (!scissor_enabled && !viewport_stale) return;
+        if (scissor_enabled) glDisable(GL_SCISSOR_TEST);
+        if (viewport_stale) glViewport(0, 0, native_width_, native_height_);
+        ++editor_clip_resets_;
+        if (log_ && (editor_clip_resets_ <= 8u ||
+                     (editor_clip_resets_ % 120u) == 0u)) {
+            *log_ << "RESULT: DYNARMIC_V22_EDITOR_CLIP_RESET scissor="
+                  << (scissor_enabled ? 1 : 0)
+                  << " viewport=" << viewport[0] << ',' << viewport[1]
+                  << ',' << viewport[2] << ',' << viewport[3]
+                  << " target=0,0," << native_width_ << ',' << native_height_
+                  << " count=" << editor_clip_resets_ << '\n';
+            log_->flush();
+        }
+    }
     void Swap() { if (device_) SwapBuffers(device_); }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -3079,19 +3103,8 @@ public:
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
 
-    void SetGameplayActive(bool active) {
-        if (!active) {
-            cursor_force_visible_ = false;
-            pause_touch_blocked_ = false;
-        }
-        gameplay_active_ = active;
-        UpdateCursorVisibility();
-    }
-
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
-        if (active) cursor_force_visible_ = true;
-        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::PlatformButton,
@@ -3193,22 +3206,6 @@ private:
         gpu_results_.clear();
     }
 
-    bool PauseButtonHit(float x, float y) const {
-        return disable_pause_button_option_ && gameplay_active_ &&
-               x >= static_cast<float>(native_width_) * 0.86f &&
-               y <= static_cast<float>(native_height_) * 0.22f;
-    }
-
-    void UpdateCursorVisibility() {
-        const bool hidden =
-            hide_cursor_option_ && gameplay_active_ && active_ &&
-            !text_input_active_ && !cursor_force_visible_;
-        if (cursor_hidden_ == hidden) return;
-        cursor_hidden_ = hidden;
-        if (window_)
-            SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
-    }
-
     void Queue(HostEvent event) {
         if (event.type == HostEventType::TouchMove && !events_.empty() &&
             events_.back().type == HostEventType::TouchMove) {
@@ -3276,36 +3273,16 @@ private:
                     self->Queue(HostEvent{HostEventType::PlatformButton,
                                           0.0f, 0.0f, 1u, false});
                 }
-                if (!becoming_active) self->cursor_force_visible_ = true;
-                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
         }
         case WM_ERASEBKGND:
             return 1;
-        case WM_SETCURSOR:
-            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
-                SetCursor(nullptr);
-                return TRUE;
-            }
-            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
             SetFocus(window);
-            if (self->PauseButtonHit(x, y)) {
-                self->pause_touch_blocked_ = true;
-                return 0;
-            }
-            self->pause_touch_blocked_ = false;
-            /* A Resume click occurs while PlayLayer is still alive.  Clear
-             * the temporary pause-menu state here.  Editor scenes report
-             * gameplay_active_=false, so their cursor remains visible. */
-            if (self->gameplay_active_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
-            }
             self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
@@ -3318,10 +3295,6 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
-            if (self->pause_touch_blocked_) {
-                self->pause_touch_blocked_ = false;
-                return 0;
-            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -3331,7 +3304,6 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
-            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -3339,16 +3311,19 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
-                self->cursor_force_visible_ = !self->cursor_force_visible_;
-                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
+                return 0;
+            }
+            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
+                (wparam == 'Z' || wparam == 'X')) {
+                self->Queue(HostEvent{HostEventType::PracticeCheckpoint,
+                                      0.0f, 0.0f,
+                                      wparam == 'Z' ? 1u : 0u});
                 return 0;
             }
             if (!self->text_input_active_ &&
                 (wparam == 'A' || wparam == VK_LEFT) &&
                 !self->platform_left_down_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
                 self->platform_left_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 2u, true});
@@ -3357,8 +3332,6 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'D' || wparam == VK_RIGHT) &&
                 !self->platform_right_down_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
                 self->platform_right_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 3u, true});
@@ -3366,8 +3339,6 @@ private:
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 1u, true});
@@ -3431,12 +3402,6 @@ private:
     bool platform_left_down_ = false;
     bool platform_right_down_ = false;
     bool text_input_active_ = false;
-    bool disable_pause_button_option_ = true;
-    bool pause_touch_blocked_ = false;
-    bool hide_cursor_option_ = true;
-    bool gameplay_active_ = false;
-    bool cursor_hidden_ = false;
-    bool cursor_force_visible_ = false;
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -3453,6 +3418,7 @@ private:
     EndQueryFn end_query_ = nullptr;
     GetQueryObjectivFn get_query_object_iv_ = nullptr;
     GetQueryObjectui64vFn get_query_object_ui64v_ = nullptr;
+    u64 editor_clip_resets_ = 0u;
 };
 #else
 class WinGlHost {
@@ -3463,7 +3429,7 @@ public:
     bool PumpMessages() { return false; }
     std::vector<HostEvent> TakeEvents() { return {}; }
     std::pair<int, int> ClientSize() const { return {1280, 720}; }
-    void ResetFrameClipState() {}
+    void ResetFrameClipState(bool) {}
     void Swap() {}
     void BeginGpuFrame(u64) {}
     void EndGpuFrame() {}
@@ -3472,7 +3438,6 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
-    void SetGameplayActive(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -3715,7 +3680,9 @@ public:
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
-    void ResetFrameClipState() {}
+    void ResetFrameClipState() {
+        gl_.ResetFrameClipState(IsV22EditorSceneActive());
+    }
     void SwapBuffersHost() { gl_.Swap(); }
     void BeginGpuFrame(u64 frame) { gl_.BeginGpuFrame(frame); }
     void EndGpuFrame() { gl_.EndGpuFrame(); }
@@ -3758,10 +3725,6 @@ public:
     std::vector<HostEvent> TakeHostEvents() { return gl_.TakeEvents(); }
     bool WindowActive() const { return gl_.Active(); }
     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
-
-    void BeginDesktopGameplayFrame() {
-        v22_play_visibility_seen_this_frame_ = false;
-    }
 
     /*
      * The beta does not call its editor timeline helpers continuously through
@@ -3830,14 +3793,6 @@ public:
         return true;
     }
 
-    void EndDesktopGameplayFrame() {
-        u32 editor = 0u;
-        const bool editor_playtest = IsV22EditorPlaytestActive(editor);
-        const bool editor_scene = IsV22EditorSceneActive();
-        const bool gameplay = v22_play_visibility_seen_this_frame_ || editor_playtest;
-        if (gameplay && !editor_scene) HideV22PauseButtonVisual();
-        gl_.SetGameplayActive(gameplay && !editor_scene);
-    }
 
     bool TerminationRequested() const { return termination_requested_; }
     void ReportHeapStatus(const char* reason) { LogHeapStatus(reason); }
@@ -4038,42 +3993,29 @@ public:
         return button == 1u ? 32u : button == 2u ? 65u : 68u;
     }
 
-    void HideV22PauseButtonVisual() {
-        if (!gd_settings_disable_pause_button() ||
-            !runtime_.v22_ui_layer_offset)
-            return;
 
+    bool SendPracticeCheckpoint(bool place) {
         u32 layer = 0u;
-        if (!ResolveV22ActiveGameLayer(layer) || !layer ||
+        if (!ResolveV22ActiveGameLayer(layer)) return false;
+        u32 editor = 0u;
+        if (!layer || IsV22EditorPlaytestActive(editor) ||
+            !runtime_.v22_ui_layer_offset ||
             !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u))
-            return;
-        const u32 ui_layer =
-            env_.MemoryRead32(layer + runtime_.v22_ui_layer_offset);
-        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
-            !env_.IsMapped(ui_layer + 0x1C0u, 4u))
-            return;
-
-        /*
-         * In this late-beta UILayer layout, +0x1C0 is the top-right pause
-         * CCMenuItemSpriteExtra created by UILayer::init. CCNode's visible
-         * byte is +234. Hiding the node removes the visual button while the
-         * untouched UILayer::onPause callback remains available to Escape.
-         */
-        const u32 pause_item = env_.MemoryRead32(ui_layer + 0x1C0u);
-        if (!LooksLikeGuestObject(runtime_, env_, pause_item) ||
-            !env_.IsMapped(pause_item + 234u, 1u))
-            return;
-        if (env_.MemoryRead8(pause_item + 234u) != 0u) {
-            env_.MemoryWrite8(pause_item + 234u, 0u);
-            if (!v22_pause_button_hidden_logged_) {
-                log_ << "RESULT: DYNARMIC_V22_PAUSE_BUTTON_VISUAL_HIDDEN "
-                     << "ui=0x" << std::hex << ui_layer
-                     << " item=0x" << pause_item << std::dec
-                     << " escape-pause=preserved\n";
-                log_.flush();
-                v22_pause_button_hidden_logged_ = true;
-            }
-        }
+            return true;
+        const u32 ui_layer = env_.MemoryRead32(
+            layer + runtime_.v22_ui_layer_offset);
+        const u32 function = place ? runtime_.v22_ui_on_check
+                                   : runtime_.v22_ui_on_delete_check;
+        if (!function || !LooksLikeGuestObject(runtime_, env_, ui_layer))
+            return true;
+        LogHostDispatch(place ? "practiceCheckpointPlace"
+                              : "practiceCheckpointRemove",
+                        function, std::string("key=") +
+                        (place ? "Z" : "X"));
+        return RunFunction(function, {ui_layer, 0u}, nullptr,
+                           place ? "UILayer::onCheck hotkey"
+                                 : "UILayer::onDeleteCheck hotkey",
+                           0u, std::chrono::milliseconds(1000));
     }
 
     bool SendPlatformerButton(u32 button, bool pressed) {
@@ -6661,7 +6603,6 @@ private:
     }
 
     bool HostV22PlayVisibility(u32 play_layer) {
-        v22_play_visibility_seen_this_frame_ = true;
         if (!LooksLikeGuestObject(runtime_, env_, play_layer))
             return Fail("V22 PlayLayer visibility received an invalid layer");
 
@@ -6732,6 +6673,11 @@ private:
             v22_editor_visualized_objects_.clear();
             v22_editor_visibility_passes_ = 0u;
             v22_draw_grid_layer_ = 0u;
+            v22_editor_overlay_frames_ = 0u;
+            v22_editor_overlay_playtest_active_ = false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
+                 << std::hex << editor_layer << std::dec << '\n';
+            log_.flush();
         }
         ++v22_editor_visibility_passes_;
 
@@ -7304,6 +7250,12 @@ private:
         v22_editor_visual_layer_ = editor;
         v22_editor_visualized_objects_.clear();
         v22_editor_visibility_passes_ = 0u;
+        v22_draw_grid_layer_ = 0u;
+        v22_editor_overlay_frames_ = 0u;
+        v22_editor_overlay_playtest_active_ = false;
+        log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
+             << std::hex << editor << std::dec << " source=create\n";
+        log_.flush();
         // The selected late beta needs only this ABI-validated initializer.
         // Do not run libgame.so constructors or ApplyHooks globally: they also
         // install unrelated DPAD/GDPS/timer/shader hooks and can overwrite the
@@ -11181,10 +11133,8 @@ private:
     u64 v22_editor_visibility_passes_=0;
     u64 v22_editor_overlay_frames_=0;
     bool v22_editor_overlay_playtest_active_=false;
-    bool v22_pause_button_hidden_logged_=false;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_platformer_ui_logged_=0;
-    bool v22_play_visibility_seen_this_frame_=false;
     bool v22_mouse_platformer_jump_down_=false;
     u32 v22_mouse_platformer_touch_ui_=0;
     u64 v22_companion_hooks_installed_=0;
@@ -11594,7 +11544,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest3 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest4 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12208,11 +12158,11 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
-             " top-right-pause-touch="+
-             (gd_settings_disable_pause_button() ? "blocked" : "normal")+
-             " escape-pause=preserved"+
-             " hide-cursor="+
-             (gd_settings_hide_cursor_during_play() ? "true" : "false")+
+             " desktop-pause-button=native"+
+             " mouse-cursor=native-visible"+
+             " practice-zx="+
+             ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check)
+                  ? "ready" : "partial")+
              " exact-editor-visibility="+
              (gd_settings_v22_exact_editor_visibility()
                   ? "true" : "false"));
@@ -12220,7 +12170,7 @@ int main(int argc,char** argv) {
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
         emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=guest-owned-no-host-viewport-scissor-clear-rewrite");
+             "state=editor-only-scissor-viewport-sanitizer");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
@@ -12603,6 +12553,10 @@ int main(int argc,char** argv) {
                         ok=executor.SendDeleteBackward(
                             runtime.native_delete_backward);
                     break;
+                case HostEventType::PracticeCheckpoint:
+                    if(!native_paused)
+                        ok=executor.SendPracticeCheckpoint(event.value != 0u);
+                    break;
                 case HostEventType::PlatformButton:
                     if(!native_paused)
                         ok=executor.SendPlatformerButton(
@@ -12648,7 +12602,6 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
-            executor.BeginDesktopGameplayFrame();
             executor.ResetFrameClipState();
             if(!executor.UpdateV22EditorOverlayFrame())
                 throw std::runtime_error(executor.LastError());
@@ -12659,7 +12612,6 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
-            executor.EndDesktopGameplayFrame();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

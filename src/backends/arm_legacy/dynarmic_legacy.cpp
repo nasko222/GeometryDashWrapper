@@ -995,6 +995,8 @@ struct ElfRuntime {
     u32 native_pause = 0;
     u32 native_resume = 0;
     u32 game_manager_shared_state = 0;
+    u32 ui_on_check = 0;
+    u32 ui_on_delete_check = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -1482,6 +1484,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
             else if (name == "_ZN11GameManager11sharedStateEv")
                 runtime.game_manager_shared_state = address;
+            else if (name == "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE")
+                runtime.ui_on_check = address;
+            else if (name == "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE")
+                runtime.ui_on_delete_check = address;
         }
     }
 
@@ -1667,6 +1673,7 @@ enum class HostEventType {
     KeyDown,
     TextInput,
     DeleteBackward,
+    PracticeCheckpoint,
     Pause,
     Resume
 };
@@ -1713,10 +1720,6 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
-        disable_pause_button_option_ =
-            gd_settings_disable_pause_button();
-        hide_cursor_option_ =
-            gd_settings_hide_cursor_during_play();
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnifiedLegacyArmWindow";
         WNDCLASSEXA wc{};
@@ -1864,20 +1867,8 @@ public:
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
 
-    void SetGameplayActive(bool active, bool editor_active = false) {
-        if (!active) {
-            cursor_force_visible_ = false;
-            pause_touch_blocked_ = false;
-        }
-        gameplay_active_ = active;
-        editor_active_ = editor_active;
-        UpdateCursorVisibility();
-    }
-
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
-        if (active) cursor_force_visible_ = true;
-        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::TouchEnd,
@@ -1970,22 +1961,6 @@ private:
         gpu_results_.clear();
     }
 
-    bool PauseButtonHit(float x, float y) const {
-        return disable_pause_button_option_ && gameplay_active_ &&
-               x >= static_cast<float>(native_width_) * 0.86f &&
-               y <= static_cast<float>(native_height_) * 0.22f;
-    }
-
-    void UpdateCursorVisibility() {
-        const bool hidden =
-            hide_cursor_option_ && gameplay_active_ && !editor_active_ && active_ &&
-            !text_input_active_ && !cursor_force_visible_;
-        if (cursor_hidden_ == hidden) return;
-        cursor_hidden_ = hidden;
-        if (window_)
-            SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
-    }
-
     void Queue(HostEvent event) {
         if (event.type == HostEventType::TouchMove && !events_.empty() &&
             events_.back().type == HostEventType::TouchMove) {
@@ -2038,36 +2013,16 @@ private:
             const bool becoming_active = wparam != 0;
             if (self->active_ != becoming_active) {
                 self->active_ = becoming_active;
-                if (!becoming_active) self->cursor_force_visible_ = true;
-                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
         }
         case WM_ERASEBKGND:
             return 1;
-        case WM_SETCURSOR:
-            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
-                SetCursor(nullptr);
-                return TRUE;
-            }
-            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
             SetFocus(window);
-            if (self->PauseButtonHit(x, y)) {
-                self->pause_touch_blocked_ = true;
-                return 0;
-            }
-            self->pause_touch_blocked_ = false;
-            /* A Resume click happens while PlayLayer is still alive.  Clear
-             * the temporary pause-menu cursor state on a real player click;
-             * editor scenes are excluded by editor_active_. */
-            if (self->gameplay_active_ && !self->editor_active_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
-            }
             self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
@@ -2080,10 +2035,6 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
-            if (self->pause_touch_blocked_) {
-                self->pause_touch_blocked_ = false;
-                return 0;
-            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -2093,7 +2044,6 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
-            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -2101,15 +2051,17 @@ private:
             return 0;
         case WM_KEYDOWN:
             if (wparam == VK_ESCAPE) {
-                self->cursor_force_visible_ = !self->cursor_force_visible_;
-                self->UpdateCursorVisibility();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
+                return 0;
+            }
+            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
+                (wparam == 'Z' || wparam == 'X')) {
+                self->Queue(HostEvent{HostEventType::PracticeCheckpoint,
+                                      0.0f, 0.0f, wparam == 'Z' ? 1u : 0u});
                 return 0;
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
-                self->cursor_force_visible_ = false;
-                self->UpdateCursorVisibility();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::TouchBegin,
                                       static_cast<float>(self->native_width_) * 0.5f,
@@ -2159,13 +2111,6 @@ private:
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
     bool text_input_active_ = false;
-    bool disable_pause_button_option_ = true;
-    bool pause_touch_blocked_ = false;
-    bool hide_cursor_option_ = true;
-    bool gameplay_active_ = false;
-    bool editor_active_ = false;
-    bool cursor_hidden_ = false;
-    bool cursor_force_visible_ = false;
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -2352,14 +2297,12 @@ public:
         const auto now = std::chrono::steady_clock::now();
         if (gameplay_check_at_.time_since_epoch().count() != 0 &&
             now - gameplay_check_at_ < std::chrono::milliseconds(100)) {
-            gl_.SetGameplayActive(gameplay_active_cache_, editor_active_cache_);
             return;
         }
         gameplay_check_at_ = now;
         gameplay_active_cache_ = false;
         editor_active_cache_ = false;
         if (!runtime_.game_manager_shared_state) {
-            gl_.SetGameplayActive(false, false);
             return;
         }
 
@@ -2369,7 +2312,6 @@ public:
                          100000000u,
                          std::chrono::milliseconds(5000)) ||
             !manager || !env_.IsMapped(manager, 0x600u)) {
-            gl_.SetGameplayActive(false, false);
             return;
         }
 
@@ -2382,39 +2324,35 @@ public:
                 active_play_layer_ = candidate;
             }
         }
-        HideLegacyPauseButtonVisual();
-        gl_.SetGameplayActive(gameplay_active_cache_, editor_active_cache_);
     }
 
-    void HideLegacyPauseButtonVisual() {
-        if (!gd_settings_disable_pause_button() || !gameplay_active_cache_ ||
-            editor_active_cache_ || !active_play_layer_ ||
-            legacy_pause_hidden_for_layer_ == active_play_layer_) return;
-        const SymbolRecord* set_visible = FindSymbol(
-            runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
-        if (!set_visible) return;
+
+    bool SendPracticeCheckpoint(bool place) {
+        if (!gameplay_active_cache_ || editor_active_cache_ ||
+            !active_play_layer_) return true;
+        const u32 function = place ? runtime_.ui_on_check
+                                   : runtime_.ui_on_delete_check;
+        if (!function) return true;
+        u32 ui_layer = 0u;
         for (u32 offset = 0x100u; offset < 0x3000u; offset += 4u) {
             if (!env_.IsMapped(active_play_layer_ + offset, 4u)) continue;
-            const u32 ui = env_.MemoryRead32(active_play_layer_ + offset);
-            if (!GuestObjectTypeContains(ui, "UILayer")) continue;
-            for (u32 field : {0x1B8u, 0x1B4u}) {
-                if (!env_.IsMapped(ui + field, 4u)) continue;
-                const u32 node = env_.MemoryRead32(ui + field);
-                if (!GuestObjectTypeContains(node, "CCMenuItem") &&
-                    !GuestObjectTypeContains(node, "CCMenu")) continue;
-                u32 ignored = 0u;
-                if (RunFunction(set_visible->address, {node, 0u}, &ignored,
-                                "legacy hide top-right pause control",
-                                100000000u, std::chrono::milliseconds(1000))) {
-                    legacy_pause_hidden_for_layer_ = active_play_layer_;
-                    log_ << "RESULT: DYNARMIC_LEGACY_PAUSE_BUTTON_HIDDEN ui=0x"
-                         << std::hex << ui << " node=0x" << node
-                         << " field=0x" << field << std::dec << '\n';
-                    log_.flush();
-                }
-                return;
+            const u32 candidate = env_.MemoryRead32(active_play_layer_ + offset);
+            if (GuestObjectTypeContains(candidate, "UILayer")) {
+                ui_layer = candidate;
+                break;
             }
         }
+        if (!ui_layer) return true;
+        u32 ignored = 0u;
+        log_ << "RESULT: DYNARMIC_PRACTICE_HOTKEY key="
+             << (place ? 'Z' : 'X') << " callback="
+             << (place ? "UILayer::onCheck" : "UILayer::onDeleteCheck")
+             << '\n';
+        log_.flush();
+        return RunFunction(function, {ui_layer, 0u}, &ignored,
+                           place ? "UILayer::onCheck hotkey"
+                                 : "UILayer::onDeleteCheck hotkey",
+                           100000000u, std::chrono::milliseconds(1000));
     }
 
     bool TerminationRequested() const { return termination_requested_; }
@@ -6270,7 +6208,6 @@ private:
     bool gameplay_active_cache_ = false;
     bool editor_active_cache_ = false;
     u32 active_play_layer_ = 0u;
-    u32 legacy_pause_hidden_for_layer_ = 0u;
     WinGlHost gl_;
     double frame_interval_=1.0/60.0;
     std::unordered_map<u32,u32> gl_string_cache_;
@@ -6602,7 +6539,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-endurancetest3 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-endurancetest4 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6913,11 +6850,11 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()) +
-             " top-right-pause-touch=" +
-             (gd_settings_disable_pause_button() ? "blocked" : "normal") +
-             " escape-pause=preserved" +
-             " hide-cursor=" +
-             (gd_settings_hide_cursor_during_play() ? "true" : "false"));
+             " desktop-pause-button=native" +
+             " mouse-cursor=native-visible" +
+             " practice-zx=" +
+             ((runtime.ui_on_check && runtime.ui_on_delete_check)
+                  ? "ready" : "partial"));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
@@ -7051,6 +6988,10 @@ int main(int argc,char** argv) {
                     if(!native_paused)
                         ok=executor.SendDeleteBackward(
                             runtime.native_delete_backward);
+                    break;
+                case HostEventType::PracticeCheckpoint:
+                    if(!native_paused)
+                        ok=executor.SendPracticeCheckpoint(event.value != 0u);
                     break;
                 case HostEventType::Pause:
                     if(!native_paused){

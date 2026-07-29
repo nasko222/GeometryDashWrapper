@@ -1,4 +1,4 @@
-# EnduranceTest3 Test Sheet
+# EnduranceTest4 Test Sheet
 
 Copy this file and mark results.
 
@@ -53,25 +53,28 @@ Network legacy API completed through WinHTTP
 
 ## Desktop gameplay behavior
 
-- [ ] x86 pacing remains as smooth as Fix6
-- [ ] Cursor hides during x86 gameplay
-- [ ] Cursor is visible in the pause menu
-- [ ] Cursor hides again after returning to gameplay
-- [ ] ARMv7 cursor hides during gameplay
-- [ ] ARMv7 cursor remains visible in pause menu and editor
-- [ ] Legacy ARM cursor hides again after Resume
-- [ ] Legacy ARM top-right pause graphic is absent in 1.0/1.01/1.4
-- [ ] Top-right pause graphic is absent in selected 2.2 beta
+- [ ] x86 pacing remains as smooth as EnduranceTest3
+- [ ] Cursor stays visible during x86 gameplay, pause and Resume
+- [ ] Cursor stays visible during legacy ARM gameplay, pause and Resume
+- [ ] Cursor stays visible during ARMv7 gameplay, pause and editor use
+- [ ] Native top-right pause button remains present in every version
 - [ ] Escape opens the complete pause menu
 - [ ] Resume/restart/quit buttons still work
+- [ ] Practice Mode: Z places a checkpoint
+- [ ] Practice Mode: X removes the latest checkpoint
+- [ ] Normal Mode: Z/X do not create or remove checkpoints
+- [ ] Holding Z/X does not auto-repeat checkpoint actions
+- [ ] 1.0–1.4 music volume is identical on attempt 1, attempt 2 and later
 
 ## Selected 2.2 beta editor
 
 - [ ] Sawblades use black texture
 - [ ] Clubstep/Fingerdash monsters use black texture
-- [ ] Editor playtest death X uses black texture
-- [ ] Song-only vertical line renders and moves
-- [ ] BPM guidelines render
+- [ ] Record the editor playtest death-X colour (unchanged in this build)
+- [ ] Song-only vertical line renders and moves on first editor open
+- [ ] BPM guidelines render on first editor open
+- [ ] Close/reopen editor: song line renders and moves again
+- [ ] Close/reopen editor: BPM guidelines render again
 - [ ] No moving black region appears at the right
 - [ ] Stopping playtest removes stale clip/black region
 - [ ] Pan and zoom remain correct

@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.5-endurancetest3"
+#define LAUNCHER_VERSION "0.9.5-endurancetest4"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -736,8 +736,6 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t full_bypass[64];
     wchar_t highest[64];
     wchar_t pulse[64];
-    wchar_t disable_pause[64];
-    wchar_t hide_cursor[64];
     wchar_t isolated_saves[64];
     wchar_t network_mode[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
@@ -772,12 +770,6 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"FORCE_HIGHEST_GRAPHICS", L"true", highest, ARRAY_COUNT(highest)));
     fwprintf(file, L"music_pulse_max=%ls\n",
              GetSetting(L"MUSIC_PULSE_MAX", L"0.30", pulse, ARRAY_COUNT(pulse)));
-    fwprintf(file, L"disable_pause_button=%ls\n",
-             GetSetting(L"DISABLE_PAUSE_BUTTON", L"true", disable_pause,
-                        ARRAY_COUNT(disable_pause)));
-    fwprintf(file, L"hide_cursor_during_play=%ls\n",
-             GetSetting(L"HIDE_CURSOR_DURING_PLAY", L"true", hide_cursor,
-                        ARRAY_COUNT(hide_cursor)));
     fwprintf(file, L"version_isolated_saves=%ls\n",
              GetSetting(L"VERSION_ISOLATED_SAVES", L"true", isolated_saves,
                         ARRAY_COUNT(isolated_saves)));

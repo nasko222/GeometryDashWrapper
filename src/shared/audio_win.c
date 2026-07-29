@@ -1151,6 +1151,7 @@ void audio_play_background(const char *path, int loop) {
     snprintf(command, sizeof(command), "play gd18_music%s",
              loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
+        set_alias_volume("gd18_music", g_music_volume);
         g_music_loop = loop != 0;
         g_music_paused = 0;
         runtime_log("Audio music playing: %s (loop=%s)", file_name_part(path),
@@ -1182,6 +1183,8 @@ void audio_resume_background(void) {
                  g_music_loop ? " repeat" : "");
         mci_command(command, NULL, 0, 1);
     }
+    /* MCI can restore the device default after resume/play/seek. */
+    set_alias_volume("gd18_music", g_music_volume);
     g_music_paused = 0;
 }
 
@@ -1197,6 +1200,7 @@ void audio_resume_background_from(float seconds) {
     snprintf(command, sizeof(command), "play gd18_music from %lu%s",
              milliseconds, g_music_loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
+        set_alias_volume("gd18_music", g_music_volume);
         g_music_paused = 0;
         runtime_log("Audio music resumed from %lu ms", milliseconds);
     }
@@ -1210,7 +1214,8 @@ void audio_rewind_background(void) {
         char command[96];
         snprintf(command, sizeof(command), "play gd18_music%s",
                  g_music_loop ? " repeat" : "");
-        mci_command(command, NULL, 0, 1);
+        if (mci_command(command, NULL, 0, 1))
+            set_alias_volume("gd18_music", g_music_volume);
     }
 }
 
@@ -1228,7 +1233,8 @@ void audio_set_background_time(float seconds) {
     if (playing) {
         snprintf(command, sizeof(command), "play gd18_music from %lu%s",
                  milliseconds, g_music_loop ? " repeat" : "");
-        mci_command(command, NULL, 0, 1);
+        if (mci_command(command, NULL, 0, 1))
+            set_alias_volume("gd18_music", g_music_volume);
     }
 }
 

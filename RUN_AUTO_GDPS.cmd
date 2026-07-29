@@ -7,8 +7,6 @@ set "HACK_ICONS=false"
 set "FULL_BYPASS=true"
 set "FORCE_HIGHEST_GRAPHICS=true"
 set "MUSIC_PULSE_MAX=0.30"
-set "DISABLE_PAUSE_BUTTON=true"
-set "HIDE_CURSOR_DURING_PLAY=true"
 set "VERSION_ISOLATED_SAVES=true"
 
 if not exist "GeometryDashLauncher.exe" (
