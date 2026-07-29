@@ -995,8 +995,12 @@ struct ElfRuntime {
     u32 native_pause = 0;
     u32 native_resume = 0;
     u32 game_manager_shared_state = 0;
+    u32 play_layer_get_practice_mode = 0;
+    u32 play_layer_get_ui_layer = 0;
     u32 ui_on_check = 0;
     u32 ui_on_delete_check = 0;
+    bool ui_on_check_has_sender = false;
+    bool ui_on_delete_check_has_sender = false;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -1484,10 +1488,25 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
             else if (name == "_ZN11GameManager11sharedStateEv")
                 runtime.game_manager_shared_state = address;
-            else if (name == "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE")
+            else if (name == "_ZNK9PlayLayer15getPracticeModeEv")
+                runtime.play_layer_get_practice_mode = address;
+            else if (name == "_ZNK9PlayLayer10getUILayerEv")
+                runtime.play_layer_get_ui_layer = address;
+            else if (name == "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE") {
                 runtime.ui_on_check = address;
-            else if (name == "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE")
+                runtime.ui_on_check_has_sender = true;
+            } else if (name == "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE") {
                 runtime.ui_on_delete_check = address;
+                runtime.ui_on_delete_check_has_sender = true;
+            } else if (name == "_ZN7UILayer7onCheckEv" &&
+                       !runtime.ui_on_check) {
+                runtime.ui_on_check = address;
+                runtime.ui_on_check_has_sender = false;
+            } else if (name == "_ZN7UILayer13onDeleteCheckEv" &&
+                       !runtime.ui_on_delete_check) {
+                runtime.ui_on_delete_check = address;
+                runtime.ui_on_delete_check_has_sender = false;
+            }
         }
     }
 
@@ -2328,28 +2347,63 @@ public:
 
 
     bool SendPracticeCheckpoint(bool place) {
+        /* Refresh before handling the key, not after the next rendered frame. */
+        gameplay_check_at_ = {};
+        RefreshDesktopGameplayState();
         if (!gameplay_active_cache_ || editor_active_cache_ ||
             !active_play_layer_) return true;
+
+        /* All known 1.0-1.4 images export this accessor.  Without a proven
+           Practice Mode result, fail closed and never invoke a checkpoint. */
+        if (!runtime_.play_layer_get_practice_mode) return true;
+        u32 practice_mode = 0u;
+        if (!RunFunction(runtime_.play_layer_get_practice_mode,
+                         {active_play_layer_}, &practice_mode,
+                         "PlayLayer::getPracticeMode hotkey guard",
+                         100000000u, std::chrono::milliseconds(1000)))
+            return false;
+        if ((practice_mode & 0xffu) == 0u) {
+            log_ << "RESULT: DYNARMIC_PRACTICE_HOTKEY_IGNORED key="
+                 << (place ? 'Z' : 'X') << " mode=normal\n";
+            log_.flush();
+            return true;
+        }
+
         const u32 function = place ? runtime_.ui_on_check
                                    : runtime_.ui_on_delete_check;
         if (!function) return true;
         u32 ui_layer = 0u;
-        for (u32 offset = 0x100u; offset < 0x3000u; offset += 4u) {
-            if (!env_.IsMapped(active_play_layer_ + offset, 4u)) continue;
-            const u32 candidate = env_.MemoryRead32(active_play_layer_ + offset);
-            if (GuestObjectTypeContains(candidate, "UILayer")) {
-                ui_layer = candidate;
-                break;
+        if (runtime_.play_layer_get_ui_layer) {
+            if (!RunFunction(runtime_.play_layer_get_ui_layer,
+                             {active_play_layer_}, &ui_layer,
+                             "PlayLayer::getUILayer checkpoint hotkey",
+                             100000000u, std::chrono::milliseconds(1000)))
+                return false;
+        }
+        if (!GuestObjectTypeContains(ui_layer, "UILayer")) {
+            ui_layer = 0u;
+            for (u32 offset = 0x100u; offset < 0x3000u; offset += 4u) {
+                if (!env_.IsMapped(active_play_layer_ + offset, 4u)) continue;
+                const u32 candidate = env_.MemoryRead32(active_play_layer_ + offset);
+                if (GuestObjectTypeContains(candidate, "UILayer")) {
+                    ui_layer = candidate;
+                    break;
+                }
             }
         }
         if (!ui_layer) return true;
+        const bool has_sender = place ? runtime_.ui_on_check_has_sender
+                                      : runtime_.ui_on_delete_check_has_sender;
+        const std::vector<u32> arguments = has_sender
+            ? std::vector<u32>{ui_layer, 0u}
+            : std::vector<u32>{ui_layer};
         u32 ignored = 0u;
         log_ << "RESULT: DYNARMIC_PRACTICE_HOTKEY key="
-             << (place ? 'Z' : 'X') << " callback="
+             << (place ? 'Z' : 'X') << " mode=practice callback="
              << (place ? "UILayer::onCheck" : "UILayer::onDeleteCheck")
-             << '\n';
+             << " abi=" << (has_sender ? "sender" : "no-arg") << '\n';
         log_.flush();
-        return RunFunction(function, {ui_layer, 0u}, &ignored,
+        return RunFunction(function, arguments, &ignored,
                            place ? "UILayer::onCheck hotkey"
                                  : "UILayer::onDeleteCheck hotkey",
                            100000000u, std::chrono::milliseconds(1000));
@@ -6539,7 +6593,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-endurancetest4 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-endurancetest5 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6853,8 +6907,9 @@ int main(int argc,char** argv) {
              " desktop-pause-button=native" +
              " mouse-cursor=native-visible" +
              " practice-zx=" +
-             ((runtime.ui_on_check && runtime.ui_on_delete_check)
-                  ? "ready" : "partial"));
+             ((runtime.ui_on_check && runtime.ui_on_delete_check &&
+                runtime.play_layer_get_practice_mode)
+                  ? "ready-practice-guarded" : "disabled-unproven"));
         GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
@@ -7029,6 +7084,7 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
+            audio_maintain_background_volume();
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,

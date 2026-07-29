@@ -18,6 +18,9 @@ float audio_get_background_time(void);
 int audio_is_background_playing(void);
 float audio_get_background_volume(void);
 void audio_set_background_volume(float volume);
+/* Reapply the current MCI volume while a newly restarted stream settles.
+   The legacy ARM renderer calls this once per active frame. */
+void audio_maintain_background_volume(void);
 float audio_get_output_peak(void);
 
 void audio_preload_effect(const char *path);

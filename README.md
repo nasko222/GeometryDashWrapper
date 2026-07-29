@@ -1,9 +1,9 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest4
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest5
 
-`endurancetest` is the cross-version stability branch. EnduranceTest4 removes
-the pause-button and cursor experiments completely, adds the original PC
-Practice Mode Z/X controls, fixes editor-session overlay reset, targets the
-2.2 right-side black region, and repairs legacy MCI music-volume replay.
+`endurancetest` is the cross-version stability branch. EnduranceTest5 is a
+regression correction over EnduranceTest4. It makes Z/X strictly Practice
+Mode-only, repairs the legacy callback ABI, removes the destructive editor grid
+refresh and rolls back the unsuccessful OpenGL clip-state experiment.
 
 ## Running
 
@@ -22,34 +22,43 @@ save profile and dated log folder.
 set "VERSION_ISOLATED_SAVES=true"
 ```
 
-Version-isolated saves remain toggleable and enabled by default. Setting
-`VERSION_ISOLATED_SAVES=false` restores the old flat `save\` root. Existing
-flat saves are not guessed or migrated automatically.
+Version-isolated saves remain toggleable and enabled by default. Existing flat
+saves are not guessed or migrated automatically.
 
-## EnduranceTest4 changes
+## EnduranceTest5 changes
 
-- Removes all wrapper cursor hiding on x86, legacy ARM and ARMv7. The Windows
-  cursor is no longer modified by gameplay, pause, Resume or editor state.
-- Removes all wrapper pause-button hit blocking and visual hiding. The APK's
-  top-right pause control is native again; Escape still calls Android Back.
-- Adds Z to place and X to remove Practice Mode checkpoints by calling the
-  APK's own `UILayer::onCheck` and `UILayer::onDeleteCheck` callbacks.
-- Reapplies the stored music volume after MCI play/resume/seek operations,
-  targeting the 1.0–1.4 first-attempt/later-attempt volume mismatch.
-- Resets song-guide/BPM lifecycle counters whenever a different 2.2 editor
-  layer appears, so reopening the editor starts the overlay refresh at frame 1.
-- Clears stale OpenGL scissor state and restores the native viewport before
-  2.2 editor frames. This narrowly targets the moving right-side black region.
-- Keeps EnduranceTest3's x86 pacing, account backup transport, save isolation,
-  network handling and object-colour repair. No x86 optimisation was attempted.
+- **Z/X are now fail-closed and Practice Mode-only.**
+  - Selected ARMv7 beta: checks the exact `PlayLayer + 0x29A0` flag derived
+    from that APK's `PlayLayer::togglePracticeMode(bool)` implementation.
+  - x86: derives the flag offset from each APK's own
+    `PlayLayer::togglePracticeMode(bool)` compare/store instructions.
+  - legacy ARM 1.0–1.4: calls the exported
+    `PlayLayer::getPracticeMode()` accessor before any checkpoint callback.
+- Legacy ARM now resolves both old no-argument checkpoint callbacks and newer
+  sender-argument callbacks. It also uses `PlayLayer::getUILayer()` when
+  available, fixing Z/X doing nothing on 1.0–1.4.
+- Removes every host call to `LevelEditorLayer::updateGridLayer`. The uploaded
+  log showed the guessed playtest flag alternating between 0 and 1 repeatedly;
+  those calls rebuilt the grid and could erase placed-object visuals and BPM
+  guides.
+- Keeps the per-frame song-position guide, periodic
+  `DrawGridLayer::updateTimeMarkers`, and editor-session reset.
+- Rolls back EnduranceTest4's editor scissor/viewport sanitizer. The guest again
+  owns all editor clip state. The right-side black region remains open rather
+  than being falsely claimed fixed.
+- Legacy MCI volume is reasserted for 45 rendered frames after play, resume,
+  rewind or seek/replay. This targets MCI restoring device-default volume after
+  the immediate command has already returned.
+- Keeps the accepted x86 pacing, networking, backups and save isolation
+  unchanged. No x86 optimisation was attempted.
+- Mouse hiding and pause-button hiding remain completely removed.
 - Contains no Python files and no `.gitignore`.
 
 ## Runtime confirmation needed
 
-The black-region repair, repeated editor reopening, legacy volume consistency
-and Z/X callbacks still require a Windows/APK test. The editor death-X colour
-was not changed in this build because the uploaded logs do not establish the
-beta's intended colour.
+Windows/APK testing is still required for legacy attempt-to-attempt volume,
+Practice Mode Z/X on every supported version, and editor BPM/object stability.
+The moving right-side black region is **not claimed fixed** in this build.
 
 ## Code guide
 

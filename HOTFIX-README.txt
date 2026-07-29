@@ -1,27 +1,9 @@
-Apply these files over EnduranceTest3, then delete the files listed below.
-A full unified patch is included separately.
+EnduranceTest4 -> EnduranceTest5 source hotfix
 
-Changed/new files:
-- RUN_AUTO_BOOMLINGS.cmd
-- ENDURANCETEST4.md
-- VERSION.txt
-- README.md
-- build_dynarmic.ps1
-- ENDURANCETEST4-VERIFICATION.txt
-- RUN_AUTO_GDPS.cmd
-- BUILDING.md
-- ENDURANCE-TEST-CHECKLIST.md
-- SOURCE-CONTENTS.md
-- BRANCH.txt
-- src/launcher/native_launcher.c
-- src/shared/runtime_settings.h
-- src/shared/audio_win.c
-- src/shared/runtime_settings.c
-- src/shared/build_info.h
-- src/backends/x86/main.c
-- src/backends/arm_legacy/dynarmic_legacy.cpp
-- src/backends/armv7/dynarmic_armv7.cpp
+Recommended:
+1. Extract this folder beside the EnduranceTest4 source folder.
+2. Drag the EnduranceTest4 source folder onto APPLY_TO_ENDURANCETEST4.cmd.
+3. Rebuild with BUILD_ALL.cmd from the patched source folder.
 
-Delete from EnduranceTest3:
-- ENDURANCETEST3-VERIFICATION.txt
-- ENDURANCETEST3.md
+The script copies the changed source/docs and deletes the two obsolete
+EnduranceTest4 branch documents. No APK or compiled binary is included.

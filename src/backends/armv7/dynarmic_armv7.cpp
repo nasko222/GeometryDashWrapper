@@ -1185,6 +1185,7 @@ struct ElfRuntime {
     u32 v22_ui_on_check = 0;
     u32 v22_ui_on_delete_check = 0;
     u32 v22_ui_layer_offset = 0;
+    u32 v22_practice_mode_offset = 0;
     u32 v22_editor_playtest_state_offset = 0;
     u32 v22_companion_image_min = 0;
     u32 v22_companion_image_max = 0;
@@ -1866,6 +1867,9 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     if (runtime.v22_play_layer_level_offset == 820u &&
         runtime.v22_game_level_id_offset == 272u) {
         runtime.v22_ui_layer_offset = 11424u;
+        /* Disassembled from this exact 9,578,364-byte image:
+           PlayLayer::togglePracticeMode reads/writes byte +0x29A0. */
+        runtime.v22_practice_mode_offset = 0x29A0u;
         runtime.v22_editor_playtest_state_offset = 11404u;
     }
 }
@@ -3039,30 +3043,10 @@ public:
         return {width, height};
     }
 
-    // Reset the stale playtest clip that produces the moving right-side void.
-    // This is intentionally editor-only and leaves colour/depth masks alone.
-    void ResetFrameClipState(bool editor_active) {
-        if (!editor_active || !context_) return;
-        GLint viewport[4] = {0, 0, 0, 0};
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        const bool scissor_enabled = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
-        const bool viewport_stale = viewport[0] != 0 || viewport[1] != 0 ||
-            viewport[2] != native_width_ || viewport[3] != native_height_;
-        if (!scissor_enabled && !viewport_stale) return;
-        if (scissor_enabled) glDisable(GL_SCISSOR_TEST);
-        if (viewport_stale) glViewport(0, 0, native_width_, native_height_);
-        ++editor_clip_resets_;
-        if (log_ && (editor_clip_resets_ <= 8u ||
-                     (editor_clip_resets_ % 120u) == 0u)) {
-            *log_ << "RESULT: DYNARMIC_V22_EDITOR_CLIP_RESET scissor="
-                  << (scissor_enabled ? 1 : 0)
-                  << " viewport=" << viewport[0] << ',' << viewport[1]
-                  << ',' << viewport[2] << ',' << viewport[3]
-                  << " target=0,0," << native_width_ << ',' << native_height_
-                  << " count=" << editor_clip_resets_ << '\n';
-            log_->flush();
-        }
-    }
+    // Deliberately leave GL clip state under guest control.  EnduranceTest4's
+    // host scissor/viewport sanitizer did not remove the right-side void and
+    // risked invalidating editor-owned render state.
+    void ResetFrameClipState(bool) {}
     void Swap() { if (device_) SwapBuffers(device_); }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -3418,7 +3402,6 @@ private:
     EndQueryFn end_query_ = nullptr;
     GetQueryObjectivFn get_query_object_iv_ = nullptr;
     GetQueryObjectui64vFn get_query_object_ui64v_ = nullptr;
-    u64 editor_clip_resets_ = 0u;
 };
 #else
 class WinGlHost {
@@ -3773,23 +3756,10 @@ public:
                 return false;
         }
 
-        u32 playtest_editor = 0u;
-        const bool playtest_active =
-            IsV22EditorPlaytestActive(playtest_editor);
-        if (v22_editor_overlay_frames_ == 1u ||
-            playtest_active != v22_editor_overlay_playtest_active_) {
-            if (runtime_.v22_level_editor_update_grid_layer &&
-                !RunFunction(runtime_.v22_level_editor_update_grid_layer,
-                             {editor}, nullptr,
-                             "LevelEditorLayer::updateGridLayer transition", 0u,
-                             std::chrono::milliseconds(2000)))
-                return false;
-            log_ << "RESULT: DYNARMIC_V22_EDITOR_GRID_REFRESH active="
-                 << (playtest_active ? 1 : 0)
-                 << " frame=" << v22_editor_overlay_frames_ << '\n';
-            log_.flush();
-            v22_editor_overlay_playtest_active_ = playtest_active;
-        }
+        /* Never call LevelEditorLayer::updateGridLayer from the host.
+           The uploaded EnduranceTest4 run showed the guessed playtest flag
+           flickering every few frames; each transition rebuilt the grid and
+           could make placed objects and BPM guides disappear. */
         return true;
     }
 
@@ -4000,8 +3970,16 @@ public:
         u32 editor = 0u;
         if (!layer || IsV22EditorPlaytestActive(editor) ||
             !runtime_.v22_ui_layer_offset ||
+            !runtime_.v22_practice_mode_offset ||
+            !env_.IsMapped(layer + runtime_.v22_practice_mode_offset, 1u) ||
             !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u))
             return true;
+        if (env_.MemoryRead8(layer + runtime_.v22_practice_mode_offset) == 0u) {
+            log_ << "RESULT: DYNARMIC_PRACTICE_HOTKEY_IGNORED key="
+                 << (place ? 'Z' : 'X') << " mode=normal\n";
+            log_.flush();
+            return true;
+        }
         const u32 ui_layer = env_.MemoryRead32(
             layer + runtime_.v22_ui_layer_offset);
         const u32 function = place ? runtime_.v22_ui_on_check
@@ -11544,7 +11522,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest4 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest5 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12161,16 +12139,17 @@ int main(int argc,char** argv) {
              " desktop-pause-button=native"+
              " mouse-cursor=native-visible"+
              " practice-zx="+
-             ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check)
-                  ? "ready" : "partial")+
+             ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
+                runtime.v22_practice_mode_offset)
+                  ? "ready-practice-guarded" : "disabled-unproven")+
              " exact-editor-visibility="+
              (gd_settings_v22_exact_editor_visibility()
                   ? "true" : "false"));
         emit("RESULT: DYNARMIC_V22_PLATFORMER_SWING_REOPEN_PATCH count="+
              std::to_string(swing_reopen_patches)+
              " policy=hide-on-toggle-reappear-on-menu-reopen");
-        emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_READY "
-             "state=editor-only-scissor-viewport-sanitizer");
+        emit("RESULT: DYNARMIC_V22_FRAME_CLIP_RESET_DISABLED "
+             "reason=guest-editor-state-authoritative");
         emit("RESULT: DYNARMIC_V22_LEVEL_SETUP_BRIDGE_READY callsites="+
              std::to_string(prepare_bridges)+
              " source=guest-valid-first+vtable-level-scan+apk-catalog+"
