@@ -1,6 +1,6 @@
 # Source contents
 
-This archive contains the complete EnduranceTest8 wrapper source, native
+This archive contains the complete EnduranceTest9 wrapper source, native
 launcher, PowerShell/CMD build scripts, pinned dependency metadata, zlib/stb
 source, supplied icon families and documentation.
 

@@ -1182,7 +1182,6 @@ struct ElfRuntime {
     u32 v22_draw_grid_update_music_guide_time = 0;
     u32 v22_draw_grid_update_time_markers = 0;
     u32 v22_level_editor_level_settings_updated = 0;
-    u32 v22_ccsprite_batch_update_blend = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
@@ -2585,7 +2584,6 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime.v22_draw_grid_update_time_markers = draw_grid_markers->address;
         runtime.v22_level_editor_level_settings_updated =
             level_settings_updated->address;
-        runtime.v22_ccsprite_batch_update_blend = batch_update_blend->address;
 
         const u32 editor_host = EnsureImport(
             runtime, env, "__dynarmic_v22_editor_visibility");
@@ -3802,6 +3800,10 @@ public:
             v22_editor_overlay_playtest_active_ = false;
             v22_editor_level_settings_refreshed_ = false;
             v22_editor_background_frozen_logged_ = false;
+            v22_editor_background_nodes_.fill(0u);
+            v22_editor_background_x_.fill(0u);
+            v22_editor_background_y_.fill(0u);
+            v22_editor_background_restores_ = 0u;
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
@@ -6735,45 +6737,172 @@ private:
         return 0u;
     }
 
-    bool HostV22UpdateCameraBackground(u32 layer, u32 point_address) {
+    bool AnchorV22EditorBackgroundNodes(u32 editor_layer) {
         /*
-         * This import is reached only from the audited BL inside
-         * LevelEditorLayer::updateEditor. The right-side "void" moves, wraps at
-         * the left edge and resets when the background texture changes, exactly
-         * matching updateCameraBGArt. Suppress that editor call completely;
-         * PlayLayer's separate callsites remain unmodified.
+         * EnduranceTest8 removed the audited updateCameraBGArt call, but the
+         * beta's earlier editor-update stages can still move the three actual
+         * background nodes.  The Windows screenshot shows the result wrapping
+         * exactly like a tiled background while the emulator keeps it fixed.
+         *
+         * Capture each node's first stable editor position and restore it at
+         * the exact point where updateCameraBGArt would have run.  A texture
+         * change may replace a node; a new pointer is therefore recaptured
+         * instead of inheriting stale coordinates.  This is editor-only and
+         * does not touch the separate PlayLayer/gameplay callsites.
          */
-        if (!v22_editor_background_frozen_logged_) {
+        static constexpr std::array<u32, 3> kBackgroundNodeFields{
+            0x498u, 0x49Cu, 0x4A0u};
+        static constexpr u32 kPositionOffset = 0x44u;
+        static constexpr u32 kTransformDirtyOffset = 0xE8u;
+        static constexpr u32 kInverseDirtyOffset = 0xDEu;
+
+        bool captured_any = false;
+        bool restored_any = false;
+        for (std::size_t index = 0; index < kBackgroundNodeFields.size(); ++index) {
+            const u32 field = kBackgroundNodeFields[index];
+            u32 node = 0u;
+            if (env_.IsMapped(editor_layer + field, 4u))
+                node = env_.MemoryRead32(editor_layer + field);
+
+            if (!LooksLikeGuestObject(runtime_, env_, node) ||
+                !env_.IsMapped(node + kPositionOffset, 8u) ||
+                !env_.IsMapped(node + kInverseDirtyOffset, 1u) ||
+                !env_.IsMapped(node + kTransformDirtyOffset, 1u)) {
+                v22_editor_background_nodes_[index] = 0u;
+                continue;
+            }
+
+            if (v22_editor_background_nodes_[index] != node) {
+                v22_editor_background_nodes_[index] = node;
+                v22_editor_background_x_[index] =
+                    env_.MemoryRead32(node + kPositionOffset);
+                v22_editor_background_y_[index] =
+                    env_.MemoryRead32(node + kPositionOffset + 4u);
+                captured_any = true;
+                continue;
+            }
+
+            const u32 current_x = env_.MemoryRead32(node + kPositionOffset);
+            const u32 current_y = env_.MemoryRead32(node + kPositionOffset + 4u);
+            if (current_x == v22_editor_background_x_[index] &&
+                current_y == v22_editor_background_y_[index])
+                continue;
+
+            env_.MemoryWrite32(node + kPositionOffset,
+                               v22_editor_background_x_[index]);
+            env_.MemoryWrite32(node + kPositionOffset + 4u,
+                               v22_editor_background_y_[index]);
+            env_.MemoryWrite8(node + kTransformDirtyOffset, 1u);
+            env_.MemoryWrite8(node + kInverseDirtyOffset, 1u);
+            ++v22_editor_background_restores_;
+            restored_any = true;
+        }
+
+        if (captured_any) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_ANCHOR_CAPTURE"
+                 << " editor=0x" << std::hex << editor_layer << std::dec
+                 << " nodes=";
+            for (std::size_t index = 0; index < v22_editor_background_nodes_.size();
+                 ++index) {
+                if (index) log_ << ',';
+                log_ << "0x" << std::hex << v22_editor_background_nodes_[index]
+                     << std::dec;
+            }
+            log_ << " policy=editor-node-position-anchor\n";
+            log_.flush();
+        }
+        if (restored_any &&
+            (!v22_editor_background_frozen_logged_ ||
+             (v22_editor_background_restores_ % 300u) == 0u)) {
             v22_editor_background_frozen_logged_ = true;
-            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_FROZEN editor=0x"
-                 << std::hex << layer << " point=0x" << point_address
-                 << std::dec
-                 << " policy=level-editor-callsite-no-scroll\n";
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_POSITION_RESTORED"
+                 << " editor=0x" << std::hex << editor_layer << std::dec
+                 << " count=" << v22_editor_background_restores_
+                 << " policy=editor-only-gameplay-untouched\n";
             log_.flush();
         }
         return true;
     }
 
+    bool HostV22UpdateCameraBackground(u32 layer, u32 point_address) {
+        (void)point_address;
+        return AnchorV22EditorBackgroundNodes(layer);
+    }
+
     bool HostV22BatchUpdateBlend(u32 batch_node) {
         /*
-         * The selected beta can transiently leave the new ground batch node
-         * null while changing ground texture. Android tolerates the surrounding
-         * lifecycle, but executing updateBlendFunc with this==0 faults at +0x54
-         * in the wrapper. Ignore only the impossible null call; every valid
-         * batch node still runs the original function byte-for-byte.
+         * Exact beta implementation of CCSpriteBatchNode::updateBlendFunc():
+         *
+         *   atlas   = this[0x108]
+         *   texture = atlas[0x48]
+         *   dst     = GL_ONE_MINUS_SRC_ALPHA (0x303)
+         *   src     = texture->hasPremultipliedAlpha ? GL_ONE : GL_SRC_ALPHA
+         *
+         * The uploaded EnduranceTest8 log proves `this` is valid at host-hook
+         * entry, then the nested guest call loses its callee-saved object
+         * register and faults at address 0x54.  Reproduce these four accesses
+         * directly on the host instead of invoking the fragile nested helper.
+         * Missing community background/ground assets safely retain the normal
+         * non-PMA defaults rather than crashing or freezing.
          */
-        if (!batch_node) {
-            ++v22_null_batch_blend_guards_;
-            log_ << "RESULT: DYNARMIC_V22_NULL_BATCH_BLEND_GUARD count="
-                 << v22_null_batch_blend_guards_
-                 << " action=skip-null-this\n";
+        static constexpr u32 kTextureAtlasOffset = 0x108u;
+        static constexpr u32 kBlendSourceOffset = 0x10Cu;
+        static constexpr u32 kBlendDestinationOffset = 0x110u;
+        static constexpr u32 kAtlasTextureOffset = 0x48u;
+        static constexpr u32 kTexturePmaOffset = 0x54u;
+        static constexpr u32 kGlOne = 1u;
+        static constexpr u32 kGlSrcAlpha = 0x302u;
+        static constexpr u32 kGlOneMinusSrcAlpha = 0x303u;
+
+        ++v22_batch_blend_repairs_;
+        if (!batch_node ||
+            !env_.IsMapped(batch_node + kTextureAtlasOffset, 4u) ||
+            !env_.IsMapped(batch_node + kBlendSourceOffset, 8u)) {
+            ++v22_missing_batch_texture_fallbacks_;
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_SAFE_FALLBACK count="
+                 << v22_missing_batch_texture_fallbacks_
+                 << " batch=0x" << std::hex << batch_node << std::dec
+                 << " reason=invalid-batch action=skip\n";
             log_.flush();
             return true;
         }
-        u32 ignored = 0u;
-        return RunNestedPreservingState(
-            runtime_.v22_ccsprite_batch_update_blend, {batch_node}, ignored,
-            "CCSpriteBatchNode::updateBlendFunc passthrough", 100000000u);
+
+        const u32 atlas = env_.MemoryRead32(batch_node + kTextureAtlasOffset);
+        u32 texture = 0u;
+        if (atlas && env_.IsMapped(atlas + kAtlasTextureOffset, 4u))
+            texture = env_.MemoryRead32(atlas + kAtlasTextureOffset);
+
+        bool premultiplied_alpha = false;
+        const bool texture_valid =
+            texture && env_.IsMapped(texture + kTexturePmaOffset, 1u);
+        if (texture_valid)
+            premultiplied_alpha =
+                env_.MemoryRead8(texture + kTexturePmaOffset) != 0u;
+
+        env_.MemoryWrite32(batch_node + kBlendDestinationOffset,
+                           kGlOneMinusSrcAlpha);
+        env_.MemoryWrite32(batch_node + kBlendSourceOffset,
+                           premultiplied_alpha ? kGlOne : kGlSrcAlpha);
+
+        if (!texture_valid) {
+            ++v22_missing_batch_texture_fallbacks_;
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_SAFE_FALLBACK count="
+                 << v22_missing_batch_texture_fallbacks_
+                 << " batch=0x" << std::hex << batch_node
+                 << " atlas=0x" << atlas
+                 << " texture=0x" << texture << std::dec
+                 << " reason=missing-texture blend=src-alpha/one-minus-src-alpha\n";
+            log_.flush();
+        } else if (v22_batch_blend_repairs_ == 1u) {
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_HOST_EXACT"
+                 << " batch=0x" << std::hex << batch_node
+                 << " atlas=0x" << atlas
+                 << " texture=0x" << texture << std::dec
+                 << " pma=" << (premultiplied_alpha ? 1 : 0)
+                 << " source=exact-field-reproduction\n";
+            log_.flush();
+        }
+        return true;
     }
 
     bool HostV22EditorVisibility(u32 editor_layer, u32 delta_bits) {
@@ -6788,6 +6917,10 @@ private:
             v22_editor_overlay_playtest_active_ = false;
             v22_editor_level_settings_refreshed_ = false;
             v22_editor_background_frozen_logged_ = false;
+            v22_editor_background_nodes_.fill(0u);
+            v22_editor_background_x_.fill(0u);
+            v22_editor_background_y_.fill(0u);
+            v22_editor_background_restores_ = 0u;
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
@@ -11484,7 +11617,12 @@ private:
     bool v22_editor_overlay_playtest_active_=false;
     bool v22_editor_level_settings_refreshed_=false;
     bool v22_editor_background_frozen_logged_=false;
-    u64 v22_null_batch_blend_guards_=0;
+    std::array<u32,3> v22_editor_background_nodes_{};
+    std::array<u32,3> v22_editor_background_x_{};
+    std::array<u32,3> v22_editor_background_y_{};
+    u64 v22_editor_background_restores_=0;
+    u64 v22_batch_blend_repairs_=0;
+    u64 v22_missing_batch_texture_fallbacks_=0;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_editor_hide_variable_address_=0;
     u32 v22_platformer_ui_logged_=0;
@@ -11899,7 +12037,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest8 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest9 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12566,7 +12704,7 @@ int main(int argc,char** argv) {
                     std::string(
                         visual_hooks.exact_companion_editor
                             ? "exact-companion"
-                            : "host-camera-cull+client-array-repair") +
+                            : "host-camera-cull+client-array+background-anchor") +
                     " visibility-pointers=" +
                     std::to_string(visual_hooks.editor_visibility.first) +
                     " visibility-calls=" +

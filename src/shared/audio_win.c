@@ -77,8 +77,6 @@ static volatile LONG g_effect_log_count;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
-static int g_legacy_first_play_full_volume;
-static int g_music_alias_newly_opened;
 static HANDLE g_output_meter_thread;
 static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
@@ -780,7 +778,6 @@ static void close_music(void) {
     mci_command("close gd18_music", NULL, 0, 0);
     g_music_open = 0;
     g_music_paused = 0;
-    g_music_alias_newly_opened = 0;
     g_music_path[0] = 0;
 }
 
@@ -823,7 +820,6 @@ static int open_music(const char *requested) {
     }
     snprintf(g_music_path, sizeof(g_music_path), "%s", path);
     g_music_open = 1;
-    g_music_alias_newly_opened = 1;
     return 1;
 }
 
@@ -1084,21 +1080,11 @@ void audio_initialize(const char *executable_directory) {
     memset(g_effect_asset_cache, 0, sizeof(g_effect_asset_cache));
     g_effect_asset_cache_count = 0;
     memset(g_effects, 0, sizeof(g_effects));
-    g_music_alias_newly_opened = 0;
-    g_legacy_first_play_full_volume = 0;
     initialize_output_meter();
     initialize_effect_worker();
     runtime_log(
         "Windows audio bridge initialized; music=MCI effects=waveOut APK cache: %s",
         g_audio_cache_directory);
-}
-
-void audio_set_legacy_first_play_full_volume(int enabled) {
-    g_legacy_first_play_full_volume = enabled != 0;
-    runtime_log("Audio legacy first-play policy: %s",
-                g_legacy_first_play_full_volume
-                    ? "new-level-alias-full-volume"
-                    : "disabled");
 }
 
 void audio_set_writable_directory(const char *writable_directory) {
@@ -1160,21 +1146,6 @@ void audio_preload_background(const char *path) {
 void audio_play_background(const char *path, int loop) {
     char command[96];
     if (!open_music(path)) return;
-    /*
-     * Legacy 1.0-1.4 starts a newly-opened level alias quieter than the same
-     * alias after the first restart. The previous experiments tried to keep
-     * replay at the saved volume and had no effect. Do the opposite only for
-     * the first non-looping play: start that newly-opened level track at full
-     * MCI device volume, matching the loud attempt-2 path. Menu loops and all
-     * non-legacy backends keep their existing volume behavior.
-     */
-    if (g_legacy_first_play_full_volume && !loop &&
-        g_music_alias_newly_opened) {
-        set_alias_volume("gd18_music", 1.0f);
-        runtime_log("Audio legacy first-play loudness: %s volume=1000",
-                    file_name_part(path));
-    }
-    g_music_alias_newly_opened = 0;
     mci_command("seek gd18_music to start", NULL, 0, 0);
     snprintf(command, sizeof(command), "play gd18_music%s",
              loop ? " repeat" : "");

@@ -1,12 +1,11 @@
-Geometry Dash Wrapper EnduranceTest7 -> EnduranceTest8 source hotfix
+Geometry Dash Wrapper EnduranceTest8 -> EnduranceTest9 hotfix
 
-1. Start with the complete 0.9.5-endurancetest7 source tree.
-2. Delete these superseded files from its root:
-     ENDURANCETEST7.md
-     ENDURANCETEST7-VERIFICATION.txt
-3. Copy every other file/folder from this hotfix over that source tree,
-   preserving relative paths and replacing existing files.
-4. Build normally with BUILD_ALL.cmd.
+1. Start with a clean EnduranceTest8 full-source tree.
+2. Copy every file/folder from this hotfix directory over that tree.
+3. Delete APPLY-HOTFIX.txt after reading it.
+4. Delete these superseded files from the target tree:
+   - ENDURANCETEST8-VERIFICATION.txt
+   - ENDURANCETEST8.md
+5. Build normally with BUILD_ALL.cmd.
 
-The hotfix intentionally contains no APK, Android .so, Windows binary, Python
-file, x86 backend source, .git directory or .gitignore.
+This hotfix intentionally contains no x86 backend file.

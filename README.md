@@ -1,21 +1,22 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest8
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest9
 
-`endurancetest` is the cross-version stability branch. EnduranceTest8 is a
-focused 2.2 beta editor correction based on `logs(9).zip` and the screenshot of
-the moving black region.
+`endurancetest` is the cross-version stability branch. EnduranceTest9 is a
+focused correction based on `logs(10).zip` after BPM guidelines were confirmed
+working in EnduranceTest8.
 
-## Changes from EnduranceTest7
+## Changes from EnduranceTest8
 
-- freezes only the selected beta editor's background-art scrolling call;
-- rebuilds BPM markers through `LevelEditorLayer::levelSettingsUpdated()` once
-  per editor session;
-- skips the exact null `CCSpriteBatchNode::updateBlendFunc()` call responsible
-  for the repeatable ground-texture crash, while preserving all valid calls;
-- enables a legacy-only first-level-play volume-1000 experiment so attempt 1
-  targets the louder attempt-2 level;
-- keeps Z/X, x86 pacing, networking, backups, save isolation, selection
-  rectangle rendering and editor camera/object lifecycle unchanged.
+- anchors the selected 2.2 beta editor's three real background nodes at their
+  initial positions, while leaving gameplay background callsites untouched;
+- replaces the fragile nested guest `CCSpriteBatchNode::updateBlendFunc()` call
+  with an exact host reproduction of its four field accesses;
+- makes community background/ground entries with absent texture data fail
+  safely with standard alpha blending instead of crashing or freezing;
+- keeps the confirmed BPM setup path, selection rectangle, object lifecycle,
+  Z/X controls, x86 pacing, networking, backups and save isolation unchanged;
+- fully removes the failed legacy first-play volume-1000 experiment and adds no
+  new unverified audio behavior.
 
 Nothing in this source archive is claimed Windows-runtime-confirmed until tested
-with the target APKs. See `ENDURANCETEST8.md` and
-`ENDURANCETEST8-VERIFICATION.txt`.
+with the target APKs. See `ENDURANCETEST9.md` and
+`ENDURANCETEST9-VERIFICATION.txt`.
