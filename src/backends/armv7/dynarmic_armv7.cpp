@@ -1167,6 +1167,7 @@ struct ElfRuntime {
     u32 v22_game_object_has_secondary_color = 0;
     u32 v22_game_object_add_color_sprite = 0;
     u32 v22_game_object_activate = 0;
+    u32 v22_game_object_deactivate = 0;
     u32 v22_game_object_set_opacity = 0;
     u32 v22_ccsprite_set_opacity = 0;
     u32 v22_gjbase_pre_update_visibility = 0;
@@ -2452,6 +2453,8 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN10GameObject22addColorSpriteToParentEb");
     const SymbolRecord* activate_object = FindSymbol(
         runtime, "_ZN10GameObject14activateObjectEv");
+    const SymbolRecord* deactivate_object = FindSymbol(
+        runtime, "_ZN10GameObject16deactivateObjectEb");
     const SymbolRecord* game_object_opacity = FindSymbol(
         runtime, "_ZN10GameObject10setOpacityEh");
     const SymbolRecord* sprite_opacity = FindSymbol(
@@ -2522,7 +2525,8 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime.v22_companion_editor_visibility_enabled = true;
     } else {
         if (!add_main_sprite || !has_secondary_color || !add_color_sprite ||
-            !activate_object || !game_object_opacity || !sprite_opacity ||
+            !activate_object || !deactivate_object ||
+            !game_object_opacity || !sprite_opacity ||
             !pre_update_visibility || !update_object_colors || !add_object ||
             !remove_all_objects || !process_area_visual_actions ||
             !sort_batchnode_children || !update_grid_layer ||
@@ -2535,6 +2539,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             has_secondary_color->address;
         runtime.v22_game_object_add_color_sprite = add_color_sprite->address;
         runtime.v22_game_object_activate = activate_object->address;
+        runtime.v22_game_object_deactivate = deactivate_object->address;
         runtime.v22_game_object_set_opacity = game_object_opacity->address;
         runtime.v22_ccsprite_set_opacity = sprite_opacity->address;
         runtime.v22_gjbase_pre_update_visibility =
@@ -2895,6 +2900,12 @@ struct HostEvent {
 #endif
 #ifndef GL_ELEMENT_ARRAY_BUFFER
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#endif
+#ifndef GL_ARRAY_BUFFER_BINDING
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#endif
+#ifndef GL_ELEMENT_ARRAY_BUFFER_BINDING
+#define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
 #endif
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER 0x8D40
@@ -3722,6 +3733,7 @@ public:
         if (!IsV22EditorSceneActive()) {
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
+            v22_editor_time_marker_source_.clear();
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
@@ -3746,20 +3758,34 @@ public:
             }
         }
 
+        /*
+         * updateTimeMarkers is a rebuild operation, not a harmless frame tick.
+         * EnduranceTest6 called it every 60 frames, including while the beta's
+         * marker source string was transiently empty, which could erase all BPM
+         * guides.  The real layer stores that source at +0x160. Rebuild only
+         * after the game has supplied a non-empty value and only when it changes.
+         */
         if (draw_grid && runtime_.v22_draw_grid_update_time_markers &&
-            (v22_editor_overlay_frames_ == 1u ||
-             (v22_editor_overlay_frames_ % 60u) == 0u)) {
-            if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
-                             {draw_grid}, nullptr,
-                             "DrawGridLayer::updateTimeMarkers periodic", 0u,
-                             std::chrono::milliseconds(1000)))
-                return false;
+            v22_editor_overlay_frames_ >= 2u) {
+            std::string marker_source;
+            if (ReadGuestCowStringObject(draw_grid + 0x160u, marker_source,
+                                         1024u * 1024u) &&
+                !marker_source.empty() &&
+                marker_source != v22_editor_time_marker_source_) {
+                if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
+                                 {draw_grid}, nullptr,
+                                 "DrawGridLayer::updateTimeMarkers changed-source",
+                                 0u, std::chrono::milliseconds(1000)))
+                    return false;
+                v22_editor_time_marker_source_ = std::move(marker_source);
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH bytes="
+                     << v22_editor_time_marker_source_.size()
+                     << " frame=" << v22_editor_overlay_frames_ << '\n';
+                log_.flush();
+            }
         }
 
-        /* Never call LevelEditorLayer::updateGridLayer from the host.
-           The uploaded EnduranceTest4 run showed the guessed playtest flag
-           flickering every few frames; each transition rebuilt the grid and
-           could make placed objects and BPM guides disappear. */
+        /* Never call LevelEditorLayer::updateGridLayer from the host. */
         return true;
     }
 
@@ -6653,19 +6679,13 @@ private:
             v22_draw_grid_layer_ = 0u;
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
+            v22_editor_time_marker_source_.clear();
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
         }
         ++v22_editor_visibility_passes_;
 
-        /*
-         * This is the ordering used by the beta's LevelEditorLayerExt helper.
-         * The older host replacement skipped preUpdateVisibility entirely,
-         * which left editor camera/clip state stale after playtesting and also
-         * prevented thin overlays such as the song-position line from being
-         * prepared for the frame.
-         */
         u32 ignored = 0u;
         if (!RunNestedPreservingState(
                 runtime_.v22_gjbase_pre_update_visibility,
@@ -6673,8 +6693,12 @@ private:
                 "V22 editor pre-update visibility", 250000000u))
             return false;
 
-        constexpr u32 kSectionArrayOffset = 840u;
-        constexpr u32 kColorArrayOffset = 11268u;
+        constexpr u32 kSectionArrayOffset = 0x348u;
+        constexpr u32 kColorArrayOffset = 0x2C04u;
+        constexpr u32 kCameraNodeOffset = 0x48Cu;
+        constexpr u32 kNodeScaleOffset = 0x38u;
+        constexpr u32 kNodePositionOffset = 0x44u;
+        constexpr u32 kNodeVisibleOffset = 0xEAu;
         const u32 color_array =
             env_.IsMapped(editor_layer + kColorArrayOffset, 4u)
                 ? env_.MemoryRead32(editor_layer + kColorArrayOffset)
@@ -6688,114 +6712,182 @@ private:
             return true;
 
         /*
-         * Keep the host-side section walk (it is much faster than emulating
-         * the companion's 10,000-section loop), but reproduce the missing
-         * colour queue and post-visibility calls. Base editor object textures
-         * are intentionally white; updateObjectColors is what turns saws,
-         * monsters and the playtest death X into their actual colours.
+         * Reproduce the beta companion's camera culling without emulating its
+         * very expensive dynamic_cast/10,000-section loop. The old host bridge
+         * marked every object visible forever and never called deactivateObject;
+         * after playtest/panning this left stale batches and could produce the
+         * moving right-side void or apparently missing objects.
          */
-        constexpr u32 kMaximumObjectsPerSection = 100000u;
-        constexpr u32 kMaximumObjectsScanned = 250000u;
-        constexpr u32 kMaximumActivationsPerFrame = 32u;
-        constexpr u32 kMaximumColorObjectsPerFrame = 8192u;
-        u32 objects_scanned = 0u;
-        u32 newly_activated = 0u;
-        u32 pending = 0u;
-        u32 color_queued = 0u;
-        u32 color_queue_truncated = 0u;
-
-        for (u32 section_index = 0;
-             section_index < sections.count &&
-             objects_scanned < kMaximumObjectsScanned;
-             ++section_index) {
-            const u32 section = env_.MemoryRead32(
-                sections.elements + section_index * 4u);
-            if (!section) continue;
-            GuestCcArrayView objects;
-            if (!ReadGuestCcArray(
-                    section, kMaximumObjectsPerSection, objects))
-                continue;
-
-            for (u32 object_index = 0;
-                 object_index < objects.count &&
-                 objects_scanned < kMaximumObjectsScanned;
-                 ++object_index) {
-                const u32 object = env_.MemoryRead32(
-                    objects.elements + object_index * 4u);
-                ++objects_scanned;
-                if (!LooksLikeGuestObject(runtime_, env_, object) ||
-                    !env_.IsMapped(object + 1236u, 1u))
-                    continue;
-
-                env_.MemoryWrite8(object + 234u, 1u);
-                bool ready_for_colours =
-                    v22_editor_visualized_objects_.contains(object);
-                if (!ready_for_colours) {
-                    if (newly_activated >= kMaximumActivationsPerFrame) {
-                        ++pending;
-                        continue;
-                    }
-
-                    if (!RunNestedPreservingState(
-                            runtime_.v22_game_object_add_main_sprite,
-                            {object, 0u}, ignored,
-                            "V22 editor add main sprite", 100000000u))
-                        return false;
-                    u32 has_secondary = 0u;
-                    if (!RunNestedPreservingState(
-                            runtime_.v22_game_object_has_secondary_color,
-                            {object}, has_secondary,
-                            "V22 editor secondary-color query", 100000000u))
-                        return false;
-                    if (has_secondary &&
-                        !RunNestedPreservingState(
-                            runtime_.v22_game_object_add_color_sprite,
-                            {object, 1u}, ignored,
-                            "V22 editor add color sprite", 100000000u))
-                        return false;
-                    if (!RunNestedPreservingState(
-                            runtime_.v22_game_object_activate, {object}, ignored,
-                            "V22 editor activate object", 100000000u))
-                        return false;
-                    if (!RunNestedPreservingState(
-                            runtime_.v22_game_object_set_opacity,
-                            {object, 255u}, ignored,
-                            "V22 editor object opacity", 100000000u))
-                        return false;
-                    env_.MemoryWrite8(object + 234u, 1u);
-                    v22_editor_visualized_objects_.insert(object);
-                    ready_for_colours = true;
-                    ++newly_activated;
-                }
-
-                /*
-                 * LevelEditorLayerExt checks this byte before placing an object
-                 * in the editor colour queue. Preserve that rule and use the
-                 * real CCArray::addObject so retain/release ownership remains
-                 * correct when removeAllObjects runs below.
-                 */
-                if (ready_for_colours && color_array &&
-                    env_.IsMapped(object + 0x405u, 1u) &&
-                    env_.MemoryRead8(object + 0x405u) == 0u) {
-                    if (color_queued < kMaximumColorObjectsPerFrame) {
-                        if (!RunNestedPreservingState(
-                                runtime_.v22_ccarray_add_object,
-                                {color_array, object}, ignored,
-                                "V22 editor queue object colour", 100000000u))
-                            return false;
-                        ++color_queued;
-                    } else {
-                        ++color_queue_truncated;
+        bool camera_valid = false;
+        float visible_left = 0.0f;
+        float visible_bottom = 0.0f;
+        float visible_right = 0.0f;
+        float visible_top = 0.0f;
+        u32 section_begin = 0u;
+        u32 section_end = sections.count ? sections.count - 1u : 0u;
+        if (env_.IsMapped(editor_layer + kCameraNodeOffset, 4u)) {
+            const u32 camera = env_.MemoryRead32(editor_layer + kCameraNodeOffset);
+            if (LooksLikeGuestObject(runtime_, env_, camera) &&
+                env_.IsMapped(camera + kNodeScaleOffset, 4u) &&
+                env_.IsMapped(camera + kNodePositionOffset, 8u)) {
+                const float scale = WordToFloat(
+                    env_.MemoryRead32(camera + kNodeScaleOffset));
+                const float camera_x = WordToFloat(
+                    env_.MemoryRead32(camera + kNodePositionOffset));
+                const float camera_y = WordToFloat(
+                    env_.MemoryRead32(camera + kNodePositionOffset + 4u));
+                if (std::isfinite(scale) && std::fabs(scale) > 0.0001f &&
+                    std::isfinite(camera_x) && std::isfinite(camera_y)) {
+                    visible_left = -camera_x / scale;
+                    visible_bottom = -camera_y / scale;
+                    const auto client_size = gl_.ClientSize();
+                    visible_right = visible_left +
+                        static_cast<float>(client_size.first) / scale + 30.0f;
+                    visible_top = visible_bottom +
+                        static_cast<float>(client_size.second) / scale + 30.0f;
+                    camera_valid = std::isfinite(visible_right) &&
+                                   std::isfinite(visible_top) &&
+                                   visible_right >= visible_left &&
+                                   visible_top >= visible_bottom;
+                    if (camera_valid && sections.count) {
+                        const int first = static_cast<int>(
+                            std::floor(visible_left / 100.0f)) - 1;
+                        const int last = static_cast<int>(
+                            std::ceil(visible_right / 100.0f)) + 1;
+                        section_begin = static_cast<u32>(
+                            std::clamp(first, 0,
+                                static_cast<int>(sections.count) - 1));
+                        section_end = static_cast<u32>(
+                            std::clamp(last, 0,
+                                static_cast<int>(sections.count) - 1));
+                        if (section_end < section_begin)
+                            std::swap(section_begin, section_end);
                     }
                 }
             }
         }
 
-        /*
-         * These are frame-level operations in the companion implementation,
-         * not "new object" operations. Running them every pass fixes stale
-         * area visuals and batch ordering after Start/Stop in the editor.
-         */
+        constexpr u32 kMaximumObjectsPerSection = 100000u;
+        constexpr u32 kMaximumObjectsScanned = 250000u;
+        constexpr u32 kMaximumColorObjectsPerFrame = 8192u;
+        u32 objects_scanned = 0u;
+        u32 visible_objects = 0u;
+        u32 newly_activated = 0u;
+        u32 deactivated = 0u;
+        u32 color_queued = 0u;
+        u32 color_queue_truncated = 0u;
+        std::unordered_set<u32> visible_now;
+        visible_now.reserve(v22_editor_visualized_objects_.size() + 64u);
+
+        if (sections.count) {
+            for (u32 section_index = section_begin;
+                 section_index <= section_end &&
+                 section_index < sections.count &&
+                 objects_scanned < kMaximumObjectsScanned;
+                 ++section_index) {
+                const u32 section = env_.MemoryRead32(
+                    sections.elements + section_index * 4u);
+                if (!section) continue;
+                GuestCcArrayView objects;
+                if (!ReadGuestCcArray(section, kMaximumObjectsPerSection, objects))
+                    continue;
+
+                for (u32 object_index = 0;
+                     object_index < objects.count &&
+                     objects_scanned < kMaximumObjectsScanned;
+                     ++object_index) {
+                    const u32 object = env_.MemoryRead32(
+                        objects.elements + object_index * 4u);
+                    ++objects_scanned;
+                    if (!LooksLikeGuestObject(runtime_, env_, object) ||
+                        !env_.IsMapped(object + 0x4B0u, 1u))
+                        continue;
+
+                    bool inside = true;
+                    if (camera_valid &&
+                        env_.IsMapped(object + kNodePositionOffset, 8u)) {
+                        const float x = WordToFloat(
+                            env_.MemoryRead32(object + kNodePositionOffset));
+                        const float y = WordToFloat(
+                            env_.MemoryRead32(object + kNodePositionOffset + 4u));
+                        inside = std::isfinite(x) && std::isfinite(y) &&
+                                 x >= visible_left && x <= visible_right &&
+                                 y >= visible_bottom && y <= visible_top;
+                    }
+                    if (!inside) continue;
+
+                    visible_now.insert(object);
+                    ++visible_objects;
+                    const bool was_visible =
+                        v22_editor_visualized_objects_.contains(object);
+                    const bool node_visible =
+                        env_.IsMapped(object + kNodeVisibleOffset, 1u) &&
+                        env_.MemoryRead8(object + kNodeVisibleOffset) != 0u;
+                    if (!was_visible || !node_visible) {
+                        if (!RunNestedPreservingState(
+                                runtime_.v22_game_object_add_main_sprite,
+                                {object, 0u}, ignored,
+                                "V22 editor add main sprite", 100000000u))
+                            return false;
+                        u32 has_secondary = 0u;
+                        if (!RunNestedPreservingState(
+                                runtime_.v22_game_object_has_secondary_color,
+                                {object}, has_secondary,
+                                "V22 editor secondary-color query", 100000000u))
+                            return false;
+                        if (has_secondary &&
+                            !RunNestedPreservingState(
+                                runtime_.v22_game_object_add_color_sprite,
+                                {object, 1u}, ignored,
+                                "V22 editor add color sprite", 100000000u))
+                            return false;
+                        if (!RunNestedPreservingState(
+                                runtime_.v22_game_object_activate, {object}, ignored,
+                                "V22 editor activate object", 100000000u))
+                            return false;
+                        if (!RunNestedPreservingState(
+                                runtime_.v22_game_object_set_opacity,
+                                {object, 255u}, ignored,
+                                "V22 editor object opacity", 100000000u))
+                            return false;
+                        ++newly_activated;
+                    }
+
+                    if (color_array && env_.MemoryRead8(object + 0x405u) == 0u) {
+                        if (color_queued < kMaximumColorObjectsPerFrame) {
+                            if (!RunNestedPreservingState(
+                                    runtime_.v22_ccarray_add_object,
+                                    {color_array, object}, ignored,
+                                    "V22 editor queue object colour", 100000000u))
+                                return false;
+                            ++color_queued;
+                        } else {
+                            ++color_queue_truncated;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (camera_valid) {
+            for (const u32 object : v22_editor_visualized_objects_) {
+                if (visible_now.contains(object) ||
+                    !LooksLikeGuestObject(runtime_, env_, object))
+                    continue;
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_object_deactivate,
+                        {object, 0u}, ignored,
+                        "V22 editor deactivate offscreen object", 100000000u))
+                    return false;
+                ++deactivated;
+            }
+            v22_editor_visualized_objects_ = std::move(visible_now);
+        } else {
+            /* If camera state is temporarily invalid, never hide known objects. */
+            v22_editor_visualized_objects_.insert(
+                visible_now.begin(), visible_now.end());
+        }
+
         if (color_array) {
             if (!RunNestedPreservingState(
                     runtime_.v22_level_editor_update_object_colors,
@@ -6819,24 +6911,24 @@ private:
                 "V22 editor sort batch nodes", 250000000u))
             return false;
 
-        /* Timeline/BPM/grid state is updated once per rendered frame by
-         * UpdateV22EditorOverlayFrame().  Keeping it out of this nested import
-         * callback avoids intermittent updates and expensive re-entrant work. */
-
-        if (newly_activated || color_queue_truncated ||
+        if (newly_activated || deactivated || color_queue_truncated ||
             v22_editor_visibility_passes_ == 1u ||
             (v22_editor_visibility_passes_ % 120u) == 0u) {
-            log_ << "RESULT: DYNARMIC_V22_EDITOR_NATIVE_VISIBILITY "
-                 << "editor=0x" << std::hex << editor_layer << std::dec
-                 << " preupdate=1"
-                 << " sections=" << sections.count
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_CAMERA_CULL"
+                 << " editor=0x" << std::hex << editor_layer << std::dec
+                 << " camera=" << (camera_valid ? 1 : 0)
+                 << " rect=" << std::fixed << std::setprecision(1)
+                 << visible_left << ',' << visible_bottom << ','
+                 << visible_right << ',' << visible_top
+                 << " sections=" << section_begin << '-' << section_end
+                 << '/' << sections.count
                  << " scanned=" << objects_scanned
+                 << " visible=" << visible_objects
                  << " activated=" << newly_activated
-                 << " total=" << v22_editor_visualized_objects_.size()
-                 << " pending=" << pending
+                 << " deactivated=" << deactivated
+                 << " tracked=" << v22_editor_visualized_objects_.size()
                  << " color-queued=" << color_queued
                  << " color-truncated=" << color_queue_truncated
-                 << " post-visuals=1"
                  << " pass=" << v22_editor_visibility_passes_ << '\n';
             log_.flush();
         }
@@ -8373,6 +8465,14 @@ private:
             const std::size_t bytes = static_cast<std::size_t>(arguments[0]) * sizeof(GLuint);
             std::vector<GLuint> values(static_cast<std::size_t>(arguments[0]));
             if (bytes) env_.ReadBytes(static_cast<u32>(arguments[1]), values.data(), bytes);
+            if (name == "glDeleteBuffers") {
+                for (const GLuint value : values) {
+                    if (value == gl_array_buffer_binding_)
+                        gl_array_buffer_binding_ = 0u;
+                    if (value == gl_element_buffer_binding_)
+                        gl_element_buffer_binding_ = 0u;
+                }
+            }
             reinterpret_cast<Fn>(function)(static_cast<GLsizei>(arguments[0]), values.data());
         } else if (name == "glGetBooleanv") {
             using Fn = void (APIENTRY*)(GLenum, GLboolean*);
@@ -8452,13 +8552,84 @@ private:
             result = CallGlRaw(function, arguments, count);
         } else if (name == "glVertexAttribPointer") {
             using Fn = void (APIENTRY*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
-            const void* pointer = gl_array_buffer_binding_ ? reinterpret_cast<const void*>(arguments[5]) : env_.HostPointer(static_cast<u32>(arguments[5]), 1);
-            reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]),static_cast<GLint>(arguments[1]),static_cast<GLenum>(arguments[2]),static_cast<GLboolean>(arguments[3]),static_cast<GLsizei>(arguments[4]),pointer);
+            using GetIntegerFn = void (APIENTRY*)(GLenum, GLint*);
+            using BindBufferFn = void (APIENTRY*)(GLenum, GLuint);
+            const u32 guest_pointer = static_cast<u32>(arguments[5]);
+            const bool guest_client_memory =
+                guest_pointer != 0u && env_.IsMapped(guest_pointer, 1u);
+            const void* pointer = guest_client_memory
+                ? env_.HostPointer(guest_pointer, 1u)
+                : reinterpret_cast<const void*>(arguments[5]);
+            GLint actual_binding = 0;
+            auto* get_integer = reinterpret_cast<GetIntegerFn>(
+                gl_.Resolve("glGetIntegerv"));
+            auto* bind_buffer = reinterpret_cast<BindBufferFn>(
+                gl_.Resolve("glBindBuffer"));
+            const GLint cached_binding =
+                static_cast<GLint>(gl_array_buffer_binding_);
+            if (guest_client_memory && cached_binding != 0 &&
+                get_integer && bind_buffer) {
+                get_integer(GL_ARRAY_BUFFER_BINDING, &actual_binding);
+                gl_array_buffer_binding_ = static_cast<u32>(
+                    std::max(actual_binding, 0));
+                if (actual_binding != 0)
+                    bind_buffer(GL_ARRAY_BUFFER, 0u);
+                ++gl_client_array_rebinds_;
+                if (gl_client_array_rebinds_ == 1u) {
+                    log_ << "RESULT: DYNARMIC_GL_CLIENT_ARRAY_REBIND_READY "
+                         << "policy=mapped-guest-pointer-overrides-vbo "
+                         << "cached=" << cached_binding
+                         << " actual=" << actual_binding << '\n';
+                    log_.flush();
+                }
+            }
+            reinterpret_cast<Fn>(function)(
+                static_cast<GLuint>(arguments[0]),
+                static_cast<GLint>(arguments[1]),
+                static_cast<GLenum>(arguments[2]),
+                static_cast<GLboolean>(arguments[3]),
+                static_cast<GLsizei>(arguments[4]), pointer);
+            if (guest_client_memory && actual_binding != 0 && bind_buffer) {
+                bind_buffer(GL_ARRAY_BUFFER,
+                            static_cast<GLuint>(actual_binding));
+            }
         } else if (name == "glDrawElements") {
             using Fn = void (APIENTRY*)(GLenum, GLsizei, GLenum, const void*);
-            std::size_t element_size = arguments[2] == 0x1401u ? 1u : arguments[2] == 0x1403u ? 2u : 4u;
-            const void* indices = gl_element_buffer_binding_ ? reinterpret_cast<const void*>(arguments[3]) : env_.HostPointer(static_cast<u32>(arguments[3]), static_cast<std::size_t>(arguments[1]) * element_size);
-            reinterpret_cast<Fn>(function)(static_cast<GLenum>(arguments[0]),static_cast<GLsizei>(arguments[1]),static_cast<GLenum>(arguments[2]),indices);
+            using GetIntegerFn = void (APIENTRY*)(GLenum, GLint*);
+            using BindBufferFn = void (APIENTRY*)(GLenum, GLuint);
+            const std::size_t element_size = arguments[2] == 0x1401u ? 1u : arguments[2] == 0x1403u ? 2u : 4u;
+            const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * element_size;
+            const u32 guest_indices = static_cast<u32>(arguments[3]);
+            const bool guest_client_memory =
+                guest_indices != 0u && env_.IsMapped(guest_indices, bytes ? bytes : 1u);
+            const void* indices = guest_client_memory
+                ? env_.HostPointer(guest_indices, bytes ? bytes : 1u)
+                : reinterpret_cast<const void*>(arguments[3]);
+            GLint actual_binding = 0;
+            auto* get_integer = reinterpret_cast<GetIntegerFn>(
+                gl_.Resolve("glGetIntegerv"));
+            auto* bind_buffer = reinterpret_cast<BindBufferFn>(
+                gl_.Resolve("glBindBuffer"));
+            const GLint cached_binding =
+                static_cast<GLint>(gl_element_buffer_binding_);
+            if (guest_client_memory && cached_binding != 0 &&
+                get_integer && bind_buffer) {
+                get_integer(GL_ELEMENT_ARRAY_BUFFER_BINDING, &actual_binding);
+                gl_element_buffer_binding_ = static_cast<u32>(
+                    std::max(actual_binding, 0));
+                if (actual_binding != 0)
+                    bind_buffer(GL_ELEMENT_ARRAY_BUFFER, 0u);
+                ++gl_client_element_rebinds_;
+            }
+            reinterpret_cast<Fn>(function)(
+                static_cast<GLenum>(arguments[0]),
+                static_cast<GLsizei>(arguments[1]),
+                static_cast<GLenum>(arguments[2]), indices);
+            if (guest_client_memory && actual_binding != 0 && bind_buffer) {
+                bind_buffer(GL_ELEMENT_ARRAY_BUFFER,
+                            static_cast<GLuint>(actual_binding));
+                ++gl_client_element_rebinds_;
+            }
         } else if (name == "glReadPixels") {
             using Fn = void (APIENTRY*)(GLint,GLint,GLsizei,GLsizei,GLenum,GLenum,void*);
             const std::size_t bytes = GlPixelBytes(static_cast<u32>(arguments[2]),static_cast<u32>(arguments[3]),static_cast<u32>(arguments[4]),static_cast<u32>(arguments[5]));
@@ -11111,6 +11282,7 @@ private:
     u64 v22_editor_visibility_passes_=0;
     u64 v22_editor_overlay_frames_=0;
     bool v22_editor_overlay_playtest_active_=false;
+    std::string v22_editor_time_marker_source_;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_platformer_ui_logged_=0;
     bool v22_mouse_platformer_jump_down_=false;
@@ -11194,6 +11366,8 @@ private:
     std::unordered_map<u32,u32> gl_string_cache_;
     u32 gl_array_buffer_binding_=0;
     u32 gl_element_buffer_binding_=0;
+    u64 gl_client_array_rebinds_=0;
+    u64 gl_client_element_rebinds_=0;
     u32 gl_framebuffer_binding_=0;
     u32 edge_clip_normalization_logs_=0;
     u64 logged_guest_stdio_=0;
@@ -11522,7 +11696,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest5 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest6 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12189,7 +12363,7 @@ int main(int argc,char** argv) {
                     std::string(
                         visual_hooks.exact_companion_editor
                             ? "exact-companion"
-                            : "host-approximation") +
+                            : "host-camera-cull+client-array-repair") +
                     " visibility-pointers=" +
                     std::to_string(visual_hooks.editor_visibility.first) +
                     " visibility-calls=" +

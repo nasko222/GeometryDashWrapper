@@ -77,11 +77,6 @@ static volatile LONG g_effect_log_count;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
-/* Windows MCI can accept a volume command and then restore the device default
-   asynchronously when a seek/play restart actually begins.  Keep the desired
-   volume authoritative for a few rendered frames after each restart. */
-static int g_music_volume_reassert_frames;
-static int g_music_volume_reassert_log_pending;
 static HANDLE g_output_meter_thread;
 static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
@@ -769,11 +764,6 @@ static int audio_asset_path(const char *requested, int effect,
     return 0;
 }
 
-static void schedule_music_volume_reassert(void) {
-    g_music_volume_reassert_frames = 45;
-    g_music_volume_reassert_log_pending = 1;
-}
-
 static void set_alias_volume(const char *alias, float volume) {
     char command[128];
     int level = (int)(clamp_volume(volume) * 1000.0f + 0.5f);
@@ -1162,7 +1152,6 @@ void audio_play_background(const char *path, int loop) {
              loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
         set_alias_volume("gd18_music", g_music_volume);
-        schedule_music_volume_reassert();
         g_music_loop = loop != 0;
         g_music_paused = 0;
         runtime_log("Audio music playing: %s (loop=%s)", file_name_part(path),
@@ -1196,7 +1185,6 @@ void audio_resume_background(void) {
     }
     /* MCI can restore the device default after resume/play/seek. */
     set_alias_volume("gd18_music", g_music_volume);
-    schedule_music_volume_reassert();
     g_music_paused = 0;
 }
 
@@ -1213,7 +1201,6 @@ void audio_resume_background_from(float seconds) {
              milliseconds, g_music_loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
         set_alias_volume("gd18_music", g_music_volume);
-        schedule_music_volume_reassert();
         g_music_paused = 0;
         runtime_log("Audio music resumed from %lu ms", milliseconds);
     }
@@ -1229,7 +1216,6 @@ void audio_rewind_background(void) {
                  g_music_loop ? " repeat" : "");
         if (mci_command(command, NULL, 0, 1)) {
             set_alias_volume("gd18_music", g_music_volume);
-            schedule_music_volume_reassert();
         }
     }
 }
@@ -1250,7 +1236,6 @@ void audio_set_background_time(float seconds) {
                  milliseconds, g_music_loop ? " repeat" : "");
         if (mci_command(command, NULL, 0, 1)) {
             set_alias_volume("gd18_music", g_music_volume);
-            schedule_music_volume_reassert();
         }
     }
 }
@@ -1282,20 +1267,16 @@ void audio_set_background_volume(float volume) {
     g_music_volume = clamp_volume(volume);
     if (g_music_open) {
         set_alias_volume("gd18_music", g_music_volume);
-        schedule_music_volume_reassert();
     }
 }
 
 void audio_maintain_background_volume(void) {
-    if (!g_music_open || g_music_volume_reassert_frames <= 0) return;
-    if (g_music_volume_reassert_log_pending) {
-        runtime_log("Audio MCI volume guard active: volume=%.3f frames=%d",
-                    g_music_volume, g_music_volume_reassert_frames);
-        g_music_volume_reassert_log_pending = 0;
-    }
-    set_alias_volume("gd18_music", g_music_volume);
-    --g_music_volume_reassert_frames;
+    /* EnduranceTest5's 45-frame MCI reassert loop did not change the
+       attempt-to-attempt volume problem and only repeated the same command.
+       Keep the API for both ARM loops, but leave volume ownership to the
+       game's immediate set/play/resume calls until the real cause is proven. */
 }
+
 
 float audio_get_output_peak(void) {
     union {

@@ -1,8 +1,22 @@
-Geometry Dash Wrapper EnduranceTest1 -> EnduranceTest2 source hotfix
+Overlay this folder onto EnduranceTest5, then delete the files listed below.
 
-1. Copy the contents of this folder over the EnduranceTest1 source root.
-2. Delete the files listed in DELETE-OLD-FILES.txt.
-3. Run BUILD_ALL.cmd.
+Changed/new files:
+- BRANCH.txt
+- BUILDING.md
+- ENDURANCE-TEST-CHECKLIST.md
+- ENDURANCETEST6-VERIFICATION.txt
+- ENDURANCETEST6.md
+- README.md
+- SOURCE-CONTENTS.md
+- VERSION.txt
+- build_dynarmic.ps1
+- src/backends/arm_legacy/dynarmic_legacy.cpp
+- src/backends/armv7/dynarmic_armv7.cpp
+- src/backends/x86/main.c
+- src/launcher/native_launcher.c
+- src/shared/audio_win.c
+- src/shared/build_info.h
 
-All three backends and the native launcher carry the new version identifier.
-The x86 backend and ARMv7 backend contain functional source changes.
+Delete old files:
+- ENDURANCETEST5-VERIFICATION.txt
+- ENDURANCETEST5.md

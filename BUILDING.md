@@ -1,27 +1,6 @@
-# Building EnduranceTest5 on Windows
+# Building EnduranceTest6
 
-Use the included native build scripts from a normal Windows command prompt.
-Python is not required.
-
-## Complete build
-
-```bat
-BUILD_ALL.cmd
-```
-
-## Individual targets
-
-```bat
-BUILD_LAUNCHER.cmd
-BUILD_X86.cmd
-BUILD_DYNARMIC.cmd
-```
-
-The Dynarmic builder revision is pinned to
-`dynarmic-x64-builder51-0.9.5-endurancetest5` so an older cached builder is not
-silently reused.
-
-## Source policy
-
-The archive intentionally contains no APK, extracted `.so`, built `.exe` or
-`.dll`, Python file, `.git` directory, or `.gitignore`.
+Run `BUILD_ALL.cmd` on Windows with the pinned Zig/CMake/Ninja workflow already
+used by the project. Python is not required. The source archive intentionally
+contains no APK or prebuilt game library; drag the desired APK onto a launcher
+after building.

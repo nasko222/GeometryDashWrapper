@@ -33,6 +33,7 @@ typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
 typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
+typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
 
 typedef struct {
     HWND window;
@@ -68,6 +69,8 @@ typedef struct {
     GameManagerSharedStateFunction game_manager_shared_state;
     UiCheckpointFunction ui_on_check;
     UiCheckpointFunction ui_on_delete_check;
+    UiCheckpointNoSenderFunction ui_on_check_no_sender;
+    UiCheckpointNoSenderFunction ui_on_delete_check_no_sender;
     uint32_t practice_mode_offset;
     LARGE_INTEGER frame_clock_frequency;
     LONGLONG next_frame_deadline;
@@ -671,9 +674,12 @@ static void *find_active_ui_layer(void) {
 static int send_practice_checkpoint_hotkey(int place) {
     UiCheckpointFunction callback = place ? g_host.ui_on_check
                                           : g_host.ui_on_delete_check;
+    UiCheckpointNoSenderFunction old_callback =
+        place ? g_host.ui_on_check_no_sender
+              : g_host.ui_on_delete_check_no_sender;
     void *ui_layer;
     unsigned char *play_layer;
-    if (!callback) return 0;
+    if (!callback && !old_callback) return 0;
     if (!detect_gameplay_active() || !g_host.active_play_layer) return 0;
     if (g_host.editor_cache_value) return 1;
     play_layer = (unsigned char *)g_host.active_play_layer;
@@ -690,9 +696,11 @@ static int send_practice_checkpoint_hotkey(int place) {
     }
     ui_layer = find_active_ui_layer();
     if (!ui_layer) return 1;
-    callback(ui_layer, NULL);
-    runtime_log("Practice hotkey: %c mode=practice -> UILayer::%s",
-                place ? 'Z' : 'X', place ? "onCheck" : "onDeleteCheck");
+    if (callback) callback(ui_layer, NULL);
+    else old_callback(ui_layer);
+    runtime_log("Practice hotkey: %c mode=practice -> UILayer::%s abi=%s",
+                place ? 'Z' : 'X', place ? "onCheck" : "onDeleteCheck",
+                callback ? "sender" : "legacy-no-sender");
     return 1;
 }
 
@@ -1175,13 +1183,25 @@ int main(int argc, char **argv) {
         &image, "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
     g_host.ui_on_delete_check = (UiCheckpointFunction)elf_image_find_export(
         &image, "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE");
+    if (!g_host.ui_on_check)
+        g_host.ui_on_check_no_sender =
+            (UiCheckpointNoSenderFunction)elf_image_find_export(
+                &image, "_ZN7UILayer7onCheckEv");
+    if (!g_host.ui_on_delete_check)
+        g_host.ui_on_delete_check_no_sender =
+            (UiCheckpointNoSenderFunction)elf_image_find_export(
+                &image, "_ZN7UILayer13onDeleteCheckEv");
     g_host.practice_mode_offset = derive_practice_mode_offset(&image);
     runtime_log("PC gameplay detection: GameManager::sharedState=%s",
                 g_host.game_manager_shared_state ? "ready" : "unavailable");
-    runtime_log("Practice Z/X callbacks: place=%s remove=%s guard_offset=0x%lx",
-                g_host.ui_on_check ? "ready" : "unavailable",
-                g_host.ui_on_delete_check ? "ready" : "unavailable",
-                (unsigned long)g_host.practice_mode_offset);
+    runtime_log("Practice Z/X callbacks: place=%s remove=%s guard_offset=0x%lx abi=%s",
+                (g_host.ui_on_check || g_host.ui_on_check_no_sender)
+                    ? "ready" : "unavailable",
+                (g_host.ui_on_delete_check || g_host.ui_on_delete_check_no_sender)
+                    ? "ready" : "unavailable",
+                (unsigned long)g_host.practice_mode_offset,
+                (g_host.ui_on_check || g_host.ui_on_delete_check)
+                    ? "sender" : "legacy-no-sender");
     install_desktop_keyboard_offset_patches(&image);
     install_configurable_x86_hacks(&image);
     if (mode == 0) {
