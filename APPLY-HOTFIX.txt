@@ -1,22 +1,12 @@
-Overlay this folder onto EnduranceTest5, then delete the files listed below.
+Geometry Dash Wrapper EnduranceTest6 -> EnduranceTest7 source hotfix
 
-Changed/new files:
-- BRANCH.txt
-- BUILDING.md
-- ENDURANCE-TEST-CHECKLIST.md
-- ENDURANCETEST6-VERIFICATION.txt
-- ENDURANCETEST6.md
-- README.md
-- SOURCE-CONTENTS.md
-- VERSION.txt
-- build_dynarmic.ps1
-- src/backends/arm_legacy/dynarmic_legacy.cpp
-- src/backends/armv7/dynarmic_armv7.cpp
-- src/backends/x86/main.c
-- src/launcher/native_launcher.c
-- src/shared/audio_win.c
-- src/shared/build_info.h
+1. Start from the complete 0.9.5-endurancetest6 source tree.
+2. Copy every file/folder from this hotfix directory over that source tree,
+   preserving paths and replacing existing files.
+3. Delete these superseded EnduranceTest6-only files:
+   - ENDURANCETEST6.md
+   - ENDURANCETEST6-VERIFICATION.txt
+4. Run BUILD_ALL.cmd on Windows.
 
-Delete old files:
-- ENDURANCETEST5-VERIFICATION.txt
-- ENDURANCETEST5.md
+No APK, EXE, DLL or Python file is included.
+The complete x86 backend is intentionally absent because it is unchanged.

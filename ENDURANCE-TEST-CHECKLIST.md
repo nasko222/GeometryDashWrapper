@@ -1,50 +1,47 @@
-# EnduranceTest6 Test Sheet
+# EnduranceTest7 Test Sheet
 
-## Z/X safety
+## Confirmed controls — regression only
 
-- [ ] Normal Mode: Z does not create a checkpoint.
-- [ ] Normal Mode: X does not remove anything.
-- [ ] Practice Mode: Z creates one checkpoint per press.
-- [ ] Practice Mode: X removes the latest checkpoint per press.
-- [ ] Hold Z/X: auto-repeat does not create/remove repeatedly.
-- [ ] Repeat on legacy ARM 1.0, 1.01 and 1.4.
-- [ ] Repeat on x86 1.6–2.11.
-- [ ] Repeat on selected ARMv7 2.2 beta.
+- [ ] Normal Mode: Z/X do nothing.
+- [ ] Practice Mode: Z places and X removes one checkpoint per press.
+- [ ] Repeat briefly on legacy ARM, older x86 and ARMv7 2.2.
 
-Expected normal-mode log:
+No Practice Mode implementation changed in this build.
+
+## 2.2 beta editor
+
+- [ ] Open an editor level with BPM enabled: guidelines appear immediately.
+- [ ] Song-position line appears and moves.
+- [ ] Close and reopen the editor: BPM guidelines and song line return.
+- [ ] Press Play, Stop, pan left/right, zoom and use swipe selection.
+- [ ] Placed objects and the swipe-selection rectangle remain visible.
+- [ ] Record whether the moving right-side black region appears.
+- [ ] Keep the editor open for at least 10 minutes.
+
+Expected new log entries:
 
 ```text
-DYNARMIC_PRACTICE_HOTKEY_IGNORED ... mode=normal
+DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH mode=session-once frame=1
+DYNARMIC_V22_EDITOR_CAMERA_CULL ... opacity=0:...,70:...,255:... hide-0121=...
 ```
 
-## 2.2 editor
-
-- [ ] Open editor: song line appears and moves.
-- [ ] BPM guidelines appear.
-- [ ] Press Play, Stop, then inspect every placed object.
-- [ ] Objects do not disappear after repeated Play/Stop cycles.
-- [ ] Close and reopen editor: song line and BPM guidelines appear again.
-- [ ] No `DYNARMIC_V22_EDITOR_GRID_REFRESH` line appears.
-- [ ] Record whether the right-side black region still appears.
+There must be no host `DYNARMIC_V22_EDITOR_GRID_REFRESH` call.
 
 ## Legacy music
 
-- [ ] Attempt 1 volume.
-- [ ] Attempt 2 volume.
-- [ ] Attempts 3–5 volume.
-- [ ] Pause/resume volume.
-- [ ] Restart-level volume.
+- [ ] Compare attempt 1 and attempt 2 with the same Windows output volume.
+- [ ] Compare attempts 3–5.
+- [ ] Test Restart, death restart and pause/resume.
+- [ ] Change the music slider while a stream is open and confirm the current
+      stream responds.
 
-Expected guard log after a restart:
-
-```text
-Audio MCI volume guard active: volume=... frames=45
-```
+Expected behavior: newly opened tracks receive no automatic `setaudio` command;
+only a live volume setter for the currently open alias sends one.
 
 ## Regression checks
 
 - [ ] Mouse remains native-visible.
 - [ ] Native pause button remains present.
-- [ ] 1.93 backup and load remain functional.
+- [ ] 1.93 backup/load remains functional.
 - [ ] 2.11 save/load remains functional.
-- [ ] x86 pacing remains identical to EnduranceTest4/accepted Fix6.
+- [ ] x86 pacing remains identical to EnduranceTest6.

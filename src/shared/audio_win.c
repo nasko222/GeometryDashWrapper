@@ -820,7 +820,13 @@ static int open_music(const char *requested) {
     }
     snprintf(g_music_path, sizeof(g_music_path), "%s", path);
     g_music_open = 1;
-    set_alias_volume("gd18_music", g_music_volume);
+    /*
+     * Deliberately do not carry the stored Android volume into a newly opened
+     * MCI alias. Legacy clients preload one alias, set their saved volume, and
+     * later open a different level track. Applying the stored value here made
+     * attempt 1 quieter than the device-default volume used after MCI restart.
+     * A live slider change still affects the alias that is currently open.
+     */
     return 1;
 }
 
@@ -1151,7 +1157,6 @@ void audio_play_background(const char *path, int loop) {
     snprintf(command, sizeof(command), "play gd18_music%s",
              loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
-        set_alias_volume("gd18_music", g_music_volume);
         g_music_loop = loop != 0;
         g_music_paused = 0;
         runtime_log("Audio music playing: %s (loop=%s)", file_name_part(path),
@@ -1183,8 +1188,6 @@ void audio_resume_background(void) {
                  g_music_loop ? " repeat" : "");
         mci_command(command, NULL, 0, 1);
     }
-    /* MCI can restore the device default after resume/play/seek. */
-    set_alias_volume("gd18_music", g_music_volume);
     g_music_paused = 0;
 }
 
@@ -1200,7 +1203,6 @@ void audio_resume_background_from(float seconds) {
     snprintf(command, sizeof(command), "play gd18_music from %lu%s",
              milliseconds, g_music_loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
-        set_alias_volume("gd18_music", g_music_volume);
         g_music_paused = 0;
         runtime_log("Audio music resumed from %lu ms", milliseconds);
     }
@@ -1214,9 +1216,7 @@ void audio_rewind_background(void) {
         char command[96];
         snprintf(command, sizeof(command), "play gd18_music%s",
                  g_music_loop ? " repeat" : "");
-        if (mci_command(command, NULL, 0, 1)) {
-            set_alias_volume("gd18_music", g_music_volume);
-        }
+        (void)mci_command(command, NULL, 0, 1);
     }
 }
 
@@ -1234,9 +1234,7 @@ void audio_set_background_time(float seconds) {
     if (playing) {
         snprintf(command, sizeof(command), "play gd18_music from %lu%s",
                  milliseconds, g_music_loop ? " repeat" : "");
-        if (mci_command(command, NULL, 0, 1)) {
-            set_alias_volume("gd18_music", g_music_volume);
-        }
+        (void)mci_command(command, NULL, 0, 1);
     }
 }
 
@@ -1265,18 +1263,9 @@ float audio_get_background_volume(void) { return g_music_volume; }
 
 void audio_set_background_volume(float volume) {
     g_music_volume = clamp_volume(volume);
-    if (g_music_open) {
+    if (g_music_open)
         set_alias_volume("gd18_music", g_music_volume);
-    }
 }
-
-void audio_maintain_background_volume(void) {
-    /* EnduranceTest5's 45-frame MCI reassert loop did not change the
-       attempt-to-attempt volume problem and only repeated the same command.
-       Keep the API for both ARM loops, but leave volume ownership to the
-       game's immediate set/play/resume calls until the real cause is proven. */
-}
-
 
 float audio_get_output_peak(void) {
     union {

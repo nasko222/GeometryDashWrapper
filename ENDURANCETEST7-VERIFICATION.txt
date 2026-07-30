@@ -1,0 +1,112 @@
+Geometry Dash Wrapper 0.9.5-endurancetest7 verification
+
+Runtime status: NOT TESTED on Windows in this environment.
+The following are binary-derived and source/static checks, not gameplay confirmation.
+
+01. PASS: ARMv7 C++20 syntax with lightweight Dynarmic interface stubs
+02. PASS: legacy ARM C++20 syntax with lightweight Dynarmic interface stubs
+03. PASS: exact selected libcocos2dcpp.so available [b89f96e4526ecefd329b9644a011f6af35c3cf499e1f2ded63fe01a7b3d36c4c]
+04. PASS: exact selected companion libgame.so available [f72c7ed18d0db17ff4a6a1d7284eadae7549fe7e52ba268cbc63b815c7be4917]
+05. PASS: exact APK symbol _ZN11GameManager11sharedStateEv
+06. PASS: exact APK symbol _ZN11GameManager15getGameVariableEPKc
+07. PASS: exact APK symbol _ZN13DrawGridLayer17updateTimeMarkersEv
+08. PASS: exact APK symbol _ZN10GameObject10setOpacityEh
+09. PASS: companion visibility helper is exact 636-byte target
+10. PASS: companion option literal 0121 present
+11. PASS: companion opacity offset #0x4af
+12. PASS: companion opacity offset #0x236
+13. PASS: companion opacity offset #0x405
+14. PASS: companion opacity offset #0x2c50
+15. PASS: companion opacity offset #0x450
+16. PASS: companion opacity offset #0x454
+17. PASS: companion opacity 0 branch
+18. PASS: companion opacity 70 branch
+19. PASS: companion opacity 255 branch
+20. PASS: runtime stores getGameVariable target
+21. PASS: visual hook resolves GameManager sharedState
+22. PASS: visual hook resolves getGameVariable
+23. PASS: 0121 guest string allocated
+24. PASS: special flag +0x4AF policy present
+25. PASS: special flag +0x236/+0x405 policy present
+26. PASS: selected-group +0x2C50 policy present
+27. PASS: primary/secondary +0x450/+0x454 policy present
+28. PASS: exact opacity 0/70/255 source policy
+29. PASS: old unconditional activation opacity 255 removed
+30. PASS: opacity diagnostics emitted
+31. PASS: BPM markers rebuild once at editor frame 1
+32. PASS: BPM refresh diagnostic identifies session-once
+33. PASS: old marker source state removed
+34. PASS: no periodic marker modulo refresh
+35. PASS: song guide remains per rendered editor frame
+36. PASS: no host updateGridLayer invocation
+37. PASS: guest client-array/VBO repair retained
+38. PASS: client-array diagnostic retained
+39. PASS: camera culling retained
+40. PASS: offscreen visible-set lifecycle retained
+41. PASS: x86 source tree byte-for-byte unchanged [915406cbd194ef3edaa38c66d8bc2ab8901bdf3318fb3d3815e870f38ff65f2a]
+42. PASS: ARMv7 Practice Mode context unchanged
+43. PASS: legacy Practice Mode context unchanged
+44. PASS: x86 pace_x86_frame source unchanged [386204233ba951a16a59f5f66323ff1ed3464d9803c78ba6069529d0d6f923b6]
+45. PASS: legacy frame volume-maintenance API removed
+46. PASS: all restart volume reassert calls removed
+47. PASS: new MCI aliases receive no automatic saved volume
+48. PASS: audio_play_background has no volume reassert
+49. PASS: audio_resume_background has no volume reassert
+50. PASS: audio_resume_background_from has no volume reassert
+51. PASS: audio_rewind_background has no volume reassert
+52. PASS: audio_set_background_time has no volume reassert
+53. PASS: live setter still affects current open alias
+54. PASS: version file
+55. PASS: branch file
+56. PASS: launcher/build version strings
+57. PASS: EnduranceTest7 documentation
+58. PASS: source policy clean
+Passed 58/58 focused audits.
+
+JULY 30 UPLOADED-LOG DIAGNOSIS
+
+1. Legacy ARM attempt volume
+- Geometry Dash 1.0 and 1.4 both call preloadBackgroundMusic before their
+  initial setBackgroundMusicVolume call.
+- Later, opening a level track creates a different MCI alias. EnduranceTest6
+  automatically copied the stored Android volume into every new alias, while
+  MCI restart behavior returned to the device volume after the first attempt.
+- EnduranceTest7 removes the frame guard and every play/resume/seek reassert.
+  It also sends no stored-volume command merely because a new alias opened.
+- A live setBackgroundMusicVolume call still changes the currently open alias.
+
+2. Selected 2.2 beta BPM markers
+- The editor session reset occurs and DrawGridLayer is found before overlay
+  frame 1; the song guide update also runs at frame 1.
+- No successful time-marker rebuild is logged in the EnduranceTest6 run.
+- EnduranceTest7 invokes DrawGridLayer::updateTimeMarkers exactly once at frame
+  1 of each newly created editor session. It is never periodic and the host
+  never calls LevelEditorLayer::updateGridLayer.
+
+3. Selected 2.2 beta black moving region
+- EnduranceTest6 camera culling and client-array/VBO repair remain active and
+  no other editor regressions were reported in the July 30 test.
+- The exact 636-byte LevelEditorLayerExt::updateVisibilityH companion helper
+  does not force every visible object to opacity 255. It uses object fields
+  +0x4AF, +0x236, +0x405, editor field +0x2C50, object group fields +0x450 and
+  +0x454, and GameManager variable "0121" to choose opacity 0, 70 or 255.
+- EnduranceTest6 forced activated objects fully opaque. EnduranceTest7 follows
+  the exact helper's opacity policy while retaining the fast host camera walk.
+
+UNCHANGED
+- Practice Mode Z/X source is unchanged in ARMv7 and legacy ARM.
+- The complete x86 backend source tree is byte-for-byte unchanged.
+- pace_x86_frame hash remains
+  386204233ba951a16a59f5f66323ff1ed3464d9803c78ba6069529d0d6f923b6.
+- Network, account backup, save isolation, native cursor and native pause
+  behavior are unchanged.
+
+RUNTIME TARGETS — NOT YET CLAIMED FIXED
+- BPM guidelines appear on first editor open and after close/reopen.
+- The right-side black moving region no longer appears during Play/Stop,
+  horizontal panning or zooming.
+- Legacy attempt 1 has the same loudness as attempt 2 onward.
+
+LIMITATIONS
+- Complete Windows execution and APK gameplay testing are unavailable in this
+  environment. The user must confirm these three runtime targets.

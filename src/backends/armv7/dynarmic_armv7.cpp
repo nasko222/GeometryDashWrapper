@@ -1170,6 +1170,7 @@ struct ElfRuntime {
     u32 v22_game_object_deactivate = 0;
     u32 v22_game_object_set_opacity = 0;
     u32 v22_ccsprite_set_opacity = 0;
+    u32 v22_game_manager_get_game_variable = 0;
     u32 v22_gjbase_pre_update_visibility = 0;
     u32 v22_level_editor_update_object_colors = 0;
     u32 v22_ccarray_add_object = 0;
@@ -2459,6 +2460,10 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN10GameObject10setOpacityEh");
     const SymbolRecord* sprite_opacity = FindSymbol(
         runtime, "_ZN7cocos2d8CCSprite10setOpacityEh");
+    const SymbolRecord* game_manager_shared = FindSymbol(
+        runtime, "_ZN11GameManager11sharedStateEv");
+    const SymbolRecord* get_game_variable = FindSymbol(
+        runtime, "_ZN11GameManager15getGameVariableEPKc");
     const SymbolRecord* pre_update_visibility = FindSymbol(
         runtime, "_ZN15GJBaseGameLayer19preUpdateVisibilityEf");
     const SymbolRecord* update_object_colors = FindSymbol(
@@ -2527,6 +2532,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         if (!add_main_sprite || !has_secondary_color || !add_color_sprite ||
             !activate_object || !deactivate_object ||
             !game_object_opacity || !sprite_opacity ||
+            !game_manager_shared || !get_game_variable ||
             !pre_update_visibility || !update_object_colors || !add_object ||
             !remove_all_objects || !process_area_visual_actions ||
             !sort_batchnode_children || !update_grid_layer ||
@@ -2542,6 +2548,9 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime.v22_game_object_deactivate = deactivate_object->address;
         runtime.v22_game_object_set_opacity = game_object_opacity->address;
         runtime.v22_ccsprite_set_opacity = sprite_opacity->address;
+        runtime.v22_game_manager_shared = game_manager_shared->address;
+        runtime.v22_game_manager_get_game_variable =
+            get_game_variable->address;
         runtime.v22_gjbase_pre_update_visibility =
             pre_update_visibility->address;
         runtime.v22_level_editor_update_object_colors =
@@ -3733,7 +3742,6 @@ public:
         if (!IsV22EditorSceneActive()) {
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
-            v22_editor_time_marker_source_.clear();
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
@@ -3759,30 +3767,24 @@ public:
         }
 
         /*
-         * updateTimeMarkers is a rebuild operation, not a harmless frame tick.
-         * EnduranceTest6 called it every 60 frames, including while the beta's
-         * marker source string was transiently empty, which could erase all BPM
-         * guides.  The real layer stores that source at +0x160. Rebuild only
-         * after the game has supplied a non-empty value and only when it changes.
+         * The beta itself rebuilds markers when the editor initializes and
+         * immediately before playback.  EnduranceTest3 proved that one initial
+         * call makes the BPM guides appear; its regression came from repeating
+         * this destructive rebuild every 60 frames.  Rebuild exactly once for
+         * each newly-created editor layer.  The session counter is reset by the
+         * editor-create and visibility-entry paths, so reopening the editor gets
+         * one fresh rebuild without erasing markers during normal editing.
          */
         if (draw_grid && runtime_.v22_draw_grid_update_time_markers &&
-            v22_editor_overlay_frames_ >= 2u) {
-            std::string marker_source;
-            if (ReadGuestCowStringObject(draw_grid + 0x160u, marker_source,
-                                         1024u * 1024u) &&
-                !marker_source.empty() &&
-                marker_source != v22_editor_time_marker_source_) {
-                if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
-                                 {draw_grid}, nullptr,
-                                 "DrawGridLayer::updateTimeMarkers changed-source",
-                                 0u, std::chrono::milliseconds(1000)))
-                    return false;
-                v22_editor_time_marker_source_ = std::move(marker_source);
-                log_ << "RESULT: DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH bytes="
-                     << v22_editor_time_marker_source_.size()
-                     << " frame=" << v22_editor_overlay_frames_ << '\n';
-                log_.flush();
-            }
+            v22_editor_overlay_frames_ == 1u) {
+            if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
+                             {draw_grid}, nullptr,
+                             "DrawGridLayer::updateTimeMarkers session-once",
+                             0u, std::chrono::milliseconds(1000)))
+                return false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH "
+                 << "mode=session-once frame=1\n";
+            log_.flush();
         }
 
         /* Never call LevelEditorLayer::updateGridLayer from the host. */
@@ -6679,7 +6681,6 @@ private:
             v22_draw_grid_layer_ = 0u;
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
-            v22_editor_time_marker_source_.clear();
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
@@ -6776,6 +6777,46 @@ private:
         u32 deactivated = 0u;
         u32 color_queued = 0u;
         u32 color_queue_truncated = 0u;
+        u32 opacity_hidden = 0u;
+        u32 opacity_dimmed = 0u;
+        u32 opacity_full = 0u;
+
+        /*
+         * LevelEditorLayerExt::updateVisibilityH uses game variable "0121"
+         * when deciding whether special editor-only objects must be fully
+         * hidden.  Query it once per visibility pass instead of once per
+         * object.  The exact companion code then combines that option with
+         * object flags at +0x4AF, +0x236 and +0x405.
+         */
+        bool hide_special_editor_objects = false;
+        if (runtime_.v22_game_manager_shared &&
+            runtime_.v22_game_manager_get_game_variable) {
+            if (!v22_editor_hide_variable_address_)
+                v22_editor_hide_variable_address_ = AllocateString("0121");
+            u32 game_manager = 0u;
+            u32 hide_value = 0u;
+            if (v22_editor_hide_variable_address_) {
+                if (!RunNestedPreservingState(
+                        runtime_.v22_game_manager_shared, {}, game_manager,
+                        "V22 GameManager::sharedState for editor opacity",
+                        100000000u))
+                    return false;
+                if (game_manager &&
+                    !RunNestedPreservingState(
+                        runtime_.v22_game_manager_get_game_variable,
+                        {game_manager, v22_editor_hide_variable_address_},
+                        hide_value,
+                        "V22 GameManager::getGameVariable(0121)",
+                        100000000u))
+                    return false;
+                hide_special_editor_objects = hide_value != 0u;
+            }
+        }
+
+        const u32 selected_color_group =
+            env_.IsMapped(editor_layer + 0x2C50u, 4u)
+                ? env_.MemoryRead32(editor_layer + 0x2C50u)
+                : 0u;
         std::unordered_set<u32> visible_now;
         visible_now.reserve(v22_editor_visualized_objects_.size() + 64u);
 
@@ -6845,15 +6886,54 @@ private:
                                 runtime_.v22_game_object_activate, {object}, ignored,
                                 "V22 editor activate object", 100000000u))
                             return false;
-                        if (!RunNestedPreservingState(
-                                runtime_.v22_game_object_set_opacity,
-                                {object, 255u}, ignored,
-                                "V22 editor object opacity", 100000000u))
-                            return false;
                         ++newly_activated;
                     }
 
-                    if (color_array && env_.MemoryRead8(object + 0x405u) == 0u) {
+                    /*
+                     * Faithfully reproduce the companion's editor opacity
+                     * policy.  The old host bridge forced every activated
+                     * object to 255, exposing objects the beta deliberately
+                     * keeps at opacity 0 or 70.  Large hidden helper sprites are
+                     * a direct candidate for the moving black "void".
+                     */
+                    const bool object_flag_4af =
+                        env_.IsMapped(object + 0x4AFu, 1u) &&
+                        env_.MemoryRead8(object + 0x4AFu) != 0u;
+                    const bool object_flag_236 =
+                        env_.IsMapped(object + 0x236u, 1u) &&
+                        env_.MemoryRead8(object + 0x236u) != 0u;
+                    const bool color_pending =
+                        env_.MemoryRead8(object + 0x405u) == 0u;
+                    u32 opacity = 70u;
+                    if ((object_flag_4af && hide_special_editor_objects) ||
+                        (object_flag_236 && color_pending)) {
+                        opacity = 0u;
+                        ++opacity_hidden;
+                    } else {
+                        const u32 primary_group =
+                            env_.IsMapped(object + 0x450u, 4u)
+                                ? env_.MemoryRead32(object + 0x450u)
+                                : 0u;
+                        const u32 secondary_group =
+                            env_.IsMapped(object + 0x454u, 4u)
+                                ? env_.MemoryRead32(object + 0x454u)
+                                : 0u;
+                        const bool selected =
+                            selected_color_group == primary_group ||
+                            (selected_color_group != 0xFFFFFFFFu &&
+                             secondary_group != 0u &&
+                             selected_color_group == secondary_group);
+                        opacity = selected ? 255u : 70u;
+                        if (selected) ++opacity_full;
+                        else ++opacity_dimmed;
+                    }
+                    if (!RunNestedPreservingState(
+                            runtime_.v22_game_object_set_opacity,
+                            {object, opacity}, ignored,
+                            "V22 editor exact object opacity", 100000000u))
+                        return false;
+
+                    if (color_array && color_pending) {
                         if (color_queued < kMaximumColorObjectsPerFrame) {
                             if (!RunNestedPreservingState(
                                     runtime_.v22_ccarray_add_object,
@@ -6929,6 +7009,11 @@ private:
                  << " tracked=" << v22_editor_visualized_objects_.size()
                  << " color-queued=" << color_queued
                  << " color-truncated=" << color_queue_truncated
+                 << " opacity=0:" << opacity_hidden
+                 << ",70:" << opacity_dimmed
+                 << ",255:" << opacity_full
+                 << " hide-0121="
+                 << (hide_special_editor_objects ? 1 : 0)
                  << " pass=" << v22_editor_visibility_passes_ << '\n';
             log_.flush();
         }
@@ -11282,8 +11367,8 @@ private:
     u64 v22_editor_visibility_passes_=0;
     u64 v22_editor_overlay_frames_=0;
     bool v22_editor_overlay_playtest_active_=false;
-    std::string v22_editor_time_marker_source_;
     std::unordered_set<u32> v22_editor_visualized_objects_;
+    u32 v22_editor_hide_variable_address_=0;
     u32 v22_platformer_ui_logged_=0;
     bool v22_mouse_platformer_jump_down_=false;
     u32 v22_mouse_platformer_touch_ui_=0;
@@ -11696,7 +11781,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest6 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest7 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
