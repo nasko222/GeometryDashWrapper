@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.5-endurancetest10"
+#define LAUNCHER_VERSION "0.9.5-endurancetest11"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768

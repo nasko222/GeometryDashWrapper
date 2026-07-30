@@ -4,6 +4,7 @@
 void audio_initialize(const char *executable_directory);
 void audio_set_apk_path(const char *apk_path);
 void audio_set_writable_directory(const char *writable_directory);
+void audio_set_legacy_first_play_prime(int enabled);
 void audio_shutdown(void);
 
 void audio_preload_background(const char *path);

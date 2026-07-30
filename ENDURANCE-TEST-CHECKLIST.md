@@ -1,39 +1,40 @@
-# EnduranceTest10 Test Sheet
+# EnduranceTest11 Test Sheet
 
 ## Selected 2.2 beta editor
 
-- [ ] Open the editor and confirm BPM guidelines still render.
-- [ ] Press Play and verify the right-side black region does not begin moving.
-- [ ] Let playtest run long enough that the old region would wrap/restart.
-- [ ] Stop and restart playtest; background state remains fixed both times.
-- [ ] Change every ground option. Entries above 18 clamp to ground 18 and do not
-      crash or freeze.
-- [ ] Change every background option. Entries above 26 clamp to background 26
-      and do not create a missing texture.
-- [ ] Pan/zoom and use swipe selection; objects and the selection rectangle remain.
-- [ ] Confirm normal level gameplay backgrounds still use the original movement.
+- [ ] Open the editor and verify the black moving region is still gone.
+- [ ] Confirm BPM guidelines, song line and swipe-selection rectangle still work.
+- [ ] Cycle through every valid ground normally.
+- [ ] Select one of the community entries that previously froze.
+- [ ] The editor remains responsive and packaged ground 1 is used as fallback.
+- [ ] Stop/restart playtesting and confirm the background remains fixed.
+
+For the invalid entry, search the log for:
+
+```text
+DYNARMIC_V22_MISSING_GROUND_TEXTURE_REPLACED
+```
+
+`DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE ... fallback-load-failed` should not
+appear in the successful fallback case.
+
+## Legacy ARM music
+
+- [ ] Test 1.0, then preferably 1.3/1.4.
+- [ ] Enter a level from the menu and compare attempt 1 with attempt 2.
+- [ ] Confirm the one-time prime is inaudible and does not add a long delay.
+- [ ] Confirm menu music, pause/resume and the volume slider still behave.
 
 Search the log for:
 
 ```text
-DYNARMIC_V22_ART_ASSET_LIMITS ground=18 background=26
-DYNARMIC_V22_EDITOR_BACKGROUND_UPDATE_SUPPRESSED
-DYNARMIC_V22_BATCH_BLEND_HOST_EXACT
-DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH mode=level-settings-updated
+Audio legacy first-play decoder prime: 100 ms muted
 ```
-
-`DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE` should not appear during ordinary
-background/ground selection after the selector clamp.
-
-## Legacy ARM
-
-- [ ] Music behavior is unchanged from EnduranceTest9.
-- [ ] Z/X remain Practice Mode-only and functional.
-- [ ] Run 1.3 long enough to check whether the earlier random freeze repeats.
 
 ## Regression checks
 
-- [ ] x86 smoothness and Z/X unchanged.
-- [ ] Backups/login/online levels unchanged.
-- [ ] Version-isolated saves unchanged.
-- [ ] Mouse and pause button remain native/visible.
+- [ ] Practice Z/X remains functional and Practice Mode-only.
+- [ ] x86 smoothness and behavior remain unchanged.
+- [ ] Backups/login/online levels remain unchanged.
+- [ ] Version-isolated saves remain unchanged.
+- [ ] Mouse and pause-button behavior remains native.

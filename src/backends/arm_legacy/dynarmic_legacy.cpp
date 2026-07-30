@@ -2274,6 +2274,7 @@ public:
         const std::string executable_directory_string =
             executable_directory.empty() ? std::string(".") : executable_directory.string();
         audio_initialize(executable_directory_string.c_str());
+        audio_set_legacy_first_play_prime(1);
         audio_set_writable_directory(writable_path_.c_str());
         audio_set_apk_path(apk_path_.c_str());
         audio_initialized_ = true;
@@ -6593,7 +6594,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.5-endurancetest10 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.5-endurancetest11 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

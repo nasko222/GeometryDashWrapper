@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder55-0.9.5-endurancetest10"
+$BuilderRevision = "dynarmic-x64-builder56-0.9.5-endurancetest11"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {

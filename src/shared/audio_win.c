@@ -77,6 +77,8 @@ static volatile LONG g_effect_log_count;
 static int g_music_open;
 static int g_music_paused;
 static int g_music_loop;
+static int g_legacy_first_play_prime;
+static int g_music_needs_first_play_prime;
 static HANDLE g_output_meter_thread;
 static HANDLE g_output_meter_stop;
 static volatile LONG g_output_peak_bits;
@@ -778,6 +780,7 @@ static void close_music(void) {
     mci_command("close gd18_music", NULL, 0, 0);
     g_music_open = 0;
     g_music_paused = 0;
+    g_music_needs_first_play_prime = 0;
     g_music_path[0] = 0;
 }
 
@@ -820,6 +823,7 @@ static int open_music(const char *requested) {
     }
     snprintf(g_music_path, sizeof(g_music_path), "%s", path);
     g_music_open = 1;
+    g_music_needs_first_play_prime = 1;
     return 1;
 }
 
@@ -1115,6 +1119,46 @@ void audio_set_apk_path(const char *apk_path) {
     }
 }
 
+void audio_set_legacy_first_play_prime(int enabled) {
+    g_legacy_first_play_prime = enabled != 0;
+    if (!g_legacy_first_play_prime)
+        g_music_needs_first_play_prime = 0;
+}
+
+static void prime_legacy_level_music_first_play(void) {
+    char value[64] = {0};
+    char command[128];
+    char *end = NULL;
+    long restore_volume = 1000;
+    int queried_volume = 0;
+
+    if (!g_music_open || !g_legacy_first_play_prime ||
+        !g_music_needs_first_play_prime)
+        return;
+
+    if (mci_command("status gd18_music volume", value,
+                    sizeof(value), 0)) {
+        const long parsed = strtol(value, &end, 10);
+        if (end != value && parsed >= 0 && parsed <= 1000) {
+            restore_volume = parsed;
+            queried_volume = 1;
+        }
+    }
+
+    mci_command("setaudio gd18_music volume to 0", NULL, 0, 0);
+    mci_command("set gd18_music time format milliseconds", NULL, 0, 0);
+    if (mci_command("play gd18_music from 0 to 100 wait", NULL, 0, 0)) {
+        mci_command("stop gd18_music", NULL, 0, 0);
+        mci_command("seek gd18_music to start", NULL, 0, 0);
+    }
+    snprintf(command, sizeof(command),
+             "setaudio gd18_music volume to %ld", restore_volume);
+    mci_command(command, NULL, 0, 0);
+    g_music_needs_first_play_prime = 0;
+    runtime_log("Audio legacy first-play decoder prime: 100 ms muted, restore-volume=%ld source=%s",
+                restore_volume, queried_volume ? "mci-status" : "device-default");
+}
+
 void audio_shutdown(void) {
     if (g_output_meter_stop) SetEvent(g_output_meter_stop);
     if (g_output_meter_thread) {
@@ -1146,6 +1190,7 @@ void audio_preload_background(const char *path) {
 void audio_play_background(const char *path, int loop) {
     char command[96];
     if (!open_music(path)) return;
+    if (!loop) prime_legacy_level_music_first_play();
     mci_command("seek gd18_music to start", NULL, 0, 0);
     snprintf(command, sizeof(command), "play gd18_music%s",
              loop ? " repeat" : "");
