@@ -1,12 +1,11 @@
-# Building EnduranceTest9
+# Building EnduranceTest10
 
-Use `BUILD_ALL.cmd` from a Windows command prompt. The scripts download/use the
-same pinned CMake, Ninja, Zig and Dynarmic dependencies as EnduranceTest8.
+Run `BUILD_ALL.cmd` on Windows. The scripts fetch or reuse the pinned CMake,
+Ninja, Zig and Dynarmic dependencies and build the native launcher plus all
+wrapper backends.
 
-The archive intentionally contains no APK, extracted Android library, built EXE
-or DLL, Python dependency, `.git` directory or `.gitignore`. Place or drag an APK
-only after building, using `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd`.
+No APK, extracted Android library, built EXE/DLL, Python file or `.gitignore` is
+included in this source archive. Supply APKs through the normal launcher flow.
 
-The runtime changes are limited to the ARMv7 editor background/batch-node bridge
-and removal of the failed legacy audio experiment. The x86 backend source is
-unchanged from EnduranceTest8.
+The EnduranceTest10 changes are confined to the ARMv7 2.2-beta editor path and
+version metadata. The x86 backend is unchanged.

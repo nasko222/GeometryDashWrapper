@@ -1,22 +1,15 @@
-# Geometry Dash Wrapper 0.9.5 — EnduranceTest9
+# Geometry Dash Wrapper 0.9.5 — EnduranceTest10
 
-`endurancetest` is the cross-version stability branch. EnduranceTest9 is a
-focused correction based on `logs(10).zip` after BPM guidelines were confirmed
-working in EnduranceTest8.
+This source tree contains the unified Windows wrapper for legacy ARM, ARMv7
+2.2 beta, and native x86 Geometry Dash APKs.
 
-## Changes from EnduranceTest8
+EnduranceTest10 is a narrow 2.2 editor correction. It clamps community-expanded
+background/ground selectors to assets actually packaged by the selected beta and
+suppresses all three background-scrolling callsites only while the editor is
+active. Normal gameplay backgrounds remain on the game's original path.
 
-- anchors the selected 2.2 beta editor's three real background nodes at their
-  initial positions, while leaving gameplay background callsites untouched;
-- replaces the fragile nested guest `CCSpriteBatchNode::updateBlendFunc()` call
-  with an exact host reproduction of its four field accesses;
-- makes community background/ground entries with absent texture data fail
-  safely with standard alpha blending instead of crashing or freezing;
-- keeps the confirmed BPM setup path, selection rectangle, object lifecycle,
-  Z/X controls, x86 pacing, networking, backups and save isolation unchanged;
-- fully removes the failed legacy first-play volume-1000 experiment and adds no
-  new unverified audio behavior.
+Confirmed working behavior retained from earlier builds includes Practice Z/X,
+BPM guidelines, selection rectangles, online transport, isolated saves, native
+launch, dated logs, and the accepted x86 frame pacing.
 
-Nothing in this source archive is claimed Windows-runtime-confirmed until tested
-with the target APKs. See `ENDURANCETEST9.md` and
-`ENDURANCETEST9-VERIFICATION.txt`.
+Build with `BUILD_ALL.cmd`. APKs are intentionally not included.

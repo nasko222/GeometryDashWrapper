@@ -1443,6 +1443,32 @@ static void WriteV22ThumbCallThenImportThunk(
     env.MemoryWrite32(address + 20u, destination);
 }
 
+static void WriteV22ThumbConditionalImportThenCallThunk(
+    ProbeEnvironment& env, u32 address, u32 predicate_import, u32 original) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 conditional thunk address is not aligned");
+    /*
+     * Preserve the CCPoint pointer and layer, ask the host whether this is the
+     * active editor, and call the untouched guest function only when it is not.
+     * updateCameraBGArt returns void, so restoring r0/r1 before returning is
+     * harmless and keeps the caller ABI exact.
+     */
+    env.MemoryWrite16(address + 0u, 0xB503u);  // push {r0,r1,lr}
+    env.MemoryWrite16(address + 2u, 0x4B05u);  // ldr r3,[pc,#20] -> host
+    env.MemoryWrite16(address + 4u, 0x4798u);  // blx r3
+    env.MemoryWrite16(address + 6u, 0x2800u);  // cmp r0,#0
+    env.MemoryWrite16(address + 8u, 0xD103u);  // bne suppress/return
+    env.MemoryWrite16(address + 10u, 0x9800u); // ldr r0,[sp,#0]
+    env.MemoryWrite16(address + 12u, 0x9901u); // ldr r1,[sp,#4]
+    env.MemoryWrite16(address + 14u, 0x4B03u); // ldr r3,[pc,#12] -> original
+    env.MemoryWrite16(address + 16u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 18u, 0xBD03u); // pop {r0,r1,pc}
+    env.MemoryWrite16(address + 20u, 0xBF00u); // alignment
+    env.MemoryWrite16(address + 22u, 0xBF00u);
+    env.MemoryWrite32(address + 24u, predicate_import);
+    env.MemoryWrite32(address + 28u, original);
+}
+
 static std::vector<u32> FindThumbBlCallSites(const ElfRuntime& runtime,
                                              ProbeEnvironment& env,
                                              u32 target_address) {
@@ -2440,8 +2466,69 @@ struct V22VisualHookCounts {
     std::pair<std::size_t, std::size_t> play_visibility;
     std::pair<std::size_t, std::size_t> camera_background;
     std::pair<std::size_t, std::size_t> batch_blend;
+    u32 ground_asset_max = 0u;
+    u32 background_asset_max = 0u;
     bool exact_companion_editor = false;
 };
+
+static std::pair<u32, u32> PatchV22ArtAssetLimits(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    const SymbolRecord* load_ground = FindSymbol(
+        runtime, "_ZN11GameManager10loadGroundEi");
+    const SymbolRecord* get_ground = FindSymbol(
+        runtime, "_ZN11GameManager11getGTextureEi");
+    const SymbolRecord* load_background = FindSymbol(
+        runtime, "_ZN11GameManager14loadBackgroundEi");
+    const SymbolRecord* get_background = FindSymbol(
+        runtime, "_ZN11GameManager12getBGTextureEi");
+    if (!load_ground || !get_ground || !load_background || !get_background)
+        throw std::runtime_error(
+            "V22 art asset-limit symbols are unavailable");
+
+    /*
+     * This community beta exposes the later game's selector ranges (30 ground
+     * slots and 45 background slots), while its APK contains only 18 ground
+     * textures and 26 background textures.  Selecting an absent entry creates
+     * a SpriteBatchNode with a null texture.  Do not let that invalid object
+     * enter initWithTexture: clamp the beta's own load/get functions to the
+     * assets actually packaged in this APK.  Every patched halfword is checked
+     * first so a different binary layout fails closed instead of being edited.
+     */
+    struct LimitPatch {
+        const SymbolRecord* symbol;
+        u32 compare_offset;
+        u32 move_offset;
+        u16 expected_compare;
+        u16 expected_move;
+        u16 replacement_compare;
+        u16 replacement_move;
+    };
+    const std::array<LimitPatch, 4> patches{{
+        {load_ground,       8u, 12u, 0x291Eu, 0x211Eu, 0x2912u, 0x2112u},
+        {get_ground,        6u, 10u, 0x291Eu, 0x211Eu, 0x2912u, 0x2112u},
+        {load_background,   8u, 12u, 0x292Du, 0x212Du, 0x291Au, 0x211Au},
+        {get_background,    6u, 10u, 0x292Du, 0x212Du, 0x291Au, 0x211Au},
+    }};
+    for (const LimitPatch& patch : patches) {
+        const u32 begin = patch.symbol->address & ~1u;
+        if (!env.IsMapped(begin + patch.compare_offset, 2u) ||
+            !env.IsMapped(begin + patch.move_offset, 2u) ||
+            env.MemoryRead16(begin + patch.compare_offset) !=
+                patch.expected_compare ||
+            env.MemoryRead16(begin + patch.move_offset) !=
+                patch.expected_move)
+            throw std::runtime_error(
+                "V22 art asset-limit instruction validation failed");
+    }
+    for (const LimitPatch& patch : patches) {
+        const u32 begin = patch.symbol->address & ~1u;
+        env.MemoryWrite16(begin + patch.compare_offset,
+                          patch.replacement_compare);
+        env.MemoryWrite16(begin + patch.move_offset,
+                          patch.replacement_move);
+    }
+    return {18u, 26u};
+}
 
 static V22VisualHookCounts InstallV22SafeVisualHooks(
     ElfRuntime& runtime, ProbeEnvironment& env) {
@@ -2491,15 +2578,18 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN16LevelEditorLayer20levelSettingsUpdatedEv");
     const SymbolRecord* update_camera_background = FindSymbol(
         runtime, "_ZN15GJBaseGameLayer17updateCameraBGArtEN7cocos2d7CCPointE");
-    const SymbolRecord* level_editor_update = FindSymbol(
-        runtime, "_ZN16LevelEditorLayer12updateEditorEf");
     const SymbolRecord* batch_update_blend = FindSymbol(
         runtime, "_ZN7cocos2d17CCSpriteBatchNode15updateBlendFuncEv");
     const SymbolRecord* batch_init_texture = FindSymbol(
         runtime, "_ZN7cocos2d17CCSpriteBatchNode15initWithTextureEPNS_11CCTexture2DEj");
-    if (!editor_visibility || !play_visibility)
+    if (!editor_visibility || !play_visibility ||
+        !update_camera_background || !batch_update_blend ||
+        !batch_init_texture)
         throw std::runtime_error(
-            "V22 primary visibility symbols are unavailable");
+            "V22 primary visual symbols are unavailable");
+
+    const auto [ground_asset_max, background_asset_max] =
+        PatchV22ArtAssetLimits(runtime, env);
 
     std::pair<std::size_t, std::size_t> editor_visibility_counts{};
     bool exact_companion_editor = false;
@@ -2551,8 +2641,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             !sort_batchnode_children || !update_grid_layer ||
             !draw_grid_vtable || !draw_grid_music || !draw_grid_markers ||
             !level_settings_updated || !update_camera_background ||
-            !level_editor_update || !batch_update_blend ||
-            !batch_init_texture)
+            !batch_update_blend || !batch_init_texture)
             throw std::runtime_error(
                 "safe V22 host visual bridge symbols are unavailable");
 
@@ -2593,21 +2682,28 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
     }
 
     /*
-     * Do not redirect updateCameraBGArt globally: PlayLayer uses the same
-     * function and normal gameplay must keep scrolling. Patch only the single
-     * BL inside LevelEditorLayer::updateEditor. Likewise, the observed null
-     * updateBlendFunc crash comes from SpriteBatchNode::initWithTexture, so
-     * guard only that exact callsite instead of every batch-node invocation.
+     * updateCameraBGArt has three callers in this exact beta: the direct editor
+     * update plus the shared new/old camera paths used while editor playtesting.
+     * EnduranceTest8 patched only the direct caller, which is why the wrapped
+     * black background kept moving during playtest and disappeared on Stop.
+     * Route all three calls through the host.  The host suppresses them only
+     * when `this` is the active LevelEditorLayer and invokes the untouched
+     * original function for normal PlayLayer gameplay.
+     *
+     * The blend replacement remains limited to the one call inside
+     * SpriteBatchNode::initWithTexture.  The asset-limit patch above prevents
+     * missing community art from reaching that constructor; this hook remains
+     * as a defensive exact implementation for valid textures.
      */
     const u32 camera_background_host = EnsureImport(
         runtime, env, "__dynarmic_v22_update_camera_background");
     const std::vector<u32> camera_background_calls =
-        FindThumbBlCallSitesInRange(
-            env, level_editor_update->address, level_editor_update->size,
-            update_camera_background->address);
+        FindThumbBlCallSites(
+            runtime, env, update_camera_background->address);
     EnsureV22ThunkPage(env);
-    WriteV22ThumbImportThunk(
-        env, kV22ThunkBase + 0x80u, camera_background_host);
+    WriteV22ThumbConditionalImportThenCallThunk(
+        env, kV22ThunkBase + 0x80u, camera_background_host,
+        update_camera_background->address);
     for (u32 call : camera_background_calls)
         WriteThumbBl(env, call, kV22ThunkBase + 0x80u);
     const std::pair<std::size_t, std::size_t> camera_background_counts{
@@ -2619,15 +2715,15 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         env, batch_init_texture->address, batch_init_texture->size,
         batch_update_blend->address);
     WriteV22ThumbImportThunk(
-        env, kV22ThunkBase + 0x88u, batch_blend_host);
+        env, kV22ThunkBase + 0xA0u, batch_blend_host);
     for (u32 call : batch_blend_calls)
-        WriteThumbBl(env, call, kV22ThunkBase + 0x88u);
+        WriteThumbBl(env, call, kV22ThunkBase + 0xA0u);
     const std::pair<std::size_t, std::size_t> batch_blend_counts{
         0u, batch_blend_calls.size()};
-    if (camera_background_calls.size() != 1u ||
+    if (camera_background_calls.size() != 3u ||
         batch_blend_calls.size() != 1u)
         throw std::runtime_error(
-            "V22 editor background/blend exact callsites were not unique");
+            "V22 background/blend exact callsite validation failed");
 
     const u32 play_host = EnsureImport(
         runtime, env, "__dynarmic_v22_play_visibility");
@@ -2648,6 +2744,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
     return V22VisualHookCounts{
         editor_visibility_counts, play_visibility_counts,
         camera_background_counts, batch_blend_counts,
+        ground_asset_max, background_asset_max,
         exact_companion_editor};
 }
 
@@ -3799,11 +3896,6 @@ public:
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
             v22_editor_level_settings_refreshed_ = false;
-            v22_editor_background_frozen_logged_ = false;
-            v22_editor_background_nodes_.fill(0u);
-            v22_editor_background_x_.fill(0u);
-            v22_editor_background_y_.fill(0u);
-            v22_editor_background_restores_ = 0u;
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
@@ -6737,96 +6829,23 @@ private:
         return 0u;
     }
 
-    bool AnchorV22EditorBackgroundNodes(u32 editor_layer) {
-        /*
-         * EnduranceTest8 removed the audited updateCameraBGArt call, but the
-         * beta's earlier editor-update stages can still move the three actual
-         * background nodes.  The Windows screenshot shows the result wrapping
-         * exactly like a tiled background while the emulator keeps it fixed.
-         *
-         * Capture each node's first stable editor position and restore it at
-         * the exact point where updateCameraBGArt would have run.  A texture
-         * change may replace a node; a new pointer is therefore recaptured
-         * instead of inheriting stale coordinates.  This is editor-only and
-         * does not touch the separate PlayLayer/gameplay callsites.
-         */
-        static constexpr std::array<u32, 3> kBackgroundNodeFields{
-            0x498u, 0x49Cu, 0x4A0u};
-        static constexpr u32 kPositionOffset = 0x44u;
-        static constexpr u32 kTransformDirtyOffset = 0xE8u;
-        static constexpr u32 kInverseDirtyOffset = 0xDEu;
-
-        bool captured_any = false;
-        bool restored_any = false;
-        for (std::size_t index = 0; index < kBackgroundNodeFields.size(); ++index) {
-            const u32 field = kBackgroundNodeFields[index];
-            u32 node = 0u;
-            if (env_.IsMapped(editor_layer + field, 4u))
-                node = env_.MemoryRead32(editor_layer + field);
-
-            if (!LooksLikeGuestObject(runtime_, env_, node) ||
-                !env_.IsMapped(node + kPositionOffset, 8u) ||
-                !env_.IsMapped(node + kInverseDirtyOffset, 1u) ||
-                !env_.IsMapped(node + kTransformDirtyOffset, 1u)) {
-                v22_editor_background_nodes_[index] = 0u;
-                continue;
+    bool HostV22UpdateCameraBackground(
+        u32 layer, u32 point_address, u32& suppress) {
+        (void)point_address;
+        suppress = 0u;
+        if (layer && layer == v22_editor_visual_layer_ &&
+            IsV22EditorSceneActive()) {
+            suppress = 1u;
+            ++v22_editor_background_updates_suppressed_;
+            if (!v22_editor_background_suppression_logged_) {
+                v22_editor_background_suppression_logged_ = true;
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_UPDATE_SUPPRESSED"
+                     << " editor=0x" << std::hex << layer << std::dec
+                     << " callsites=3 policy=editor-only-gameplay-original\n";
+                log_.flush();
             }
-
-            if (v22_editor_background_nodes_[index] != node) {
-                v22_editor_background_nodes_[index] = node;
-                v22_editor_background_x_[index] =
-                    env_.MemoryRead32(node + kPositionOffset);
-                v22_editor_background_y_[index] =
-                    env_.MemoryRead32(node + kPositionOffset + 4u);
-                captured_any = true;
-                continue;
-            }
-
-            const u32 current_x = env_.MemoryRead32(node + kPositionOffset);
-            const u32 current_y = env_.MemoryRead32(node + kPositionOffset + 4u);
-            if (current_x == v22_editor_background_x_[index] &&
-                current_y == v22_editor_background_y_[index])
-                continue;
-
-            env_.MemoryWrite32(node + kPositionOffset,
-                               v22_editor_background_x_[index]);
-            env_.MemoryWrite32(node + kPositionOffset + 4u,
-                               v22_editor_background_y_[index]);
-            env_.MemoryWrite8(node + kTransformDirtyOffset, 1u);
-            env_.MemoryWrite8(node + kInverseDirtyOffset, 1u);
-            ++v22_editor_background_restores_;
-            restored_any = true;
-        }
-
-        if (captured_any) {
-            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_ANCHOR_CAPTURE"
-                 << " editor=0x" << std::hex << editor_layer << std::dec
-                 << " nodes=";
-            for (std::size_t index = 0; index < v22_editor_background_nodes_.size();
-                 ++index) {
-                if (index) log_ << ',';
-                log_ << "0x" << std::hex << v22_editor_background_nodes_[index]
-                     << std::dec;
-            }
-            log_ << " policy=editor-node-position-anchor\n";
-            log_.flush();
-        }
-        if (restored_any &&
-            (!v22_editor_background_frozen_logged_ ||
-             (v22_editor_background_restores_ % 300u) == 0u)) {
-            v22_editor_background_frozen_logged_ = true;
-            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_POSITION_RESTORED"
-                 << " editor=0x" << std::hex << editor_layer << std::dec
-                 << " count=" << v22_editor_background_restores_
-                 << " policy=editor-only-gameplay-untouched\n";
-            log_.flush();
         }
         return true;
-    }
-
-    bool HostV22UpdateCameraBackground(u32 layer, u32 point_address) {
-        (void)point_address;
-        return AnchorV22EditorBackgroundNodes(layer);
     }
 
     bool HostV22BatchUpdateBlend(u32 batch_node) {
@@ -6842,8 +6861,9 @@ private:
          * entry, then the nested guest call loses its callee-saved object
          * register and faults at address 0x54.  Reproduce these four accesses
          * directly on the host instead of invoking the fragile nested helper.
-         * Missing community background/ground assets safely retain the normal
-         * non-PMA defaults rather than crashing or freezing.
+         * Invalid community asset indices are clamped before construction.
+         * A missing texture here is therefore only a defensive diagnostic; it
+         * must not be treated as a complete recovery from a null constructor.
          */
         static constexpr u32 kTextureAtlasOffset = 0x108u;
         static constexpr u32 kBlendSourceOffset = 0x10Cu;
@@ -6859,7 +6879,7 @@ private:
             !env_.IsMapped(batch_node + kTextureAtlasOffset, 4u) ||
             !env_.IsMapped(batch_node + kBlendSourceOffset, 8u)) {
             ++v22_missing_batch_texture_fallbacks_;
-            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_SAFE_FALLBACK count="
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE count="
                  << v22_missing_batch_texture_fallbacks_
                  << " batch=0x" << std::hex << batch_node << std::dec
                  << " reason=invalid-batch action=skip\n";
@@ -6886,12 +6906,12 @@ private:
 
         if (!texture_valid) {
             ++v22_missing_batch_texture_fallbacks_;
-            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_SAFE_FALLBACK count="
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE count="
                  << v22_missing_batch_texture_fallbacks_
                  << " batch=0x" << std::hex << batch_node
                  << " atlas=0x" << atlas
                  << " texture=0x" << texture << std::dec
-                 << " reason=missing-texture blend=src-alpha/one-minus-src-alpha\n";
+                 << " reason=unexpected-after-asset-clamp blend=src-alpha/one-minus-src-alpha\n";
             log_.flush();
         } else if (v22_batch_blend_repairs_ == 1u) {
             log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_HOST_EXACT"
@@ -6916,11 +6936,7 @@ private:
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
             v22_editor_level_settings_refreshed_ = false;
-            v22_editor_background_frozen_logged_ = false;
-            v22_editor_background_nodes_.fill(0u);
-            v22_editor_background_x_.fill(0u);
-            v22_editor_background_y_.fill(0u);
-            v22_editor_background_restores_ = 0u;
+            v22_editor_background_suppression_logged_ = false;
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
@@ -10785,8 +10801,9 @@ private:
             return finish_hot(0u);
         }
         if (name == "__dynarmic_v22_update_camera_background") {
-            if (!HostV22UpdateCameraBackground(r0, r1)) return false;
-            return finish_hot(0u);
+            u32 suppress = 0u;
+            if (!HostV22UpdateCameraBackground(r0, r1, suppress)) return false;
+            return finish_hot(suppress);
         }
         if (name == "__dynarmic_v22_batch_update_blend") {
             if (!HostV22BatchUpdateBlend(r0)) return false;
@@ -11616,11 +11633,8 @@ private:
     u64 v22_editor_overlay_frames_=0;
     bool v22_editor_overlay_playtest_active_=false;
     bool v22_editor_level_settings_refreshed_=false;
-    bool v22_editor_background_frozen_logged_=false;
-    std::array<u32,3> v22_editor_background_nodes_{};
-    std::array<u32,3> v22_editor_background_x_{};
-    std::array<u32,3> v22_editor_background_y_{};
-    u64 v22_editor_background_restores_=0;
+    bool v22_editor_background_suppression_logged_=false;
+    u64 v22_editor_background_updates_suppressed_=0;
     u64 v22_batch_blend_repairs_=0;
     u64 v22_missing_batch_texture_fallbacks_=0;
     std::unordered_set<u32> v22_editor_visualized_objects_;
@@ -12037,7 +12051,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest9 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest10 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12704,7 +12718,7 @@ int main(int argc,char** argv) {
                     std::string(
                         visual_hooks.exact_companion_editor
                             ? "exact-companion"
-                            : "host-camera-cull+client-array+background-anchor") +
+                            : "host-camera-cull+client-array+background-suppression") +
                     " visibility-pointers=" +
                     std::to_string(visual_hooks.editor_visibility.first) +
                     " visibility-calls=" +
@@ -12717,6 +12731,12 @@ int main(int argc,char** argv) {
                     std::to_string(visual_hooks.batch_blend.first) +
                     " blend-calls=" +
                     std::to_string(visual_hooks.batch_blend.second));
+                emit(
+                    "RESULT: DYNARMIC_V22_ART_ASSET_LIMITS ground=" +
+                    std::to_string(visual_hooks.ground_asset_max) +
+                    " background=" +
+                    std::to_string(visual_hooks.background_asset_max) +
+                    " policy=apk-native-assets-only");
                 emit(
                     "RESULT: DYNARMIC_V22_PLATFORMER_SAFE_VISUAL_HOOK_READY "
                     "count=1 touch-hooks=disabled companion-gdps=disabled "

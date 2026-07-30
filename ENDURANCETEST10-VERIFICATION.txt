@@ -1,0 +1,160 @@
+Geometry Dash Wrapper 0.9.5-endurancetest10
+Verification and uploaded-log diagnosis
+
+RUNTIME STATUS
+--------------
+This source was not executed on Windows in this environment. The selected-APK
+binary audit, C++ syntax checks and package reconstruction tests passed. The new
+asset clamps and editor-only background suppression still require the user's
+Windows test before they can be called confirmed runtime fixes.
+
+UPLOADED LOG DIAGNOSIS
+----------------------
+- The EnduranceTest9 run retained the working BPM setup path.
+- The old background anchor captured only the primary node and restored it once.
+  The user observed that the black region continued while playtesting and
+  disappeared on Stop.
+- Exact selected-APK disassembly contains three calls to updateCameraBGArt: one
+  in LevelEditorLayer::updateEditor and one in each shared new/old camera path.
+  EnduranceTest8/9 redirected only the direct editor call.
+- The failing invalid-ground run ends immediately after the host reports a null
+  texture. EnduranceTest9 wrote fallback blend fields but then allowed
+  SpriteBatchNode::initWithTexture to continue with the invalid texture.
+- The APK contains ground art 1-18 and background art 1-26, while the community
+  binary's load/get routines clamp to 30 and 45 respectively.
+
+ENDURANCETEST10 CHANGES
+-----------------------
+- Validates and patches GameManager::loadGround/getGTexture from max 30 to 18.
+- Validates and patches GameManager::loadBackground/getBGTexture from max 45 to 26.
+- Invalid community selector entries therefore resolve to the last packaged
+  texture before SpriteBatchNode construction instead of producing null art.
+- Redirects all three exact updateCameraBGArt callsites through a guest-side
+  conditional thunk. The host suppresses the call only when `this` is the
+  active LevelEditorLayer. Normal PlayLayer gameplay executes the untouched
+  original function directly, without a nested-emulation call.
+- Removes the ineffective background-node position anchor.
+- Retains the defensive exact host updateBlendFunc implementation, but no longer
+  claims a missing texture can be fully recovered after construction begins.
+
+UNCHANGED
+---------
+- Working BPM levelSettingsUpdated path and per-frame song guide.
+- Swipe-selection/client-array VBO correction and editor object culling.
+- Practice Z/X implementation.
+- Complete x86 backend and accepted x86 frame pacing.
+- Shared audio source and legacy music behavior from EnduranceTest9.
+- Networking, backups, native launch and version-isolated saves.
+
+SOURCE/STATIC AUDIT
+-------------------
+01. PASS: EnduranceTest9 source available
+02. PASS: EnduranceTest10 source available
+03. PASS: exact selected 2.2 SO available [c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c]
+04. PASS: exact selected APK available [d9e6b2083ef94a2369e6d8dafb49cf1ba98c1aad102966d0d073c3b235be7364]
+05. PASS: uploaded EnduranceTest9 log available
+06. PASS: uploaded run info available
+07. PASS: ARMv7 C++20 syntax
+08. PASS: legacy ARM C++20 syntax
+09. PASS: BPM path remained successful
+10. PASS: old anchor captured only primary node
+11. PASS: old anchor restored only once [1]
+12. PASS: missing texture fallback reached
+13. PASS: log terminates directly after fallback
+14. PASS: run exited abnormally
+15. PASS: APK grounds are exactly 1 through 18 [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]]
+16. PASS: APK backgrounds are exactly 1 through 26 [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]]
+17. PASS: exact APK symbol _ZN15GJBaseGameLayer17updateCameraBGArtEN7cocos2d7CCPointE
+18. PASS: exact APK symbol _ZN16LevelEditorLayer12updateEditorEf
+19. PASS: exact APK symbol _ZN15GJBaseGameLayer12updateCameraEf
+20. PASS: exact APK symbol _ZN15GJBaseGameLayer15updateCameraOldEf
+21. PASS: exact APK symbol _ZN11GameManager10loadGroundEi
+22. PASS: exact APK symbol _ZN11GameManager11getGTextureEi
+23. PASS: exact APK symbol _ZN11GameManager14loadBackgroundEi
+24. PASS: exact APK symbol _ZN11GameManager12getBGTextureEi
+25. PASS: exact APK symbol _ZN7cocos2d17CCSpriteBatchNode15updateBlendFuncEv
+26. PASS: exact APK symbol _ZN7cocos2d17CCSpriteBatchNode15initWithTextureEPNS_11CCTexture2DEj
+27. PASS: exactly three updateCameraBGArt callsites [0x2c7056,0x383ad0,0x386d02]
+28. PASS: one background call in _ZN16LevelEditorLayer12updateEditorEf [0x2c7056]
+29. PASS: one background call in _ZN15GJBaseGameLayer12updateCameraEf [0x383ad0]
+30. PASS: one background call in _ZN15GJBaseGameLayer15updateCameraOldEf [0x386d02]
+31. PASS: one updateBlendFunc call in initWithTexture [0x4a049a]
+32. PASS: exact instruction _ZN11GameManager10loadGroundEi+0x8 [0x291e]
+33. PASS: exact instruction _ZN11GameManager10loadGroundEi+0xc [0x211e]
+34. PASS: exact instruction _ZN11GameManager11getGTextureEi+0x6 [0x291e]
+35. PASS: exact instruction _ZN11GameManager11getGTextureEi+0xa [0x211e]
+36. PASS: exact instruction _ZN11GameManager14loadBackgroundEi+0x8 [0x292d]
+37. PASS: exact instruction _ZN11GameManager14loadBackgroundEi+0xc [0x212d]
+38. PASS: exact instruction _ZN11GameManager12getBGTextureEi+0x6 [0x292d]
+39. PASS: exact instruction _ZN11GameManager12getBGTextureEi+0xa [0x212d]
+40. PASS: asset clamp helper exists
+41. PASS: asset clamp searches _ZN11GameManager10loadGroundEi
+42. PASS: asset clamp searches _ZN11GameManager11getGTextureEi
+43. PASS: asset clamp searches _ZN11GameManager14loadBackgroundEi
+44. PASS: asset clamp searches _ZN11GameManager12getBGTextureEi
+45. PASS: asset clamp contains 0x291Eu
+46. PASS: asset clamp contains 0x211Eu
+47. PASS: asset clamp contains 0x292Du
+48. PASS: asset clamp contains 0x212Du
+49. PASS: asset clamp contains 0x2912u
+50. PASS: asset clamp contains 0x2112u
+51. PASS: asset clamp contains 0x291Au
+52. PASS: asset clamp contains 0x211Au
+53. PASS: asset clamp validates before writes
+54. PASS: asset clamp returns exact maxima
+55. PASS: asset clamp called during visual install
+56. PASS: startup reports exact asset limits
+57. PASS: conditional background thunk exists
+58. PASS: conditional thunk contains 0xB503u
+59. PASS: conditional thunk contains 0x4B05u
+60. PASS: conditional thunk contains 0x4798u
+61. PASS: conditional thunk contains 0x2800u
+62. PASS: conditional thunk contains 0xD103u
+63. PASS: conditional thunk contains 0x9800u
+64. PASS: conditional thunk contains 0x9901u
+65. PASS: conditional thunk contains 0x4B03u
+66. PASS: conditional thunk contains 0xBD03u
+67. PASS: conditional thunk has separate host/original literals
+68. PASS: global background callsite scan used
+69. PASS: three callsites required
+70. PASS: background thunk does not overlap batch thunk
+71. PASS: host suppression function exists
+72. PASS: host suppresses only current editor
+73. PASS: host returns predicate not nested guest call
+74. PASS: normal gameplay path stays original in thunk
+75. PASS: new suppression diagnostic exists
+76. PASS: old background anchor removed
+77. PASS: old anchor state removed
+78. PASS: host exact blend retained
+79. PASS: host exact blend still avoids nested helper
+80. PASS: missing texture diagnostic renamed
+81. PASS: batch hook remains one exact init callsite
+82. PASS: BPM levelSettingsUpdated retained
+83. PASS: song guide retained
+84. PASS: no destructive updateGridLayer call
+85. PASS: client-array VBO repair retained
+86. PASS: camera culling retained
+87. PASS: ARMv7 Practice Z/X unchanged
+88. PASS: complete x86 backend unchanged [b256ea220bba2d3d3f7c243b94009dca37e9705fa6f370391f1e2bf103c54c27]
+89. PASS: x86 pacing unchanged
+90. PASS: shared audio source unchanged [3011d39dc5566ef1e1579d3228719f265499cc99e730245040bca04ad247b0cb]
+91. PASS: legacy source behavior unchanged except version
+92. PASS: version file
+93. PASS: branch file
+94. PASS: build info version
+95. PASS: launcher version
+96. PASS: builder revision
+97. PASS: EnduranceTest10 docs present
+98. PASS: superseded EnduranceTest9 docs removed
+99. PASS: source policy clean
+Passed 99/99 focused audits.
+
+PACKAGE INTEGRITY
+-----------------
+The release script independently verifies that:
+- the complete source ZIP extracts to the exact EnduranceTest10 tree;
+- the EnduranceTest9-to-EnduranceTest10 hotfix plus documented deletions rebuilds
+  the exact EnduranceTest10 tree;
+- the textual patch applies to EnduranceTest9 and rebuilds the exact tree;
+- the source tree includes no APK, Android .so, built EXE/DLL, Python file,
+  .git directory or .gitignore.
