@@ -1,7 +1,7 @@
 #ifndef GD_BUILD_INFO_H
 #define GD_BUILD_INFO_H
 
-#define GD_WRAPPER_VERSION "0.9.5-endurancetest7"
+#define GD_WRAPPER_VERSION "0.9.5-endurancetest8"
 #define GD_WRAPPER_BRANCH "endurancetest"
 #define GD_X86_BACKEND_NAME "x86-native/0.9.3-alpha3"
 #define GD_ARM_LEGACY_BACKEND_NAME "arm-dynarmic/dynarmictest14-fix1"

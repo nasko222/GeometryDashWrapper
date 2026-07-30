@@ -1,0 +1,94 @@
+Geometry Dash Wrapper 0.9.5-endurancetest8 verification
+
+RUNTIME STATUS
+--------------
+Not executed on Windows in this environment. The following are source/static
+checks and diagnoses from the user's uploaded 2026-07-30 logs and screenshot.
+The editor background freeze, BPM guides, ground-texture crash guard and legacy
+first-play loudness require the user's target-PC/APK test.
+
+UPLOADED LOG DIAGNOSIS
+----------------------
+1. Selected 2.2 beta ground-texture crash
+- The failing nativeTouchesEnd stops at
+  cocos2d::CCSpriteBatchNode::updateBlendFunc()+0x23.
+- R0 (the C++ this pointer) is zero and the faulting access is address 0x54.
+- EnduranceTest8 patches only the unique updateBlendFunc call inside
+  CCSpriteBatchNode::initWithTexture. A null this is skipped; every non-null call
+  executes the original guest function.
+
+2. Moving right-side black region
+- The screenshot and user reproduction show a region that moves left, exits,
+  wraps/restarts, and resets when the editor background texture changes.
+- The exact beta has one updateCameraBGArt call inside
+  LevelEditorLayer::updateEditor, at ELF address 0x2C7056.
+- EnduranceTest8 replaces only this editor call with a no-op. The separate
+  GJBaseGameLayer/PlayLayer updateCameraBGArt callsites remain untouched, so
+  normal gameplay background movement is preserved.
+
+3. Missing BPM guides
+- EnduranceTest7 successfully logged its direct updateTimeMarkers call, but no
+  guides appeared.
+- Exact disassembly shows updateTimeMarkers only reparses the marker string
+  already held by DrawGridLayer.
+- LevelEditorLayer::levelSettingsUpdated retrieves the current song marker
+  string from LevelSettingsObject/LevelTools and calls loadTimeMarkers.
+- EnduranceTest8 runs that real setup path once after the first complete editor
+  frame and never performs a periodic/destructive marker rebuild.
+
+4. Legacy music loudness
+- All previous frame guards and play/resume/seek volume reasserts remain absent.
+- Legacy ARM alone enables an opposite experiment: a newly-opened, non-looping
+  level track is set to MCI volume 1000 immediately before its first play.
+- Menu loops and x86/ARMv7 are unaffected. This aims to make attempt 1 match the
+  already-louder attempt 2+ path.
+
+5. Geometry Dash 1.3 freeze
+- One uploaded 1.3 log ends without a guest fault or diagnostic crash point.
+- A second 1.3 run continues for thousands of frames and exits normally.
+- No unrelated 1.3 change is made in this focused build.
+
+FOCUSED AUDIT
+-------------
+49/49 checks passed.
+
+PASS: ARMv7 C++20 syntax with lightweight Dynarmic interface stubs.
+PASS: legacy ARM C++20 syntax with lightweight Dynarmic interface stubs.
+PASS: exact selected APK symbols verified.
+PASS: unique LevelEditorLayer updateCameraBGArt callsite verified at 0x2C7056.
+PASS: unique initWithTexture updateBlendFunc callsite verified at 0x4A049A.
+PASS: editor background patch is callsite-specific, not global.
+PASS: BPM path uses LevelEditorLayer::levelSettingsUpdated once per session.
+PASS: direct host updateTimeMarkers invocation removed.
+PASS: null batch guard skips only this==0 and preserves valid original calls.
+PASS: EnduranceTest6/7 client-array and object-culling work retained.
+PASS: no host updateGridLayer call.
+PASS: no old viewport/scissor editor experiment.
+PASS: legacy-only first-play volume policy; menu loops excluded.
+PASS: previous volume maintenance/reassert experiments absent.
+PASS: x86 backend tree byte-for-byte unchanged.
+PASS: x86 pace_x86_frame unchanged
+      SHA256 386204233ba951a16a59f5f66323ff1ed3464d9803c78ba6069529d0d6f923b6.
+PASS: ARMv7 and legacy Z/X checkpoint implementations unchanged.
+PASS: version/build/launcher strings updated to EnduranceTest8.
+PASS: source policy clean: no APK, SO, EXE, DLL, Python, .git or .gitignore.
+
+EXPECTED NEW DIAGNOSTICS
+------------------------
+RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_FROZEN ...
+RESULT: DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH mode=level-settings-updated ...
+RESULT: DYNARMIC_V22_NULL_BATCH_BLEND_GUARD ...
+Audio legacy first-play loudness: <track> volume=1000
+
+LIMITATIONS
+-----------
+- No complete Windows executable was built or run here.
+- The user's exact APK and Windows runtime are required to confirm behavior.
+- EnduranceTest8 does not claim the black region, BPM guides, ground texture
+  crash or legacy volume issue fixed until that test succeeds.
+
+PACKAGE VERIFICATION
+--------------------
+PASS: complete source ZIP extracted tree matches the source tree.
+PASS: EnduranceTest7 + hotfix overlay reconstructs the source tree.
+PASS: EnduranceTest7 + textual patch (`patch -p1`) reconstructs the source tree.

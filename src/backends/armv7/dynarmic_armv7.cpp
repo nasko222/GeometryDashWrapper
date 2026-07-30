@@ -1181,6 +1181,8 @@ struct ElfRuntime {
     u32 v22_draw_grid_vtable = 0;
     u32 v22_draw_grid_update_music_guide_time = 0;
     u32 v22_draw_grid_update_time_markers = 0;
+    u32 v22_level_editor_level_settings_updated = 0;
+    u32 v22_ccsprite_batch_update_blend = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
@@ -2437,6 +2439,8 @@ static bool HasCompatibleV22CompanionEditorInitializer(
 struct V22VisualHookCounts {
     std::pair<std::size_t, std::size_t> editor_visibility;
     std::pair<std::size_t, std::size_t> play_visibility;
+    std::pair<std::size_t, std::size_t> camera_background;
+    std::pair<std::size_t, std::size_t> batch_blend;
     bool exact_companion_editor = false;
 };
 
@@ -2484,6 +2488,16 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN13DrawGridLayer20updateMusicGuideTimeEf");
     const SymbolRecord* draw_grid_markers = FindSymbol(
         runtime, "_ZN13DrawGridLayer17updateTimeMarkersEv");
+    const SymbolRecord* level_settings_updated = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer20levelSettingsUpdatedEv");
+    const SymbolRecord* update_camera_background = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer17updateCameraBGArtEN7cocos2d7CCPointE");
+    const SymbolRecord* level_editor_update = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer12updateEditorEf");
+    const SymbolRecord* batch_update_blend = FindSymbol(
+        runtime, "_ZN7cocos2d17CCSpriteBatchNode15updateBlendFuncEv");
+    const SymbolRecord* batch_init_texture = FindSymbol(
+        runtime, "_ZN7cocos2d17CCSpriteBatchNode15initWithTextureEPNS_11CCTexture2DEj");
     if (!editor_visibility || !play_visibility)
         throw std::runtime_error(
             "V22 primary visibility symbols are unavailable");
@@ -2536,7 +2550,10 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             !pre_update_visibility || !update_object_colors || !add_object ||
             !remove_all_objects || !process_area_visual_actions ||
             !sort_batchnode_children || !update_grid_layer ||
-            !draw_grid_vtable || !draw_grid_music || !draw_grid_markers)
+            !draw_grid_vtable || !draw_grid_music || !draw_grid_markers ||
+            !level_settings_updated || !update_camera_background ||
+            !level_editor_update || !batch_update_blend ||
+            !batch_init_texture)
             throw std::runtime_error(
                 "safe V22 host visual bridge symbols are unavailable");
 
@@ -2566,6 +2583,9 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime.v22_draw_grid_vtable = draw_grid_vtable->address;
         runtime.v22_draw_grid_update_music_guide_time = draw_grid_music->address;
         runtime.v22_draw_grid_update_time_markers = draw_grid_markers->address;
+        runtime.v22_level_editor_level_settings_updated =
+            level_settings_updated->address;
+        runtime.v22_ccsprite_batch_update_blend = batch_update_blend->address;
 
         const u32 editor_host = EnsureImport(
             runtime, env, "__dynarmic_v22_editor_visibility");
@@ -2573,6 +2593,43 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             runtime, env, *editor_visibility, editor_host,
             kV22ThunkBase + 0x40u);
     }
+
+    /*
+     * Do not redirect updateCameraBGArt globally: PlayLayer uses the same
+     * function and normal gameplay must keep scrolling. Patch only the single
+     * BL inside LevelEditorLayer::updateEditor. Likewise, the observed null
+     * updateBlendFunc crash comes from SpriteBatchNode::initWithTexture, so
+     * guard only that exact callsite instead of every batch-node invocation.
+     */
+    const u32 camera_background_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_update_camera_background");
+    const std::vector<u32> camera_background_calls =
+        FindThumbBlCallSitesInRange(
+            env, level_editor_update->address, level_editor_update->size,
+            update_camera_background->address);
+    EnsureV22ThunkPage(env);
+    WriteV22ThumbImportThunk(
+        env, kV22ThunkBase + 0x80u, camera_background_host);
+    for (u32 call : camera_background_calls)
+        WriteThumbBl(env, call, kV22ThunkBase + 0x80u);
+    const std::pair<std::size_t, std::size_t> camera_background_counts{
+        0u, camera_background_calls.size()};
+
+    const u32 batch_blend_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_batch_update_blend");
+    const std::vector<u32> batch_blend_calls = FindThumbBlCallSitesInRange(
+        env, batch_init_texture->address, batch_init_texture->size,
+        batch_update_blend->address);
+    WriteV22ThumbImportThunk(
+        env, kV22ThunkBase + 0x88u, batch_blend_host);
+    for (u32 call : batch_blend_calls)
+        WriteThumbBl(env, call, kV22ThunkBase + 0x88u);
+    const std::pair<std::size_t, std::size_t> batch_blend_counts{
+        0u, batch_blend_calls.size()};
+    if (camera_background_calls.size() != 1u ||
+        batch_blend_calls.size() != 1u)
+        throw std::runtime_error(
+            "V22 editor background/blend exact callsites were not unique");
 
     const u32 play_host = EnsureImport(
         runtime, env, "__dynarmic_v22_play_visibility");
@@ -2592,6 +2649,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             "safe V22 visual hooks did not find primary references");
     return V22VisualHookCounts{
         editor_visibility_counts, play_visibility_counts,
+        camera_background_counts, batch_blend_counts,
         exact_companion_editor};
 }
 
@@ -3742,6 +3800,8 @@ public:
         if (!IsV22EditorSceneActive()) {
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
+            v22_editor_level_settings_refreshed_ = false;
+            v22_editor_background_frozen_logged_ = false;
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
@@ -3767,23 +3827,27 @@ public:
         }
 
         /*
-         * The beta itself rebuilds markers when the editor initializes and
-         * immediately before playback.  EnduranceTest3 proved that one initial
-         * call makes the BPM guides appear; its regression came from repeating
-         * this destructive rebuild every 60 frames.  Rebuild exactly once for
-         * each newly-created editor layer.  The session counter is reset by the
-         * editor-create and visibility-entry paths, so reopening the editor gets
-         * one fresh rebuild without erasing markers during normal editing.
+         * updateTimeMarkers() merely reparses the string already stored on the
+         * DrawGridLayer. In this Android beta that string is still empty when
+         * the wrapper first sees the grid, so calling it directly can never
+         * create BPM guides. LevelEditorLayer::levelSettingsUpdated() is the
+         * game's real setup path: it obtains the current song marker string
+         * from LevelSettingsObject/LevelTools and then calls loadTimeMarkers.
+         * Run it once, after the first complete editor frame, and never rebuild
+         * markers periodically while the user edits.
          */
-        if (draw_grid && runtime_.v22_draw_grid_update_time_markers &&
-            v22_editor_overlay_frames_ == 1u) {
-            if (!RunFunction(runtime_.v22_draw_grid_update_time_markers,
-                             {draw_grid}, nullptr,
-                             "DrawGridLayer::updateTimeMarkers session-once",
+        if (draw_grid && runtime_.v22_level_editor_level_settings_updated &&
+            !v22_editor_level_settings_refreshed_ &&
+            v22_editor_overlay_frames_ >= 2u) {
+            if (!RunFunction(runtime_.v22_level_editor_level_settings_updated,
+                             {editor}, nullptr,
+                             "LevelEditorLayer::levelSettingsUpdated session-once",
                              0u, std::chrono::milliseconds(1000)))
                 return false;
+            v22_editor_level_settings_refreshed_ = true;
             log_ << "RESULT: DYNARMIC_V22_EDITOR_TIME_MARKERS_REFRESH "
-                 << "mode=session-once frame=1\n";
+                 << "mode=level-settings-updated frame="
+                 << v22_editor_overlay_frames_ << '\n';
             log_.flush();
         }
 
@@ -6671,6 +6735,47 @@ private:
         return 0u;
     }
 
+    bool HostV22UpdateCameraBackground(u32 layer, u32 point_address) {
+        /*
+         * This import is reached only from the audited BL inside
+         * LevelEditorLayer::updateEditor. The right-side "void" moves, wraps at
+         * the left edge and resets when the background texture changes, exactly
+         * matching updateCameraBGArt. Suppress that editor call completely;
+         * PlayLayer's separate callsites remain unmodified.
+         */
+        if (!v22_editor_background_frozen_logged_) {
+            v22_editor_background_frozen_logged_ = true;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_FROZEN editor=0x"
+                 << std::hex << layer << " point=0x" << point_address
+                 << std::dec
+                 << " policy=level-editor-callsite-no-scroll\n";
+            log_.flush();
+        }
+        return true;
+    }
+
+    bool HostV22BatchUpdateBlend(u32 batch_node) {
+        /*
+         * The selected beta can transiently leave the new ground batch node
+         * null while changing ground texture. Android tolerates the surrounding
+         * lifecycle, but executing updateBlendFunc with this==0 faults at +0x54
+         * in the wrapper. Ignore only the impossible null call; every valid
+         * batch node still runs the original function byte-for-byte.
+         */
+        if (!batch_node) {
+            ++v22_null_batch_blend_guards_;
+            log_ << "RESULT: DYNARMIC_V22_NULL_BATCH_BLEND_GUARD count="
+                 << v22_null_batch_blend_guards_
+                 << " action=skip-null-this\n";
+            log_.flush();
+            return true;
+        }
+        u32 ignored = 0u;
+        return RunNestedPreservingState(
+            runtime_.v22_ccsprite_batch_update_blend, {batch_node}, ignored,
+            "CCSpriteBatchNode::updateBlendFunc passthrough", 100000000u);
+    }
+
     bool HostV22EditorVisibility(u32 editor_layer, u32 delta_bits) {
         if (!LooksLikeGuestObject(runtime_, env_, editor_layer))
             return Fail("V22 editor visibility received an invalid layer");
@@ -6681,6 +6786,8 @@ private:
             v22_draw_grid_layer_ = 0u;
             v22_editor_overlay_frames_ = 0u;
             v22_editor_overlay_playtest_active_ = false;
+            v22_editor_level_settings_refreshed_ = false;
+            v22_editor_background_frozen_logged_ = false;
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
@@ -10544,6 +10651,14 @@ private:
             if (!HostV22PlayVisibility(r0)) return false;
             return finish_hot(0u);
         }
+        if (name == "__dynarmic_v22_update_camera_background") {
+            if (!HostV22UpdateCameraBackground(r0, r1)) return false;
+            return finish_hot(0u);
+        }
+        if (name == "__dynarmic_v22_batch_update_blend") {
+            if (!HostV22BatchUpdateBlend(r0)) return false;
+            return finish_hot(0u);
+        }
         if (name == "__dynarmic_v22_edit_level_onEdit") {
             const bool ok = HostV22EditLevelButton();
             if (!ok) return false;
@@ -11367,6 +11482,9 @@ private:
     u64 v22_editor_visibility_passes_=0;
     u64 v22_editor_overlay_frames_=0;
     bool v22_editor_overlay_playtest_active_=false;
+    bool v22_editor_level_settings_refreshed_=false;
+    bool v22_editor_background_frozen_logged_=false;
+    u64 v22_null_batch_blend_guards_=0;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_editor_hide_variable_address_=0;
     u32 v22_platformer_ui_logged_=0;
@@ -11781,7 +11899,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest7 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest8 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12452,7 +12570,15 @@ int main(int argc,char** argv) {
                     " visibility-pointers=" +
                     std::to_string(visual_hooks.editor_visibility.first) +
                     " visibility-calls=" +
-                    std::to_string(visual_hooks.editor_visibility.second));
+                    std::to_string(visual_hooks.editor_visibility.second) +
+                    " background-pointers=" +
+                    std::to_string(visual_hooks.camera_background.first) +
+                    " background-calls=" +
+                    std::to_string(visual_hooks.camera_background.second) +
+                    " blend-pointers=" +
+                    std::to_string(visual_hooks.batch_blend.first) +
+                    " blend-calls=" +
+                    std::to_string(visual_hooks.batch_blend.second));
                 emit(
                     "RESULT: DYNARMIC_V22_PLATFORMER_SAFE_VISUAL_HOOK_READY "
                     "count=1 touch-hooks=disabled companion-gdps=disabled "
