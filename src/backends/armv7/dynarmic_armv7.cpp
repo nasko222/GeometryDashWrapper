@@ -1182,9 +1182,6 @@ struct ElfRuntime {
     u32 v22_draw_grid_update_music_guide_time = 0;
     u32 v22_draw_grid_update_time_markers = 0;
     u32 v22_level_editor_level_settings_updated = 0;
-    u32 v22_texture_cache_shared = 0;
-    u32 v22_texture_cache_add_image = 0;
-    u32 v22_texture_atlas_set_texture = 0;
     u32 v22_gjbase_queue_button = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
@@ -1470,6 +1467,30 @@ static void WriteV22ThumbConditionalImportThenCallThunk(
     env.MemoryWrite16(address + 22u, 0xBF00u);
     env.MemoryWrite32(address + 24u, predicate_import);
     env.MemoryWrite32(address + 28u, original);
+}
+
+static void WriteV22ThumbNullTextureGuardThunk(
+    ProbeEnvironment& env, u32 address, u32 original, u32 reject_import) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 null-texture guard address is not aligned");
+    /*
+     * CCSpriteBatchNode::initWithTexture(this, texture, capacity) returns bool.
+     * A null texture is never a usable batch node.  Reject it before any fields
+     * are mutated, while valid textures tail-call the untouched guest function.
+     * This is intentionally narrower than EnduranceTest11's global atlas
+     * substitution, which also changed the editor's legitimate ground-visibility
+     * construction path and broke the Show Ground toggle.
+     */
+    env.MemoryWrite16(address + 0u, 0x2900u); // cmp r1,#0
+    env.MemoryWrite16(address + 2u, 0xD001u); // beq reject
+    env.MemoryWrite16(address + 4u, 0x4B02u); // ldr r3,[pc,#8] -> original
+    env.MemoryWrite16(address + 6u, 0x4718u); // bx r3
+    env.MemoryWrite16(address + 8u, 0x4B02u); // ldr r3,[pc,#8] -> host reject
+    env.MemoryWrite16(address + 10u, 0x4718u); // bx r3
+    env.MemoryWrite16(address + 12u, 0xBF00u);
+    env.MemoryWrite16(address + 14u, 0xBF00u);
+    env.MemoryWrite32(address + 16u, original);
+    env.MemoryWrite32(address + 20u, reject_import);
 }
 
 static std::vector<u32> FindThumbBlCallSites(const ElfRuntime& runtime,
@@ -2469,6 +2490,7 @@ struct V22VisualHookCounts {
     std::pair<std::size_t, std::size_t> play_visibility;
     std::pair<std::size_t, std::size_t> camera_background;
     std::pair<std::size_t, std::size_t> batch_blend;
+    std::pair<std::size_t, std::size_t> batch_init_guard;
     u32 ground_asset_max = 0u;
     u32 background_asset_max = 0u;
     bool exact_companion_editor = false;
@@ -2585,16 +2607,9 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime, "_ZN7cocos2d17CCSpriteBatchNode15updateBlendFuncEv");
     const SymbolRecord* batch_init_texture = FindSymbol(
         runtime, "_ZN7cocos2d17CCSpriteBatchNode15initWithTextureEPNS_11CCTexture2DEj");
-    const SymbolRecord* texture_cache_shared = FindSymbol(
-        runtime, "_ZN7cocos2d14CCTextureCache18sharedTextureCacheEv");
-    const SymbolRecord* texture_cache_add_image = FindSymbol(
-        runtime, "_ZN7cocos2d14CCTextureCache8addImageEPKcb");
-    const SymbolRecord* texture_atlas_set_texture = FindSymbol(
-        runtime, "_ZN7cocos2d14CCTextureAtlas10setTextureEPNS_11CCTexture2DE");
     if (!editor_visibility || !play_visibility ||
         !update_camera_background || !batch_update_blend ||
-        !batch_init_texture || !texture_cache_shared ||
-        !texture_cache_add_image || !texture_atlas_set_texture)
+        !batch_init_texture)
         throw std::runtime_error(
             "V22 primary visual symbols are unavailable");
 
@@ -2651,9 +2666,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
             !sort_batchnode_children || !update_grid_layer ||
             !draw_grid_vtable || !draw_grid_music || !draw_grid_markers ||
             !level_settings_updated || !update_camera_background ||
-            !batch_update_blend || !batch_init_texture ||
-            !texture_cache_shared || !texture_cache_add_image ||
-            !texture_atlas_set_texture)
+            !batch_update_blend || !batch_init_texture)
             throw std::runtime_error(
                 "safe V22 host visual bridge symbols are unavailable");
 
@@ -2685,10 +2698,6 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         runtime.v22_draw_grid_update_time_markers = draw_grid_markers->address;
         runtime.v22_level_editor_level_settings_updated =
             level_settings_updated->address;
-        runtime.v22_texture_cache_shared = texture_cache_shared->address;
-        runtime.v22_texture_cache_add_image = texture_cache_add_image->address;
-        runtime.v22_texture_atlas_set_texture =
-            texture_atlas_set_texture->address;
 
         const u32 editor_host = EnsureImport(
             runtime, env, "__dynarmic_v22_editor_visibility");
@@ -2725,6 +2734,17 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
     const std::pair<std::size_t, std::size_t> camera_background_counts{
         0u, camera_background_calls.size()};
 
+    const u32 reject_null_texture_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_reject_null_batch_texture");
+    EnsureV22ThunkPage(env);
+    const u32 batch_init_guard_wrapper = kV22ThunkBase + 0xC0u;
+    WriteV22ThumbNullTextureGuardThunk(
+        env, batch_init_guard_wrapper, batch_init_texture->address,
+        reject_null_texture_host);
+    const auto batch_init_guard_counts = RedirectV22FunctionReferences(
+        runtime, env, *batch_init_texture, batch_init_guard_wrapper | 1u,
+        kV22ThunkBase + 0xE0u);
+
     const u32 batch_blend_host = EnsureImport(
         runtime, env, "__dynarmic_v22_batch_update_blend");
     const std::vector<u32> batch_blend_calls = FindThumbBlCallSitesInRange(
@@ -2737,7 +2757,8 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
     const std::pair<std::size_t, std::size_t> batch_blend_counts{
         0u, batch_blend_calls.size()};
     if (camera_background_calls.size() != 3u ||
-        batch_blend_calls.size() != 1u)
+        batch_blend_calls.size() != 1u ||
+        batch_init_guard_counts.first + batch_init_guard_counts.second == 0u)
         throw std::runtime_error(
             "V22 background/blend exact callsite validation failed");
 
@@ -2760,7 +2781,7 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
     return V22VisualHookCounts{
         editor_visibility_counts, play_visibility_counts,
         camera_background_counts, batch_blend_counts,
-        ground_asset_max, background_asset_max,
+        batch_init_guard_counts, ground_asset_max, background_asset_max,
         exact_companion_editor};
 }
 
@@ -6864,65 +6885,18 @@ private:
         return true;
     }
 
-    bool LoadV22FallbackGroundTexture(u32 atlas, u32& texture) {
-        static constexpr char kFallbackGround[] =
-            "groundSquare_01_001.png";
-        if (!atlas || !runtime_.v22_texture_cache_shared ||
-            !runtime_.v22_texture_cache_add_image ||
-            !runtime_.v22_texture_atlas_set_texture)
-            return false;
-
-        const u32 path = Allocate(sizeof(kFallbackGround));
-        if (!path) return false;
-        ScopeExit release_path([&]() { Free(path); });
-        if (!env_.WriteBytes(path, kFallbackGround,
-                             sizeof(kFallbackGround)))
-            return false;
-
-        u32 cache = 0u;
-        if (!RunNestedPreservingState(
-                runtime_.v22_texture_cache_shared, {}, cache,
-                "V22 fallback texture cache", 250000000u) ||
-            !LooksLikeGuestObject(runtime_, env_, cache))
-            return false;
-
-        u32 fallback = 0u;
-        if (!RunNestedPreservingState(
-                runtime_.v22_texture_cache_add_image,
-                {cache, path, 0u}, fallback,
-                "V22 fallback ground addImage", 750000000u) ||
-            !LooksLikeGuestObject(runtime_, env_, fallback))
-            return false;
-
-        u32 ignored = 0u;
-        if (!RunNestedPreservingState(
-                runtime_.v22_texture_atlas_set_texture,
-                {atlas, fallback}, ignored,
-                "V22 fallback atlas setTexture", 250000000u))
-            return false;
-
-        texture = fallback;
-        ++v22_missing_ground_texture_repairs_;
-        log_ << "RESULT: DYNARMIC_V22_MISSING_GROUND_TEXTURE_REPLACED count="
-             << v22_missing_ground_texture_repairs_
-             << " atlas=0x" << std::hex << atlas
-             << " texture=0x" << fallback << std::dec
-             << " fallback=" << kFallbackGround
-             << " policy=editor-only-valid-texture-substitution\n";
+    bool HostV22RejectNullBatchTexture(u32 batch_node) {
+        ++v22_null_batch_texture_rejections_;
+        log_ << "RESULT: DYNARMIC_V22_NULL_BATCH_TEXTURE_REJECTED count="
+             << v22_null_batch_texture_rejections_
+             << " batch=0x" << std::hex << batch_node << std::dec
+             << " action=init-return-false policy=no-half-built-node\n";
         log_.flush();
         return true;
     }
 
     bool HostV22BatchUpdateBlend(u32 batch_node) {
-        /*
-         * Exact beta implementation of CCSpriteBatchNode::updateBlendFunc().
-         * Some community selector entries still reach this constructor with a
-         * null texture even after the beta's numeric range is clamped.  The
-         * EnduranceTest10 log stops on that exact frame: writing fallback blend
-         * factors is not enough because initWithTexture continues with a
-         * half-built atlas.  While an editor is active, replace that null atlas
-         * texture with packaged ground #1 before the constructor resumes.
-         */
+        /* Exact beta CCSpriteBatchNode::updateBlendFunc field behavior. */
         static constexpr u32 kTextureAtlasOffset = 0x108u;
         static constexpr u32 kBlendSourceOffset = 0x10Cu;
         static constexpr u32 kBlendDestinationOffset = 0x110u;
@@ -6937,32 +6911,22 @@ private:
             !env_.IsMapped(batch_node + kTextureAtlasOffset, 4u) ||
             !env_.IsMapped(batch_node + kBlendSourceOffset, 8u)) {
             ++v22_missing_batch_texture_fallbacks_;
-            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE count="
+            log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_INVALID_NODE count="
                  << v22_missing_batch_texture_fallbacks_
                  << " batch=0x" << std::hex << batch_node << std::dec
-                 << " reason=invalid-batch action=skip\n";
+                 << " action=skip\n";
             log_.flush();
             return true;
         }
 
         const u32 atlas = env_.MemoryRead32(batch_node + kTextureAtlasOffset);
-        u32 texture = 0u;
-        if (atlas && env_.IsMapped(atlas + kAtlasTextureOffset, 4u))
-            texture = env_.MemoryRead32(atlas + kAtlasTextureOffset);
-
-        bool texture_valid =
+        const u32 texture =
+            atlas && env_.IsMapped(atlas + kAtlasTextureOffset, 4u)
+                ? env_.MemoryRead32(atlas + kAtlasTextureOffset) : 0u;
+        const bool texture_valid =
             texture && env_.IsMapped(texture + kTexturePmaOffset, 1u);
-        if (!texture_valid && v22_editor_visual_layer_ &&
-            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_)) {
-            if (LoadV22FallbackGroundTexture(atlas, texture))
-                texture_valid =
-                    env_.IsMapped(texture + kTexturePmaOffset, 1u);
-        }
-
-        bool premultiplied_alpha = false;
-        if (texture_valid)
-            premultiplied_alpha =
-                env_.MemoryRead8(texture + kTexturePmaOffset) != 0u;
+        const bool premultiplied_alpha =
+            texture_valid && env_.MemoryRead8(texture + kTexturePmaOffset) != 0u;
 
         env_.MemoryWrite32(batch_node + kBlendDestinationOffset,
                            kGlOneMinusSrcAlpha);
@@ -6974,9 +6938,8 @@ private:
             log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE count="
                  << v22_missing_batch_texture_fallbacks_
                  << " batch=0x" << std::hex << batch_node
-                 << " atlas=0x" << atlas
-                 << " texture=0x" << texture << std::dec
-                 << " reason=fallback-load-failed action=continue-defensively\n";
+                 << " atlas=0x" << atlas << " texture=0x" << texture
+                 << std::dec << " action=defensive-blend-only\n";
             log_.flush();
         } else if (v22_batch_blend_repairs_ == 1u) {
             log_ << "RESULT: DYNARMIC_V22_BATCH_BLEND_HOST_EXACT"
@@ -10870,6 +10833,10 @@ private:
             if (!HostV22UpdateCameraBackground(r0, r1, suppress)) return false;
             return finish_hot(suppress);
         }
+        if (name == "__dynarmic_v22_reject_null_batch_texture") {
+            if (!HostV22RejectNullBatchTexture(r0)) return false;
+            return finish_hot(0u);
+        }
         if (name == "__dynarmic_v22_batch_update_blend") {
             if (!HostV22BatchUpdateBlend(r0)) return false;
             return finish_hot(0u);
@@ -11702,7 +11669,7 @@ private:
     u64 v22_editor_background_updates_suppressed_=0;
     u64 v22_batch_blend_repairs_=0;
     u64 v22_missing_batch_texture_fallbacks_=0;
-    u64 v22_missing_ground_texture_repairs_=0;
+    u64 v22_null_batch_texture_rejections_=0;
     std::unordered_set<u32> v22_editor_visualized_objects_;
     u32 v22_editor_hide_variable_address_=0;
     u32 v22_platformer_ui_logged_=0;
@@ -12117,7 +12084,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest11 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.5-endurancetest12 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12796,7 +12763,11 @@ int main(int argc,char** argv) {
                     " blend-pointers=" +
                     std::to_string(visual_hooks.batch_blend.first) +
                     " blend-calls=" +
-                    std::to_string(visual_hooks.batch_blend.second));
+                    std::to_string(visual_hooks.batch_blend.second) +
+                    " init-guard-pointers=" +
+                    std::to_string(visual_hooks.batch_init_guard.first) +
+                    " init-guard-calls=" +
+                    std::to_string(visual_hooks.batch_init_guard.second));
                 emit(
                     "RESULT: DYNARMIC_V22_ART_ASSET_LIMITS ground=" +
                     std::to_string(visual_hooks.ground_asset_max) +

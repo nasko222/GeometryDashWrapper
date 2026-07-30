@@ -1,0 +1,126 @@
+Geometry Dash Wrapper 0.9.5-endurancetest12
+Verification and uploaded-log diagnosis
+
+RUNTIME STATUS
+--------------
+The EnduranceTest11 Windows logs were analyzed. The new EnduranceTest12 source
+was not executed on Windows in this environment. Source audits, exact selected-
+APK symbol checks, both ARM C++20 syntax checks, and package reconstruction tests
+passed. Show Ground and the legacy first-play audio comparison still require the
+user's Windows runtime test.
+
+UPLOADED LOG DIAGNOSIS
+----------------------
+- The confirmed 2.2 editor black-region suppression remained active.
+- The working BPM levelSettingsUpdated path remained active.
+- EnduranceTest11's global missing-ground substitution ran ten times in one
+  session. It hooked every null atlas texture reached through
+  CCSpriteBatchNode::initWithTexture, including legitimate editor ground-layer
+  construction, rather than only unsupported community selector entries.
+- The exact APK exposes EditorPauseLayer::toggleEditorGround,
+  LevelEditorLayer::toggleGround, and GJGroundLayer::showGround. The native
+  visibility path is therefore present; it should not be replaced by a global
+  texture substitution.
+- The legacy log proves the muted 100 ms decoder prime executed before the first
+  Stereo Madness play, yet the user still heard attempt 2+ louder. That
+  experiment is therefore removed.
+
+ENDURANCETEST12 CHANGES
+-----------------------
+- Removes LoadV22FallbackGroundTexture and all packaged-ground substitution.
+- Adds a guest-side entry guard around CCSpriteBatchNode::initWithTexture:
+  valid textures tail-call the untouched original function; a null texture
+  returns false through a host diagnostic before any node fields are mutated.
+- Keeps the exact host updateBlendFunc field implementation for valid nodes.
+- Keeps the 18-ground/26-background native-asset clamps as a first line of
+  defense, while the entry guard safely handles any remaining unsupported path.
+- Removes the legacy muted/waiting/stopping decoder-prime implementation and API.
+- On legacy ARM only, the first non-looping play of each freshly opened music
+  alias receives one immediate `play ... from 0` second-start command. It makes
+  no volume change and does not stop, mute, wait, or rewind between the two
+  starts. This directly reproduces the state transition observed on attempt 2.
+
+UNCHANGED
+---------
+- Confirmed 2.2 editor background/black-region suppression.
+- BPM guidelines, per-frame song line, swipe-selection/client-array correction,
+  editor culling/opacity, and Practice Z/X.
+- Complete x86 backend and accepted x86 pacing.
+- Networking, backups, native launch, and version-isolated saves.
+
+SOURCE/STATIC AUDIT
+-------------------
+01. PASS: EnduranceTest11 baseline exists
+02. PASS: EnduranceTest12 source exists
+03. PASS: version
+04. PASS: branch
+05. PASS: ARMv7 C++20 syntax
+06. PASS: legacy ARM C++20 syntax
+07. PASS: exact selected SO available [c5471f55feb02638de6a8ef01299703205986f6f169211e313dba575ce6fbd6c]
+08. PASS: uploaded V22 log available
+09. PASS: uploaded legacy log available
+10. PASS: black editor fix confirmed in supplied run
+11. PASS: BPM refresh remained active
+12. PASS: ET11 global substitution activated repeatedly [10]
+13. PASS: legacy muted prime executed but did not solve issue
+14. PASS: legacy has repeated level plays [3]
+15. PASS: exact APK symbol _ZN7cocos2d17CCSpriteBatchNode15initWithTextureEPNS_11CCTexture2DEj
+16. PASS: exact APK symbol _ZN7cocos2d17CCSpriteBatchNode15updateBlendFuncEv
+17. PASS: exact APK symbol _ZN16EditorPauseLayer18toggleEditorGroundEPN7cocos2d8CCObjectE
+18. PASS: exact APK symbol _ZN16LevelEditorLayer12toggleGroundEb
+19. PASS: exact APK symbol _ZN13GJGroundLayer10showGroundEv
+20. PASS: null guard token WriteV22ThumbNullTextureGuardThunk
+21. PASS: null guard token __dynarmic_v22_reject_null_batch_texture
+22. PASS: null guard token DYNARMIC_V22_NULL_BATCH_TEXTURE_REJECTED
+23. PASS: null guard token batch_init_guard_counts
+24. PASS: null guard instruction 0x2900u
+25. PASS: null guard instruction 0xD001u
+26. PASS: null guard instruction 0x4B02u
+27. PASS: null guard instruction 0x4718u
+28. PASS: null guard valid path tail-calls original
+29. PASS: null guard rejected path calls host
+30. PASS: null guard returns false through host dispatch
+31. PASS: init guard requires at least one reference
+32. PASS: startup reports init guard
+33. PASS: removed ET11 fallback token LoadV22FallbackGroundTexture
+34. PASS: removed ET11 fallback token groundSquare_01_001.png
+35. PASS: removed ET11 fallback token DYNARMIC_V22_MISSING_GROUND_TEXTURE_REPLACED
+36. PASS: removed ET11 fallback token v22_texture_atlas_set_texture
+37. PASS: exact blend host retained
+38. PASS: asset limit patches retained
+39. PASS: confirmed background suppression unchanged
+40. PASS: BPM/song overlay unchanged
+41. PASS: editor visibility/culling unchanged
+42. PASS: ARMv7 Practice Z/X unchanged
+43. PASS: removed failed audio token audio_set_legacy_first_play_prime
+44. PASS: removed failed audio token decoder prime
+45. PASS: removed failed audio token play gd18_music from 0 to 100 wait
+46. PASS: removed failed audio token setaudio gd18_music volume to 0
+47. PASS: new audio replay token audio_set_legacy_first_play_replay
+48. PASS: new audio replay token g_music_needs_first_play_replay
+49. PASS: new audio replay token play gd18_music from 0
+50. PASS: new audio replay token Audio legacy first-play MCI replay
+51. PASS: legacy-only enables replay
+52. PASS: non-looping aliases only
+53. PASS: no volume override in replay block
+54. PASS: no stop in replay block
+55. PASS: no wait command in replay block
+56. PASS: legacy Practice Z/X unchanged
+57. PASS: complete x86 backend byte-identical
+58. PASS: EnduranceTest12 note exists
+59. PASS: superseded EnduranceTest11 notes removed
+60. PASS: builder revision isolated
+61. PASS: source policy clean [[]]
+
+Passed 61/61 focused audits.
+
+
+PACKAGE INTEGRITY
+-----------------
+The release script independently verifies that:
+- the full source ZIP extracts to the exact EnduranceTest12 tree;
+- the EnduranceTest11-to-EnduranceTest12 hotfix plus documented deletions
+  rebuilds the exact tree;
+- the textual patch applies to EnduranceTest11 and rebuilds the exact tree;
+- the source contains no APK, Android .so, built EXE/DLL, Python file,
+  .git directory, or .gitignore.

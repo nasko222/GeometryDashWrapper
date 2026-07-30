@@ -1,12 +1,11 @@
-Geometry Dash Wrapper EnduranceTest10 -> EnduranceTest11 hotfix
+Geometry Dash Wrapper EnduranceTest11 -> EnduranceTest12 hotfix
 
-1. Start with the complete EnduranceTest10 source tree.
-2. Copy every file and folder beside this APPLY-HOTFIX.txt into that source
-   tree, preserving paths and replacing existing files.
-3. Delete these superseded files from the source root:
-     ENDURANCETEST10.md
-     ENDURANCETEST10-VERIFICATION.txt
-4. Do not copy APPLY-HOTFIX.txt into the final source tree.
-5. Run BUILD_ALL.cmd on Windows.
+1. Start with a clean EnduranceTest11 full-source tree.
+2. Copy every file/folder from this hotfix directory over that tree.
+3. Delete APPLY-HOTFIX.txt after reading it.
+4. Delete these superseded files from the target tree:
+   - ENDURANCETEST11-VERIFICATION.txt
+   - ENDURANCETEST11.md
+5. Build normally with BUILD_ALL.cmd.
 
-The hotfix contains no APK, built binary, Python file, or x86 backend file.
+The complete x86 backend is not included because it is unchanged.

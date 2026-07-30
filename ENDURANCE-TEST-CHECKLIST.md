@@ -1,40 +1,34 @@
-# EnduranceTest11 Test Sheet
+# EnduranceTest12 Test Sheet
 
 ## Selected 2.2 beta editor
 
-- [ ] Open the editor and verify the black moving region is still gone.
-- [ ] Confirm BPM guidelines, song line and swipe-selection rectangle still work.
-- [ ] Cycle through every valid ground normally.
-- [ ] Select one of the community entries that previously froze.
-- [ ] The editor remains responsive and packaged ground 1 is used as fallback.
-- [ ] Stop/restart playtesting and confirm the background remains fixed.
+- [ ] Confirm the black moving region remains gone.
+- [ ] Confirm BPM guidelines, song line and swipe-selection rectangle remain.
+- [ ] Open editor pause/options and toggle **Show Ground** off and on.
+- [ ] The valid selected ground reappears immediately.
+- [ ] Select a community ground entry with no texture. The editor remains
+      responsive and no half-built batch node is created.
 
-For the invalid entry, search the log for:
+Relevant log line for an unsupported texture:
 
 ```text
-DYNARMIC_V22_MISSING_GROUND_TEXTURE_REPLACED
+DYNARMIC_V22_NULL_BATCH_TEXTURE_REJECTED
 ```
-
-`DYNARMIC_V22_BATCH_BLEND_MISSING_TEXTURE ... fallback-load-failed` should not
-appear in the successful fallback case.
 
 ## Legacy ARM music
 
-- [ ] Test 1.0, then preferably 1.3/1.4.
-- [ ] Enter a level from the menu and compare attempt 1 with attempt 2.
-- [ ] Confirm the one-time prime is inaudible and does not add a long delay.
-- [ ] Confirm menu music, pause/resume and the volume slider still behave.
+- [ ] Test 1.0 and preferably 1.3/1.4.
+- [ ] Compare attempt 1 with attempt 2 without moving the volume slider.
+- [ ] Confirm there is no 100 ms muted prime or extra delay.
 
-Search the log for:
+Expected first-level-play log:
 
 ```text
-Audio legacy first-play decoder prime: 100 ms muted
+Audio legacy first-play MCI replay: second-start=ok
 ```
 
 ## Regression checks
 
-- [ ] Practice Z/X remains functional and Practice Mode-only.
-- [ ] x86 smoothness and behavior remain unchanged.
-- [ ] Backups/login/online levels remain unchanged.
-- [ ] Version-isolated saves remain unchanged.
-- [ ] Mouse and pause-button behavior remains native.
+- [ ] Practice Z/X remains Practice Mode-only.
+- [ ] x86 behavior/pacing is unchanged.
+- [ ] Network, backups and isolated saves remain unchanged.
