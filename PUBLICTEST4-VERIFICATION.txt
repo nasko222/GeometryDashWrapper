@@ -1,0 +1,30 @@
+Geometry Dash Wrapper 0.9.6-publictest4 focused verification
+
+Runtime target:
+  Forlorn 1.9c supplied by the user reached the real AppDelegate in PublicTest3.
+  PublicTest3 then entered the bundled legacy TestFlight SDK and exhausted the
+  execution budget while stubbing its Foundation/network startup.
+
+PublicTest4 change:
+  PASS: +[TestFlight takeOff:] is recognized by real guest class/selector name.
+  PASS: only that legacy telemetry bootstrap call is converted to a no-op.
+  PASS: real Forlorn AppDelegate execution continues after the skipped call.
+  PASS: delegate budget exhaustion now has a dedicated diagnostic.
+  PASS: existing guest Objective-C class/instance dispatch remains present.
+  PASS: Geometry Dash 1.0 constructor deferral remains present.
+
+Regression isolation:
+  PASS: x86 backend source tree byte-for-byte unchanged from PublicTest3.
+  PASS: shared audio/storage/network/song/runtime sources byte-for-byte unchanged.
+  PASS: Android ARM legacy and ARMv7 code changed only in displayed version text.
+  PASS: PublicTest2/3 corrected isolated iOS CMake target retained.
+
+Expected Forlorn marker:
+  IOS: bypassing legacy TestFlight +takeOff: count=1 policy=telemetry-disabled
+
+Then send the remainder of ios-armv7.log; the first subsequent UIKit/OpenGL/
+Foundation incompatibility is the next target.
+
+PASS: iOS C++20 syntax-only compile completed successfully using the local Dynarmic interface stub.
+
+No Windows runtime execution was performed in this environment.

@@ -529,8 +529,16 @@ public:
         }
         if(delegate_launch_returned_){
             log_<<"RESULT: IOS_DELEGATE_LAUNCH_RETURNED delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)<<" r0=0x"<<Hex(delegate_return_value_)<<" unknown-imports="<<unknown_import_count_<<" objc-stubs="<<unimplemented_objc_count_<<"\n";
-            log_<<"Execution status: PublicTest3 executed the real iOS application delegate launch method; rendering/event-loop work is next.\n";
+            log_<<"Execution status: PublicTest4 executed the real iOS application delegate launch method; rendering/event-loop work is next.\n";
             return true;
+        }
+        if(delegate_launch_active_ && budget==0u){
+            log_<<"RESULT: IOS_DELEGATE_TICK_BUDGET_EXHAUSTED pc=0x"<<Hex(cpu_.Regs()[15])
+                <<" lr=0x"<<Hex(cpu_.Regs()[14])
+                <<" unknown-imports="<<unknown_import_count_
+                <<" objc-stubs="<<unimplemented_objc_count_
+                <<" testflight-bypasses="<<testflight_bypass_count_<<"\n";
+            return false;
         }
         if(reached_ui_application_main_){
             log_<<"RESULT: IOS_BOOTSTRAP_REACHED_UIAPPLICATIONMAIN delegate="<<(delegate_name_.empty()?"unknown":delegate_name_);
@@ -757,6 +765,21 @@ private:
         const GuestClass* guest_class_receiver=nullptr;
         bool guest_meta_receiver=false;
         for(const auto& c:classes_){if(c.class_addr==receiver){guest_class_receiver=&c;break;}if(c.meta_addr==receiver){guest_class_receiver=&c;guest_meta_receiver=true;break;}}
+
+        // Forlorn 1.9c bundles the pre-Apple TestFlight SDK.  Its +takeOff:
+        // startup performs telemetry/cache/network initialization before the
+        // game itself starts.  None of that SDK is required for gameplay, and
+        // emulating it first would only hide the next real UIKit/game blocker.
+        // Treat the call as a successful no-op, exactly like an unavailable
+        // analytics service.
+        if(guest_class_receiver && guest_class_receiver->name=="TestFlight" && selector=="takeOff:"){
+            ++testflight_bypass_count_;
+            if(testflight_bypass_count_<=4u)
+                log_<<"IOS: bypassing legacy TestFlight +takeOff: count="<<testflight_bypass_count_<<" policy=telemetry-disabled\n";
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+
         if(guest_class_receiver&&!guest_meta_receiver&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewGuestInstance(*guest_class_receiver);return true;}
         if(guest_class_receiver){const GuestMethod* method=FindMethod(guest_class_receiver->class_methods,selector);if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest class dispatch "<<guest_class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}}
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){const GuestMethod* method=FindMethod(instance_class->instance_methods,selector);if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}if(selector=="init"||selector.starts_with("initWith")||selector=="retain"||selector=="autorelease"||selector=="copy"||selector=="mutableCopy"){cpu_.Regs()[0]=receiver;return true;}if(selector=="release"||selector=="dealloc"){cpu_.Regs()[0]=0;return true;}}
@@ -829,7 +852,7 @@ private:
 
     MachImage image_; Logger& log_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::vector<GuestClass> classes_;
-    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;u32 exit_code_=0;u32 delegate_instance_=0,application_instance_=0,delegate_return_value_=0;u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0;bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false;std::string delegate_name_;
+    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;u32 exit_code_=0;u32 delegate_instance_=0,application_instance_=0,delegate_return_value_=0;u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0;bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false;std::string delegate_name_;
 };
 
 static std::string GetLogPath(int argc,char** argv){for(int i=2;i<argc;++i){std::string a=argv[i];if(a.starts_with("--log="))return a.substr(6);}const char* env=std::getenv("GD_LOG_PATH");return env?env:"ios-armv7.log";}
