@@ -1,0 +1,37 @@
+Geometry Dash Wrapper 0.9.6-publictest6 verification
+
+Basis:
+  PublicTest5 Forlorn runtime completed the real AppDelegate launch and returned.
+  The log also showed cocos2d category methods and inherited methods falling
+  through to bootstrap stubs.
+
+PublicTest6 focused changes:
+  PASS: parses __objc_catlist and merges category instance/class methods.
+  PASS: category methods override/extend the owning guest class by selector.
+  PASS: guest Objective-C instance lookup walks guest superclasses.
+  PASS: guest Objective-C class lookup walks guest superclasses.
+  PASS: AppDelegate return transitions into real +[CCDirector sharedDirector].
+  PASS: queries real -[CCDirector runningScene].
+  PASS: calls real/inherited -[CCDirector drawScene] for 60 host-driven frames.
+  PASS: each frame advances a synthetic iOS clock by 16,667 microseconds.
+  PASS: gettimeofday/time/rand/random/usleep bootstrap behavior is present.
+  PASS: constant mapped strings receive common NSString path/string behavior.
+  PASS: TestFlight telemetry bypass remains.
+  PASS: Geometry Dash 1.0 constructor deferral remains.
+
+Regression isolation:
+  PASS: x86 backend source tree byte-for-byte unchanged from PublicTest5.
+  PASS: shared audio/storage/network/song/runtime sources byte-for-byte unchanged.
+  PASS: Android ARM legacy/ARMv7 implementation changed only in version text.
+  PASS: isolated iOS CMake target remains.
+
+Syntax:
+  PASS: iOS C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected Forlorn success marker:
+  RESULT: IOS_FRAME_PUMP_OK frames=60 ...
+
+If it fails before that, send the complete PublicTest6 ios-armv7.log; the exact
+frame fault/import/Objective-C call becomes the next compatibility target.
+
+No Windows runtime test was performed here.

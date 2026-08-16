@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,7 +59,9 @@ constexpr u32 kStackBase = 0x70000000u;
 constexpr u32 kStackSize = 0x01000000u;
 constexpr u32 kSvcReturn = 0x00fffffeu;
 constexpr u64 kRunChunk = 5000000u;
-constexpr u64 kRunBudget = 150000000u;
+constexpr u64 kRunBudget = 600000000u;
+constexpr u32 kFrameProbeCount = 60u;
+constexpr u64 kSyntheticFrameUsec = 16667u;
 
 static u16 ReadLe16(const u8* p) { return static_cast<u16>(p[0] | (u16(p[1]) << 8)); }
 static u32 ReadLe32(const u8* p) {
@@ -481,7 +485,9 @@ public:
         BindStream(image_.dyld.weak_bind_off, image_.dyld.weak_bind_size, "weak-bind");
         BindStream(image_.dyld.lazy_bind_off, image_.dyld.lazy_bind_size, "lazy-bind");
         ParseGuestClasses();
+        ParseGuestCategories();
         log_ << "IOS: imports bound=" << imports_.size() << " guest-objc-classes=" << classes_.size()
+             << " guest-objc-category-methods=" << guest_category_method_count_
              << " mod-init-functions=" << image_.constructor_count << "\n";
         ReportDelegate("AppController");
         ReportDelegate("AppDelegate");
@@ -515,17 +521,17 @@ public:
             const u64 consumed = std::max<u64>(chunk - remaining, 1u);
             budget -= std::min<u64>(budget, consumed);
             if (env_.invalid_access) {
-                log_ << (delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x") << Hex(env_.fault_address)
+                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_MEMORY_FAULT address=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x")) << Hex(env_.fault_address)
                      << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
                 return false;
             }
             if (env_.interpreter_fallback) {
-                log_ << (delegate_launch_active_?"RESULT: IOS_DELEGATE_INTERPRETER_FALLBACK pc=0x":"RESULT: IOS_BOOTSTRAP_INTERPRETER_FALLBACK pc=0x") << Hex(env_.fallback_pc)
+                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_INTERPRETER_FALLBACK pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_INTERPRETER_FALLBACK pc=0x":"RESULT: IOS_BOOTSTRAP_INTERPRETER_FALLBACK pc=0x")) << Hex(env_.fallback_pc)
                      << " count=" << env_.fallback_count << "\n";
                 return false;
             }
             if (env_.exception_seen) {
-                log_ << (delegate_launch_active_?"RESULT: IOS_DELEGATE_EXCEPTION pc=0x":"RESULT: IOS_BOOTSTRAP_EXCEPTION pc=0x") << Hex(env_.exception_pc) << "\n";
+                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_EXCEPTION pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_EXCEPTION pc=0x":"RESULT: IOS_BOOTSTRAP_EXCEPTION pc=0x")) << Hex(env_.exception_pc) << "\n";
                 return false;
             }
             if (env_.svc_pending) {
@@ -533,9 +539,18 @@ public:
                 continue;
             }
         }
+        if(frame_probe_completed_){
+            log_<<"RESULT: IOS_FRAME_PUMP_OK frames="<<frame_count_
+                <<" director=0x"<<Hex(director_instance_)
+                <<" running-scene=0x"<<Hex(running_scene_)
+                <<" unknown-imports="<<unknown_import_count_
+                <<" objc-stubs="<<unimplemented_objc_count_
+                <<" category-methods="<<guest_category_method_count_<<"\n";
+            log_<<"Execution status: PublicTest6 drove the real cocos2d drawScene loop for one synthetic second; visible host rendering/input is next.\n";
+            return true;
+        }
         if(delegate_launch_returned_){
-            log_<<"RESULT: IOS_DELEGATE_LAUNCH_RETURNED delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)<<" r0=0x"<<Hex(delegate_return_value_)<<" unknown-imports="<<unknown_import_count_<<" objc-stubs="<<unimplemented_objc_count_<<"\n";
-            log_<<"Execution status: PublicTest4 executed the real iOS application delegate launch method; rendering/event-loop work is next.\n";
+            log_<<"RESULT: IOS_DELEGATE_LAUNCH_RETURNED_NO_FRAME_PUMP delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)<<" r0=0x"<<Hex(delegate_return_value_)<<" unknown-imports="<<unknown_import_count_<<" objc-stubs="<<unimplemented_objc_count_<<"\n";
             return true;
         }
         if(delegate_launch_active_ && budget==0u){
@@ -747,26 +762,96 @@ private:
     void ParseGuestClasses(){const MachSection* s=FindSection("__objc_classlist");if(!s)return;for(u32 off=0;off+4u<=s->size;off+=4u){const u32 c=env_.MemoryRead32(s->addr+off);if(!c||!env_.IsMapped(c,20u))continue;const u32 meta=env_.MemoryRead32(c);const u32 superclass=env_.MemoryRead32(c+4u);const u32 data=env_.MemoryRead32(c+16u)&~3u;if(!data||!env_.IsMapped(data,40u))continue;const u32 namep=env_.MemoryRead32(data+16u),methods=env_.MemoryRead32(data+20u),instance_size=env_.MemoryRead32(data+8u);std::string name;if(!namep||!env_.ReadCString(namep,name,4096u))continue;GuestClass gc;gc.name=name;gc.class_addr=c;gc.meta_addr=meta;gc.superclass_addr=superclass;gc.instance_size=instance_size;gc.instance_methods=ParseMethods(methods);if(meta&&env_.IsMapped(meta,20u)){const u32 md=env_.MemoryRead32(meta+16u)&~3u;if(md&&env_.IsMapped(md,24u))gc.class_methods=ParseMethods(env_.MemoryRead32(md+20u));}classes_.push_back(std::move(gc));}}
     void ReportDelegate(const std::string& name){for(const auto& c:classes_)if(c.name==name){log_<<"IOS: found delegate class "<<name<<" class=0x"<<Hex(c.class_addr)<<" instanceSize="<<c.instance_size<<"\n";for(const auto& m:c.instance_methods)if(m.selector=="application:didFinishLaunchingWithOptions:"||m.selector=="applicationDidFinishLaunching:")log_<<"IOS: delegate launch method "<<m.selector<<" imp=0x"<<Hex(m.imp)<<"\n";}}
 
+    GuestClass* FindGuestClassByClassAddressMutable(u32 addr){for(auto& c:classes_)if(c.class_addr==addr||c.meta_addr==addr)return &c;return nullptr;}
     const GuestClass* FindGuestClassByName(std::string_view name)const{for(const auto& c:classes_)if(c.name==name)return &c;return nullptr;}
     const GuestClass* FindGuestClassByClassAddress(u32 addr)const{for(const auto& c:classes_)if(c.class_addr==addr||c.meta_addr==addr)return &c;return nullptr;}
     const GuestClass* FindGuestClassForInstance(u32 object)const{if(!object||!env_.IsMapped(object,4u))return nullptr;const u32 isa=const_cast<ProbeEnvironment&>(env_).MemoryRead32(object);for(const auto& c:classes_)if(c.class_addr==isa)return &c;return nullptr;}
     const GuestMethod* FindMethod(const std::vector<GuestMethod>& methods,std::string_view selector)const{for(const auto& m:methods)if(m.selector==selector)return &m;return nullptr;}
+    const GuestMethod* FindInstanceMethodRecursive(const GuestClass* cls,std::string_view selector)const{
+        std::set<u32> seen;
+        while(cls&&seen.insert(cls->class_addr).second){
+            if(const GuestMethod* m=FindMethod(cls->instance_methods,selector))return m;
+            cls=FindGuestClassByClassAddress(cls->superclass_addr);
+        }
+        return nullptr;
+    }
+    const GuestMethod* FindClassMethodRecursive(const GuestClass* cls,std::string_view selector)const{
+        std::set<u32> seen;
+        while(cls&&seen.insert(cls->class_addr).second){
+            if(const GuestMethod* m=FindMethod(cls->class_methods,selector))return m;
+            cls=FindGuestClassByClassAddress(cls->superclass_addr);
+        }
+        return nullptr;
+    }
+    void MergeCategoryMethods(std::vector<GuestMethod>& target,const std::vector<GuestMethod>& extra){
+        for(const auto& m:extra){
+            auto it=std::find_if(target.begin(),target.end(),[&](const GuestMethod& e){return e.selector==m.selector;});
+            if(it!=target.end())*it=m; else target.push_back(m);
+            ++guest_category_method_count_;
+        }
+    }
+    void ParseGuestCategories(){
+        const MachSection* s=FindSection("__objc_catlist");if(!s)return;
+        for(u32 off=0;off+4u<=s->size;off+=4u){
+            const u32 cat=env_.MemoryRead32(s->addr+off);
+            if(!cat||!env_.IsMapped(cat,16u))continue;
+            const u32 cls_addr=env_.MemoryRead32(cat+4u);
+            GuestClass* cls=FindGuestClassByClassAddressMutable(cls_addr);
+            if(!cls)continue;
+            MergeCategoryMethods(cls->instance_methods,ParseMethods(env_.MemoryRead32(cat+8u)));
+            MergeCategoryMethods(cls->class_methods,ParseMethods(env_.MemoryRead32(cat+12u)));
+        }
+    }
     u32 NewGuestInstance(const GuestClass& cls){const u32 bytes=std::max<u32>(cls.instance_size,4u);const u32 object=Allocate(bytes,8u);std::vector<u8> zero(bytes);env_.WriteBytes(object,zero.data(),zero.size());env_.MemoryWrite32(object,cls.class_addr);return object;}
     void EnterGuestMethod(const GuestMethod& method){cpu_.Regs()[15]=method.imp&~1u;cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((method.imp&1u)?0x20u:0u));}
     std::string ResolveDelegateName(u32 object){const std::string candidate=DescribeString(object);if(!candidate.empty()&&FindGuestClassByName(candidate))return candidate;for(std::string_view preferred:{std::string_view("AppDelegate"),std::string_view("AppController")})if(FindGuestClassByName(preferred))return std::string(preferred);return {};}
     bool BeginDelegateLaunch(){
         const GuestClass* cls=FindGuestClassByName(delegate_name_);
         if(!cls){log_<<"RESULT: IOS_DELEGATE_CLASS_NOT_FOUND name="<<(delegate_name_.empty()?"unknown":delegate_name_)<<"\n";done_=true;return true;}
-        const GuestMethod* method=FindMethod(cls->instance_methods,"application:didFinishLaunchingWithOptions:");
-        if(!method)method=FindMethod(cls->instance_methods,"applicationDidFinishLaunching:");
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,"application:didFinishLaunchingWithOptions:");
+        if(!method)method=FindInstanceMethodRecursive(cls,"applicationDidFinishLaunching:");
         if(!method){log_<<"RESULT: IOS_DELEGATE_LAUNCH_METHOD_NOT_FOUND class="<<cls->name<<"\n";done_=true;return true;}
         delegate_instance_=NewGuestInstance(*cls);
         application_instance_=NewExternalInstance("UIApplication");
         cpu_.Regs()[0]=delegate_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=application_instance_;cpu_.Regs()[3]=0u;
         cpu_.Regs()[14]=kControlBase;
         EnterGuestMethod(*method);
-        delegate_launch_active_=true;delegate_launch_started_=true;
+        delegate_launch_active_=true;delegate_launch_started_=true;host_call_stage_=HostCallStage::Delegate;
         log_<<"IOS: UIApplicationMain entering real delegate class="<<cls->name<<" selector="<<method->selector<<" imp=0x"<<Hex(method->imp)<<" self=0x"<<Hex(delegate_instance_)<<"\n";
+        return true;
+    }
+
+    bool BeginDirectorAcquire(){
+        const GuestClass* cls=FindGuestClassByName("CCDirector");
+        if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_NO_CCDIRECTOR_CLASS\n";done_=true;return true;}
+        const GuestMethod* method=FindClassMethodRecursive(cls,"sharedDirector");
+        if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_SHARED_DIRECTOR\n";done_=true;return true;}
+        cpu_.Regs()[0]=cls->class_addr;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+        EnterGuestMethod(*method);host_call_stage_=HostCallStage::AcquireDirector;
+        log_<<"IOS: UIApplicationMain continuing into cocos2d event loop: acquiring CCDirector\n";
+        return true;
+    }
+
+    bool BeginRunningSceneQuery(){
+        const GuestClass* cls=FindGuestClassForInstance(director_instance_);
+        if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,"runningScene");
+        if(!method)return BeginFrameProbe();
+        cpu_.Regs()[0]=director_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+        EnterGuestMethod(*method);host_call_stage_=HostCallStage::QueryRunningScene;
+        return true;
+    }
+
+    bool BeginFrameProbe(){
+        const GuestClass* cls=FindGuestClassForInstance(director_instance_);
+        if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,"drawScene");
+        if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_DRAWSCENE director-class="<<cls->name<<"\n";done_=true;return true;}
+        virtual_time_usec_+=kSyntheticFrameUsec;
+        cpu_.Regs()[0]=director_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+        EnterGuestMethod(*method);host_call_stage_=HostCallStage::Frame;frame_pump_active_=true;
+        if(frame_count_<3u||frame_count_%20u==0u)
+            log_<<"IOS: frame pump begin frame="<<(frame_count_+1u)<<" director="<<cls->name<<" drawScene=0x"<<Hex(method->imp)<<"\n";
         return true;
     }
 
@@ -783,13 +868,13 @@ private:
         const GuestClass* class_receiver=nullptr;
         for(const auto& c:classes_)if(c.class_addr==receiver||c.meta_addr==receiver){class_receiver=&c;break;}
         if(class_receiver){
-            if(const GuestMethod* method=FindMethod(class_receiver->class_methods,selector)){
+            if(const GuestMethod* method=FindClassMethodRecursive(class_receiver,selector)){
                 if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret class dispatch "<<class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
                 EnterGuestMethod(*method);return true;
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
-            if(const GuestMethod* method=FindMethod(instance_class->instance_methods,selector)){
+            if(const GuestMethod* method=FindInstanceMethodRecursive(instance_class,selector)){
                 if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
                 EnterGuestMethod(*method);return true;
             }
@@ -839,7 +924,7 @@ private:
         if(guest_class_receiver&&!guest_meta_receiver&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewGuestInstance(*guest_class_receiver);return true;}
         if(guest_class_receiver){const GuestMethod* method=FindMethod(guest_class_receiver->class_methods,selector);if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest class dispatch "<<guest_class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}}
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
-            const GuestMethod* method=FindMethod(instance_class->instance_methods,selector);
+            const GuestMethod* method=FindInstanceMethodRecursive(instance_class,selector);
             if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}
             if(selector=="class"){cpu_.Regs()[0]=instance_class->class_addr;return true;}
             if(selector=="layer"&&(instance_class->name=="EAGLView"||instance_class->name=="UIView")){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
@@ -867,6 +952,16 @@ private:
             if(selector=="length"){cpu_.Regs()[0]=static_cast<u32>(fo.string_value.size());return true;}
             if(selector=="respondsToSelector:"||selector=="isKindOfClass:"||selector=="isMemberOfClass:"){cpu_.Regs()[0]=1u;return true;}
         }
+        const std::string string_value=DescribeString(receiver);
+        if(!string_value.empty()){
+            if(selector=="length"){cpu_.Regs()[0]=static_cast<u32>(string_value.size());return true;}
+            if(selector=="UTF8String"||selector=="cStringUsingEncoding:"){cpu_.Regs()[0]=AllocateCString(string_value);return true;}
+            if(selector=="lowercaseString"){std::string v=string_value;std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});cpu_.Regs()[0]=NewFakeString(v);return true;}
+            if(selector=="isEqualToString:"){cpu_.Regs()[0]=string_value==DescribeString(cpu_.Regs()[2])?1u:0u;return true;}
+            if(selector=="isAbsolutePath"){cpu_.Regs()[0]=(!string_value.empty()&&(string_value[0]=='/'||(string_value.size()>2&&string_value[1]==':')))?1u:0u;return true;}
+            if(selector=="lastPathComponent"){const auto p=string_value.find_last_of("/\\");cpu_.Regs()[0]=NewFakeString(p==std::string::npos?string_value:string_value.substr(p+1u));return true;}
+            if(selector=="stringByDeletingLastPathComponent"){const auto p=string_value.find_last_of("/\\");cpu_.Regs()[0]=NewFakeString(p==std::string::npos?std::string{}:string_value.substr(0,p));return true;}
+        }
         if(++unimplemented_objc_count_<=64u){const std::string class_name=ClassNameForAddress(receiver);log_<<"IOS: objc bootstrap stub receiver=0x"<<Hex(receiver)<<" class="<<(class_name.empty()?"unknown":class_name)<<" selector="<<(selector.empty()?"<unknown>":selector)<<" -> nil/0\n";}
         cpu_.Regs()[0]=0;return true;
     }
@@ -876,7 +971,7 @@ private:
         if(!super_ptr||!env_.IsMapped(super_ptr,8u)){cpu_.Regs()[0]=0;return true;}
         const u32 receiver=env_.MemoryRead32(super_ptr);const u32 current_class=env_.MemoryRead32(super_ptr+4u);
         const GuestClass* current=FindGuestClassByClassAddress(current_class);
-        if(current){if(const GuestClass* parent=FindGuestClassByClassAddress(current->superclass_addr)){if(const GuestMethod* method=FindMethod(parent->instance_methods,selector)){cpu_.Regs()[0]=receiver;EnterGuestMethod(*method);return true;}}}
+        if(current){if(const GuestClass* parent=FindGuestClassByClassAddress(current->superclass_addr)){if(const GuestMethod* method=FindInstanceMethodRecursive(parent,selector)){cpu_.Regs()[0]=receiver;EnterGuestMethod(*method);return true;}}}
         // The common superclass calls during bootstrap are NSObject/UIKit init,
         // retain and release operations. Returning the original receiver is the
         // safe Objective-C identity behavior for those initializers.
@@ -886,7 +981,36 @@ private:
         cpu_.Regs()[0]=receiver;return true;
     }
 
-    bool HandleSvc(u32 svc){if(svc==kSvcReturn){if(delegate_launch_active_){delegate_launch_active_=false;delegate_launch_returned_=true;delegate_return_value_=cpu_.Regs()[0];log_<<"IOS: real delegate launch returned r0=0x"<<Hex(delegate_return_value_)<<"\n";}done_=true;return true;}if(svc==0||svc>imports_.size()){log_<<"RESULT: IOS_UNKNOWN_SVC id="<<svc<<"\n";return false;}Import& imp=imports_[svc-1u];++imp.calls;std::string name=imp.name;if(!name.empty()&&name[0]=='_')name.erase(name.begin());if(imp.calls==1u)log_<<"IOS IMPORT: "<<imp.name<<" r0=0x"<<Hex(cpu_.Regs()[0])<<" r1=0x"<<Hex(cpu_.Regs()[1])<<"\n";
+    bool HandleSvc(u32 svc){if(svc==kSvcReturn){
+        if(host_call_stage_==HostCallStage::Delegate){
+            delegate_launch_active_=false;delegate_launch_returned_=true;delegate_return_value_=cpu_.Regs()[0];
+            log_<<"IOS: real delegate launch returned r0=0x"<<Hex(delegate_return_value_)<<"\n";
+            host_call_stage_=HostCallStage::None;
+            return BeginDirectorAcquire();
+        }
+        if(host_call_stage_==HostCallStage::AcquireDirector){
+            director_instance_=cpu_.Regs()[0];host_call_stage_=HostCallStage::None;
+            const GuestClass* cls=FindGuestClassForInstance(director_instance_);
+            log_<<"IOS: CCDirector acquired object=0x"<<Hex(director_instance_)<<" class="<<(cls?cls->name:"unknown")<<"\n";
+            return BeginRunningSceneQuery();
+        }
+        if(host_call_stage_==HostCallStage::QueryRunningScene){
+            running_scene_=cpu_.Regs()[0];host_call_stage_=HostCallStage::None;
+            const GuestClass* scene_cls=FindGuestClassForInstance(running_scene_);
+            log_<<"IOS: CCDirector runningScene=0x"<<Hex(running_scene_)<<" class="<<(scene_cls?scene_cls->name:(running_scene_?"unknown":"nil"))<<"\n";
+            return BeginFrameProbe();
+        }
+        if(host_call_stage_==HostCallStage::Frame){
+            host_call_stage_=HostCallStage::None;frame_pump_active_=false;++frame_count_;
+            if(frame_count_>=kFrameProbeCount){
+                frame_probe_completed_=true;done_=true;
+                log_<<"IOS: cocos2d frame probe completed frames="<<frame_count_<<"\n";
+                return true;
+            }
+            return BeginFrameProbe();
+        }
+        done_=true;return true;
+    }if(svc==0||svc>imports_.size()){log_<<"RESULT: IOS_UNKNOWN_SVC id="<<svc<<"\n";return false;}Import& imp=imports_[svc-1u];++imp.calls;std::string name=imp.name;if(!name.empty()&&name[0]=='_')name.erase(name.begin());if(imp.calls==1u)log_<<"IOS IMPORT: "<<imp.name<<" r0=0x"<<Hex(cpu_.Regs()[0])<<" r1=0x"<<Hex(cpu_.Regs()[1])<<"\n";
         if(name=="objc_msgSend")return HandleObjcMsgSend();
         if(name=="objc_msgSend_stret")return HandleObjcMsgSendStret();
         if(name=="objc_msgSendSuper2")return HandleObjcMsgSendSuper2();
@@ -924,6 +1048,19 @@ private:
             cpu_.Regs()[0]=0u;return true;
         }
 
+        if(name=="gettimeofday"){
+            const u32 tv=cpu_.Regs()[0];
+            if(tv&&env_.IsMapped(tv,8u)){env_.MemoryWrite32(tv,static_cast<u32>(virtual_time_usec_/1000000u));env_.MemoryWrite32(tv+4u,static_cast<u32>(virtual_time_usec_%1000000u));}
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="time"){
+            const u32 sec=static_cast<u32>(virtual_time_usec_/1000000u);
+            if(cpu_.Regs()[0]&&env_.IsMapped(cpu_.Regs()[0],4u))env_.MemoryWrite32(cpu_.Regs()[0],sec);
+            cpu_.Regs()[0]=sec;return true;
+        }
+        if(name=="srand"||name=="srandom"){rng_state_=cpu_.Regs()[0]?cpu_.Regs()[0]:1u;cpu_.Regs()[0]=0u;return true;}
+        if(name=="rand"||name=="random"){rng_state_=rng_state_*1103515245u+12345u;cpu_.Regs()[0]=(rng_state_>>1u)&0x7fffffffu;return true;}
+        if(name=="usleep"){virtual_time_usec_+=cpu_.Regs()[0];cpu_.Regs()[0]=0u;return true;}
         if(name=="exit"||name=="_exit"){done_=true;exit_code_=cpu_.Regs()[0];return true;}
         if(name=="malloc"){cpu_.Regs()[0]=Allocate(std::max<u32>(cpu_.Regs()[0],1u));return true;}
         if(name=="calloc"){const u64 n=u64(cpu_.Regs()[0])*cpu_.Regs()[1];if(n>0x1000000u){cpu_.Regs()[0]=0;return true;}const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)));std::vector<u8> z(static_cast<std::size_t>(n));if(n)env_.WriteBytes(a,z.data(),z.size());cpu_.Regs()[0]=a;return true;}
@@ -941,9 +1078,18 @@ private:
 
     void BuildInitialStack(){const std::string argv0="GeometryDashWrapper-iOS";const u32 arg=AllocateCString(argv0);u32 sp=kStackBase+kStackSize-0x1000u;sp&=~7u;sp-=24u;env_.MemoryWrite32(sp+0u,1u);env_.MemoryWrite32(sp+4u,arg);env_.MemoryWrite32(sp+8u,0u);env_.MemoryWrite32(sp+12u,0u);env_.MemoryWrite32(sp+16u,0u);env_.MemoryWrite32(sp+20u,0u);initial_sp_=sp;}
 
+    enum class HostCallStage { None, Delegate, AcquireDirector, QueryRunningScene, Frame };
+
     MachImage image_; Logger& log_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::vector<GuestClass> classes_;
-    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;u32 exit_code_=0;u32 delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0;bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false;std::string delegate_name_;
+    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
+    u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
+    u32 director_instance_=0,running_scene_=0,frame_count_=0,rng_state_=1u;
+    u64 virtual_time_usec_=1350000000000000ull;
+    u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0;
+    bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false;
+    HostCallStage host_call_stage_=HostCallStage::None;
+    std::string delegate_name_;
 };
 
 static std::string GetLogPath(int argc,char** argv){for(int i=2;i<argc;++i){std::string a=argv[i];if(a.starts_with("--log="))return a.substr(6);}const char* env=std::getenv("GD_LOG_PATH");return env?env:"ios-armv7.log";}
