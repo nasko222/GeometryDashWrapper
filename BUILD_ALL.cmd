@@ -20,7 +20,7 @@ if exist dist-unified\assets rmdir /s /q dist-unified\assets
 xcopy /e /i /y assets dist-unified\assets >nul
 
 echo.
-echo All three backends and the native launcher are in dist-unified\
+echo All four backends and the native launcher are in dist-unified\
 echo Drag an APK onto RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd to run it.
-echo Drag an IPA onto either launcher to inspect its iOS bundle and Mach-O executable.
+echo Drag an ARMv7 decrypted IPA onto either launcher to analyze it and attempt the iOS bootstrap.
 exit /b 0

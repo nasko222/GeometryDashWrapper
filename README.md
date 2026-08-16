@@ -1,26 +1,34 @@
-# Geometry Dash Wrapper 0.9.6 — PublicTest1
+# Geometry Dash Wrapper 0.9.6 — PublicTest2
 
-PublicTest1 keeps the existing Android APK wrapper path and adds the first
-read-only iOS IPA inspection path.
+PublicTest2 keeps the existing Android APK wrapper path and adds the first real
+32-bit iOS execution bootstrap.
 
 ## APKs
 
 Drag an APK onto `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd` exactly as
-before. The x86, legacy ARM and ARMv7 backend selection and runtime paths are
-otherwise carried forward from EnduranceTest12.
+before. The x86, legacy ARM and ARMv7 Android runtime paths are carried forward
+from PublicTest1/EnduranceTest12 apart from the displayed version string.
 
-## IPAs — new in PublicTest1
+## IPAs — new in PublicTest2
 
-Drag an `.ipa` onto either launcher. PublicTest1 does **not** execute iOS code
-yet. It opens the IPA as a ZIP, locates `Payload/<app>.app/Info.plist`, reads XML
-or binary plist metadata, locates the app executable, and inspects thin/fat
-Mach-O headers. It reports the CPU architecture, entry-point style, imported
-dylibs/frameworks and the Mach-O encryption flag.
+Drag a decrypted 32-bit ARM `.ipa` onto either launcher. The native launcher
+first prints the existing Info.plist/Mach-O analysis, then starts the separate
+`ios-armv7/RobTopIOSArmV7.exe` backend.
 
-ARMv7/ARMv7s is reported as the best future target because the wrapper already
-has an A32 Dynarmic execution core. ARM64 is identified but still needs a new
-AArch64 execution path. PublicTest1 never attempts to bypass an encrypted iOS
-executable.
+The iOS backend selects the ARMv7 slice, maps the Mach-O segments at their
+preferred addresses, processes dyld bind/weak/lazy-bind information, prepares a
+Darwin-style initial stack and executes the real `LC_UNIXTHREAD` ARM entry point
+with Dynarmic A32.
 
-Build with `BUILD_ALL.cmd`. APKs, IPAs and built binaries are intentionally not
-included in the source archive.
+This is a bootstrap milestone, not an iOS emulator yet. The minimal Objective-C
+compatibility layer is intentionally only large enough to test startup. On
+success the backend stops at `_UIApplicationMain` and logs:
+
+`RESULT: IOS_BOOTSTRAP_REACHED_UIAPPLICATIONMAIN`
+
+UIKit event handling, rendering, audio and actual gameplay are future work.
+PublicTest2 does not bypass App Store encryption and refuses encrypted binaries.
+
+The bootstrap was designed against user-supplied decrypted copies of Geometry
+Dash 1.0 and Forlorn 1.9c. No IPA or extracted Apple executable is included in
+this source archive.

@@ -1,0 +1,123 @@
+Geometry Dash Wrapper 0.9.6-publictest2
+PublicTest2 verification
+=========================================
+
+Scope
+-----
+PublicTest2 adds a separate ARMv7 iOS bootstrap backend. It does not make the
+iOS games playable yet. The intended milestone is real Mach-O execution from
+the LC_UNIXTHREAD entry point until _UIApplicationMain.
+
+Actual supplied IPA validation
+------------------------------
+Geometry Dash 1.0 decrypted IPA
+  SHA-256: 409392082c7065108b35f7cb9b906d4d631ac90452786ab6a92fbdf59d0344bc
+  Bundle: com.robtop.geometryjump
+  Fat Mach-O: ARMv7 + ARMv7s
+  ARMv7 entry PC: 0x00003bc0
+  Encryption flag: 0
+  __mod_init_func entries: 219
+  Dyld bindings validated: 2470, 707 unique symbols
+
+Forlorn 1.9c IPA
+  SHA-256: cdfb3d117d244272288cde06344502ffa119e56075f4c45762bbd564ec3df53d
+  Bundle: com.robtop.magegame
+  Thin Mach-O: ARMv7
+  ARMv7 entry PC: 0x000024c0
+  Encryption flag: 0
+  __mod_init_func entries: 0
+  Dyld bindings validated: 5276, 492 unique symbols
+  Startup evidence: first Objective-C selector is "new" on the
+  NSAutoreleasePool class reference, followed by _UIApplicationMain with the
+  CFString delegate name "AppDelegate".
+
+Important binder correction
+----------------------------
+Geometry Dash 1.0 uses a legitimate 32-bit dyld bind-stream address wrap. A
+64-bit segment-offset accumulator rejects this stream as an impossible huge
+address. PublicTest2 deliberately performs the bind offset arithmetic at ARM32
+pointer width, matching the target process.
+
+Regression isolation
+--------------------
+- x86 backend tree is byte-for-byte identical to PublicTest1.
+- shared audio/network/storage/song/runtime source is byte-for-byte identical.
+- legacy ARM backend differs only in the displayed PublicTest2 profile version.
+- Android ARMv7 backend differs only in the displayed PublicTest2 profile version.
+- IPA execution is routed to a separate ios-armv7 backend.
+
+Compile/static verification
+---------------------------
+The new iOS backend passes local C++20 syntax checking with:
+  -Wall -Wextra -Werror
+using a Dynarmic interface stub matching the APIs used by the existing wrapper.
+
+Geometry Dash Wrapper 0.9.6-publictest2 focused audit
+RESULT: 48/48 PASS
+
+01. PASS: VERSION.txt is 0.9.6-publictest2
+02. PASS: BRANCH.txt is publictest2
+03. PASS: shared build version updated
+04. PASS: shared build branch updated
+05. PASS: iOS backend CMake target exists
+06. PASS: builder revision PublicTest2
+07. PASS: builder packages ios-armv7
+08. PASS: iOS backend timestamp refreshed
+09. PASS: BUILD_ALL reports four backends
+10. PASS: launcher version PublicTest2
+11. PASS: launcher starts iOS bootstrap
+12. PASS: launcher keeps APK path separate
+13. PASS: iOS logs use dated folder
+14. PASS: ARMv7 Mach-O selector present
+15. PASS: LC_UNIXTHREAD entry parser present
+16. PASS: dyld binder present
+17. PASS: Objective-C class binding present
+18. PASS: UIApplicationMain interception present
+19. PASS: success marker present
+20. PASS: dyld offset arithmetic is 32-bit
+21. PASS: encrypted executables refused
+22. PASS: source tree contains no APK/IPA/SO/EXE/DLL/Python/.gitignore
+23. PASS: source tree contains no .git directory
+24. PASS: x86 backend byte-identical to PublicTest1 [915406cbd194ef3edaa38c66d8bc2ab8901bdf3318fb3d3815e870f38ff65f2a]
+25. PASS: src/shared/audio_win.c unchanged
+26. PASS: src/shared/net_compat_win.c unchanged
+27. PASS: src/shared/storage_win.c unchanged
+28. PASS: src/shared/song_http_win.c unchanged
+29. PASS: src/shared/runtime_settings.c unchanged
+30. PASS: legacy ARM changes only displayed version
+31. PASS: Android ARMv7 changes only displayed version
+32. PASS: iOS backend C++20 syntax -Wall -Wextra -Werror
+33. PASS: Geometry Dash 1.0 bundle id
+34. PASS: Geometry Dash 1.0 is ARM32/ARMv7
+35. PASS: Geometry Dash 1.0 is unencrypted
+36. PASS: Geometry Dash 1.0 LC_UNIXTHREAD PC [0x3bc0]
+37. PASS: Geometry Dash 1.0 dyld bind streams validate with 32-bit wrapping [{'bind': 1934, 'weak_bind': 5, 'lazy_bind': 531}]
+38. PASS: Geometry Dash 1.0 binds _UIApplicationMain
+39. PASS: Geometry Dash 1.0 binds _objc_msgSend
+40. PASS: Forlorn 1.9c bundle id
+41. PASS: Forlorn 1.9c is ARM32/ARMv7
+42. PASS: Forlorn 1.9c is unencrypted
+43. PASS: Forlorn 1.9c LC_UNIXTHREAD PC [0x24c0]
+44. PASS: Forlorn 1.9c dyld bind streams validate with 32-bit wrapping [{'bind': 4920, 'weak_bind': 0, 'lazy_bind': 356}]
+45. PASS: Forlorn 1.9c binds _UIApplicationMain
+46. PASS: Forlorn 1.9c binds _objc_msgSend
+47. PASS: Forlorn first Objective-C selector is new [new]
+48. PASS: Forlorn UIApplicationMain delegate string is AppDelegate [AppDelegate]
+
+Actual supplied IPA validation (files are not included in the release):
+- Geometry Dash 1.0: sha256=409392082c7065108b35f7cb9b906d4d631ac90452786ab6a92fbdf59d0344bc, ipa_bytes=17064126, fat=1, armv7_slice_bytes=2275104, entry=0x3bc0, mod_init=219, bind_counts={'bind': 1934, 'weak_bind': 5, 'lazy_bind': 531}, total_bindings=2470, unique_symbols=707
+- Forlorn 1.9c: sha256=cdfb3d117d244272288cde06344502ffa119e56075f4c45762bbd564ec3df53d, ipa_bytes=56979731, fat=0, armv7_slice_bytes=2068752, entry=0x24c0, mod_init=0, bind_counts={'bind': 4920, 'weak_bind': 0, 'lazy_bind': 356}, total_bindings=5276, unique_symbols=492
+
+
+Packaging rule
+--------------
+No APK, IPA, extracted game executable, .so, EXE, DLL, Python source,
+.gitignore or .git metadata is included in the source package.
+
+Runtime status
+--------------
+The supplied IPAs were parsed and their Mach-O/dyld/Objective-C startup data
+were validated offline. This environment did NOT build or Windows-runtime-test
+the final Dynarmic executable. The first real PublicTest2 test on Windows should
+send the new ios-armv7.log. Success for this build is:
+  RESULT: IOS_BOOTSTRAP_REACHED_UIAPPLICATIONMAIN

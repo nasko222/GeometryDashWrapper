@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder58-0.9.6-publictest1"
+$BuilderRevision = "dynarmic-x64-builder59-0.9.6-publictest2"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -219,7 +219,11 @@ if ($RefreshTools) {
 }
 if ($Clean) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $BuildDir
-    $ArmOutputPaths = @((Join-Path $Output "arm-legacy"), (Join-Path $Output "armv7"))
+    $ArmOutputPaths = @(
+        (Join-Path $Output "arm-legacy"),
+        (Join-Path $Output "armv7"),
+        (Join-Path $Output "ios-armv7")
+    )
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
 }
 if ($RefreshDynarmic) {
@@ -418,6 +422,7 @@ Write-Host "Refreshing unified backend source timestamps to prevent stale Ninja 
 $ProbeSourcesToRefresh = @(
     (Join-Path $Root "src\backends\arm_legacy\dynarmic_legacy.cpp"),
     (Join-Path $Root "src\backends\armv7\dynarmic_armv7.cpp"),
+    (Join-Path $Root "src\backends\ios_armv7\dynarmic_ios_armv7.cpp"),
     (Join-Path $Root "src\shared\storage_win.c"),
     (Join-Path $Root "src\shared\audio_win.c"),
     (Join-Path $Root "src\shared\apk_extract_audio.c"),
@@ -439,19 +444,24 @@ Invoke-External -FilePath $CMakeExe -Arguments @("--build", $BuildDir, "--parall
 
 $LegacyMatches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashArmLegacy.exe" -File -Recurse)
 $ArmV7Matches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "GeometryDashArmV7.exe" -File -Recurse)
+$IosArmV7Matches = @(Get-ChildItem -LiteralPath $BuildDir -Filter "RobTopIOSArmV7.exe" -File -Recurse)
 if ($LegacyMatches.Count -lt 1) { throw "Build completed but GeometryDashArmLegacy.exe was not found" }
 if ($ArmV7Matches.Count -lt 1) { throw "Build completed but GeometryDashArmV7.exe was not found" }
+if ($IosArmV7Matches.Count -lt 1) { throw "Build completed but RobTopIOSArmV7.exe was not found" }
 $LegacyExe = $LegacyMatches[0].FullName
 $ArmV7Exe = $ArmV7Matches[0].FullName
+$IosArmV7Exe = $IosArmV7Matches[0].FullName
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $LegacyOut = Join-Path $Output "arm-legacy"
 $ArmV7Out = Join-Path $Output "armv7"
-$ArmOutputPaths = @($LegacyOut, $ArmV7Out)
+$IosArmV7Out = Join-Path $Output "ios-armv7"
+$ArmOutputPaths = @($LegacyOut, $ArmV7Out, $IosArmV7Out)
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $ArmOutputPaths
 New-Item -ItemType Directory -Force -Path $ArmOutputPaths | Out-Null
 Copy-Item -Force $LegacyExe (Join-Path $LegacyOut "GeometryDashArmLegacy.exe")
 Copy-Item -Force $ArmV7Exe (Join-Path $ArmV7Out "GeometryDashArmV7.exe")
+Copy-Item -Force $IosArmV7Exe (Join-Path $IosArmV7Out "RobTopIOSArmV7.exe")
 New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 
 $LegacyRun = @'
@@ -502,22 +512,41 @@ if not exist save mkdir save
 for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-v22beta*.log gd-arm*-imports*.txt gd-v22beta-imports*.txt gd-arm*-profile*.csv gd-dynarmic-profile*.csv gd-networktest*-profile*.csv gd-arm*-profile-summary*.txt gd-dynarmic-profile-summary*.txt gd-networktest*-profile-summary*.txt gd-run-info.txt) do del /q "%%F" >nul 2>nul
 "%~dp0GeometryDashArmV7.exe" game.apk --companion-hooks=off --debug-everything --dump-imports=gd-armv7-imports.txt --log=gd-armv7-debug.log --profile=gd-armv7-profile.csv --profile-summary=gd-armv7-profile-summary.txt
 '@
+$IosArmV7Run = @'
+@echo off
+cd /d "%~dp0.."
+set "IPA=%~1"
+if "%IPA%"=="" set "IPA=game.ipa"
+if not exist "%IPA%" (
+  echo Drag a decrypted ARMv7 iOS .ipa onto this RUN.cmd, or put it in dist-unified as game.ipa
+  pause
+  exit /b 2
+)
+"%~dp0RobTopIOSArmV7.exe" "%IPA%" --log=ios-armv7.log
+set "RESULT=%ERRORLEVEL%"
+pause
+exit /b %RESULT%
+'@
 [IO.File]::WriteAllText((Join-Path $LegacyOut "RUN.cmd"), $LegacyRun, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $LegacyOut "RUN_DEBUG.cmd"), $LegacyDebug, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN.cmd"), $ArmV7Run, [Text.Encoding]::ASCII)
 [IO.File]::WriteAllText((Join-Path $ArmV7Out "RUN_DEBUG.cmd"), $ArmV7Debug, [Text.Encoding]::ASCII)
+[IO.File]::WriteAllText((Join-Path $IosArmV7Out "RUN.cmd"), $IosArmV7Run, [Text.Encoding]::ASCII)
 
 $License = Join-Path $DynarmicSource "LICENSE.txt"
 if (Test-Path $License) {
     Copy-Item -Force $License (Join-Path $LegacyOut "DYNARMIC-LICENSE.txt")
     Copy-Item -Force $License (Join-Path $ArmV7Out "DYNARMIC-LICENSE.txt")
+    Copy-Item -Force $License (Join-Path $IosArmV7Out "DYNARMIC-LICENSE.txt")
 }
 $BoostLicense = Join-Path $BoostSource "LICENSE_1_0.txt"
 if (Test-Path $BoostLicense) {
     Copy-Item -Force $BoostLicense (Join-Path $LegacyOut "BOOST-LICENSE.txt")
     Copy-Item -Force $BoostLicense (Join-Path $ArmV7Out "BOOST-LICENSE.txt")
+    Copy-Item -Force $BoostLicense (Join-Path $IosArmV7Out "BOOST-LICENSE.txt")
 }
 [IO.File]::WriteAllText((Join-Path $Output "DYNARMIC-VERSION.txt"), "api=$DynarmicVersion`r`ncommit=$DynarmicCommit`r`nsource=$DynarmicRepo`r`n", [Text.Encoding]::ASCII)
 Write-Host "`nUnified Dynarmic backends ready:" -ForegroundColor Green
 Write-Host "  $LegacyOut"
 Write-Host "  $ArmV7Out"
+Write-Host "  $IosArmV7Out"

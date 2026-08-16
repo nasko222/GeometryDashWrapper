@@ -1,14 +1,15 @@
-# PublicTest1 checklist
+# PublicTest2 checklist
 
-APK regression:
-- launch an x86 APK;
-- launch a legacy ARM APK;
+Android regression:
+- launch one x86 APK;
+- launch one legacy ARM APK;
 - launch the ARMv7 2.2 beta;
-- confirm networking, saves and editor behavior are unchanged.
+- confirm networking, saves, audio and editor behavior did not regress.
 
-IPA analyzer:
-- drag several RobTop IPAs onto either `RUN_AUTO_*.cmd`;
-- send the complete console output;
-- include at least one old 32-bit IPA if available;
-- note whether the analyzer reports ARMv7, ARM64, a fat binary, or encryption;
-- report any IPA that says no root bundle, no executable or not Mach-O.
+iOS bootstrap:
+- drag the decrypted Geometry Dash 1.0 IPA onto either `RUN_AUTO_*.cmd`;
+- drag Forlorn 1.9c onto either launcher;
+- send the newest `logs/.../ios-armv7.log` for each;
+- success for this build means reaching
+  `RESULT: IOS_BOOTSTRAP_REACHED_UIAPPLICATIONMAIN`;
+- a window/gameplay is not expected yet in PublicTest2.

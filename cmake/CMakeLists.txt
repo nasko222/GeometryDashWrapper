@@ -84,3 +84,11 @@ gd_add_dynarmic_backend(
     "GeometryDashArmV7"
     "${GD_ROOT}/src/backends/armv7"
 )
+
+
+gd_add_dynarmic_backend(
+    RobTopIOSArmV7
+    "${GD_ROOT}/src/backends/ios_armv7/dynarmic_ios_armv7.cpp"
+    "RobTopIOSArmV7"
+    "${GD_ROOT}/src/backends/ios_armv7"
+)

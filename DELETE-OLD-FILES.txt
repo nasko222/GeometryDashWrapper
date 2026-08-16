@@ -1,0 +1,3 @@
+Delete these PublicTest1 files after applying this hotfix:
+- PUBLICTEST1-VERIFICATION.txt
+- PUBLICTEST1.md

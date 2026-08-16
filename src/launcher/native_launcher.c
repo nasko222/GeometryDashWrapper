@@ -11,7 +11,7 @@
  *   1. Read APK packages as ZIP files and preserve the existing Android path.
  *   2. Extract package/version metadata from AndroidManifest.xml.
  *   3. Select the x86, legacy ARM, or ARMv7 backend for APKs.
- *   4. PublicTest1: inspect IPA/Info.plist/Mach-O files without executing them.
+ *   4. PublicTest2: inspect IPA files, then launch the ARMv7 iOS bootstrap backend.
  *   5. Create one dated log folder per Android launch.
  *   6. Set the shared save/title/icon/server environment variables.
  *   7. Start the Android backend and wait for it to exit.
@@ -40,7 +40,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.6-publictest1"
+#define LAUNCHER_VERSION "0.9.6-publictest2"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -1128,15 +1128,15 @@ static int AnalyzeIpaInput(const wchar_t *input_path) {
     if (!have_executable) {
         ApkArchiveClose(&archive);
         printf("RESULT: IPA_ANALYZER_NO_EXECUTABLE\n");
-        printf("Execution status: analysis only; iOS backend is not implemented yet.\n");
-        return 1;
+        printf("Execution status: no executable was found, so the iOS bootstrap cannot start.\n");
+        return 0;
     }
     executable = ExtractZipEntry(&archive, &executable_entry, &executable_size);
     if (!executable) {
         ApkArchiveClose(&archive);
         printf("RESULT: IPA_ANALYZER_EXECUTABLE_EXTRACT_FAILED\n");
         printf("Executable is too large, compressed with an unsupported ZIP method, or damaged.\n");
-        return 1;
+        return 0;
     }
     if (!*executable_path) ZipEntryNameCopy(&executable_entry, executable_path,
                                             ARRAY_COUNT(executable_path));
@@ -1147,7 +1147,7 @@ static int AnalyzeIpaInput(const wchar_t *input_path) {
         ApkArchiveClose(&archive);
         printf("RESULT: IPA_ANALYZER_NOT_MACHO\n");
         printf("Execution status: selected app executable was not recognized as Mach-O.\n");
-        return 1;
+        return 0;
     }
     printf("CPU assessment: ");
     if (strcmp(primary_arch, "armv7") == 0 || strcmp(primary_arch, "armv7s") == 0 ||
@@ -1159,10 +1159,10 @@ static int AnalyzeIpaInput(const wchar_t *input_path) {
         printf("architecture needs a dedicated iOS loader/runtime path.\n");
     }
     if (encrypted) {
-        printf("Execution blocker: executable reports App Store encryption. PublicTest1 will not attempt to bypass it.\n");
+        printf("Execution blocker: executable reports App Store encryption. PublicTest2 will not attempt to bypass it.\n");
     }
     printf("RESULT: IPA_ANALYZER_OK arch=%s encrypted=%d\n", primary_arch, encrypted);
-    printf("Execution status: analysis only in PublicTest1; the Android APK path is unchanged.\n");
+    printf("Execution status: PublicTest2 will now attempt the separate ARMv7 iOS bootstrap; Android APK handling is unchanged.\n");
     free(executable);
     ApkArchiveClose(&archive);
     return 1;
@@ -1658,6 +1658,117 @@ command_error:
     return 1u;
 }
 
+static int CreateIpaRunDirectory(const wchar_t *base_directory,
+                                 wchar_t *run_directory, size_t run_capacity,
+                                 wchar_t *log_path, size_t log_capacity) {
+    SYSTEMTIME now;
+    wchar_t logs_directory[MAX_PATH * 4];
+    wchar_t day_directory[MAX_PATH * 4];
+    wchar_t folder_name[256];
+    wchar_t latest_path[MAX_PATH * 4];
+    unsigned suffix;
+    FILE *latest = NULL;
+
+    GetLocalTime(&now);
+    if (!PathJoin(logs_directory, ARRAY_COUNT(logs_directory),
+                  base_directory, L"logs")) return 0;
+    swprintf_s(day_directory, ARRAY_COUNT(day_directory), L"%ls\\%04u-%02u-%02u",
+               logs_directory, now.wYear, now.wMonth, now.wDay);
+    if (!EnsureDirectory(day_directory)) return 0;
+
+    swprintf_s(folder_name, ARRAY_COUNT(folder_name),
+               L"%02u-%02u-%02u__ios-armv7__publictest2",
+               now.wHour, now.wMinute, now.wSecond);
+    for (suffix = 1u; suffix < 1000u; ++suffix) {
+        if (suffix == 1u) {
+            swprintf_s(run_directory, run_capacity, L"%ls\\%ls",
+                       day_directory, folder_name);
+        } else {
+            swprintf_s(run_directory, run_capacity, L"%ls\\%ls__%02u",
+                       day_directory, folder_name, suffix);
+        }
+        if (CreateDirectoryW(run_directory, NULL)) break;
+        if (GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+    }
+    if (suffix >= 1000u) return 0;
+
+    if (!PathJoin(log_path, log_capacity, run_directory, L"ios-armv7.log"))
+        return 0;
+
+    if (PathJoin(latest_path, ARRAY_COUNT(latest_path),
+                 logs_directory, L"latest-run.txt") &&
+        _wfopen_s(&latest, latest_path, L"wb, ccs=UTF-8") == 0 && latest) {
+        fwprintf(latest, L"%ls\n", run_directory);
+        fclose(latest);
+    }
+    return 1;
+}
+
+static DWORD LaunchIpaBootstrap(const wchar_t *input_path) {
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    wchar_t base_directory[MAX_PATH * 4];
+    wchar_t backend_path[MAX_PATH * 4];
+    wchar_t ipa_path[MAX_PATH * 4];
+    wchar_t run_directory[MAX_PATH * 4];
+    wchar_t log_path[MAX_PATH * 4];
+    wchar_t command[MAX_COMMAND_LINE];
+    DWORD full_length;
+    DWORD exit_code = 1u;
+
+    memset(&startup, 0, sizeof(startup));
+    memset(&process, 0, sizeof(process));
+    startup.cb = sizeof(startup);
+
+    if (!GetExecutableDirectory(base_directory, ARRAY_COUNT(base_directory))) {
+        PrintWindowsError(L"GetModuleFileName");
+        return 1u;
+    }
+    full_length = GetFullPathNameW(input_path, ARRAY_COUNT(ipa_path), ipa_path, NULL);
+    if (!full_length || full_length >= ARRAY_COUNT(ipa_path)) {
+        PrintWindowsError(L"GetFullPathName");
+        return 1u;
+    }
+    if (!PathJoin(backend_path, ARRAY_COUNT(backend_path),
+                  base_directory, L"ios-armv7\\RobTopIOSArmV7.exe")) {
+        return 1u;
+    }
+    if (!FileExists(backend_path)) {
+        fwprintf(stderr,
+                 L"ERROR: iOS ARMv7 backend is not built: %ls\n"
+                 L"Run BUILD_ALL.cmd first.\n", backend_path);
+        return 1u;
+    }
+    if (!CreateIpaRunDirectory(base_directory, run_directory,
+                               ARRAY_COUNT(run_directory),
+                               log_path, ARRAY_COUNT(log_path))) {
+        fwprintf(stderr, L"ERROR: Could not create the iOS dated log folder.\n");
+        return 1u;
+    }
+
+    SetEnvironmentVariableW(L"GD_LOG_PATH", log_path);
+    command[0] = L'\0';
+    if (!AppendCommandArgument(command, ARRAY_COUNT(command), backend_path) ||
+        !AppendCommandArgument(command, ARRAY_COUNT(command), ipa_path) ||
+        !AppendOption(command, ARRAY_COUNT(command), L"--log=", log_path)) {
+        fwprintf(stderr, L"ERROR: iOS backend command line exceeded the safe limit.\n");
+        return 1u;
+    }
+
+    wprintf(L"\nPublicTest2: starting real ARMv7 iOS bootstrap...\n");
+    wprintf(L"iOS log: %ls\n", log_path);
+    if (!CreateProcessW(backend_path, command, NULL, NULL, FALSE, 0,
+                        NULL, base_directory, &startup, &process)) {
+        PrintWindowsError(L"CreateProcess iOS backend");
+        return 1u;
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) exit_code = 1u;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return exit_code;
+}
+
 /* ------------------------------- Main workflow ------------------------------ */
 
 static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *context) {
@@ -1819,10 +1930,14 @@ int wmain(int argc, wchar_t **argv) {
     DWORD exit_code;
     launcher_error[0] = L'\0';
 
-    /* PublicTest1: IPA files are inspected only. APK launch remains on the
-       pre-existing path below so the stable Android behavior is isolated. */
+    /*
+     * PublicTest2 keeps IPA execution entirely separate from the stable Android
+     * launcher path. First print the analyzer report, then let the dedicated
+     * ARMv7 Mach-O bootstrap make the real execution attempt.
+     */
     if (argc >= 2 && argv[1] && *argv[1] && PathHasExtension(argv[1], L".ipa")) {
-        return AnalyzeIpaInput(argv[1]) ? 0 : 2;
+        if (!AnalyzeIpaInput(argv[1])) return 2;
+        return (int)LaunchIpaBootstrap(argv[1]);
     }
 
     if (!InitializeLauncherContext(argc, argv, &context)) return 2;
