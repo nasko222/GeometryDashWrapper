@@ -1,0 +1,34 @@
+Geometry Dash Wrapper 0.9.6-publictest5 verification
+
+PublicTest4 runtime diagnosis:
+  PASS: final PC 0x50000aec is the return instruction of the imported
+        _objc_msgSend trampoline in the supplied Forlorn 1.9c IPA.
+  PASS: LR 0xe1af1 is the normal Thumb return immediately after the observed
+        NSNumber/objc_msgSend call.
+  PASS: PublicTest4 incorrectly subtracted kRunChunk (5,000,000) for every
+        callback halt, explaining the artificial 150,000,000-tick exhaustion.
+
+PublicTest5:
+  PASS: callback halts preserve Dynarmic GetTicksRemaining().
+  PASS: run budget charges only consumed ticks (minimum one).
+  PASS: Objective-C stret ABI is decoded as dest/self/_cmd.
+  PASS: UIScreen/view CGRect bootstrap returns 320x480.
+  PASS: EAGLView/UIView layer returns a persistent CAEAGLLayer fake object.
+  PASS: Foundation number/container/URL convenience objects return non-null objects.
+  PASS: EAGLContext surface/current-context success paths are present.
+  PASS: minimal OpenGL ES framebuffer/object/query and OpenAL bootstrap paths are present.
+  PASS: legacy TestFlight +takeOff: bypass is retained.
+  PASS: Geometry Dash 1.0's 219-constructor delegate deferral is retained.
+
+Regression isolation:
+  PASS: x86 source tree byte-for-byte unchanged from PublicTest4.
+  PASS: shared audio/storage/network/song/runtime source byte-for-byte unchanged.
+  PASS: Android ARM legacy/ARMv7 behavior changed only in displayed version metadata.
+  PASS: isolated iOS CMake target from the PublicTest2 build fix is retained.
+
+Syntax:
+  PASS: iOS C++20 syntax-only compile using local Dynarmic interface stub.
+
+Runtime:
+  Not Windows-runtime-tested here. Test Forlorn 1.9c and send the full
+  ios-armv7.log from PublicTest5.

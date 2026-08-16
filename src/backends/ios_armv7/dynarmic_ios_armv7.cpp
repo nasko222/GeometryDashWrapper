@@ -422,7 +422,7 @@ public:
     u64 GetTicksRemaining() override { return ticks_left; }
 private:
     static constexpr u32 kShift=12u; static constexpr std::size_t kGuestPageCount=std::size_t{1}<<(32u-kShift); static constexpr std::int16_t kUnmappedPage=-1;
-    void RequestHalt(){ if(cpu_) cpu_->HaltExecution(Dynarmic::HaltReason::UserDefined1); ticks_left=0; }
+    void RequestHalt(){ if(cpu_) cpu_->HaltExecution(Dynarmic::HaltReason::UserDefined1); }
     void RebuildPageLookup(){ std::fill(page_regions_.begin(),page_regions_.end(),kUnmappedPage); if(regions_.size()>32760u)throw std::runtime_error("too many guest regions"); for(std::size_t i=0;i<regions_.size();++i){const auto& r=regions_[i];u64 b=u64(r.base)>>kShift;u64 e=(u64(r.base)+r.data.size()-1u)>>kShift;for(u64 p=b;p<=e;++p)page_regions_[static_cast<std::size_t>(p)]=static_cast<std::int16_t>(i);} }
     const MemoryRegion* FindContaining(u32 a) const { const auto i=page_regions_[a>>kShift]; if(i<0)return nullptr;const auto& r=regions_[static_cast<std::size_t>(i)];return u64(a)<u64(r.base)+r.data.size()&&a>=r.base?&r:nullptr; }
     MemoryRegion* FindContainingMutable(u32 a){ const auto i=page_regions_[a>>kShift];if(i<0)return nullptr;auto& r=regions_[static_cast<std::size_t>(i)];return u64(a)<u64(r.base)+r.data.size()&&a>=r.base?&r:nullptr; }
@@ -507,7 +507,13 @@ public:
             const auto reason = cpu_.Run();
             (void)reason;
             cpu_.ClearHalt(Dynarmic::HaltReason::UserDefined1);
-            budget -= chunk;
+            // PublicTest4 charged a whole 5M-tick chunk every time an import
+            // SVC halted Dynarmic, even if only a handful of guest instructions
+            // had executed. Preserve GetTicksRemaining() on a halt and charge
+            // only the work actually consumed.
+            const u64 remaining = std::min<u64>(env_.ticks_left, chunk);
+            const u64 consumed = std::max<u64>(chunk - remaining, 1u);
+            budget -= std::min<u64>(budget, consumed);
             if (env_.invalid_access) {
                 log_ << (delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x") << Hex(env_.fault_address)
                      << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
@@ -583,6 +589,20 @@ private:
     }
     u32 NewExternalInstance(const std::string& cls){ const u32 a=Allocate(64u); const u32 c=EnsureExternalClass(cls); env_.MemoryWrite32(a,c); fake_objects_[a]=FakeObject{cls,false,false,{}}; return a; }
     u32 NewFakeString(const std::string& text){ u32 a=NewExternalInstance("NSString"); const u32 chars=AllocateCString(text); env_.MemoryWrite32(a+8u,chars); env_.MemoryWrite32(a+12u,static_cast<u32>(text.size())); fake_objects_[a].string_value=text; return a; }
+    u32 AssociatedExternal(u32 owner,std::string_view key,std::string_view cls){
+        const std::string k=std::to_string(owner)+":"+std::string(key);
+        auto it=associated_fake_.find(k);if(it!=associated_fake_.end())return it->second;
+        const u32 obj=NewExternalInstance(std::string(cls));associated_fake_[k]=obj;return obj;
+    }
+    bool WriteCGRect(u32 dest,float x,float y,float w,float h){
+        if(!dest||!env_.IsMapped(dest,16u))return false;
+        const std::array<float,4> rect{x,y,w,h};
+        return env_.WriteBytes(dest,rect.data(),sizeof(rect));
+    }
+    void WriteGeneratedIds(u32 count,u32 ptr){
+        if(!ptr||!count||count>4096u||!env_.IsMapped(ptr,std::size_t(count)*4u))return;
+        for(u32 i=0;i<count;++i)env_.MemoryWrite32(ptr+i*4u,gl_object_counter_++);
+    }
 
     u32 EnsureImport(const std::string& name){ auto it=import_by_name_.find(name); if(it!=import_by_name_.end())return imports_[it->second].stub; const std::size_t idx=imports_.size(); if((idx+1u)*8u>kImportSize)throw std::runtime_error("too many iOS imports"); Import imp{name,kImportBase+static_cast<u32>(idx*8u),static_cast<u32>(idx+1u),0}; WriteArmSvc(imp.stub,imp.svc); imports_.push_back(imp);import_by_name_[name]=idx;return imp.stub; }
     u32 ResolveSymbol(const std::string& symbol){
@@ -753,6 +773,41 @@ private:
     std::string ClassNameForAddress(u32 addr)const{auto it=fake_objects_.find(addr);if(it!=fake_objects_.end())return it->second.class_name;for(const auto& c:classes_)if(c.class_addr==addr||c.meta_addr==addr)return c.name;const GuestClass* instance=FindGuestClassForInstance(addr);return instance?instance->name:std::string{};}
     std::string DescribeString(u32 obj){if(!obj)return {};auto it=fake_objects_.find(obj);if(it!=fake_objects_.end()&&!it->second.string_value.empty())return it->second.string_value;std::string direct;if(env_.ReadCString(obj,direct,512u)&&!direct.empty()&&std::all_of(direct.begin(),direct.end(),[](unsigned char c){return c>=0x20&&c<0x7f;}))return direct;if(env_.IsMapped(obj,16u)){const u32 chars=env_.MemoryRead32(obj+8u);std::string s;if(chars&&env_.ReadCString(chars,s,512u))return s;}return {};}
 
+    bool HandleObjcMsgSendStret(){
+        const u32 dest=cpu_.Regs()[0],receiver=cpu_.Regs()[1],selector_addr=cpu_.Regs()[2];
+        std::string selector;if(selector_addr)env_.ReadCString(selector_addr,selector,1024u);
+        if(!dest||!env_.IsMapped(dest,16u))return true;
+
+        if(!receiver){WriteCGRect(dest,0.0f,0.0f,0.0f,0.0f);return true;}
+
+        const GuestClass* class_receiver=nullptr;
+        for(const auto& c:classes_)if(c.class_addr==receiver||c.meta_addr==receiver){class_receiver=&c;break;}
+        if(class_receiver){
+            if(const GuestMethod* method=FindMethod(class_receiver->class_methods,selector)){
+                if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret class dispatch "<<class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
+                EnterGuestMethod(*method);return true;
+            }
+        }
+        if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            if(const GuestMethod* method=FindMethod(instance_class->instance_methods,selector)){
+                if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
+                EnterGuestMethod(*method);return true;
+            }
+        }
+
+        const std::string cls=ClassNameForAddress(receiver);
+        if(selector=="bounds"||selector=="frame"||selector=="applicationFrame"){
+            WriteCGRect(dest,0.0f,0.0f,320.0f,480.0f);
+            if(++stret_stub_logs_<=16u)
+                log_<<"IOS: UIKit CGRect bootstrap class="<<(cls.empty()?"unknown":cls)<<" selector="<<selector<<" -> 320x480\n";
+            return true;
+        }
+        WriteCGRect(dest,0.0f,0.0f,0.0f,0.0f);
+        if(++stret_stub_logs_<=16u)
+            log_<<"IOS: objc stret bootstrap stub class="<<(cls.empty()?"unknown":cls)<<" selector="<<(selector.empty()?"<unknown>":selector)<<" -> zero-rect\n";
+        return true;
+    }
+
     bool HandleObjcMsgSend(){
         const u32 receiver=cpu_.Regs()[0],selector_addr=cpu_.Regs()[1];
         std::string selector;if(selector_addr)env_.ReadCString(selector_addr,selector,1024u);
@@ -780,19 +835,34 @@ private:
             return true;
         }
 
+        if(guest_class_receiver&&selector=="class"){cpu_.Regs()[0]=receiver;return true;}
         if(guest_class_receiver&&!guest_meta_receiver&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewGuestInstance(*guest_class_receiver);return true;}
         if(guest_class_receiver){const GuestMethod* method=FindMethod(guest_class_receiver->class_methods,selector);if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest class dispatch "<<guest_class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}}
-        if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){const GuestMethod* method=FindMethod(instance_class->instance_methods,selector);if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}if(selector=="init"||selector.starts_with("initWith")||selector=="retain"||selector=="autorelease"||selector=="copy"||selector=="mutableCopy"){cpu_.Regs()[0]=receiver;return true;}if(selector=="release"||selector=="dealloc"){cpu_.Regs()[0]=0;return true;}}
+        if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            const GuestMethod* method=FindMethod(instance_class->instance_methods,selector);
+            if(method){if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";EnterGuestMethod(*method);return true;}
+            if(selector=="class"){cpu_.Regs()[0]=instance_class->class_addr;return true;}
+            if(selector=="layer"&&(instance_class->name=="EAGLView"||instance_class->name=="UIView")){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
+            if(selector=="init"||selector.starts_with("initWith")||selector=="retain"||selector=="autorelease"||selector=="copy"||selector=="mutableCopy"){cpu_.Regs()[0]=receiver;return true;}
+            if(selector=="release"||selector=="dealloc"){cpu_.Regs()[0]=0;return true;}
+        }
 
         const auto fit=fake_objects_.find(receiver);
         if(fit!=fake_objects_.end()){
             const auto& fo=fit->second;
             if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
+            if((fo.is_class||fo.is_meta)&&selector=="class"){cpu_.Regs()[0]=receiver;return true;}
+            if(fo.is_class&&(selector=="sharedApplication"||selector=="sharedInstance"||selector=="defaultManager"||selector=="defaultCenter"||selector=="standardUserDefaults"||selector=="mainBundle"||selector=="mainScreen"||selector=="currentDevice")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
+            if(fo.is_class&&(selector.starts_with("numberWith")||selector.starts_with("valueWith")||selector.starts_with("arrayWith")||selector.starts_with("dictionaryWith")||selector.starts_with("setWith")||selector.starts_with("URLWith")||selector.starts_with("dataWith")||selector.starts_with("colorWith")||selector.starts_with("fontWith")||selector.starts_with("imageNamed"))){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
+            if(fo.is_class&&selector=="setCurrentContext:"){cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
+            if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
+            if(!fo.is_class&&(selector=="presentRenderbuffer:"||selector=="renderbufferStorage:fromDrawable:")){cpu_.Regs()[0]=1u;return true;}
+            if(!fo.is_class&&(selector=="drawableWidth"||selector=="width")){cpu_.Regs()[0]=320u;return true;}
+            if(!fo.is_class&&(selector=="drawableHeight"||selector=="height")){cpu_.Regs()[0]=480u;return true;}
             if(selector=="retain"||selector=="autorelease"||selector=="copy"||selector=="mutableCopy"){cpu_.Regs()[0]=receiver;return true;}
             if(selector=="release"||selector=="dealloc"){cpu_.Regs()[0]=0;return true;}
             if(selector=="class"){cpu_.Regs()[0]=fo.is_class?receiver:env_.MemoryRead32(receiver);return true;}
-            if(fo.is_class&&(selector=="sharedApplication"||selector=="sharedInstance"||selector=="defaultManager"||selector=="defaultCenter"||selector=="standardUserDefaults"||selector=="mainBundle"||selector=="mainScreen"||selector=="currentDevice")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
             if(selector=="UTF8String"||selector=="cStringUsingEncoding:"){cpu_.Regs()[0]=fo.string_value.empty()?0u:AllocateCString(fo.string_value);return true;}
             if(selector=="length"){cpu_.Regs()[0]=static_cast<u32>(fo.string_value.size());return true;}
             if(selector=="respondsToSelector:"||selector=="isKindOfClass:"||selector=="isMemberOfClass:"){cpu_.Regs()[0]=1u;return true;}
@@ -818,9 +888,9 @@ private:
 
     bool HandleSvc(u32 svc){if(svc==kSvcReturn){if(delegate_launch_active_){delegate_launch_active_=false;delegate_launch_returned_=true;delegate_return_value_=cpu_.Regs()[0];log_<<"IOS: real delegate launch returned r0=0x"<<Hex(delegate_return_value_)<<"\n";}done_=true;return true;}if(svc==0||svc>imports_.size()){log_<<"RESULT: IOS_UNKNOWN_SVC id="<<svc<<"\n";return false;}Import& imp=imports_[svc-1u];++imp.calls;std::string name=imp.name;if(!name.empty()&&name[0]=='_')name.erase(name.begin());if(imp.calls==1u)log_<<"IOS IMPORT: "<<imp.name<<" r0=0x"<<Hex(cpu_.Regs()[0])<<" r1=0x"<<Hex(cpu_.Regs()[1])<<"\n";
         if(name=="objc_msgSend")return HandleObjcMsgSend();
-        if(name=="objc_msgSend_stret"){if(cpu_.Regs()[0]&&env_.IsMapped(cpu_.Regs()[0],16u)){std::array<u8,16> z{};env_.WriteBytes(cpu_.Regs()[0],z.data(),z.size());}return true;}
+        if(name=="objc_msgSend_stret")return HandleObjcMsgSendStret();
         if(name=="objc_msgSendSuper2")return HandleObjcMsgSendSuper2();
-        if(name=="objc_msgSendSuper2_stret"){if(cpu_.Regs()[0]&&env_.IsMapped(cpu_.Regs()[0],16u)){std::array<u8,16> z{};env_.WriteBytes(cpu_.Regs()[0],z.data(),z.size());}return true;}
+        if(name=="objc_msgSendSuper2_stret"){if(cpu_.Regs()[0]&&env_.IsMapped(cpu_.Regs()[0],16u))WriteCGRect(cpu_.Regs()[0],0.0f,0.0f,0.0f,0.0f);return true;}
         if(name=="objc_retain"||name=="objc_autorelease"||name=="objc_retainAutoreleasedReturnValue"||name=="objc_autoreleaseReturnValue"){return true;}
         if(name=="objc_release"){cpu_.Regs()[0]=0;return true;}
         if(name=="objc_getClass"){std::string n;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],n,512u);for(const auto& c:classes_)if(c.name==n){cpu_.Regs()[0]=c.class_addr;return true;}cpu_.Regs()[0]=EnsureExternalClass(n.empty()?"NSObject":n);return true;}
@@ -833,6 +903,27 @@ private:
             if(image_.constructor_count!=0u){delegate_launch_deferred_=true;done_=true;cpu_.Regs()[0]=0;log_<<"IOS: delegate launch deferred until Mach-O static constructors are implemented\n";return true;}
             return BeginDelegateLaunch();
         }
+        // Minimal OpenGL ES/OpenAL bootstrap results. These do not render yet;
+        // they only provide the success/query values cocos2d expects while
+        // constructing EAGLView.
+        if(name=="glGetError"||name=="alGetError"||name=="alcGetError"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="glCheckFramebufferStatusOES"){cpu_.Regs()[0]=0x8cd5u;return true;} // GL_FRAMEBUFFER_COMPLETE
+        if(name=="glGenFramebuffersOES"||name=="glGenRenderbuffersOES"||name=="glGenBuffers"||name=="glGenTextures"||name=="alGenBuffers"||name=="alGenSources"){
+            WriteGeneratedIds(cpu_.Regs()[0],cpu_.Regs()[1]);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="glGetRenderbufferParameterivOES"){
+            const u32 pname=cpu_.Regs()[1],ptr=cpu_.Regs()[2];
+            if(ptr&&env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,pname==0x8d43u?480u:320u);
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="glGetString"){cpu_.Regs()[0]=AllocateCString("GeometryDashWrapper iOS OpenGL ES bootstrap");return true;}
+        if(name=="alcOpenDevice"||name=="alcCreateContext"){cpu_.Regs()[0]=Allocate(16u);return true;}
+        if(name=="alcMakeContextCurrent"){cpu_.Regs()[0]=1u;return true;}
+        if(name.starts_with("gl")||name.starts_with("al")||name.starts_with("alc")){
+            if(++graphics_stub_logs_<=32u)log_<<"IOS: graphics/audio bootstrap stub "<<imp.name<<"\n";
+            cpu_.Regs()[0]=0u;return true;
+        }
+
         if(name=="exit"||name=="_exit"){done_=true;exit_code_=cpu_.Regs()[0];return true;}
         if(name=="malloc"){cpu_.Regs()[0]=Allocate(std::max<u32>(cpu_.Regs()[0],1u));return true;}
         if(name=="calloc"){const u64 n=u64(cpu_.Regs()[0])*cpu_.Regs()[1];if(n>0x1000000u){cpu_.Regs()[0]=0;return true;}const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)));std::vector<u8> z(static_cast<std::size_t>(n));if(n)env_.WriteBytes(a,z.data(),z.size());cpu_.Regs()[0]=a;return true;}
@@ -851,8 +942,8 @@ private:
     void BuildInitialStack(){const std::string argv0="GeometryDashWrapper-iOS";const u32 arg=AllocateCString(argv0);u32 sp=kStackBase+kStackSize-0x1000u;sp&=~7u;sp-=24u;env_.MemoryWrite32(sp+0u,1u);env_.MemoryWrite32(sp+4u,arg);env_.MemoryWrite32(sp+8u,0u);env_.MemoryWrite32(sp+12u,0u);env_.MemoryWrite32(sp+16u,0u);env_.MemoryWrite32(sp+20u,0u);initial_sp_=sp;}
 
     MachImage image_; Logger& log_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::vector<GuestClass> classes_;
-    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;u32 exit_code_=0;u32 delegate_instance_=0,application_instance_=0,delegate_return_value_=0;u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0;bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false;std::string delegate_name_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::vector<GuestClass> classes_;
+    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;u32 exit_code_=0;u32 delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0;bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false;std::string delegate_name_;
 };
 
 static std::string GetLogPath(int argc,char** argv){for(int i=2;i<argc;++i){std::string a=argv[i];if(a.starts_with("--log="))return a.substr(6);}const char* env=std::getenv("GD_LOG_PATH");return env?env:"ios-armv7.log";}
