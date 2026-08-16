@@ -113,7 +113,7 @@ target_compile_options(RobTopIOSArmV7 PRIVATE
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
 )
-target_link_libraries(RobTopIOSArmV7 PRIVATE dynarmic)
+target_link_libraries(RobTopIOSArmV7 PRIVATE dynarmic opengl32 user32 gdi32)
 set_target_properties(RobTopIOSArmV7 PROPERTIES
     OUTPUT_NAME "RobTopIOSArmV7"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/unified-output"

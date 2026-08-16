@@ -19,9 +19,21 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+#endif
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
@@ -61,7 +73,7 @@ constexpr u32 kStackSize = 0x01000000u;
 constexpr u32 kSvcReturn = 0x00fffffeu;
 constexpr u64 kRunChunk = 5000000u;
 constexpr u64 kRunBudget = 600000000u;
-constexpr u32 kFrameProbeCount = 60u;
+constexpr u32 kFrameProbeCount = 600u;
 constexpr u64 kSyntheticFrameUsec = 16667u;
 
 static u16 ReadLe16(const u8* p) { return static_cast<u16>(p[0] | (u16(p[1]) << 8)); }
@@ -429,6 +441,16 @@ public:
         }
         return false;
     }
+    const void* HostPointer(u32 address, std::size_t size = 1u) const {
+        if(!address)return nullptr;
+        const MemoryRegion* r=Find(address,size);
+        return r ? static_cast<const void*>(r->data.data()+(address-r->base)) : nullptr;
+    }
+    void* HostPointerMutable(u32 address, std::size_t size = 1u) {
+        if(!address)return nullptr;
+        MemoryRegion* r=FindMutable(address,size);
+        return r ? static_cast<void*>(r->data.data()+(address-r->base)) : nullptr;
+    }
     void ResetStopState() { invalid_access=false; interpreter_fallback=false; exception_seen=false; svc_pending=false; pending_svc=0; fault_address=0; fallback_pc=0; fallback_count=0; exception_pc=0; }
     u8 MemoryRead8(u32 a) override { auto* r=Find(a,1); if(!r)return ReadFault<u8>(a); return r->data[a-r->base]; }
     u16 MemoryRead16(u32 a) override { return ReadTyped<u16>(a); }
@@ -477,6 +499,171 @@ public:
     Logger& operator<<(std::ostream&(*m)(std::ostream&)){ m(std::cout); if(file_)m(file_); return *this; }
     void Flush(){ std::cout.flush(); if(file_)file_.flush(); }
 private: std::ofstream file_;
+};
+
+class HostOpenGLWindow {
+public:
+    HostOpenGLWindow() = default;
+    HostOpenGLWindow(const HostOpenGLWindow&) = delete;
+    HostOpenGLWindow& operator=(const HostOpenGLWindow&) = delete;
+    ~HostOpenGLWindow(){ Shutdown(); }
+
+    bool Initialize(Logger& log) {
+#ifdef _WIN32
+        if(ready_)return true;
+        instance_=GetModuleHandleW(nullptr);
+        WNDCLASSW wc{};
+        wc.style=CS_OWNDC;
+        wc.lpfnWndProc=&HostOpenGLWindow::WndProc;
+        wc.hInstance=instance_;
+        wc.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(32512));
+        wc.lpszClassName=L"GDW_IOS_ARMV7_GL";
+        RegisterClassW(&wc);
+
+        RECT rect{0,0,480,720};
+        AdjustWindowRect(&rect,WS_OVERLAPPEDWINDOW,FALSE);
+        hwnd_=CreateWindowExW(
+            0,wc.lpszClassName,L"Forlorn - Geometry Dash Wrapper iOS",
+            WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+            CW_USEDEFAULT,CW_USEDEFAULT,rect.right-rect.left,rect.bottom-rect.top,
+            nullptr,nullptr,instance_,this);
+        if(!hwnd_){log<<"IOS HOSTGL: CreateWindowExW failed error="<<GetLastError()<<"\n";return false;}
+        dc_=GetDC(hwnd_);
+        if(!dc_){log<<"IOS HOSTGL: GetDC failed\n";Shutdown();return false;}
+
+        PIXELFORMATDESCRIPTOR pfd{};
+        pfd.nSize=sizeof(pfd);
+        pfd.nVersion=1;
+        pfd.dwFlags=PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;
+        pfd.iPixelType=PFD_TYPE_RGBA;
+        pfd.cColorBits=32;
+        pfd.cDepthBits=24;
+        pfd.cStencilBits=8;
+        pfd.iLayerType=PFD_MAIN_PLANE;
+        const int pf=ChoosePixelFormat(dc_,&pfd);
+        if(!pf||!SetPixelFormat(dc_,pf,&pfd)){log<<"IOS HOSTGL: pixel format setup failed error="<<GetLastError()<<"\n";Shutdown();return false;}
+        rc_=wglCreateContext(dc_);
+        if(!rc_||!wglMakeCurrent(dc_,rc_)){log<<"IOS HOSTGL: wglCreateContext/wglMakeCurrent failed\n";Shutdown();return false;}
+
+        LoadExtensions();
+        glViewport(0,0,480,720);
+        glClearColor(0.0f,0.0f,0.0f,1.0f);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        SwapBuffers(dc_);
+        ready_=true;
+        frame_clock_=std::chrono::steady_clock::now();
+        log<<"IOS HOSTGL: Win32 OpenGL window ready client=480x720 logical=320x480 vbo="<<(glGenBuffers_?1:0)<<"\n";
+        return true;
+#else
+        (void)log;
+        return false;
+#endif
+    }
+
+    void Shutdown() {
+#ifdef _WIN32
+        if(rc_){wglMakeCurrent(nullptr,nullptr);wglDeleteContext(rc_);rc_=nullptr;}
+        if(hwnd_&&dc_){ReleaseDC(hwnd_,dc_);dc_=nullptr;}
+        if(hwnd_){DestroyWindow(hwnd_);hwnd_=nullptr;}
+#endif
+        ready_=false;
+    }
+
+    bool Ready() const { return ready_; }
+    bool Closed() const { return closed_; }
+    u64 PresentCount() const { return present_count_; }
+
+    bool PumpMessages() {
+#ifdef _WIN32
+        MSG msg{};
+        while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){
+            if(msg.message==WM_QUIT){closed_=true;return false;}
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+#endif
+        return !closed_;
+    }
+
+    void Present() {
+#ifdef _WIN32
+        if(ready_&&dc_){SwapBuffers(dc_);++present_count_;}
+#endif
+    }
+
+    void Pace60() {
+#ifdef _WIN32
+        if(!ready_)return;
+        const auto target=frame_clock_+std::chrono::microseconds(16667);
+        const auto now=std::chrono::steady_clock::now();
+        if(now<target)std::this_thread::sleep_for(target-now);
+        frame_clock_=std::chrono::steady_clock::now();
+#endif
+    }
+
+#ifdef _WIN32
+    using PFNGLACTIVETEXTUREPROC_ = void (APIENTRY*)(GLenum);
+    using PFNGLGENBUFFERSPROC_ = void (APIENTRY*)(GLsizei,GLuint*);
+    using PFNGLBINDBUFFERPROC_ = void (APIENTRY*)(GLenum,GLuint);
+    using PFNGLBUFFERDATAPROC_ = void (APIENTRY*)(GLenum,std::ptrdiff_t,const void*,GLenum);
+    using PFNGLBUFFERSUBDATAPROC_ = void (APIENTRY*)(GLenum,std::ptrdiff_t,std::ptrdiff_t,const void*);
+    using PFNGLDELETEBUFFERSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
+    using PFNGLGENERATEMIPMAPPROC_ = void (APIENTRY*)(GLenum);
+
+    PFNGLACTIVETEXTUREPROC_ glActiveTexture_ = nullptr;
+    PFNGLGENBUFFERSPROC_ glGenBuffers_ = nullptr;
+    PFNGLBINDBUFFERPROC_ glBindBuffer_ = nullptr;
+    PFNGLBUFFERDATAPROC_ glBufferData_ = nullptr;
+    PFNGLBUFFERSUBDATAPROC_ glBufferSubData_ = nullptr;
+    PFNGLDELETEBUFFERSPROC_ glDeleteBuffers_ = nullptr;
+    PFNGLGENERATEMIPMAPPROC_ glGenerateMipmap_ = nullptr;
+#endif
+
+private:
+#ifdef _WIN32
+    template<class T>
+    static T LoadGlProc(const char* name,const char* fallback=nullptr){
+        PROC p=wglGetProcAddress(name);
+        if((!p||p==(PROC)1||p==(PROC)2||p==(PROC)3||p==(PROC)-1)&&fallback)p=wglGetProcAddress(fallback);
+        return reinterpret_cast<T>(p);
+    }
+    void LoadExtensions(){
+        glActiveTexture_=LoadGlProc<PFNGLACTIVETEXTUREPROC_>("glActiveTexture","glActiveTextureARB");
+        glGenBuffers_=LoadGlProc<PFNGLGENBUFFERSPROC_>("glGenBuffers","glGenBuffersARB");
+        glBindBuffer_=LoadGlProc<PFNGLBINDBUFFERPROC_>("glBindBuffer","glBindBufferARB");
+        glBufferData_=LoadGlProc<PFNGLBUFFERDATAPROC_>("glBufferData","glBufferDataARB");
+        glBufferSubData_=LoadGlProc<PFNGLBUFFERSUBDATAPROC_>("glBufferSubData","glBufferSubDataARB");
+        glDeleteBuffers_=LoadGlProc<PFNGLDELETEBUFFERSPROC_>("glDeleteBuffers","glDeleteBuffersARB");
+        glGenerateMipmap_=LoadGlProc<PFNGLGENERATEMIPMAPPROC_>("glGenerateMipmap","glGenerateMipmapEXT");
+    }
+    static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
+        HostOpenGLWindow* self=reinterpret_cast<HostOpenGLWindow*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+        if(msg==WM_NCCREATE){
+            auto* cs=reinterpret_cast<CREATESTRUCTW*>(lp);
+            self=reinterpret_cast<HostOpenGLWindow*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));
+        }
+        switch(msg){
+            case WM_CLOSE:
+                if(self)self->closed_=true;
+                DestroyWindow(hwnd);
+                return 0;
+            case WM_DESTROY:
+                if(self){self->closed_=true;self->hwnd_=nullptr;}
+                PostQuitMessage(0);
+                return 0;
+            default: return DefWindowProcW(hwnd,msg,wp,lp);
+        }
+    }
+    HINSTANCE instance_=nullptr;
+    HWND hwnd_=nullptr;
+    HDC dc_=nullptr;
+    HGLRC rc_=nullptr;
+#endif
+    bool ready_=false;
+    bool closed_=false;
+    u64 present_count_=0;
+    std::chrono::steady_clock::time_point frame_clock_{};
 };
 
 class IosBootstrap {
@@ -565,13 +752,17 @@ public:
             }
         }
         if(frame_probe_completed_){
-            log_<<"RESULT: IOS_FRAME_PUMP_OK frames="<<frame_count_
+            log_<<(host_window_closed_?"RESULT: IOS_HOST_WINDOW_CLOSED":"RESULT: IOS_HOST_OPENGL_PROBE_OK")
+                <<" frames="<<frame_count_
                 <<" director=0x"<<Hex(director_instance_)
                 <<" running-scene=0x"<<Hex(running_scene_)
+                <<" running-scene-class="<<(FindGuestClassForInstance(running_scene_)?FindGuestClassForInstance(running_scene_)->name:(running_scene_?"unknown":"nil"))
+                <<" presents="<<host_window_.PresentCount()
+                <<" placeholder-textures="<<placeholder_texture_uploads_
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest6 drove the real cocos2d drawScene loop for one synthetic second; visible host rendering/input is next.\n";
+            log_<<"Execution status: PublicTest9 forwarded the real Forlorn cocos2d fixed-function OpenGL ES draw loop to a Win32 OpenGL window for up to ten seconds.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -861,7 +1052,230 @@ private:
     void TraceSceneMessage(std::string_view kind,std::string_view class_name,std::string_view selector,u32 value=0u){
         if(++scene_trace_count_<=128u)
             log_<<"IOS SCENE: "<<kind<<" class="<<class_name<<" selector="<<selector
-                <<" value=0x"<<Hex(value)<<"\\n";
+                <<" value=0x"<<Hex(value)<<"\n";
+    }
+
+    u32 StackArg(u32 index) {
+        const u32 sp=cpu_.Regs()[13];
+        return (sp&&env_.IsMapped(sp+index*4u,4u))?const_cast<ProbeEnvironment&>(env_).MemoryRead32(sp+index*4u):0u;
+    }
+    bool EnsureHostGL(){
+        if(host_window_.Ready())return true;
+        if(host_window_attempted_)return false;
+        host_window_attempted_=true;
+        return host_window_.Initialize(log_);
+    }
+    const void* GuestGlPointer(u32 address,bool element=false) const {
+#ifdef _WIN32
+        const bool vbo=element ? (bound_element_array_buffer_!=0u) : (bound_array_buffer_!=0u);
+        if(vbo)return reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+#endif
+        return env_.HostPointer(address,1u);
+    }
+    bool HandleHostGraphicsImport(const std::string& name){
+#ifdef _WIN32
+        if(!EnsureHostGL())return false;
+        auto& r=cpu_.Regs();
+
+        if(name=="glGetError"){r[0]=static_cast<u32>(glGetError());return true;}
+        if(name=="glGetString"){
+            const GLubyte* p=glGetString(static_cast<GLenum>(r[0]));
+            std::string value=p?reinterpret_cast<const char*>(p):"";
+            if(r[0]==0x1f03u)value+=" GL_OES_framebuffer_object GL_EXT_discard_framebuffer";
+            r[0]=AllocateCString(value.empty()?"GeometryDashWrapper HostGL":value);
+            return true;
+        }
+        if(name=="glGetIntegerv"){
+            GLint values[16]{};
+            glGetIntegerv(static_cast<GLenum>(r[0]),values);
+            const u32 count=(r[0]==0x0ba2u||r[0]==0x0c10u)?4u:1u;
+            if(r[1]&&env_.IsMapped(r[1],count*4u))env_.WriteBytes(r[1],values,count*4u);
+            r[0]=0u;return true;
+        }
+        if(name=="glGetFloatv"){
+            GLfloat values[16]{};
+            glGetFloatv(static_cast<GLenum>(r[0]),values);
+            const u32 count=(r[0]==0x0ba6u||r[0]==0x0ba7u||r[0]==0x0ba8u)?16u:1u;
+            if(r[1]&&env_.IsMapped(r[1],count*4u))env_.WriteBytes(r[1],values,count*4u);
+            r[0]=0u;return true;
+        }
+        if(name=="glIsEnabled"){r[0]=glIsEnabled(static_cast<GLenum>(r[0]))?1u:0u;return true;}
+
+        if(name=="glClear"){glClear(static_cast<GLbitfield>(r[0]));r[0]=0u;return true;}
+        if(name=="glClearColor"){glClearColor(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]));r[0]=0u;return true;}
+        if(name=="glClearDepthf"){glClearDepth(static_cast<GLclampd>(FloatFromBits(r[0])));r[0]=0u;return true;}
+        if(name=="glEnable"){glEnable(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glDisable"){glDisable(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glBlendFunc"){glBlendFunc(static_cast<GLenum>(r[0]),static_cast<GLenum>(r[1]));r[0]=0u;return true;}
+        if(name=="glDepthFunc"){glDepthFunc(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glAlphaFunc"){glAlphaFunc(static_cast<GLenum>(r[0]),FloatFromBits(r[1]));r[0]=0u;return true;}
+        if(name=="glHint"){glHint(static_cast<GLenum>(r[0]),static_cast<GLenum>(r[1]));r[0]=0u;return true;}
+        if(name=="glLineWidth"){glLineWidth(FloatFromBits(r[0]));r[0]=0u;return true;}
+        if(name=="glPointSize"){glPointSize(FloatFromBits(r[0]));r[0]=0u;return true;}
+        if(name=="glColor4f"){glColor4f(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]));r[0]=0u;return true;}
+        if(name=="glColor4ub"){glColor4ub(static_cast<GLubyte>(r[0]),static_cast<GLubyte>(r[1]),static_cast<GLubyte>(r[2]),static_cast<GLubyte>(r[3]));r[0]=0u;return true;}
+        if(name=="glViewport"){glViewport(static_cast<GLint>(r[0]*3u/2u),static_cast<GLint>(r[1]*3u/2u),static_cast<GLsizei>(r[2]*3u/2u),static_cast<GLsizei>(r[3]*3u/2u));r[0]=0u;return true;}
+        if(name=="glScissor"){glScissor(static_cast<GLint>(r[0]*3u/2u),static_cast<GLint>(r[1]*3u/2u),static_cast<GLsizei>(r[2]*3u/2u),static_cast<GLsizei>(r[3]*3u/2u));r[0]=0u;return true;}
+        if(name=="glMatrixMode"){glMatrixMode(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glLoadIdentity"){glLoadIdentity();r[0]=0u;return true;}
+        if(name=="glPushMatrix"){glPushMatrix();r[0]=0u;return true;}
+        if(name=="glPopMatrix"){glPopMatrix();r[0]=0u;return true;}
+        if(name=="glMultMatrixf"){
+            const auto* p=static_cast<const GLfloat*>(env_.HostPointer(r[0],16u*sizeof(GLfloat)));
+            if(p)glMultMatrixf(p);
+            r[0]=0u;return true;
+        }
+        if(name=="glTranslatef"){glTranslatef(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]));r[0]=0u;return true;}
+        if(name=="glRotatef"){glRotatef(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]));r[0]=0u;return true;}
+        if(name=="glFrustumf"){
+            glFrustum(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]),FloatFromBits(StackArg(0)),FloatFromBits(StackArg(1)));
+            r[0]=0u;return true;
+        }
+        if(name=="glOrthof"){
+            glOrtho(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]),FloatFromBits(StackArg(0)),FloatFromBits(StackArg(1)));
+            r[0]=0u;return true;
+        }
+
+        if(name=="glActiveTexture"){
+            if(host_window_.glActiveTexture_)host_window_.glActiveTexture_(static_cast<GLenum>(r[0]));
+            r[0]=0u;return true;
+        }
+        if(name=="glBindTexture"){glBindTexture(static_cast<GLenum>(r[0]),static_cast<GLuint>(r[1]));bound_texture_=r[1];r[0]=0u;return true;}
+        if(name=="glGenTextures"){
+            const u32 count=r[0],ptr=r[1];
+            if(count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
+                std::vector<GLuint> ids(count);glGenTextures(static_cast<GLsizei>(count),ids.data());env_.WriteBytes(ptr,ids.data(),count*4u);
+            }
+            r[0]=0u;return true;
+        }
+        if(name=="glDeleteTextures"){
+            const u32 count=r[0],ptr=r[1];
+            if(count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
+                std::vector<GLuint> ids(count);env_.ReadBytes(ptr,ids.data(),count*4u);glDeleteTextures(static_cast<GLsizei>(count),ids.data());
+            }
+            r[0]=0u;return true;
+        }
+        if(name=="glTexParameteri"){glTexParameteri(static_cast<GLenum>(r[0]),static_cast<GLenum>(r[1]),static_cast<GLint>(r[2]));r[0]=0u;return true;}
+        if(name=="glTexEnvi"){glTexEnvi(static_cast<GLenum>(r[0]),static_cast<GLenum>(r[1]),static_cast<GLint>(r[2]));r[0]=0u;return true;}
+        if(name=="glPixelStorei"){glPixelStorei(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]));r[0]=0u;return true;}
+        if(name=="glTexImage2D"){
+            const GLsizei width=static_cast<GLsizei>(r[3]);
+            const GLsizei height=static_cast<GLsizei>(StackArg(0));
+            const GLint border=static_cast<GLint>(StackArg(1));
+            const GLenum format=static_cast<GLenum>(StackArg(2));
+            const GLenum type=static_cast<GLenum>(StackArg(3));
+            const u32 pixels_addr=StackArg(4);
+            const std::size_t approx=(width>0&&height>0&&width<16384&&height<16384)?std::size_t(width)*height*4u:1u;
+            const void* pixels=pixels_addr?env_.HostPointer(pixels_addr,std::min<std::size_t>(approx,64u*1024u*1024u)):nullptr;
+            glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),static_cast<GLint>(r[2]),width,height,border,format,type,pixels);
+            r[0]=0u;return true;
+        }
+        if(name=="glCompressedTexImage2D"){
+            const GLint level=static_cast<GLint>(r[1]);
+            const int dim=std::max(1,4>>std::min(level,2));
+            static const GLubyte checker[4*4*4]={
+                255,0,255,255, 255,255,255,255, 255,0,255,255, 255,255,255,255,
+                255,255,255,255, 255,0,255,255, 255,255,255,255, 255,0,255,255,
+                255,0,255,255, 255,255,255,255, 255,0,255,255, 255,255,255,255,
+                255,255,255,255, 255,0,255,255, 255,255,255,255, 255,0,255,255
+            };
+            glTexImage2D(static_cast<GLenum>(r[0]),level,GL_RGBA,dim,dim,0,GL_RGBA,GL_UNSIGNED_BYTE,checker);
+            if(++placeholder_texture_uploads_<=8u)log_<<"IOS HOSTGL: substituted unsupported compressed texture with 4x4 checker level="<<level<<" bound="<<bound_texture_<<"\n";
+            r[0]=0u;return true;
+        }
+        if(name=="glGenerateMipmapOES"){
+            if(host_window_.glGenerateMipmap_)host_window_.glGenerateMipmap_(static_cast<GLenum>(r[0]));
+            r[0]=0u;return true;
+        }
+
+        if(name=="glGenBuffers"){
+            const u32 count=r[0],ptr=r[1];
+            if(host_window_.glGenBuffers_&&count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
+                std::vector<GLuint> ids(count);host_window_.glGenBuffers_(static_cast<GLsizei>(count),ids.data());env_.WriteBytes(ptr,ids.data(),count*4u);
+            }else WriteGeneratedIds(count,ptr);
+            r[0]=0u;return true;
+        }
+        if(name=="glDeleteBuffers"){
+            const u32 count=r[0],ptr=r[1];
+            if(host_window_.glDeleteBuffers_&&count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
+                std::vector<GLuint> ids(count);env_.ReadBytes(ptr,ids.data(),count*4u);host_window_.glDeleteBuffers_(static_cast<GLsizei>(count),ids.data());
+            }
+            r[0]=0u;return true;
+        }
+        if(name=="glBindBuffer"){
+            const GLenum target=static_cast<GLenum>(r[0]);const GLuint id=static_cast<GLuint>(r[1]);
+            if(target==0x8892u)bound_array_buffer_=id;else if(target==0x8893u)bound_element_array_buffer_=id;
+            if(host_window_.glBindBuffer_)host_window_.glBindBuffer_(target,id);
+            r[0]=0u;return true;
+        }
+        if(name=="glBufferData"){
+            if(host_window_.glBufferData_){
+                const std::size_t size=r[1];
+                const void* data=r[2]?env_.HostPointer(r[2],std::max<std::size_t>(size,1u)):nullptr;
+                if(!r[2]||data)host_window_.glBufferData_(static_cast<GLenum>(r[0]),static_cast<std::ptrdiff_t>(size),data,static_cast<GLenum>(r[3]));
+            }
+            r[0]=0u;return true;
+        }
+        if(name=="glBufferSubData"){
+            if(host_window_.glBufferSubData_){
+                const std::size_t size=r[2];const void* data=r[3]?env_.HostPointer(r[3],std::max<std::size_t>(size,1u)):nullptr;
+                if(!r[3]||data)host_window_.glBufferSubData_(static_cast<GLenum>(r[0]),static_cast<std::ptrdiff_t>(r[1]),static_cast<std::ptrdiff_t>(size),data);
+            }
+            r[0]=0u;return true;
+        }
+
+        if(name=="glEnableClientState"){glEnableClientState(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glDisableClientState"){glDisableClientState(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
+        if(name=="glVertexPointer"){
+            const void* p=GuestGlPointer(r[3],false);
+            if(p||bound_array_buffer_)glVertexPointer(static_cast<GLint>(r[0]),static_cast<GLenum>(r[1]),static_cast<GLsizei>(r[2]),p);
+            r[0]=0u;return true;
+        }
+        if(name=="glTexCoordPointer"){
+            const void* p=GuestGlPointer(r[3],false);
+            if(p||bound_array_buffer_)glTexCoordPointer(static_cast<GLint>(r[0]),static_cast<GLenum>(r[1]),static_cast<GLsizei>(r[2]),p);
+            r[0]=0u;return true;
+        }
+        if(name=="glColorPointer"){
+            const void* p=GuestGlPointer(r[3],false);
+            if(p||bound_array_buffer_)glColorPointer(static_cast<GLint>(r[0]),static_cast<GLenum>(r[1]),static_cast<GLsizei>(r[2]),p);
+            r[0]=0u;return true;
+        }
+        if(name=="glPointSizePointerOES"){r[0]=0u;return true;}
+        if(name=="glDrawArrays"){glDrawArrays(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),static_cast<GLsizei>(r[2]));r[0]=0u;return true;}
+        if(name=="glDrawElements"){
+            const void* p=GuestGlPointer(r[3],true);
+            if(p||bound_element_array_buffer_)glDrawElements(static_cast<GLenum>(r[0]),static_cast<GLsizei>(r[1]),static_cast<GLenum>(r[2]),p);
+            r[0]=0u;return true;
+        }
+
+        // iOS renderbuffer/FBO objects are collapsed onto the Win32 default
+        // framebuffer for the first visible-host test.
+        if(name=="glGenFramebuffersOES"||name=="glGenRenderbuffersOES"){WriteGeneratedIds(r[0],r[1]);r[0]=0u;return true;}
+        if(name=="glBindFramebufferOES"||name=="glBindRenderbufferOES"||name=="glFramebufferRenderbufferOES"||name=="glFramebufferTexture2DOES"||
+           name=="glDeleteFramebuffersOES"||name=="glDeleteRenderbuffersOES"||name=="glRenderbufferStorageOES"||
+           name=="glRenderbufferStorageMultisampleAPPLE"||name=="glResolveMultisampleFramebufferAPPLE"||name=="glDiscardFramebufferEXT"){
+            r[0]=0u;return true;
+        }
+        if(name=="glCheckFramebufferStatusOES"){r[0]=0x8cd5u;return true;}
+        if(name=="glGetRenderbufferParameterivOES"){
+            const u32 pname=r[1],ptr=r[2];
+            if(ptr&&env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,pname==0x8d43u?480u:320u);
+            r[0]=0u;return true;
+        }
+        if(name=="glReadPixels"){
+            const GLsizei width=static_cast<GLsizei>(r[2]),height=static_cast<GLsizei>(r[3]);
+            const GLenum format=static_cast<GLenum>(StackArg(0)),type=static_cast<GLenum>(StackArg(1));const u32 ptr=StackArg(2);
+            const std::size_t size=(width>0&&height>0&&width<8192&&height<8192)?std::size_t(width)*height*4u:0u;
+            void* out=(ptr&&size)?env_.HostPointerMutable(ptr,size):nullptr;
+            if(out)glReadPixels(static_cast<GLint>(r[0]),static_cast<GLint>(r[1]),width,height,format,type,out);
+            r[0]=0u;return true;
+        }
+        return false;
+#else
+        (void)name;
+        return false;
+#endif
     }
 
     bool BeginDelegateLaunch(){
@@ -872,6 +1286,7 @@ private:
         if(!method){log_<<"RESULT: IOS_DELEGATE_LAUNCH_METHOD_NOT_FOUND class="<<cls->name<<"\n";done_=true;return true;}
         delegate_instance_=NewGuestInstance(*cls);
         application_instance_=NewExternalInstance("UIApplication");
+        EnsureHostGL();
         cpu_.Regs()[0]=delegate_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=application_instance_;cpu_.Regs()[3]=0u;
         cpu_.Regs()[14]=kControlBase;
         EnterGuestMethod(*method);
@@ -902,14 +1317,20 @@ private:
     }
 
     bool BeginFrameProbe(){
+        if(host_window_.Ready()&&!host_window_.PumpMessages()){
+            host_window_closed_=true;frame_probe_completed_=true;done_=true;
+            log_<<"IOS HOSTGL: window closed by user after frames="<<frame_count_<<"\n";
+            return true;
+        }
         const GuestClass* cls=FindGuestClassForInstance(director_instance_);
         if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
         const GuestMethod* method=FindInstanceMethodRecursive(cls,"drawScene");
         if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_DRAWSCENE director-class="<<cls->name<<"\n";done_=true;return true;}
         virtual_time_usec_+=kSyntheticFrameUsec;
         cpu_.Regs()[0]=director_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+        frame_present_start_=host_window_.PresentCount();
         EnterGuestMethod(*method);host_call_stage_=HostCallStage::Frame;frame_pump_active_=true;
-        if(frame_count_<3u||frame_count_%20u==0u)
+        if(frame_count_<3u||frame_count_%120u==0u)
             log_<<"IOS: frame pump begin frame="<<(frame_count_+1u)<<" director="<<cls->name<<" drawScene=0x"<<Hex(method->imp)<<"\n";
         return true;
     }
@@ -1003,6 +1424,11 @@ private:
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            if((selector=="runWithScene:"||selector=="replaceScene:"||selector=="pushScene:")&&cpu_.Regs()[2]){
+                observed_scene_=cpu_.Regs()[2];
+                const GuestClass* scene_cls=FindGuestClassForInstance(observed_scene_);
+                log_<<"IOS: observed "<<selector<<" scene=0x"<<Hex(observed_scene_)<<" class="<<(scene_cls?scene_cls->name:"unknown")<<"\n";
+            }
             if(selector=="methodForSelector:"){
                 cpu_.Regs()[0]=GuestMethodImpForSelector(instance_class,false,cpu_.Regs()[2]);
                 TraceSceneMessage("instance-runtime",instance_class->name,selector,cpu_.Regs()[0]);
@@ -1062,7 +1488,13 @@ private:
             if(fo.is_class&&selector=="setCurrentContext:"){cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
             if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
-            if(!fo.is_class&&(selector=="presentRenderbuffer:"||selector=="renderbufferStorage:fromDrawable:")){cpu_.Regs()[0]=1u;return true;}
+            if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="presentRenderbuffer:"){host_window_.Present();cpu_.Regs()[0]=1u;return true;}
+            if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="renderbufferStorage:fromDrawable:"){cpu_.Regs()[0]=1u;return true;}
+            if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="CGImage"){
+                cpu_.Regs()[0]=AssociatedExternal(receiver,"cgimage","CGImage");
+                fake_cgimages_.insert(cpu_.Regs()[0]);
+                return true;
+            }
             if(!fo.is_class&&(selector=="drawableWidth"||selector=="width")){cpu_.Regs()[0]=320u;return true;}
             if(!fo.is_class&&(selector=="drawableHeight"||selector=="height")){cpu_.Regs()[0]=480u;return true;}
             if(!fo.is_class&&fo.class_name=="UIApplication"&&selector=="delegate"){cpu_.Regs()[0]=delegate_instance_;return true;}
@@ -1130,9 +1562,14 @@ private:
         }
         if(host_call_stage_==HostCallStage::Frame){
             host_call_stage_=HostCallStage::None;frame_pump_active_=false;++frame_count_;
+            if(observed_scene_)running_scene_=observed_scene_;
+            if(host_window_.Ready()){
+                if(host_window_.PresentCount()==frame_present_start_)host_window_.Present();
+                host_window_.Pace60();
+            }
             if(frame_count_>=kFrameProbeCount){
                 frame_probe_completed_=true;done_=true;
-                log_<<"IOS: cocos2d frame probe completed frames="<<frame_count_<<"\n";
+                log_<<"IOS: cocos2d visible-host probe completed frames="<<frame_count_<<"\n";
                 return true;
             }
             return BeginFrameProbe();
@@ -1185,26 +1622,62 @@ private:
             else result=std::pow(a,FloatFromBits(cpu_.Regs()[1]));
             cpu_.Regs()[0]=FloatToBits(result);return true;
         }
+        if(name=="CGImageGetWidth"||name=="CGImageGetHeight"){cpu_.Regs()[0]=2u;return true;}
+        if(name=="CGImageGetBitsPerComponent"){cpu_.Regs()[0]=8u;return true;}
+        if(name=="CGImageGetBytesPerRow"){cpu_.Regs()[0]=8u;return true;}
+        if(name=="CGImageGetAlphaInfo"){cpu_.Regs()[0]=1u;return true;}
+        if(name=="CGImageGetColorSpace"||name=="CGColorSpaceCreateDeviceRGB"||name=="CGColorSpaceCreateDeviceGray"){
+            cpu_.Regs()[0]=Allocate(16u);return true;
+        }
+        if(name=="CGColorSpaceRelease"||name=="CGImageRelease"||name=="CGContextRelease"||name=="CGDataProviderRelease"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="CGBitmapContextCreate"){
+            const u32 data=cpu_.Regs()[0],width=cpu_.Regs()[1],height=cpu_.Regs()[2],bits=cpu_.Regs()[3];
+            const u32 bytes_per_row=StackArg(0);
+            const u32 ctx=Allocate(32u);
+            bitmap_contexts_[ctx]=std::array<u32,5>{data,width,height,bits,bytes_per_row};
+            cpu_.Regs()[0]=ctx;return true;
+        }
+        if(name=="CGContextDrawImage"){
+            const u32 ctx=cpu_.Regs()[0];
+            auto it=bitmap_contexts_.find(ctx);
+            if(it!=bitmap_contexts_.end()){
+                const u32 data=it->second[0],width=it->second[1],height=it->second[2],bpr=it->second[4];
+                if(data&&width&&height&&bpr&&u64(bpr)*height<=16u*1024u*1024u&&env_.IsMapped(data,std::size_t(bpr)*height)){
+                    std::vector<u8> pixels(std::size_t(bpr)*height,0);
+                    for(u32 y=0;y<height;++y)for(u32 x=0;x<width;++x){
+                        const std::size_t o=std::size_t(y)*bpr+x*4u;
+                        if(o+3u<pixels.size()){
+                            const bool mag=((x^y)&1u)==0u;
+                            pixels[o+0]=mag?255u:255u;
+                            pixels[o+1]=mag?0u:255u;
+                            pixels[o+2]=mag?255u:255u;
+                            pixels[o+3]=255u;
+                        }
+                    }
+                    env_.WriteBytes(data,pixels.data(),pixels.size());
+                }
+            }
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGContextClearRect"||name=="CGContextSaveGState"||name=="CGContextRestoreGState"||name=="CGContextScaleCTM"||
+           name=="CGContextTranslateCTM"||name=="CGContextSetRGBFillColor"||name=="CGContextSetGrayFillColor"||
+           name=="CGContextSetRGBStrokeColor"||name=="CGContextSetLineWidth"||name=="CGContextBeginPath"||
+           name=="CGContextMoveToPoint"||name=="CGContextAddArc"||name=="CGContextClosePath"||
+           name=="CGContextFillPath"||name=="CGContextFillEllipseInRect"||name=="CGContextStrokeEllipseInRect"){
+            cpu_.Regs()[0]=0u;return true;
+        }
         if(name=="UIApplicationMain"){
             reached_ui_application_main_=true;delegate_name_=ResolveDelegateName(cpu_.Regs()[3]);
             log_<<"IOS: UIApplicationMain reached argc="<<cpu_.Regs()[0]<<" delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)<<" constructors="<<image_.constructor_count<<"\n";
             if(image_.constructor_count!=0u){delegate_launch_deferred_=true;done_=true;cpu_.Regs()[0]=0;log_<<"IOS: delegate launch deferred until Mach-O static constructors are implemented\n";return true;}
             return BeginDelegateLaunch();
         }
-        // Minimal OpenGL ES/OpenAL bootstrap results. These do not render yet;
-        // they only provide the success/query values cocos2d expects while
-        // constructing EAGLView.
-        if(name=="glGetError"||name=="alGetError"||name=="alcGetError"){cpu_.Regs()[0]=0u;return true;}
-        if(name=="glCheckFramebufferStatusOES"){cpu_.Regs()[0]=0x8cd5u;return true;} // GL_FRAMEBUFFER_COMPLETE
-        if(name=="glGenFramebuffersOES"||name=="glGenRenderbuffersOES"||name=="glGenBuffers"||name=="glGenTextures"||name=="alGenBuffers"||name=="alGenSources"){
-            WriteGeneratedIds(cpu_.Regs()[0],cpu_.Regs()[1]);cpu_.Regs()[0]=0u;return true;
-        }
-        if(name=="glGetRenderbufferParameterivOES"){
-            const u32 pname=cpu_.Regs()[1],ptr=cpu_.Regs()[2];
-            if(ptr&&env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,pname==0x8d43u?480u:320u);
-            cpu_.Regs()[0]=0u;return true;
-        }
-        if(name=="glGetString"){cpu_.Regs()[0]=AllocateCString("GeometryDashWrapper iOS OpenGL ES bootstrap");return true;}
+        if(name.starts_with("gl")&&HandleHostGraphicsImport(name))return true;
+
+        // OpenAL is still bootstrap-only in PublicTest9. OpenGL ES is forwarded
+        // above to the real Win32 OpenGL context whenever the host window exists.
+        if(name=="alGetError"||name=="alcGetError"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="alGenBuffers"||name=="alGenSources"){WriteGeneratedIds(cpu_.Regs()[0],cpu_.Regs()[1]);cpu_.Regs()[0]=0u;return true;}
         if(name=="alcOpenDevice"||name=="alcCreateContext"){cpu_.Regs()[0]=Allocate(16u);return true;}
         if(name=="alcMakeContextCurrent"){cpu_.Regs()[0]=1u;return true;}
         if(name.starts_with("gl")||name.starts_with("al")||name.starts_with("alc")){
@@ -1248,11 +1721,17 @@ private:
     std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
-    u32 director_instance_=0,running_scene_=0,frame_count_=0,rng_state_=1u;
+    u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
+    u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false;
+    bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
+    HostOpenGLWindow host_window_;
+    std::set<u32> fake_cgimages_;
+    std::unordered_map<u32,std::array<u32,5>> bitmap_contexts_;
     std::string delegate_name_;
 };
 

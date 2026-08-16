@@ -1,0 +1,52 @@
+Geometry Dash Wrapper 0.9.6-publictest9 verification
+
+PublicTest8 runtime evidence from the supplied Forlorn 1.9c log:
+  PASS: +[BootScene node] dispatches to the real inherited cocos2d IMP.
+  PASS: BootScene -init and BootLayer -init execute.
+  PASS: BootLayer schedules a selector through the real CCScheduler.
+  PASS: methodForSelector: returns a non-zero guest IMP (0x9b131 in that run).
+  PASS: CCDirectorDisplayLink -runWithScene: and -pushScene: execute.
+  PASS: BootScene onEnter/onEnterTransitionDidFinish execute.
+  PASS: BootScene visit/transform/draw executes across the frame probe.
+  PASS: all 60 PublicTest8 frames completed without the PublicTest7 callback fault.
+  NOTE: PublicTest8's final running-scene=0 was stale because it queried
+        runningScene before frame 1 called setNextScene; the log itself proves
+        BootScene becomes the rendered scene on frame 1.
+
+PublicTest9 visible-host experiment:
+  PASS: Win32 OpenGL host window implementation present.
+  PASS: creates a WGL context with double buffering.
+  PASS: iOS EAGLContext presentRenderbuffer: maps to SwapBuffers.
+  PASS: fixed-function OpenGL ES calls map to desktop OpenGL.
+  PASS: VBO entry points are loaded through wglGetProcAddress.
+  PASS: guest VBO/client pointers are translated before host GL calls.
+  PASS: iOS FBO/renderbuffer setup is collapsed to the default host framebuffer.
+  PASS: compressed/PVRTC uploads get a visible diagnostic checker texture.
+  PASS: minimal UIImage/CGImage/CoreGraphics placeholder path is present.
+  PASS: observed runWithScene:/replaceScene:/pushScene: updates the diagnostic
+        running-scene so the final result can identify BootScene.
+  PASS: Win32 messages are pumped and frames are paced at roughly 60 Hz.
+  PASS: visible probe is 600 frames (~10 seconds) or ends when the user closes it.
+  PASS: TestFlight telemetry bypass retained.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+
+Regression isolation:
+  PASS: x86 backend source tree byte-for-byte unchanged from PublicTest8.
+  PASS: shared audio/storage/network/song/runtime sources byte-for-byte unchanged.
+  PASS: Android ARM legacy/ARMv7 implementation changes limited to version text.
+  PASS: no APK/IPA/EXE/DLL/SO files in the source package.
+
+Build/static checks:
+  PASS: normal C++20 syntax check using the local Dynarmic interface stub.
+  PASS: _WIN32 host-GL branch syntax check using local Windows/OpenGL declaration stubs.
+  PASS: iOS CMake target links opengl32, user32, and gdi32.
+
+Expected Forlorn result:
+  A Win32 window titled "Forlorn - Geometry Dash Wrapper iOS" should appear.
+  It may contain incomplete or checkerboard placeholder art because real iOS
+  PVR/PNG decoding is not implemented yet.
+
+  RESULT: IOS_HOST_OPENGL_PROBE_OK frames=600 ...
+  with running-scene-class=BootScene and a non-zero present count.
+
+No real Windows runtime execution was performed in this environment.
