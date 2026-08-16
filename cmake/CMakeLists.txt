@@ -22,16 +22,7 @@ set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${DYNARMIC_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/dynarmic" EXCLUDE_FROM_ALL)
 set(GD_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
-set(GD_SHARED_SOURCES
-    "${GD_ROOT}/src/shared/storage_win.c"
-    "${GD_ROOT}/src/shared/audio_win.c"
-    "${GD_ROOT}/src/shared/apk_extract_audio.c"
-    "${GD_ROOT}/src/shared/embedded_effects_stub.c"
-    "${GD_ROOT}/src/shared/net_compat_win.c"
-    "${GD_ROOT}/src/shared/runtime_settings.c"
-    "${GD_ROOT}/src/shared/song_http_win.c"
-    "${GD_ROOT}/src/shared/window_icon_win.c"
-    "${GD_ROOT}/third_party/stb/stb_vorbis.c"
+set(GD_ZLIB_SOURCES
     "${GD_ROOT}/third_party/zlib/adler32.c"
     "${GD_ROOT}/third_party/zlib/compress.c"
     "${GD_ROOT}/third_party/zlib/crc32.c"
@@ -43,6 +34,19 @@ set(GD_SHARED_SOURCES
     "${GD_ROOT}/third_party/zlib/trees.c"
     "${GD_ROOT}/third_party/zlib/uncompr.c"
     "${GD_ROOT}/third_party/zlib/zutil.c"
+)
+
+set(GD_SHARED_SOURCES
+    "${GD_ROOT}/src/shared/storage_win.c"
+    "${GD_ROOT}/src/shared/audio_win.c"
+    "${GD_ROOT}/src/shared/apk_extract_audio.c"
+    "${GD_ROOT}/src/shared/embedded_effects_stub.c"
+    "${GD_ROOT}/src/shared/net_compat_win.c"
+    "${GD_ROOT}/src/shared/runtime_settings.c"
+    "${GD_ROOT}/src/shared/song_http_win.c"
+    "${GD_ROOT}/src/shared/window_icon_win.c"
+    "${GD_ROOT}/third_party/stb/stb_vorbis.c"
+    ${GD_ZLIB_SOURCES}
 )
 
 function(gd_add_dynarmic_backend target source output_name backend_dir)
@@ -86,9 +90,31 @@ gd_add_dynarmic_backend(
 )
 
 
-gd_add_dynarmic_backend(
+# The PublicTest2 iOS bootstrap is intentionally isolated from the Android
+# shared runtime.  It only needs Dynarmic and zlib while it is still at the
+# Mach-O/UIApplicationMain bootstrap stage.  Pulling GD_SHARED_SOURCES here
+# introduces backend-owned symbols such as runtime_log that the iOS bootstrap
+# neither uses nor should have to implement.
+add_executable(
     RobTopIOSArmV7
     "${GD_ROOT}/src/backends/ios_armv7/dynarmic_ios_armv7.cpp"
-    "RobTopIOSArmV7"
+    ${GD_ZLIB_SOURCES}
+)
+target_include_directories(RobTopIOSArmV7 PRIVATE
+    "${GD_ROOT}/src/shared"
     "${GD_ROOT}/src/backends/ios_armv7"
+    "${GD_ROOT}/third_party/zlib"
+)
+target_compile_definitions(RobTopIOSArmV7 PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS crc32=gd_z_crc32
+)
+target_compile_options(RobTopIOSArmV7 PRIVATE
+    $<$<COMPILE_LANGUAGE:C,CXX>:-O3>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
+)
+target_link_libraries(RobTopIOSArmV7 PRIVATE dynarmic)
+set_target_properties(RobTopIOSArmV7 PROPERTIES
+    OUTPUT_NAME "RobTopIOSArmV7"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/unified-output"
 )
