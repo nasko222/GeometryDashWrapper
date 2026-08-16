@@ -582,7 +582,7 @@ private:
 };
 
 struct Import { std::string name; u32 stub=0; u32 svc=0; u64 calls=0; };
-struct FakeObject { std::string class_name; bool is_class=false; bool is_meta=false; std::string string_value; std::string resource_value; };
+struct FakeObject { std::string class_name; bool is_class=false; bool is_meta=false; std::string string_value; std::string resource_value; u32 aux0=0,aux1=0,aux2=0; };
 struct GuestMethod { std::string selector; u32 selector_addr=0; u32 imp=0; };
 struct GuestClass { std::string name; u32 class_addr=0; u32 meta_addr=0; u32 superclass_addr=0; u32 instance_size=0; std::vector<GuestMethod> instance_methods; std::vector<GuestMethod> class_methods; };
 
@@ -595,6 +595,12 @@ public:
     Logger& operator<<(std::ostream&(*m)(std::ostream&)){ m(std::cout); if(file_)m(file_); return *this; }
     void Flush(){ std::cout.flush(); if(file_)file_.flush(); }
 private: std::ofstream file_;
+};
+
+struct HostTouchEvent {
+    u32 phase = 0; // UIKit phases: began=0, moved=1, ended=3, cancelled=4
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 class HostOpenGLWindow {
@@ -655,7 +661,7 @@ public:
         frame_clock_=std::chrono::steady_clock::now();
         log<<"IOS HOSTGL: Win32 OpenGL window ready client=960x540 logical=320x480 offscreen="
            <<kPortraitWidth<<"x"<<kPortraitHeight
-           <<" presentation=CCW90 content=3:2 pillarboxed-in=16:9 vbo="<<(glGenBuffers_?1:0)<<"\n";
+           <<" presentation=CCW90 content=3:2 pillarboxed-in=16:9 input=mouse-to-uitouch vbo="<<(glGenBuffers_?1:0)<<"\n";
         return true;
 #else
         (void)log;
@@ -679,6 +685,13 @@ public:
     bool Ready() const { return ready_; }
     bool Closed() const { return closed_; }
     u64 PresentCount() const { return present_count_; }
+
+    bool PopTouchEvent(HostTouchEvent& out) {
+        if(touch_events_.empty())return false;
+        out=touch_events_.front();
+        touch_events_.erase(touch_events_.begin());
+        return true;
+    }
 
     bool PumpMessages() {
 #ifdef _WIN32
@@ -883,6 +896,38 @@ private:
         glBindTexture(GL_TEXTURE_2D,0);
         return true;
     }
+    bool ClientToGuestTouch(LPARAM lp,float& gx,float& gy,bool clamp_to_content=false) const {
+        if(!hwnd_)return false;
+        RECT client{};GetClientRect(hwnd_,&client);
+        const int client_w=static_cast<int>(std::max<LONG>(1,client.right-client.left));
+        const int client_h=static_cast<int>(std::max<LONG>(1,client.bottom-client.top));
+        constexpr double content_aspect=1.5;
+        int view_w=client_w;
+        int view_h=static_cast<int>(double(view_w)/content_aspect+0.5);
+        if(view_h>client_h){view_h=client_h;view_w=static_cast<int>(double(view_h)*content_aspect+0.5);}
+        const int view_x=(client_w-view_w)/2;
+        const int view_y=(client_h-view_h)/2;
+        int x=static_cast<int>(static_cast<short>(LOWORD(lp)));
+        int y=static_cast<int>(static_cast<short>(HIWORD(lp)));
+        if(!clamp_to_content&&(x<view_x||x>=view_x+view_w||y<view_y||y>=view_y+view_h))return false;
+        x=std::clamp(x,view_x,view_x+view_w-1);
+        y=std::clamp(y,view_y,view_y+view_h-1);
+        const float lx=float(x-view_x)/float(std::max(1,view_w));
+        const float ly=float(y-view_y)/float(std::max(1,view_h));
+        // Inverse of the final CCW90 presentation:
+        // 480x320 landscape top-left -> 320x480 UIKit portrait coordinates.
+        gx=(1.0f-ly)*320.0f;
+        gy=lx*480.0f;
+        return true;
+    }
+    void QueueTouch(u32 phase,LPARAM lp,bool clamp_to_content=false){
+        float x=0.0f,y=0.0f;
+        if(!ClientToGuestTouch(lp,x,y,clamp_to_content))return;
+        last_touch_x_=x;last_touch_y_=y;
+        if(touch_events_.size()>=64u)touch_events_.erase(touch_events_.begin());
+        touch_events_.push_back(HostTouchEvent{phase,x,y});
+    }
+
     static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HostOpenGLWindow* self=reinterpret_cast<HostOpenGLWindow*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
         if(msg==WM_NCCREATE){
@@ -891,6 +936,30 @@ private:
             SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));
         }
         switch(msg){
+            case WM_LBUTTONDOWN:
+                if(self){
+                    self->mouse_down_=true;
+                    SetFocus(hwnd);SetCapture(hwnd);
+                    self->QueueTouch(0u,lp,false);
+                }
+                return 0;
+            case WM_MOUSEMOVE:
+                if(self&&self->mouse_down_)self->QueueTouch(1u,lp,true);
+                return 0;
+            case WM_LBUTTONUP:
+                if(self&&self->mouse_down_){
+                    self->QueueTouch(3u,lp,true);
+                    self->mouse_down_=false;
+                    if(GetCapture()==hwnd)ReleaseCapture();
+                }
+                return 0;
+            case WM_CAPTURECHANGED:
+                if(self&&self->mouse_down_){
+                    self->mouse_down_=false;
+                    if(self->touch_events_.size()>=64u)self->touch_events_.erase(self->touch_events_.begin());
+                    self->touch_events_.push_back(HostTouchEvent{4u,self->last_touch_x_,self->last_touch_y_});
+                }
+                return 0;
             case WM_CLOSE:
                 if(self)self->closed_=true;
                 DestroyWindow(hwnd);
@@ -902,8 +971,8 @@ private:
             default: return DefWindowProcW(hwnd,msg,wp,lp);
         }
     }
-    static constexpr GLsizei kPortraitWidth=480;
-    static constexpr GLsizei kPortraitHeight=720;
+    static constexpr GLsizei kPortraitWidth=320;
+    static constexpr GLsizei kPortraitHeight=480;
     static constexpr GLenum kGlFramebuffer=0x8d40u;
     static constexpr GLenum kGlRenderbuffer=0x8d41u;
     static constexpr GLenum kGlColorAttachment0=0x8ce0u;
@@ -921,6 +990,9 @@ private:
 #endif
     bool ready_=false;
     bool closed_=false;
+    bool mouse_down_=false;
+    float last_touch_x_=0.0f,last_touch_y_=0.0f;
+    std::vector<HostTouchEvent> touch_events_;
     u64 present_count_=0;
     std::chrono::steady_clock::time_point frame_clock_{};
 };
@@ -1018,7 +1090,7 @@ public:
                 <<" running-scene=0x"<<Hex(running_scene_)
                 <<" running-scene-class="<<(FindGuestClassForInstance(running_scene_)?FindGuestClassForInstance(running_scene_)->name:(running_scene_?"unknown":"nil"))
                 <<" presents="<<host_window_.PresentCount()
-                <<" placeholder-textures="<<placeholder_texture_uploads_<<" real-asset-draws="<<real_asset_draws_
+                <<" placeholder-textures="<<placeholder_texture_uploads_<<" real-asset-draws="<<real_asset_draws_<<" touches="<<touch_dispatch_count_
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
@@ -1089,6 +1161,11 @@ private:
         if(!dest||!env_.IsMapped(dest,16u))return false;
         const std::array<float,4> rect{x,y,w,h};
         return env_.WriteBytes(dest,rect.data(),sizeof(rect));
+    }
+    bool WriteCGPoint(u32 dest,float x,float y){
+        if(!dest||!env_.IsMapped(dest,8u))return false;
+        const std::array<float,2> point{x,y};
+        return env_.WriteBytes(dest,point.data(),sizeof(point));
     }
     void WriteGeneratedIds(u32 count,u32 ptr){
         if(!ptr||!count||count>4096u||!env_.IsMapped(ptr,std::size_t(count)*4u))return;
@@ -1405,7 +1482,7 @@ private:
         return selector=="node"||selector=="runWithScene:"||selector=="replaceScene:"||
                selector=="pushScene:"||selector=="popScene"||selector=="runningScene"||
                selector=="schedule:"||selector=="scheduleUpdate"||selector=="methodForSelector:"||
-               selector=="onEnter"||selector=="onEnterTransitionDidFinish";
+               selector=="onEnter"||selector=="onEnterTransitionDidFinish"||selector=="loadingFinished"||selector=="loadManagers";
     }
     void TraceSceneMessage(std::string_view kind,std::string_view class_name,std::string_view selector,u32 value=0u){
         if(++scene_trace_count_<=128u)
@@ -1472,8 +1549,8 @@ private:
         if(name=="glPointSize"){glPointSize(FloatFromBits(r[0]));r[0]=0u;return true;}
         if(name=="glColor4f"){glColor4f(FloatFromBits(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]));r[0]=0u;return true;}
         if(name=="glColor4ub"){glColor4ub(static_cast<GLubyte>(r[0]),static_cast<GLubyte>(r[1]),static_cast<GLubyte>(r[2]),static_cast<GLubyte>(r[3]));r[0]=0u;return true;}
-        if(name=="glViewport"){glViewport(static_cast<GLint>(r[0]*3u/2u),static_cast<GLint>(r[1]*3u/2u),static_cast<GLsizei>(r[2]*3u/2u),static_cast<GLsizei>(r[3]*3u/2u));r[0]=0u;return true;}
-        if(name=="glScissor"){glScissor(static_cast<GLint>(r[0]*3u/2u),static_cast<GLint>(r[1]*3u/2u),static_cast<GLsizei>(r[2]*3u/2u),static_cast<GLsizei>(r[3]*3u/2u));r[0]=0u;return true;}
+        if(name=="glViewport"){glViewport(static_cast<GLint>(r[0]),static_cast<GLint>(r[1]),static_cast<GLsizei>(r[2]),static_cast<GLsizei>(r[3]));r[0]=0u;return true;}
+        if(name=="glScissor"){glScissor(static_cast<GLint>(r[0]),static_cast<GLint>(r[1]),static_cast<GLsizei>(r[2]),static_cast<GLsizei>(r[3]));r[0]=0u;return true;}
         if(name=="glMatrixMode"){glMatrixMode(static_cast<GLenum>(r[0]));r[0]=0u;return true;}
         if(name=="glLoadIdentity"){glLoadIdentity();r[0]=0u;return true;}
         if(name=="glPushMatrix"){glPushMatrix();r[0]=0u;return true;}
@@ -1636,6 +1713,38 @@ private:
 #endif
     }
 
+    void EnsureTouchObjects(){
+        if(touch_object_)return;
+        touch_object_=NewExternalInstance("UITouch");
+        touch_set_=NewExternalInstance("NSSet");
+        touch_event_=NewExternalInstance("UIEvent");
+        fake_collections_[touch_set_]={touch_object_};
+        fake_objects_[touch_event_].aux0=touch_set_;
+    }
+    bool BeginTouchDispatch(){
+        if(!eagl_view_instance_)return false;
+        HostTouchEvent event{};
+        if(!host_window_.PopTouchEvent(event))return false;
+        EnsureTouchObjects();
+        previous_touch_x_=touch_x_;previous_touch_y_=touch_y_;
+        touch_x_=event.x;touch_y_=event.y;touch_phase_=event.phase;
+        const GuestClass* cls=FindGuestClassForInstance(eagl_view_instance_);
+        if(!cls)return false;
+        const char* selector=event.phase==0u?"touchesBegan:withEvent:":
+                             event.phase==1u?"touchesMoved:withEvent:":
+                             event.phase==3u?"touchesEnded:withEvent:":
+                                             "touchesCancelled:withEvent:";
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,selector);
+        if(!method)return false;
+        cpu_.Regs()[0]=eagl_view_instance_;cpu_.Regs()[1]=method->selector_addr;
+        cpu_.Regs()[2]=touch_set_;cpu_.Regs()[3]=touch_event_;cpu_.Regs()[14]=kControlBase;
+        EnterGuestMethod(*method);host_call_stage_=HostCallStage::Touch;touch_dispatch_active_=true;
+        if(++touch_log_count_<=32u)
+            log_<<"IOS INPUT: "<<selector<<" guest=("<<std::fixed<<std::setprecision(1)<<touch_x_<<","<<touch_y_
+                <<") view=0x"<<Hex(eagl_view_instance_)<<"\n";
+        return true;
+    }
+
     bool BeginDelegateLaunch(){
         const GuestClass* cls=FindGuestClassByName(delegate_name_);
         if(!cls){log_<<"RESULT: IOS_DELEGATE_CLASS_NOT_FOUND name="<<(delegate_name_.empty()?"unknown":delegate_name_)<<"\n";done_=true;return true;}
@@ -1680,6 +1789,7 @@ private:
             log_<<"IOS HOSTGL: window closed by user after frames="<<frame_count_<<"\n";
             return true;
         }
+        if(BeginTouchDispatch())return true;
         const GuestClass* cls=FindGuestClassForInstance(director_instance_);
         if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
         const GuestMethod* method=FindInstanceMethodRecursive(cls,"drawScene");
@@ -1702,6 +1812,10 @@ private:
         if(!dest||!env_.IsMapped(dest,16u))return true;
 
         if(!receiver){WriteCGRect(dest,0.0f,0.0f,0.0f,0.0f);return true;}
+        if(auto fit=fake_objects_.find(receiver);fit!=fake_objects_.end()&&fit->second.class_name=="UITouch"){
+            if(selector=="locationInView:"){WriteCGPoint(dest,touch_x_,touch_y_);return true;}
+            if(selector=="previousLocationInView:"){WriteCGPoint(dest,previous_touch_x_,previous_touch_y_);return true;}
+        }
 
         const GuestClass* class_receiver=nullptr;
         for(const auto& c:classes_)if(c.class_addr==receiver||c.meta_addr==receiver){class_receiver=&c;break;}
@@ -1782,6 +1896,10 @@ private:
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            if(selector=="setOpenGLView:"&&cpu_.Regs()[2]){
+                eagl_view_instance_=cpu_.Regs()[2];
+                log_<<"IOS INPUT: captured EAGLView=0x"<<Hex(eagl_view_instance_)<<"\n";
+            }
             if((selector=="runWithScene:"||selector=="replaceScene:"||selector=="pushScene:")&&cpu_.Regs()[2]){
                 observed_scene_=cpu_.Regs()[2];
                 const GuestClass* scene_cls=FindGuestClassForInstance(observed_scene_);
@@ -1832,11 +1950,32 @@ private:
         const auto fit=fake_objects_.find(receiver);
         if(fit!=fake_objects_.end()){
             const auto& fo=fit->second;
-            if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
+            if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){
+                cpu_.Regs()[0]=NewExternalInstance(fo.class_name);
+                if(fo.class_name=="UIWindow")window_instance_=cpu_.Regs()[0];
+                return true;
+            }
             if((fo.is_class||fo.is_meta)&&selector=="class"){cpu_.Regs()[0]=receiver;return true;}
             if(fo.is_class&&fo.class_name=="UIApplication"&&selector=="sharedApplication"){
                 if(!application_instance_)application_instance_=NewExternalInstance("UIApplication");
                 cpu_.Regs()[0]=application_instance_;return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSThread"&&selector=="currentThread"){
+                if(!main_thread_instance_)main_thread_instance_=NewExternalInstance("NSThread");
+                cpu_.Regs()[0]=main_thread_instance_;return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSThread"&&selector=="isMainThread"){cpu_.Regs()[0]=1u;return true;}
+            if(fo.is_class&&fo.class_name=="NSThread"&&selector=="detachNewThreadSelector:toTarget:withObject:"){
+                const u32 target_sel=cpu_.Regs()[2],target_obj=cpu_.Regs()[3],object_arg=StackArg(0);
+                if(const GuestClass* target_cls=FindGuestClassForInstance(target_obj)){
+                    const std::string target_name=SelectorName(target_sel);
+                    if(const GuestMethod* target=FindInstanceMethodRecursive(target_cls,target_name)){
+                        log_<<"IOS THREAD: detach selector="<<target_name<<" target="<<target_cls->name<<" policy=synchronous\n";
+                        cpu_.Regs()[0]=target_obj;cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
+                        EnterGuestMethod(*target);return true;
+                    }
+                }
+                cpu_.Regs()[0]=0u;return true;
             }
             if(fo.is_class&&(selector=="sharedInstance"||selector=="defaultManager"||selector=="defaultCenter"||selector=="standardUserDefaults"||selector=="mainBundle"||selector=="mainScreen"||selector=="currentDevice")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
             if(fo.is_class&&fo.class_name=="NSString"&&(selector=="stringWithCString:encoding:"||selector=="stringWithUTF8String:")){
@@ -1863,6 +2002,50 @@ private:
             if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="initWithContentsOfFile:"){
                 fake_objects_[receiver].resource_value=ResolveAssetRelative(DescribeString(cpu_.Regs()[2]));
                 cpu_.Regs()[0]=receiver;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="initWithTarget:selector:object:"){
+                fake_objects_[receiver].aux0=cpu_.Regs()[2];
+                fake_objects_[receiver].aux1=cpu_.Regs()[3];
+                fake_objects_[receiver].aux2=StackArg(0);
+                cpu_.Regs()[0]=receiver;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="start"){
+                const u32 target_obj=fo.aux0,target_sel=fo.aux1,object_arg=fo.aux2;
+                if(const GuestClass* target_cls=FindGuestClassForInstance(target_obj)){
+                    const std::string target_name=SelectorName(target_sel);
+                    if(const GuestMethod* target=FindInstanceMethodRecursive(target_cls,target_name)){
+                        log_<<"IOS THREAD: NSThread start selector="<<target_name<<" target="<<target_cls->name<<" policy=synchronous\n";
+                        cpu_.Regs()[0]=target_obj;cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
+                        EnterGuestMethod(*target);return true;
+                    }
+                }
+                cpu_.Regs()[0]=0u;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="UITouch"){
+                if(selector=="locationInView:"){cpu_.Regs()[0]=FloatToBits(touch_x_);cpu_.Regs()[1]=FloatToBits(touch_y_);return true;}
+                if(selector=="previousLocationInView:"){cpu_.Regs()[0]=FloatToBits(previous_touch_x_);cpu_.Regs()[1]=FloatToBits(previous_touch_y_);return true;}
+                if(selector=="tapCount"){cpu_.Regs()[0]=1u;return true;}
+                if(selector=="phase"){cpu_.Regs()[0]=touch_phase_;return true;}
+                if(selector=="view"){cpu_.Regs()[0]=eagl_view_instance_;return true;}
+                if(selector=="window"){cpu_.Regs()[0]=window_instance_;return true;}
+            }
+            if(!fo.is_class&&fo.class_name=="UIEvent"&&selector=="allTouches"){cpu_.Regs()[0]=touch_set_;return true;}
+            if(!fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")){
+                auto it=fake_collections_.find(receiver);
+                const std::vector<u32>* values=it==fake_collections_.end()?nullptr:&it->second;
+                if(selector=="count"){cpu_.Regs()[0]=values?static_cast<u32>(values->size()):0u;return true;}
+                if(selector=="anyObject"||selector=="firstObject"||selector=="lastObject"){cpu_.Regs()[0]=(values&&!values->empty())?values->front():0u;return true;}
+                if(selector=="objectAtIndex:"||selector=="objectAtIndexedSubscript:"){
+                    const u32 idx=cpu_.Regs()[2];cpu_.Regs()[0]=(values&&idx<values->size())?(*values)[idx]:0u;return true;
+                }
+                if(selector=="allObjects"){
+                    const u32 array=NewExternalInstance("NSArray");
+                    if(values)fake_collections_[array]=*values;
+                    cpu_.Regs()[0]=array;return true;
+                }
+                if(selector=="containsObject:"){
+                    cpu_.Regs()[0]=(values&&std::find(values->begin(),values->end(),cpu_.Regs()[2])!=values->end())?1u:0u;return true;
+                }
             }
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
             if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
@@ -1937,6 +2120,10 @@ private:
             running_scene_=cpu_.Regs()[0];host_call_stage_=HostCallStage::None;
             const GuestClass* scene_cls=FindGuestClassForInstance(running_scene_);
             log_<<"IOS: CCDirector runningScene=0x"<<Hex(running_scene_)<<" class="<<(scene_cls?scene_cls->name:(running_scene_?"unknown":"nil"))<<"\n";
+            return BeginFrameProbe();
+        }
+        if(host_call_stage_==HostCallStage::Touch){
+            host_call_stage_=HostCallStage::None;touch_dispatch_active_=false;++touch_dispatch_count_;
             return BeginFrameProbe();
         }
         if(host_call_stage_==HostCallStage::Frame){
@@ -2151,19 +2338,22 @@ private:
 
     void BuildInitialStack(){const std::string argv0="GeometryDashWrapper-iOS";const u32 arg=AllocateCString(argv0);u32 sp=kStackBase+kStackSize-0x1000u;sp&=~7u;sp-=24u;env_.MemoryWrite32(sp+0u,1u);env_.MemoryWrite32(sp+4u,arg);env_.MemoryWrite32(sp+8u,0u);env_.MemoryWrite32(sp+12u,0u);env_.MemoryWrite32(sp+16u,0u);env_.MemoryWrite32(sp+20u,0u);initial_sp_=sp;}
 
-    enum class HostCallStage { None, Delegate, AcquireDirector, QueryRunningScene, Frame };
+    enum class HostCallStage { None, Delegate, AcquireDirector, QueryRunningScene, Touch, Frame };
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
+    u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0;
+    u32 touch_object_=0,touch_set_=0,touch_event_=0,touch_phase_=0;
+    float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0;
-    u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0;
-    bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false;
+    u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
+    bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
     HostOpenGLWindow host_window_;
