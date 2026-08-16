@@ -616,7 +616,11 @@ public:
         wc.lpszClassName=L"GDW_IOS_ARMV7_GL";
         RegisterClassW(&wc);
 
-        RECT rect{0,0,480,720};
+        // Keep the wrapper UI consistent with the other backends: a 16:9
+        // host window. The old iPhone game itself remains native 3:2 and
+        // is pillarboxed inside this window after rotating the portrait
+        // iOS renderbuffer 90 degrees counter-clockwise.
+        RECT rect{0,0,960,540};
         AdjustWindowRect(&rect,WS_OVERLAPPEDWINDOW,FALSE);
         hwnd_=CreateWindowExW(
             0,wc.lpszClassName,L"Forlorn - Geometry Dash Wrapper iOS",
@@ -642,13 +646,16 @@ public:
         if(!rc_||!wglMakeCurrent(dc_,rc_)){log<<"IOS HOSTGL: wglCreateContext/wglMakeCurrent failed\n";Shutdown();return false;}
 
         LoadExtensions();
-        glViewport(0,0,480,720);
+        if(!CreatePortraitFramebuffer(log)){Shutdown();return false;}
+        glViewport(0,0,kPortraitWidth,kPortraitHeight);
         glClearColor(0.0f,0.0f,0.0f,1.0f);
         glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-        SwapBuffers(dc_);
         ready_=true;
+        Present();
         frame_clock_=std::chrono::steady_clock::now();
-        log<<"IOS HOSTGL: Win32 OpenGL window ready client=480x720 logical=320x480 vbo="<<(glGenBuffers_?1:0)<<"\n";
+        log<<"IOS HOSTGL: Win32 OpenGL window ready client=960x540 logical=320x480 offscreen="
+           <<kPortraitWidth<<"x"<<kPortraitHeight
+           <<" presentation=CCW90 content=3:2 pillarboxed-in=16:9 vbo="<<(glGenBuffers_?1:0)<<"\n";
         return true;
 #else
         (void)log;
@@ -658,6 +665,10 @@ public:
 
     void Shutdown() {
 #ifdef _WIN32
+        if(rc_&&dc_)wglMakeCurrent(dc_,rc_);
+        if(offscreen_depth_&&glDeleteRenderbuffers_){glDeleteRenderbuffers_(1,&offscreen_depth_);offscreen_depth_=0;}
+        if(offscreen_fbo_&&glDeleteFramebuffers_){glDeleteFramebuffers_(1,&offscreen_fbo_);offscreen_fbo_=0;}
+        if(offscreen_texture_){glDeleteTextures(1,&offscreen_texture_);offscreen_texture_=0;}
         if(rc_){wglMakeCurrent(nullptr,nullptr);wglDeleteContext(rc_);rc_=nullptr;}
         if(hwnd_&&dc_){ReleaseDC(hwnd_,dc_);dc_=nullptr;}
         if(hwnd_){DestroyWindow(hwnd_);hwnd_=nullptr;}
@@ -683,7 +694,82 @@ public:
 
     void Present() {
 #ifdef _WIN32
-        if(ready_&&dc_){SwapBuffers(dc_);++present_count_;}
+        if(!dc_||!rc_)return;
+        if(!offscreen_fbo_||!offscreen_texture_||!glBindFramebuffer_) {
+            SwapBuffers(dc_);++present_count_;return;
+        }
+
+        // The guest renders exactly like an old iPhone: portrait 320x480
+        // renderbuffer, scaled here to 480x720. Landscape apps rotate their
+        // scene inside that portrait surface. A physical iPhone then rotates
+        // the display itself; Windows does not, so rotate the final renderbuffer
+        // counter-clockwise here instead of distorting every guest GL call.
+        glPushAttrib(GL_ALL_ATTRIB_BITS);
+        glPushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS);
+        GLint previous_matrix_mode=GL_MODELVIEW;
+        glGetIntegerv(GL_MATRIX_MODE,&previous_matrix_mode);
+
+        glBindFramebuffer_(kGlFramebuffer,0);
+        RECT client{};
+        GetClientRect(hwnd_,&client);
+        const int client_w=static_cast<int>(std::max<LONG>(1,client.right-client.left));
+        const int client_h=static_cast<int>(std::max<LONG>(1,client.bottom-client.top));
+
+        // Native Forlorn content is 480x320 = 3:2. Fit it into the 16:9
+        // wrapper window without stretching, leaving black pillarboxes.
+        constexpr double content_aspect=1.5;
+        int view_w=client_w;
+        int view_h=static_cast<int>(double(view_w)/content_aspect+0.5);
+        if(view_h>client_h){
+            view_h=client_h;
+            view_w=static_cast<int>(double(view_h)*content_aspect+0.5);
+        }
+        const int view_x=(client_w-view_w)/2;
+        const int view_y=(client_h-view_h)/2;
+
+        glViewport(0,0,client_w,client_h);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glClearColor(0.0f,0.0f,0.0f,1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glViewport(view_x,view_y,view_w,view_h);
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0.0,1.0,0.0,1.0,-1.0,1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D,offscreen_texture_);
+        glTexEnvi(GL_TEXTURE_ENV,GL_TEXTURE_ENV_MODE,GL_REPLACE);
+        glColor4f(1.0f,1.0f,1.0f,1.0f);
+
+        // Rotate CCW 90 degrees: source top-left becomes destination bottom-left.
+        glBegin(GL_QUADS);
+        glTexCoord2f(0.0f,1.0f); glVertex2f(0.0f,0.0f);
+        glTexCoord2f(0.0f,0.0f); glVertex2f(1.0f,0.0f);
+        glTexCoord2f(1.0f,0.0f); glVertex2f(1.0f,1.0f);
+        glTexCoord2f(1.0f,1.0f); glVertex2f(0.0f,1.0f);
+        glEnd();
+
+        glMatrixMode(GL_MODELVIEW);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(previous_matrix_mode);
+        glPopClientAttrib();
+        glPopAttrib();
+
+        SwapBuffers(dc_);
+        ++present_count_;
+
+        // FBO binding is not part of the legacy attribute stack.
+        glBindFramebuffer_(kGlFramebuffer,offscreen_fbo_);
 #endif
     }
 
@@ -705,6 +791,16 @@ public:
     using PFNGLBUFFERSUBDATAPROC_ = void (APIENTRY*)(GLenum,std::ptrdiff_t,std::ptrdiff_t,const void*);
     using PFNGLDELETEBUFFERSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
     using PFNGLGENERATEMIPMAPPROC_ = void (APIENTRY*)(GLenum);
+    using PFNGLGENFRAMEBUFFERSPROC_ = void (APIENTRY*)(GLsizei,GLuint*);
+    using PFNGLBINDFRAMEBUFFERPROC_ = void (APIENTRY*)(GLenum,GLuint);
+    using PFNGLDELETEFRAMEBUFFERSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
+    using PFNGLFRAMEBUFFERTEXTURE2DPROC_ = void (APIENTRY*)(GLenum,GLenum,GLenum,GLuint,GLint);
+    using PFNGLCHECKFRAMEBUFFERSTATUSPROC_ = GLenum (APIENTRY*)(GLenum);
+    using PFNGLGENRENDERBUFFERSPROC_ = void (APIENTRY*)(GLsizei,GLuint*);
+    using PFNGLBINDRENDERBUFFERPROC_ = void (APIENTRY*)(GLenum,GLuint);
+    using PFNGLDELETERENDERBUFFERSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
+    using PFNGLRENDERBUFFERSTORAGEPROC_ = void (APIENTRY*)(GLenum,GLenum,GLsizei,GLsizei);
+    using PFNGLFRAMEBUFFERRENDERBUFFERPROC_ = void (APIENTRY*)(GLenum,GLenum,GLenum,GLuint);
 
     PFNGLACTIVETEXTUREPROC_ glActiveTexture_ = nullptr;
     PFNGLGENBUFFERSPROC_ glGenBuffers_ = nullptr;
@@ -713,6 +809,16 @@ public:
     PFNGLBUFFERSUBDATAPROC_ glBufferSubData_ = nullptr;
     PFNGLDELETEBUFFERSPROC_ glDeleteBuffers_ = nullptr;
     PFNGLGENERATEMIPMAPPROC_ glGenerateMipmap_ = nullptr;
+    PFNGLGENFRAMEBUFFERSPROC_ glGenFramebuffers_ = nullptr;
+    PFNGLBINDFRAMEBUFFERPROC_ glBindFramebuffer_ = nullptr;
+    PFNGLDELETEFRAMEBUFFERSPROC_ glDeleteFramebuffers_ = nullptr;
+    PFNGLFRAMEBUFFERTEXTURE2DPROC_ glFramebufferTexture2D_ = nullptr;
+    PFNGLCHECKFRAMEBUFFERSTATUSPROC_ glCheckFramebufferStatus_ = nullptr;
+    PFNGLGENRENDERBUFFERSPROC_ glGenRenderbuffers_ = nullptr;
+    PFNGLBINDRENDERBUFFERPROC_ glBindRenderbuffer_ = nullptr;
+    PFNGLDELETERENDERBUFFERSPROC_ glDeleteRenderbuffers_ = nullptr;
+    PFNGLRENDERBUFFERSTORAGEPROC_ glRenderbufferStorage_ = nullptr;
+    PFNGLFRAMEBUFFERRENDERBUFFERPROC_ glFramebufferRenderbuffer_ = nullptr;
 #endif
 
 private:
@@ -731,6 +837,51 @@ private:
         glBufferSubData_=LoadGlProc<PFNGLBUFFERSUBDATAPROC_>("glBufferSubData","glBufferSubDataARB");
         glDeleteBuffers_=LoadGlProc<PFNGLDELETEBUFFERSPROC_>("glDeleteBuffers","glDeleteBuffersARB");
         glGenerateMipmap_=LoadGlProc<PFNGLGENERATEMIPMAPPROC_>("glGenerateMipmap","glGenerateMipmapEXT");
+        glGenFramebuffers_=LoadGlProc<PFNGLGENFRAMEBUFFERSPROC_>("glGenFramebuffers","glGenFramebuffersEXT");
+        glBindFramebuffer_=LoadGlProc<PFNGLBINDFRAMEBUFFERPROC_>("glBindFramebuffer","glBindFramebufferEXT");
+        glDeleteFramebuffers_=LoadGlProc<PFNGLDELETEFRAMEBUFFERSPROC_>("glDeleteFramebuffers","glDeleteFramebuffersEXT");
+        glFramebufferTexture2D_=LoadGlProc<PFNGLFRAMEBUFFERTEXTURE2DPROC_>("glFramebufferTexture2D","glFramebufferTexture2DEXT");
+        glCheckFramebufferStatus_=LoadGlProc<PFNGLCHECKFRAMEBUFFERSTATUSPROC_>("glCheckFramebufferStatus","glCheckFramebufferStatusEXT");
+        glGenRenderbuffers_=LoadGlProc<PFNGLGENRENDERBUFFERSPROC_>("glGenRenderbuffers","glGenRenderbuffersEXT");
+        glBindRenderbuffer_=LoadGlProc<PFNGLBINDRENDERBUFFERPROC_>("glBindRenderbuffer","glBindRenderbufferEXT");
+        glDeleteRenderbuffers_=LoadGlProc<PFNGLDELETERENDERBUFFERSPROC_>("glDeleteRenderbuffers","glDeleteRenderbuffersEXT");
+        glRenderbufferStorage_=LoadGlProc<PFNGLRENDERBUFFERSTORAGEPROC_>("glRenderbufferStorage","glRenderbufferStorageEXT");
+        glFramebufferRenderbuffer_=LoadGlProc<PFNGLFRAMEBUFFERRENDERBUFFERPROC_>("glFramebufferRenderbuffer","glFramebufferRenderbufferEXT");
+    }
+
+    bool CreatePortraitFramebuffer(Logger& log){
+        if(!glGenFramebuffers_||!glBindFramebuffer_||!glDeleteFramebuffers_||
+           !glFramebufferTexture2D_||!glCheckFramebufferStatus_||
+           !glGenRenderbuffers_||!glBindRenderbuffer_||!glDeleteRenderbuffers_||
+           !glRenderbufferStorage_||!glFramebufferRenderbuffer_){
+            log<<"IOS HOSTGL: framebuffer-object extension unavailable; cannot rotate iOS portrait surface safely\n";
+            return false;
+        }
+
+        glGenTextures(1,&offscreen_texture_);
+        glBindTexture(GL_TEXTURE_2D,offscreen_texture_);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,kPortraitWidth,kPortraitHeight,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+
+        glGenFramebuffers_(1,&offscreen_fbo_);
+        glBindFramebuffer_(kGlFramebuffer,offscreen_fbo_);
+        glFramebufferTexture2D_(kGlFramebuffer,kGlColorAttachment0,GL_TEXTURE_2D,offscreen_texture_,0);
+
+        glGenRenderbuffers_(1,&offscreen_depth_);
+        glBindRenderbuffer_(kGlRenderbuffer,offscreen_depth_);
+        glRenderbufferStorage_(kGlRenderbuffer,kGlDepthComponent24,kPortraitWidth,kPortraitHeight);
+        glFramebufferRenderbuffer_(kGlFramebuffer,kGlDepthAttachment,kGlRenderbuffer,offscreen_depth_);
+
+        const GLenum status=glCheckFramebufferStatus_(kGlFramebuffer);
+        if(status!=kGlFramebufferComplete){
+            log<<"IOS HOSTGL: portrait framebuffer incomplete status=0x"<<std::hex<<status<<std::dec<<"\n";
+            return false;
+        }
+        glBindTexture(GL_TEXTURE_2D,0);
+        return true;
     }
     static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HostOpenGLWindow* self=reinterpret_cast<HostOpenGLWindow*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
@@ -751,10 +902,22 @@ private:
             default: return DefWindowProcW(hwnd,msg,wp,lp);
         }
     }
+    static constexpr GLsizei kPortraitWidth=480;
+    static constexpr GLsizei kPortraitHeight=720;
+    static constexpr GLenum kGlFramebuffer=0x8d40u;
+    static constexpr GLenum kGlRenderbuffer=0x8d41u;
+    static constexpr GLenum kGlColorAttachment0=0x8ce0u;
+    static constexpr GLenum kGlDepthAttachment=0x8d00u;
+    static constexpr GLenum kGlDepthComponent24=0x81a6u;
+    static constexpr GLenum kGlFramebufferComplete=0x8cd5u;
+
     HINSTANCE instance_=nullptr;
     HWND hwnd_=nullptr;
     HDC dc_=nullptr;
     HGLRC rc_=nullptr;
+    GLuint offscreen_texture_=0;
+    GLuint offscreen_fbo_=0;
+    GLuint offscreen_depth_=0;
 #endif
     bool ready_=false;
     bool closed_=false;
