@@ -21,5 +21,6 @@ if "%~1"=="" (
   "GeometryDashLauncher.exe" "%~1"
 )
 set "RESULT=%ERRORLEVEL%"
-if not "%RESULT%"=="0" pause
+if /I "%~x1"==".ipa" pause
+if not "%RESULT%"=="0" if /I not "%~x1"==".ipa" pause
 exit /b %RESULT%

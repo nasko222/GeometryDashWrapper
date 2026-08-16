@@ -1,3 +1,0 @@
-Optional cleanup after applying hotfix:
-ENDURANCETEST2.md
-ENDURANCETEST2-VERIFICATION.txt

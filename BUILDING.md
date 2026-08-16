@@ -1,16 +1,12 @@
-# Building EnduranceTest12
+# Building PublicTest1
 
 Run `BUILD_ALL.cmd` on Windows. The scripts fetch or reuse the pinned CMake,
 Ninja, Zig and Dynarmic dependencies and build the native launcher plus all
-wrapper backends.
+Android wrapper backends.
 
-No APK, extracted Android library, built EXE/DLL, Python file or `.gitignore` is
-included in this source archive. Supply APKs through the normal launcher flow.
+PublicTest1 adds the IPA analyzer to the native launcher only. The analyzer uses
+the launcher's existing zlib-backed ZIP reader and does not add a Python or
+Apple-tool dependency.
 
-Runtime changes are limited to:
-
-- the ARMv7 2.2-beta null-texture batch-init guard; and
-- a legacy-ARM-only first-alias MCI replay experiment.
-
-The complete x86 backend is unchanged. The confirmed editor-background fix,
-BPM path, selection rendering, and Practice Z/X implementation are unchanged.
+No APK, IPA, extracted Android/iOS executable, built EXE/DLL, Python file or
+`.gitignore` is included in this source archive.

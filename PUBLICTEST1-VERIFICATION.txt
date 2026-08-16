@@ -1,0 +1,72 @@
+Geometry Dash Wrapper 0.9.6-publictest1
+PublicTest1 verification
+
+SCOPE
+-----
+PublicTest1 adds a read-only IPA analyzer to the native launcher. It does not execute iOS code yet.
+The existing APK backend selection/runtime path is intentionally kept on the EnduranceTest12 baseline.
+
+IPA ANALYZER
+------------
+- Detects .ipa before entering the Android launcher workflow.
+- Finds the root Payload/<app>.app/Info.plist member.
+- Parses both XML and binary plist metadata.
+- Finds CFBundleExecutable, with app-name/largest-top-file fallbacks.
+- Parses thin and fat Mach-O headers, ARMv6/ARMv7/ARMv7s/ARM64/x86/x86_64, LC_MAIN, dylib imports and encryption commands.
+- Reports ARM32 as reusable with the current A32 Dynarmic CPU core, but explicitly stops before iOS execution.
+- Does not attempt to bypass encrypted App Store executables.
+
+REGRESSION BOUNDARY
+-------------------
+- Complete x86 backend is byte-identical to EnduranceTest12.
+- Shared audio/network/storage/song sources are byte-identical to EnduranceTest12.
+- Legacy ARM and ARMv7 source differ only in their displayed version strings.
+- InitializeLauncherContext, which performs the established APK scan/metadata/backend selection/save/log setup, is byte-identical to EnduranceTest12.
+- The only launcher routing change outside the analyzer is an early .ipa branch in wmain.
+
+HOST-SIDE FIXTURE TEST
+----------------------
+A portable C harness compiled with GCC and successfully parsed:
+- a Python plistlib-generated binary Info.plist;
+- an XML Info.plist containing the same RobTop-style metadata;
+- a synthetic 32-bit ARMv7 Mach-O executable with LC_MAIN and a UIKit dylib import.
+This validates the new parsers independent of the Windows launcher plumbing.
+
+STATIC AUDIT
+------------
+01. PASS: version is 0.9.6-publictest1
+02. PASS: branch is publictest1
+03. PASS: launcher token iOS IPA inspection
+04. PASS: launcher token ParseIpaInfoPlist
+05. PASS: launcher token BplistFindTopDictionaryValue
+06. PASS: launcher token AnalyzeMachO
+07. PASS: launcher token MACH_LC_MAIN
+08. PASS: launcher token MACH_LC_ENCRYPTION_INFO
+09. PASS: launcher token IPA_ANALYZER_OK
+10. PASS: launcher token existing Dynarmic A32 core is reusable
+11. PASS: launcher token PublicTest1 will not attempt to bypass it
+12. PASS: InitializeLauncherContext Android path unchanged
+13. PASS: x86 backend byte-identical
+14. PASS: src/shared/audio_win.c byte-identical
+15. PASS: src/shared/storage_win.c byte-identical
+16. PASS: src/shared/net_compat_win.c byte-identical
+17. PASS: src/shared/song_http_win.c byte-identical
+18. PASS: src/backends/arm_legacy/dynarmic_legacy.cpp behavior unchanged except version label
+19. PASS: src/backends/armv7/dynarmic_armv7.cpp behavior unchanged except version label
+20. PASS: RUN_AUTO_GDPS.cmd IPA pause
+21. PASS: RUN_AUTO_GDPS.cmd still passes argument directly
+22. PASS: RUN_AUTO_BOOMLINGS.cmd IPA pause
+23. PASS: RUN_AUTO_BOOMLINGS.cmd still passes argument directly
+24. PASS: binary plist fixture parsed
+25. PASS: XML plist fixture parsed
+26. PASS: ARMv7 Mach-O fixture parsed
+27. PASS: source policy clean (no APK/IPA/.so/EXE/DLL/Python/.git) [[]]
+28. PASS: CPAL LICENSE present
+29. PASS: PublicTest1 docs present
+
+Passed 29/29 focused audits.
+
+RUNTIME STATUS
+--------------
+Not Windows-runtime-tested in this environment. No real RobTop IPA was supplied for PublicTest1, so the first real-IPA test is still required.
+APK regressions and iOS analyzer output should be checked on Windows before moving to a Mach-O loader.

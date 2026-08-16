@@ -1,1 +1,1 @@
-0.9.5-endurancetest12
+0.9.6-publictest1

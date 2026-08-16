@@ -8,12 +8,13 @@
  * and then passed to helper methods.
  *
  * Responsibilities:
- *   1. Read the APK as a ZIP file.
+ *   1. Read APK packages as ZIP files and preserve the existing Android path.
  *   2. Extract package/version metadata from AndroidManifest.xml.
- *   3. Select the x86, legacy ARM, or ARMv7 backend.
- *   4. Create one dated log folder per launch.
- *   5. Set the shared save/title/icon/server environment variables.
- *   6. Start the backend and wait for it to exit.
+ *   3. Select the x86, legacy ARM, or ARMv7 backend for APKs.
+ *   4. PublicTest1: inspect IPA/Info.plist/Mach-O files without executing them.
+ *   5. Create one dated log folder per Android launch.
+ *   6. Set the shared save/title/icon/server environment variables.
+ *   7. Start the Android backend and wait for it to exit.
  *
  * No Python installation is required on the user's PC.
  */
@@ -39,7 +40,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.5-endurancetest12"
+#define LAUNCHER_VERSION "0.9.6-publictest1"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -434,6 +435,739 @@ static unsigned char *ExtractZipEntry(const ApkArchive *archive,
     *output_size = entry->uncompressed_size;
     return output;
 }
+
+/* ---------------------------- iOS IPA inspection --------------------------- */
+
+#define MACH_MH_MAGIC 0xfeedfaceu
+#define MACH_MH_CIGAM 0xcefaedfeu
+#define MACH_MH_MAGIC_64 0xfeedfacfu
+#define MACH_MH_CIGAM_64 0xcffaedfeu
+#define MACH_FAT_MAGIC_BE 0xcafebabeu
+#define MACH_FAT_MAGIC_64_BE 0xcafebabfu
+#define MACH_LC_LOAD_DYLIB 0x0000000cu
+#define MACH_LC_LOAD_WEAK_DYLIB 0x80000018u
+#define MACH_LC_REEXPORT_DYLIB 0x8000001fu
+#define MACH_LC_LAZY_LOAD_DYLIB 0x00000020u
+#define MACH_LC_LOAD_UPWARD_DYLIB 0x80000023u
+#define MACH_LC_MAIN 0x80000028u
+#define MACH_LC_ENCRYPTION_INFO 0x00000021u
+#define MACH_LC_ENCRYPTION_INFO_64 0x0000002cu
+#define MACH_CPU_TYPE_X86 7u
+#define MACH_CPU_TYPE_ARM 12u
+#define MACH_CPU_ARCH_ABI64 0x01000000u
+#define MACH_CPU_TYPE_X86_64 (MACH_CPU_TYPE_X86 | MACH_CPU_ARCH_ABI64)
+#define MACH_CPU_TYPE_ARM64 (MACH_CPU_TYPE_ARM | MACH_CPU_ARCH_ABI64)
+
+static uint32_t ReadBE32(const unsigned char *data) {
+    return ((uint32_t)data[0] << 24) |
+           ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8) |
+           (uint32_t)data[3];
+}
+
+static uint64_t ReadBE64(const unsigned char *data) {
+    uint64_t value = 0;
+    unsigned index;
+    for (index = 0; index < 8u; ++index) value = (value << 8) | data[index];
+    return value;
+}
+
+static uint64_t ReadLE64(const unsigned char *data) {
+    uint64_t value = 0;
+    unsigned index;
+    for (index = 0; index < 8u; ++index) value |= (uint64_t)data[index] << (index * 8u);
+    return value;
+}
+
+static uint64_t ReadBigEndianInteger(const unsigned char *data, size_t bytes) {
+    uint64_t value = 0;
+    size_t index;
+    if (!data || !bytes || bytes > 8u) return 0;
+    for (index = 0; index < bytes; ++index) value = (value << 8) | data[index];
+    return value;
+}
+
+static int PathHasExtension(const wchar_t *path, const wchar_t *extension) {
+    const wchar_t *dot;
+    if (!path || !extension) return 0;
+    dot = wcsrchr(path, L'.');
+    return dot && _wcsicmp(dot, extension) == 0;
+}
+
+static int ZipEntryNameCopy(const ZipEntry *entry, char *destination, size_t capacity) {
+    size_t length;
+    if (!entry || !destination || capacity == 0) return 0;
+    length = entry->name_length;
+    if (length + 1u > capacity) return 0;
+    memcpy(destination, entry->name, length);
+    destination[length] = '\0';
+    return 1;
+}
+
+typedef struct IpaMetadata {
+    char bundle_id[MAX_UTF8_TEXT];
+    char version_name[MAX_UTF8_TEXT];
+    char version_code[MAX_UTF8_TEXT];
+    char executable[MAX_UTF8_TEXT];
+    char display_name[MAX_UTF8_TEXT];
+    char plist_format[32];
+} IpaMetadata;
+
+typedef struct BplistContext {
+    const unsigned char *data;
+    size_t size;
+    uint8_t offset_size;
+    uint8_t ref_size;
+    uint64_t object_count;
+    uint64_t top_object;
+    uint64_t offset_table_offset;
+} BplistContext;
+
+static void IpaMetadataDefaults(IpaMetadata *metadata) {
+    if (!metadata) return;
+    memset(metadata, 0, sizeof(*metadata));
+    strcpy_s(metadata->bundle_id, ARRAY_COUNT(metadata->bundle_id), "unknown");
+    strcpy_s(metadata->version_name, ARRAY_COUNT(metadata->version_name), "unknown");
+    strcpy_s(metadata->version_code, ARRAY_COUNT(metadata->version_code), "unknown");
+    strcpy_s(metadata->executable, ARRAY_COUNT(metadata->executable), "unknown");
+    strcpy_s(metadata->display_name, ARRAY_COUNT(metadata->display_name), "unknown");
+    strcpy_s(metadata->plist_format, ARRAY_COUNT(metadata->plist_format), "unknown");
+}
+
+static int XmlPlistValue(const char *text, const char *key,
+                         char *destination, size_t capacity) {
+    char needle[256];
+    const char *position;
+    const char *start;
+    const char *end;
+    const char *tag_end;
+    size_t length;
+    if (!text || !key || !destination || capacity == 0) return 0;
+    sprintf_s(needle, ARRAY_COUNT(needle), "<key>%s</key>", key);
+    position = strstr(text, needle);
+    if (!position) return 0;
+    position += strlen(needle);
+    while (*position && isspace((unsigned char)*position)) ++position;
+    if (strncmp(position, "<string>", 8u) == 0) {
+        start = position + 8u;
+        end = strstr(start, "</string>");
+    } else if (strncmp(position, "<integer>", 9u) == 0) {
+        start = position + 9u;
+        end = strstr(start, "</integer>");
+    } else {
+        tag_end = strchr(position, '>');
+        if (!tag_end) return 0;
+        start = tag_end + 1;
+        end = strchr(start, '<');
+    }
+    if (!end || end < start) return 0;
+    length = (size_t)(end - start);
+    while (length && isspace((unsigned char)start[length - 1u])) --length;
+    while (length && isspace((unsigned char)*start)) {
+        ++start;
+        --length;
+    }
+    if (length + 1u > capacity) length = capacity - 1u;
+    memcpy(destination, start, length);
+    destination[length] = '\0';
+    return length != 0u;
+}
+
+static int BplistInit(const unsigned char *data, size_t size, BplistContext *context) {
+    const unsigned char *trailer;
+    if (!data || !context || size < 40u || memcmp(data, "bplist00", 8u) != 0) return 0;
+    trailer = data + size - 32u;
+    memset(context, 0, sizeof(*context));
+    context->data = data;
+    context->size = size;
+    context->offset_size = trailer[6];
+    context->ref_size = trailer[7];
+    context->object_count = ReadBE64(trailer + 8);
+    context->top_object = ReadBE64(trailer + 16);
+    context->offset_table_offset = ReadBE64(trailer + 24);
+    if (!context->offset_size || context->offset_size > 8u ||
+        !context->ref_size || context->ref_size > 8u ||
+        !context->object_count || context->top_object >= context->object_count ||
+        context->object_count > 1000000u ||
+        context->offset_table_offset >= size) return 0;
+    if (context->object_count > (uint64_t)((size - (size_t)context->offset_table_offset) /
+                                           context->offset_size)) return 0;
+    return 1;
+}
+
+static int BplistObjectOffset(const BplistContext *context, uint64_t object,
+                              size_t *offset) {
+    uint64_t table_position;
+    uint64_t value;
+    if (!context || !offset || object >= context->object_count) return 0;
+    table_position = context->offset_table_offset + object * context->offset_size;
+    if (table_position > SIZE_MAX ||
+        !RangeFits(context->size, (size_t)table_position, context->offset_size)) return 0;
+    value = ReadBigEndianInteger(context->data + (size_t)table_position,
+                                 context->offset_size);
+    if (value >= context->size || value > SIZE_MAX) return 0;
+    *offset = (size_t)value;
+    return 1;
+}
+
+static int BplistReadCount(const BplistContext *context, size_t object_offset,
+                           uint8_t marker, uint64_t *count, size_t *payload_offset) {
+    uint8_t low;
+    size_t cursor;
+    if (!context || !count || !payload_offset || object_offset >= context->size) return 0;
+    low = marker & 0x0fu;
+    cursor = object_offset + 1u;
+    if (low != 0x0fu) {
+        *count = low;
+        *payload_offset = cursor;
+        return 1;
+    }
+    if (!RangeFits(context->size, cursor, 1u)) return 0;
+    {
+        uint8_t integer_marker = context->data[cursor++];
+        size_t integer_bytes;
+        if ((integer_marker >> 4) != 0x1u) return 0;
+        if ((integer_marker & 0x0fu) > 3u) return 0;
+        integer_bytes = (size_t)1u << (integer_marker & 0x0fu);
+        if (!RangeFits(context->size, cursor, integer_bytes)) return 0;
+        *count = ReadBigEndianInteger(context->data + cursor, integer_bytes);
+        cursor += integer_bytes;
+    }
+    *payload_offset = cursor;
+    return 1;
+}
+
+static int AppendUtf8Codepoint(char *destination, size_t capacity,
+                               size_t *used, uint32_t codepoint) {
+    if (!destination || !used || *used >= capacity) return 0;
+    if (codepoint <= 0x7fu) {
+        if (*used + 1u >= capacity) return 0;
+        destination[(*used)++] = (char)codepoint;
+    } else if (codepoint <= 0x7ffu) {
+        if (*used + 2u >= capacity) return 0;
+        destination[(*used)++] = (char)(0xc0u | (codepoint >> 6));
+        destination[(*used)++] = (char)(0x80u | (codepoint & 0x3fu));
+    } else {
+        if (*used + 3u >= capacity) return 0;
+        destination[(*used)++] = (char)(0xe0u | (codepoint >> 12));
+        destination[(*used)++] = (char)(0x80u | ((codepoint >> 6) & 0x3fu));
+        destination[(*used)++] = (char)(0x80u | (codepoint & 0x3fu));
+    }
+    destination[*used] = '\0';
+    return 1;
+}
+
+static int BplistDecodeObjectText(const BplistContext *context, uint64_t object,
+                                  char *destination, size_t capacity) {
+    size_t offset;
+    uint8_t marker;
+    uint8_t type;
+    uint64_t count;
+    size_t payload;
+    if (!context || !destination || capacity == 0 ||
+        !BplistObjectOffset(context, object, &offset)) return 0;
+    marker = context->data[offset];
+    type = marker >> 4;
+    destination[0] = '\0';
+    if (type == 0x5u || type == 0x6u) {
+        if (!BplistReadCount(context, offset, marker, &count, &payload) || count > SIZE_MAX)
+            return 0;
+        if (type == 0x5u) {
+            size_t length = (size_t)count;
+            if (!RangeFits(context->size, payload, length)) return 0;
+            if (length + 1u > capacity) length = capacity - 1u;
+            memcpy(destination, context->data + payload, length);
+            destination[length] = '\0';
+            return 1;
+        } else {
+            size_t index;
+            size_t used = 0;
+            if (count > SIZE_MAX / 2u ||
+                !RangeFits(context->size, payload, (size_t)count * 2u)) return 0;
+            for (index = 0; index < (size_t)count; ++index) {
+                uint32_t codepoint = ((uint32_t)context->data[payload + index * 2u] << 8) |
+                                     context->data[payload + index * 2u + 1u];
+                if (!AppendUtf8Codepoint(destination, capacity, &used, codepoint)) break;
+            }
+            return used != 0u;
+        }
+    }
+    if (type == 0x1u) {
+        size_t bytes;
+        uint64_t value;
+        unsigned power = marker & 0x0fu;
+        if (power > 3u) return 0;
+        bytes = (size_t)1u << power;
+        if (!RangeFits(context->size, offset + 1u, bytes)) return 0;
+        value = ReadBigEndianInteger(context->data + offset + 1u, bytes);
+        sprintf_s(destination, capacity, "%llu", (unsigned long long)value);
+        return 1;
+    }
+    return 0;
+}
+
+static int BplistFindTopDictionaryValue(const BplistContext *context,
+                                        const char *wanted_key,
+                                        char *destination, size_t capacity) {
+    size_t offset;
+    uint8_t marker;
+    uint64_t count;
+    size_t payload;
+    size_t refs_bytes;
+    uint64_t index;
+    if (!context || !wanted_key || !destination || capacity == 0 ||
+        !BplistObjectOffset(context, context->top_object, &offset)) return 0;
+    marker = context->data[offset];
+    if ((marker >> 4) != 0xdu ||
+        !BplistReadCount(context, offset, marker, &count, &payload) ||
+        count > SIZE_MAX / context->ref_size) return 0;
+    refs_bytes = (size_t)count * context->ref_size;
+    if (!RangeFits(context->size, payload, refs_bytes) ||
+        !RangeFits(context->size, payload + refs_bytes, refs_bytes)) return 0;
+    for (index = 0; index < count; ++index) {
+        uint64_t key_ref = ReadBigEndianInteger(
+            context->data + payload + (size_t)index * context->ref_size,
+            context->ref_size);
+        char key[128];
+        if (!BplistDecodeObjectText(context, key_ref, key, ARRAY_COUNT(key)) ||
+            strcmp(key, wanted_key) != 0) continue;
+        {
+            uint64_t value_ref = ReadBigEndianInteger(
+                context->data + payload + refs_bytes +
+                    (size_t)index * context->ref_size,
+                context->ref_size);
+            return BplistDecodeObjectText(context, value_ref,
+                                          destination, capacity);
+        }
+    }
+    return 0;
+}
+
+static int ParseIpaInfoPlist(const unsigned char *data, size_t size,
+                             IpaMetadata *metadata) {
+    BplistContext binary;
+    if (!data || !metadata || !size) return 0;
+    IpaMetadataDefaults(metadata);
+    if (size >= 8u && memcmp(data, "bplist00", 8u) == 0 &&
+        BplistInit(data, size, &binary)) {
+        strcpy_s(metadata->plist_format, ARRAY_COUNT(metadata->plist_format), "binary");
+        BplistFindTopDictionaryValue(&binary, "CFBundleIdentifier",
+                                    metadata->bundle_id, ARRAY_COUNT(metadata->bundle_id));
+        BplistFindTopDictionaryValue(&binary, "CFBundleShortVersionString",
+                                    metadata->version_name, ARRAY_COUNT(metadata->version_name));
+        BplistFindTopDictionaryValue(&binary, "CFBundleVersion",
+                                    metadata->version_code, ARRAY_COUNT(metadata->version_code));
+        BplistFindTopDictionaryValue(&binary, "CFBundleExecutable",
+                                    metadata->executable, ARRAY_COUNT(metadata->executable));
+        if (!BplistFindTopDictionaryValue(&binary, "CFBundleDisplayName",
+                                          metadata->display_name,
+                                          ARRAY_COUNT(metadata->display_name))) {
+            BplistFindTopDictionaryValue(&binary, "CFBundleName",
+                                         metadata->display_name,
+                                         ARRAY_COUNT(metadata->display_name));
+        }
+        return 1;
+    }
+    if (memchr(data, '<', size)) {
+        const char *text = (const char *)data;
+        strcpy_s(metadata->plist_format, ARRAY_COUNT(metadata->plist_format), "XML");
+        XmlPlistValue(text, "CFBundleIdentifier", metadata->bundle_id,
+                      ARRAY_COUNT(metadata->bundle_id));
+        XmlPlistValue(text, "CFBundleShortVersionString", metadata->version_name,
+                      ARRAY_COUNT(metadata->version_name));
+        XmlPlistValue(text, "CFBundleVersion", metadata->version_code,
+                      ARRAY_COUNT(metadata->version_code));
+        XmlPlistValue(text, "CFBundleExecutable", metadata->executable,
+                      ARRAY_COUNT(metadata->executable));
+        if (!XmlPlistValue(text, "CFBundleDisplayName", metadata->display_name,
+                           ARRAY_COUNT(metadata->display_name))) {
+            XmlPlistValue(text, "CFBundleName", metadata->display_name,
+                          ARRAY_COUNT(metadata->display_name));
+        }
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct IpaRootScan {
+    int has_info;
+    ZipEntry info_entry;
+    char app_prefix[MAX_ZIP_NAME];
+} IpaRootScan;
+
+static int ScanIpaRootEntry(const ZipEntry *entry, void *opaque) {
+    IpaRootScan *scan = (IpaRootScan *)opaque;
+    char name[MAX_ZIP_NAME];
+    const char *component;
+    const char *slash;
+    const char *suffix;
+    size_t prefix_length;
+    if (!scan || scan->has_info || !ZipEntryNameCopy(entry, name, ARRAY_COUNT(name))) return 1;
+    if (strncmp(name, "Payload/", 8u) != 0) return 1;
+    component = name + 8u;
+    slash = strchr(component, '/');
+    if (!slash || (size_t)(slash - component) < 4u ||
+        strncmp(slash - 4, ".app", 4u) != 0) return 1;
+    suffix = slash + 1;
+    if (strcmp(suffix, "Info.plist") != 0) return 1;
+    prefix_length = (size_t)(slash + 1 - name);
+    if (prefix_length + 1u > ARRAY_COUNT(scan->app_prefix)) return 1;
+    memcpy(scan->app_prefix, name, prefix_length);
+    scan->app_prefix[prefix_length] = '\0';
+    scan->info_entry = *entry;
+    scan->has_info = 1;
+    return 1;
+}
+
+typedef struct ExactZipEntrySearch {
+    const char *name;
+    int found;
+    ZipEntry entry;
+} ExactZipEntrySearch;
+
+static int FindExactZipEntryVisitor(const ZipEntry *entry, void *opaque) {
+    ExactZipEntrySearch *search = (ExactZipEntrySearch *)opaque;
+    if (search && !search->found && ZipNameEquals(entry, search->name)) {
+        search->entry = *entry;
+        search->found = 1;
+    }
+    return 1;
+}
+
+typedef struct IpaTopFileSearch {
+    const char *prefix;
+    int found;
+    ZipEntry entry;
+    uint32_t largest_size;
+} IpaTopFileSearch;
+
+static int FindIpaTopFileVisitor(const ZipEntry *entry, void *opaque) {
+    IpaTopFileSearch *search = (IpaTopFileSearch *)opaque;
+    char name[MAX_ZIP_NAME];
+    const char *remainder;
+    size_t prefix_length;
+    if (!search || !search->prefix ||
+        !ZipEntryNameCopy(entry, name, ARRAY_COUNT(name))) return 1;
+    prefix_length = strlen(search->prefix);
+    if (strncmp(name, search->prefix, prefix_length) != 0) return 1;
+    remainder = name + prefix_length;
+    if (!*remainder || strchr(remainder, '/') || strcmp(remainder, "Info.plist") == 0)
+        return 1;
+    if (entry->uncompressed_size >= 4u &&
+        (!search->found || entry->uncompressed_size > search->largest_size)) {
+        search->entry = *entry;
+        search->largest_size = entry->uncompressed_size;
+        search->found = 1;
+    }
+    return 1;
+}
+
+static const char *MachCpuName(uint32_t cpu_type, uint32_t cpu_subtype) {
+    uint32_t subtype = cpu_subtype & 0x00ffffffu;
+    if (cpu_type == MACH_CPU_TYPE_ARM) {
+        if (subtype == 9u) return "armv7";
+        if (subtype == 11u) return "armv7s";
+        if (subtype == 12u) return "armv7k";
+        if (subtype == 6u) return "armv6";
+        return "arm32";
+    }
+    if (cpu_type == MACH_CPU_TYPE_ARM64) return "arm64";
+    if (cpu_type == MACH_CPU_TYPE_X86) return "x86";
+    if (cpu_type == MACH_CPU_TYPE_X86_64) return "x86_64";
+    return "unknown";
+}
+
+static int IsMachDylibCommand(uint32_t command) {
+    return command == MACH_LC_LOAD_DYLIB ||
+           command == MACH_LC_LOAD_WEAK_DYLIB ||
+           command == MACH_LC_REEXPORT_DYLIB ||
+           command == MACH_LC_LAZY_LOAD_DYLIB ||
+           command == MACH_LC_LOAD_UPWARD_DYLIB;
+}
+
+static int AnalyzeThinMachO(const unsigned char *data, size_t size,
+                            size_t slice_offset, size_t slice_size,
+                            const char **primary_arch, int *encrypted_out) {
+    const unsigned char *slice;
+    uint32_t magic;
+    int swapped = 0;
+    int is64 = 0;
+    uint32_t cpu_type;
+    uint32_t cpu_subtype;
+    uint32_t file_type;
+    uint32_t command_count;
+    uint32_t command_bytes;
+    size_t header_size;
+    size_t command_offset;
+    uint32_t index;
+    uint64_t entry_offset = UINT64_MAX;
+    int encrypted = 0;
+    unsigned dylib_count = 0;
+    if (!data || !RangeFits(size, slice_offset, slice_size) || slice_size < 28u) return 0;
+    slice = data + slice_offset;
+    magic = ReadU32(slice);
+    if (magic == MACH_MH_MAGIC) {
+        swapped = 0;
+        is64 = 0;
+    } else if (magic == MACH_MH_MAGIC_64) {
+        swapped = 0;
+        is64 = 1;
+    } else if (magic == MACH_MH_CIGAM) {
+        swapped = 1;
+        is64 = 0;
+    } else if (magic == MACH_MH_CIGAM_64) {
+        swapped = 1;
+        is64 = 1;
+    } else {
+        return 0;
+    }
+#define MACH_READ32(ptr) (swapped ? ReadBE32(ptr) : ReadU32(ptr))
+    header_size = is64 ? 32u : 28u;
+    if (slice_size < header_size) return 0;
+    cpu_type = MACH_READ32(slice + 4);
+    cpu_subtype = MACH_READ32(slice + 8);
+    file_type = MACH_READ32(slice + 12);
+    command_count = MACH_READ32(slice + 16);
+    command_bytes = MACH_READ32(slice + 20);
+    if (!RangeFits(slice_size, header_size, command_bytes)) return 0;
+    if (primary_arch) *primary_arch = MachCpuName(cpu_type, cpu_subtype);
+    printf("Mach-O slice: %s (%s)\n", MachCpuName(cpu_type, cpu_subtype),
+           is64 ? "64-bit" : "32-bit");
+    printf("Mach-O file type: 0x%08lx%s\n", (unsigned long)file_type,
+           file_type == 2u ? " (executable)" : "");
+    printf("Load commands: %lu\n", (unsigned long)command_count);
+    command_offset = header_size;
+    for (index = 0; index < command_count; ++index) {
+        const unsigned char *command;
+        uint32_t command_type;
+        uint32_t command_size;
+        if (!RangeFits(slice_size, command_offset, 8u)) return 0;
+        command = slice + command_offset;
+        command_type = MACH_READ32(command);
+        command_size = MACH_READ32(command + 4);
+        if (command_size < 8u || !RangeFits(slice_size, command_offset, command_size)) return 0;
+        if (command_type == MACH_LC_MAIN && command_size >= 24u) {
+            entry_offset = swapped ? ReadBE64(command + 8) : ReadLE64(command + 8);
+        } else if ((command_type == MACH_LC_ENCRYPTION_INFO ||
+                    command_type == MACH_LC_ENCRYPTION_INFO_64) && command_size >= 20u) {
+            if (MACH_READ32(command + 16) != 0u) encrypted = 1;
+        } else if (IsMachDylibCommand(command_type) && command_size >= 24u) {
+            uint32_t name_offset = MACH_READ32(command + 8);
+            if (name_offset < command_size) {
+                const char *name = (const char *)(command + name_offset);
+                size_t available = command_size - name_offset;
+                if (memchr(name, '\0', available)) {
+                    if (dylib_count < 24u) printf("  import: %s\n", name);
+                    ++dylib_count;
+                }
+            }
+        }
+        command_offset += command_size;
+    }
+    if (entry_offset != UINT64_MAX)
+        printf("Entry offset: 0x%llx (LC_MAIN)\n", (unsigned long long)entry_offset);
+    else
+        printf("Entry offset: legacy thread entry / no LC_MAIN\n");
+    printf("Imported dylibs/frameworks: %u%s\n", dylib_count,
+           dylib_count > 24u ? " (first 24 shown)" : "");
+    printf("App Store encryption flag: %s\n", encrypted ? "ENCRYPTED" : "not encrypted");
+    if (encrypted_out) *encrypted_out = encrypted;
+#undef MACH_READ32
+    return 1;
+}
+
+static int AnalyzeMachO(const unsigned char *data, size_t size,
+                        const char **primary_arch, int *encrypted_out) {
+    uint32_t magic_le;
+    if (!data || size < 4u) return 0;
+    magic_le = ReadU32(data);
+    if (magic_le == MACH_MH_MAGIC || magic_le == MACH_MH_MAGIC_64 ||
+        magic_le == MACH_MH_CIGAM || magic_le == MACH_MH_CIGAM_64) {
+        return AnalyzeThinMachO(data, size, 0u, size, primary_arch, encrypted_out);
+    }
+    if (ReadBE32(data) == MACH_FAT_MAGIC_BE || ReadBE32(data) == MACH_FAT_MAGIC_64_BE) {
+        int fat64 = ReadBE32(data) == MACH_FAT_MAGIC_64_BE;
+        uint32_t count;
+        size_t entry_size = fat64 ? 32u : 20u;
+        size_t table_offset = 8u;
+        uint32_t index;
+        uint64_t chosen_offset = 0;
+        uint64_t chosen_size = 0;
+        int have_chosen = 0;
+        if (size < 8u) return 0;
+        count = ReadBE32(data + 4);
+        if (count > 64u || !RangeFits(size, table_offset, (size_t)count * entry_size)) return 0;
+        printf("Fat Mach-O architectures: %lu\n", (unsigned long)count);
+        for (index = 0; index < count; ++index) {
+            const unsigned char *arch = data + table_offset + (size_t)index * entry_size;
+            uint32_t cpu_type = ReadBE32(arch);
+            uint32_t cpu_subtype = ReadBE32(arch + 4);
+            uint64_t offset = fat64 ? ReadBE64(arch + 8) : ReadBE32(arch + 8);
+            uint64_t arch_size = fat64 ? ReadBE64(arch + 16) : ReadBE32(arch + 12);
+            printf("  %s: offset=0x%llx size=%llu\n",
+                   MachCpuName(cpu_type, cpu_subtype),
+                   (unsigned long long)offset, (unsigned long long)arch_size);
+            if (!have_chosen &&
+                (cpu_type == MACH_CPU_TYPE_ARM || cpu_type == MACH_CPU_TYPE_ARM64) &&
+                offset <= SIZE_MAX && arch_size <= SIZE_MAX &&
+                RangeFits(size, (size_t)offset, (size_t)arch_size)) {
+                chosen_offset = offset;
+                chosen_size = arch_size;
+                have_chosen = 1;
+            }
+        }
+        if (!have_chosen) return 0;
+        printf("Inspecting first ARM-family slice:\n");
+        return AnalyzeThinMachO(data, size, (size_t)chosen_offset,
+                                (size_t)chosen_size, primary_arch, encrypted_out);
+    }
+    return 0;
+}
+
+static int AnalyzeIpaInput(const wchar_t *input_path) {
+    wchar_t ipa_path[MAX_PATH * 4];
+    DWORD full_length;
+    ApkArchive archive;
+    IpaRootScan root;
+    IpaMetadata metadata;
+    unsigned char *plist = NULL;
+    size_t plist_size = 0;
+    ExactZipEntrySearch executable_search;
+    IpaTopFileSearch fallback_search;
+    ZipEntry executable_entry;
+    int have_executable = 0;
+    unsigned char *executable = NULL;
+    size_t executable_size = 0;
+    char executable_path[MAX_ZIP_NAME * 2];
+    const char *primary_arch = "unknown";
+    int encrypted = 0;
+    if (!input_path || !*input_path) return 0;
+    full_length = GetFullPathNameW(input_path, (DWORD)ARRAY_COUNT(ipa_path), ipa_path, NULL);
+    if (!full_length || full_length >= ARRAY_COUNT(ipa_path)) {
+        PrintWindowsError(L"GetFullPathName");
+        return 0;
+    }
+    if (!FileExists(ipa_path)) {
+        fwprintf(stderr, L"ERROR: IPA not found: %ls\n", ipa_path);
+        return 0;
+    }
+    if (!ApkArchiveOpen(ipa_path, &archive)) {
+        fwprintf(stderr, L"ERROR: Could not read IPA ZIP structure.\n");
+        return 0;
+    }
+    memset(&root, 0, sizeof(root));
+    if (!ApkArchiveVisit(&archive, ScanIpaRootEntry, &root) || !root.has_info) {
+        ApkArchiveClose(&archive);
+        fwprintf(stderr, L"ERROR: IPA has no Payload/<app>.app/Info.plist root bundle.\n");
+        return 0;
+    }
+    plist = ExtractZipEntry(&archive, &root.info_entry, &plist_size);
+    if (!plist) {
+        ApkArchiveClose(&archive);
+        fwprintf(stderr, L"ERROR: Could not extract Info.plist from IPA.\n");
+        return 0;
+    }
+    ParseIpaInfoPlist(plist, plist_size, &metadata);
+    free(plist);
+
+    memset(&executable_search, 0, sizeof(executable_search));
+    executable_path[0] = '\0';
+    if (strcmp(metadata.executable, "unknown") != 0) {
+        if (strlen(root.app_prefix) + strlen(metadata.executable) + 1u < ARRAY_COUNT(executable_path)) {
+            strcpy_s(executable_path, ARRAY_COUNT(executable_path), root.app_prefix);
+            strcat_s(executable_path, ARRAY_COUNT(executable_path), metadata.executable);
+            executable_search.name = executable_path;
+            ApkArchiveVisit(&archive, FindExactZipEntryVisitor, &executable_search);
+            if (executable_search.found) {
+                executable_entry = executable_search.entry;
+                have_executable = 1;
+            }
+        }
+    }
+    if (!have_executable) {
+        char app_name[MAX_UTF8_TEXT];
+        const char *component = root.app_prefix + 8u;
+        const char *app_suffix = strstr(component, ".app/");
+        if (app_suffix && (size_t)(app_suffix - component) + 1u < ARRAY_COUNT(app_name)) {
+            size_t name_length = (size_t)(app_suffix - component);
+            memcpy(app_name, component, name_length);
+            app_name[name_length] = '\0';
+            if (strlen(root.app_prefix) + name_length + 1u < ARRAY_COUNT(executable_path)) {
+                strcpy_s(executable_path, ARRAY_COUNT(executable_path), root.app_prefix);
+                strcat_s(executable_path, ARRAY_COUNT(executable_path), app_name);
+                memset(&executable_search, 0, sizeof(executable_search));
+                executable_search.name = executable_path;
+                ApkArchiveVisit(&archive, FindExactZipEntryVisitor, &executable_search);
+                if (executable_search.found) {
+                    executable_entry = executable_search.entry;
+                    have_executable = 1;
+                    strcpy_s(metadata.executable, ARRAY_COUNT(metadata.executable), app_name);
+                }
+            }
+        }
+    }
+    if (!have_executable) {
+        memset(&fallback_search, 0, sizeof(fallback_search));
+        fallback_search.prefix = root.app_prefix;
+        ApkArchiveVisit(&archive, FindIpaTopFileVisitor, &fallback_search);
+        if (fallback_search.found) {
+            executable_entry = fallback_search.entry;
+            have_executable = 1;
+            ZipEntryNameCopy(&executable_entry, executable_path, ARRAY_COUNT(executable_path));
+        }
+    }
+
+    printf("Geometry Dash Wrapper %s - iOS IPA analyzer\n", LAUNCHER_VERSION);
+    wprintf(L"IPA: %ls\n", ipa_path);
+    printf("App bundle: %s\n", root.app_prefix);
+    printf("Info.plist: %s\n", metadata.plist_format);
+    printf("Name: %s\n", metadata.display_name);
+    printf("Bundle ID: %s\n", metadata.bundle_id);
+    printf("Version: %s (build %s)\n", metadata.version_name, metadata.version_code);
+    printf("CFBundleExecutable: %s\n", metadata.executable);
+    if (!have_executable) {
+        ApkArchiveClose(&archive);
+        printf("RESULT: IPA_ANALYZER_NO_EXECUTABLE\n");
+        printf("Execution status: analysis only; iOS backend is not implemented yet.\n");
+        return 1;
+    }
+    executable = ExtractZipEntry(&archive, &executable_entry, &executable_size);
+    if (!executable) {
+        ApkArchiveClose(&archive);
+        printf("RESULT: IPA_ANALYZER_EXECUTABLE_EXTRACT_FAILED\n");
+        printf("Executable is too large, compressed with an unsupported ZIP method, or damaged.\n");
+        return 1;
+    }
+    if (!*executable_path) ZipEntryNameCopy(&executable_entry, executable_path,
+                                            ARRAY_COUNT(executable_path));
+    printf("Executable member: %s (%lu bytes)\n", executable_path,
+           (unsigned long)executable_size);
+    if (!AnalyzeMachO(executable, executable_size, &primary_arch, &encrypted)) {
+        free(executable);
+        ApkArchiveClose(&archive);
+        printf("RESULT: IPA_ANALYZER_NOT_MACHO\n");
+        printf("Execution status: selected app executable was not recognized as Mach-O.\n");
+        return 1;
+    }
+    printf("CPU assessment: ");
+    if (strcmp(primary_arch, "armv7") == 0 || strcmp(primary_arch, "armv7s") == 0 ||
+        strcmp(primary_arch, "armv6") == 0 || strcmp(primary_arch, "arm32") == 0) {
+        printf("existing Dynarmic A32 core is reusable; Mach-O/iOS runtime still needed.\n");
+    } else if (strcmp(primary_arch, "arm64") == 0) {
+        printf("new AArch64 execution path plus Mach-O/iOS runtime is required.\n");
+    } else {
+        printf("architecture needs a dedicated iOS loader/runtime path.\n");
+    }
+    if (encrypted) {
+        printf("Execution blocker: executable reports App Store encryption. PublicTest1 will not attempt to bypass it.\n");
+    }
+    printf("RESULT: IPA_ANALYZER_OK arch=%s encrypted=%d\n", primary_arch, encrypted);
+    printf("Execution status: analysis only in PublicTest1; the Android APK path is unchanged.\n");
+    free(executable);
+    ApkArchiveClose(&archive);
+    return 1;
+}
+
 
 /* ----------------------- Android binary manifest reader --------------------- */
 
@@ -1084,6 +1818,13 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t launcher_error[1024];
     DWORD exit_code;
     launcher_error[0] = L'\0';
+
+    /* PublicTest1: IPA files are inspected only. APK launch remains on the
+       pre-existing path below so the stable Android behavior is isolated. */
+    if (argc >= 2 && argv[1] && *argv[1] && PathHasExtension(argv[1], L".ipa")) {
+        return AnalyzeIpaInput(argv[1]) ? 0 : 2;
+    }
+
     if (!InitializeLauncherContext(argc, argv, &context)) return 2;
 
     SetEnvironmentVariableW(L"GD_SAVE_DIR", context.save_directory);

@@ -21,5 +21,6 @@ xcopy /e /i /y assets dist-unified\assets >nul
 
 echo.
 echo All three backends and the native launcher are in dist-unified\
-echo Drag an APK onto RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.
+echo Drag an APK onto RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd to run it.
+echo Drag an IPA onto either launcher to inspect its iOS bundle and Mach-O executable.
 exit /b 0
