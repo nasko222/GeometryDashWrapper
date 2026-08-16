@@ -1,0 +1,51 @@
+Geometry Dash Wrapper 0.9.6-publictest10 verification
+
+PublicTest9 user runtime:
+  PASS: Win32 OpenGL window/context created.
+  PASS: real BootScene observed and executed.
+  PASS: 600 real cocos2d frames and 600 presents completed.
+  PASS: no runtime crash; PublicTest9 intentionally exited after its 600-frame
+        diagnostic limit.
+  FAIL: visible window remained black.
+
+Concrete PublicTest9 causes fixed:
+  PASS: _CGAffineTransformIdentity is now a 24-byte guest float data constant,
+        not an executable SVC import thunk.
+  PASS: CGPointZero, CGSizeZero and CGRectZero are guest data constants.
+  PASS: CGAffineTransform make/translate/scale/rotate/concat/invert handlers
+        implement the 32-bit iOS hidden-struct-return ABI.
+  PASS: IPA app resources are indexed directly at runtime.
+  PASS: NSBundle resource lookup maps back into Payload/<app>.app/.
+  PASS: UIImage retains the corresponding IPA resource identity.
+  PASS: Apple CgBI PNG decoding is implemented using raw-DEFLATE zlib data,
+        PNG filters, BGRA->RGBA conversion and alpha unpremultiplication.
+  PASS: standard noninterlaced RGBA PNG decoding is also accepted.
+  PASS: CGImage width/height/bytes-per-row reflect real decoded PNG dimensions.
+  PASS: CGContextDrawImage copies real decoded IPA image pixels into cocos2d's
+        texture upload buffer.
+  PASS: host window no longer auto-closes after 600 frames.
+  PASS: per-frame BootScene logging flood removed.
+
+Supplied Forlorn fixture validation:
+  PASS: Payload/Forlorn.app/Default.png detected as Apple CgBI PNG.
+  PASS: Default.png IHDR = 320x480, 8-bit RGBA, noninterlaced.
+  PASS: raw CgBI stream inflates to the exact expected 614880 bytes.
+
+Regression:
+  PASS: PublicTest9 LoadCursorW/MAKEINTRESOURCEW build fix retained.
+  PASS: x86 backend source unchanged.
+  PASS: shared Android audio/storage/network/song/runtime source unchanged.
+  PASS: Android ARM implementation changes limited to version text.
+  PASS: TestFlight bypass retained.
+  PASS: Geometry Dash 1.0 219-constructor deferral retained.
+
+Syntax:
+  PASS: iOS C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected useful PublicTest10 markers:
+  IOS ASSET: indexed ...
+  IOS ASSET: UIImage Default.png -> Default.png
+  IOS ASSET: decoded Default.png 320x480 RGBA
+  IOS: observed runWithScene: ... class=BootScene
+
+The host window should remain open until manually closed.

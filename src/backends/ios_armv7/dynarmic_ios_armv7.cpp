@@ -73,7 +73,7 @@ constexpr u32 kStackSize = 0x01000000u;
 constexpr u32 kSvcReturn = 0x00fffffeu;
 constexpr u64 kRunChunk = 5000000u;
 constexpr u64 kRunBudget = 600000000u;
-constexpr u32 kFrameProbeCount = 600u;
+constexpr u32 kFrameProbeCount = 0u; // 0 = run until the user closes the host window
 constexpr u64 kSyntheticFrameUsec = 16667u;
 
 static u16 ReadLe16(const u8* p) { return static_cast<u16>(p[0] | (u16(p[1]) << 8)); }
@@ -207,6 +207,102 @@ static std::vector<u8> ExtractZip(const std::vector<u8>& zip, const ZipEntry& e)
     const u32 actual = static_cast<u32>(crc32(0, reinterpret_cast<const Bytef*>(out.data()), static_cast<uInt>(out.size())));
     if (actual != e.crc) throw std::runtime_error("IPA member CRC mismatch for " + e.name);
     return out;
+}
+
+
+struct DecodedPng {
+    u32 width = 0;
+    u32 height = 0;
+    std::vector<u8> rgba;
+};
+
+static u8 PaethByte(u8 a,u8 b,u8 c) {
+    const int p=int(a)+int(b)-int(c);
+    const int pa=std::abs(p-int(a)),pb=std::abs(p-int(b)),pc=std::abs(p-int(c));
+    return pa<=pb&&pa<=pc?a:(pb<=pc?b:c);
+}
+
+static bool DecodeIosPngRgba(const std::vector<u8>& png, DecodedPng& out) {
+    static constexpr u8 sig[8]={0x89,'P','N','G',0x0d,0x0a,0x1a,0x0a};
+    if(png.size()<33u||std::memcmp(png.data(),sig,8u)!=0)return false;
+    bool cgbi=false;
+    u32 width=0,height=0;
+    u8 bit_depth=0,color_type=0,interlace=0;
+    std::vector<u8> compressed;
+    std::size_t pos=8u;
+    while(pos+12u<=png.size()){
+        const u32 len=ReadBe32(png.data()+pos);
+        if(!RangeFits(png.size(),pos+8u,std::size_t(len)+4u))return false;
+        const char* type=reinterpret_cast<const char*>(png.data()+pos+4u);
+        const u8* data=png.data()+pos+8u;
+        if(std::memcmp(type,"CgBI",4u)==0)cgbi=true;
+        else if(std::memcmp(type,"IHDR",4u)==0){
+            if(len!=13u)return false;
+            width=ReadBe32(data);height=ReadBe32(data+4u);
+            bit_depth=data[8];color_type=data[9];interlace=data[12];
+        }else if(std::memcmp(type,"IDAT",4u)==0){
+            compressed.insert(compressed.end(),data,data+len);
+        }else if(std::memcmp(type,"IEND",4u)==0)break;
+        pos+=12u+len;
+    }
+    if(!width||!height||width>8192u||height>8192u||bit_depth!=8u||color_type!=6u||interlace!=0u||compressed.empty())return false;
+    const std::size_t stride=std::size_t(width)*4u;
+    const std::size_t raw_size=(stride+1u)*height;
+    if(raw_size>256u*1024u*1024u)return false;
+    std::vector<u8> raw(raw_size);
+    z_stream stream{};
+    stream.next_in=const_cast<Bytef*>(reinterpret_cast<const Bytef*>(compressed.data()));
+    stream.avail_in=static_cast<uInt>(compressed.size());
+    stream.next_out=reinterpret_cast<Bytef*>(raw.data());
+    stream.avail_out=static_cast<uInt>(raw.size());
+    if(inflateInit2(&stream,cgbi?-MAX_WBITS:MAX_WBITS)!=Z_OK)return false;
+    const int result=inflate(&stream,Z_FINISH);
+    inflateEnd(&stream);
+    if(result!=Z_STREAM_END||stream.total_out!=raw_size)return false;
+
+    std::vector<u8> recon(std::size_t(width)*height*4u);
+    std::vector<u8> prev(stride,0u),row(stride,0u);
+    std::size_t rp=0u;
+    for(u32 y=0;y<height;++y){
+        const u8 filter=raw[rp++];
+        const u8* src=raw.data()+rp;rp+=stride;
+        for(std::size_t x=0;x<stride;++x){
+            const u8 left=x>=4u?row[x-4u]:0u;
+            const u8 up=prev[x];
+            const u8 ul=x>=4u?prev[x-4u]:0u;
+            u8 value=src[x];
+            if(filter==1u)value=static_cast<u8>(value+left);
+            else if(filter==2u)value=static_cast<u8>(value+up);
+            else if(filter==3u)value=static_cast<u8>(value+u8((u16(left)+u16(up))/2u));
+            else if(filter==4u)value=static_cast<u8>(value+PaethByte(left,up,ul));
+            else if(filter!=0u)return false;
+            row[x]=value;
+        }
+        std::memcpy(recon.data()+std::size_t(y)*stride,row.data(),stride);
+        prev.swap(row);
+    }
+
+    out.width=width;out.height=height;out.rgba.resize(std::size_t(width)*height*4u);
+    for(std::size_t i=0;i<out.rgba.size();i+=4u){
+        if(cgbi){
+            u32 b=recon[i+0],g=recon[i+1],r=recon[i+2],a=recon[i+3];
+            if(a&&a<255u){
+                r=std::min<u32>(255u,(r*255u+a/2u)/a);
+                g=std::min<u32>(255u,(g*255u+a/2u)/a);
+                b=std::min<u32>(255u,(b*255u+a/2u)/a);
+            }
+            out.rgba[i+0]=static_cast<u8>(r);out.rgba[i+1]=static_cast<u8>(g);
+            out.rgba[i+2]=static_cast<u8>(b);out.rgba[i+3]=static_cast<u8>(a);
+        }else{
+            std::memcpy(out.rgba.data()+i,recon.data()+i,4u);
+        }
+    }
+    return true;
+}
+
+static std::string LowerAscii(std::string s){
+    std::transform(s.begin(),s.end(),s.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+    return s;
 }
 
 static bool IsMachOMagic(const std::vector<u8>& bytes) {
@@ -486,7 +582,7 @@ private:
 };
 
 struct Import { std::string name; u32 stub=0; u32 svc=0; u64 calls=0; };
-struct FakeObject { std::string class_name; bool is_class=false; bool is_meta=false; std::string string_value; };
+struct FakeObject { std::string class_name; bool is_class=false; bool is_meta=false; std::string string_value; std::string resource_value; };
 struct GuestMethod { std::string selector; u32 selector_addr=0; u32 imp=0; };
 struct GuestClass { std::string name; u32 class_addr=0; u32 meta_addr=0; u32 superclass_addr=0; u32 instance_size=0; std::vector<GuestMethod> instance_methods; std::vector<GuestMethod> class_methods; };
 
@@ -668,8 +764,8 @@ private:
 
 class IosBootstrap {
 public:
-    IosBootstrap(MachImage image, Logger& log)
-        : image_(std::move(image)), log_(log), monitor_(1), cpu_(MakeConfig()) {
+    IosBootstrap(MachImage image, Logger& log, const std::vector<u8>& ipa, std::string app_root)
+        : image_(std::move(image)), log_(log), ipa_(&ipa), app_root_(std::move(app_root)), monitor_(1), cpu_(MakeConfig()) {
         env_.AttachCpu(&cpu_);
     }
 
@@ -694,6 +790,7 @@ public:
         BindStream(image_.dyld.bind_off, image_.dyld.bind_size, "bind");
         BindStream(image_.dyld.weak_bind_off, image_.dyld.weak_bind_size, "weak-bind");
         BindStream(image_.dyld.lazy_bind_off, image_.dyld.lazy_bind_size, "lazy-bind");
+        BuildAssetIndex();
         ParseGuestClasses();
         ParseGuestCategories();
         log_ << "IOS: imports bound=" << imports_.size() << " guest-objc-classes=" << classes_.size()
@@ -758,11 +855,11 @@ public:
                 <<" running-scene=0x"<<Hex(running_scene_)
                 <<" running-scene-class="<<(FindGuestClassForInstance(running_scene_)?FindGuestClassForInstance(running_scene_)->name:(running_scene_?"unknown":"nil"))
                 <<" presents="<<host_window_.PresentCount()
-                <<" placeholder-textures="<<placeholder_texture_uploads_
+                <<" placeholder-textures="<<placeholder_texture_uploads_<<" real-asset-draws="<<real_asset_draws_
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest9 forwarded the real Forlorn cocos2d fixed-function OpenGL ES draw loop to a Win32 OpenGL window for up to ten seconds.\n";
+            log_<<"Execution status: PublicTest10 forwarded the real Forlorn cocos2d fixed-function OpenGL ES draw loop to a Win32 OpenGL window until the user closed it.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -835,12 +932,109 @@ private:
         for(u32 i=0;i<count;++i)env_.MemoryWrite32(ptr+i*4u,gl_object_counter_++);
     }
 
+    void BuildAssetIndex(){
+        if(!ipa_)return;
+        try{
+            for(const auto& e:ListZip(*ipa_)){
+                if(!e.name.starts_with(app_root_)||e.name.size()<=app_root_.size())continue;
+                const std::string rel=e.name.substr(app_root_.size());
+                if(rel.empty()||rel.back()=='/'||e.uncompressed_size>64u*1024u*1024u)continue;
+                const std::size_t index=asset_entries_.size();
+                asset_entries_.push_back(e);
+                asset_relative_.push_back(rel);
+                auto add=[&](std::string key){key=LowerAscii(std::move(key));if(!key.empty()&&!asset_lookup_.count(key))asset_lookup_[key]=index;};
+                add(rel);
+                const auto slash=rel.find_last_of('/');
+                add(slash==std::string::npos?rel:rel.substr(slash+1u));
+            }
+            log_<<"IOS ASSET: indexed "<<asset_entries_.size()<<" app resources from "<<app_root_<<"\n";
+        }catch(const std::exception& e){
+            log_<<"IOS ASSET: index failed error="<<e.what()<<"\n";
+        }
+    }
+    std::string NormalizeAssetRequest(std::string request)const{
+        std::replace(request.begin(),request.end(),'\\','/');
+        if(request.starts_with("ipa://"))request.erase(0,6u);
+        const auto app=request.find(".app/");
+        if(app!=std::string::npos)request=request.substr(app+5u);
+        while(!request.empty()&&(request.front()=='/'||request.front()=='.'))request.erase(request.begin());
+        return request;
+    }
+    std::string ResolveAssetRelative(std::string request)const{
+        request=NormalizeAssetRequest(std::move(request));
+        if(request.empty())return {};
+        auto find_key=[&](const std::string& key)->std::string{
+            auto it=asset_lookup_.find(LowerAscii(key));
+            return it==asset_lookup_.end()?std::string{}:asset_relative_[it->second];
+        };
+        if(auto v=find_key(request);!v.empty())return v;
+        const auto slash=request.find_last_of('/');
+        if(slash!=std::string::npos)if(auto v=find_key(request.substr(slash+1u));!v.empty())return v;
+        return {};
+    }
+    const DecodedPng* DecodeAsset(std::string relative){
+        relative=ResolveAssetRelative(std::move(relative));
+        if(relative.empty()||!ipa_)return nullptr;
+        auto cached=decoded_assets_.find(relative);
+        if(cached!=decoded_assets_.end())return &cached->second;
+        auto it=asset_lookup_.find(LowerAscii(relative));
+        if(it==asset_lookup_.end())return nullptr;
+        try{
+            const auto bytes=ExtractZip(*ipa_,asset_entries_[it->second]);
+            DecodedPng decoded;
+            if(!DecodeIosPngRgba(bytes,decoded))return nullptr;
+            auto [pos,ok]=decoded_assets_.emplace(relative,std::move(decoded));
+            if(ok&&++asset_decode_logs_<=16u)
+                log_<<"IOS ASSET: decoded "<<relative<<" "<<pos->second.width<<"x"<<pos->second.height<<" RGBA\n";
+            return &pos->second;
+        }catch(const std::exception& e){
+            if(++asset_failure_logs_<=8u)log_<<"IOS ASSET: decode failed "<<relative<<" error="<<e.what()<<"\n";
+            return nullptr;
+        }
+    }
+    u32 NewImageForAsset(const std::string& request){
+        const std::string rel=ResolveAssetRelative(request);
+        const u32 image=NewExternalInstance("UIImage");
+        fake_objects_[image].resource_value=rel;
+        if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: UIImage "<<request<<" -> "<<rel<<"\n";
+        return image;
+    }
+    u32 EnsureFloatData(const std::string& symbol,std::initializer_list<float> values){
+        auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
+        const u32 addr=Allocate(static_cast<u32>(values.size()*sizeof(float)),4u);
+        std::vector<float> data(values);
+        env_.WriteBytes(addr,data.data(),data.size()*sizeof(float));
+        data_symbols_[symbol]=addr;return addr;
+    }
+    struct Affine { float a=1.0f,b=0.0f,c=0.0f,d=1.0f,tx=0.0f,ty=0.0f; };
+    Affine ReadAffineCallArg(){
+        return Affine{FloatFromBits(cpu_.Regs()[1]),FloatFromBits(cpu_.Regs()[2]),FloatFromBits(cpu_.Regs()[3]),
+                      FloatFromBits(StackArg(0)),FloatFromBits(StackArg(1)),FloatFromBits(StackArg(2))};
+    }
+    bool WriteAffine(u32 dest,const Affine& t){
+        const std::array<float,6> v{t.a,t.b,t.c,t.d,t.tx,t.ty};
+        return dest&&env_.IsMapped(dest,sizeof(v))&&env_.WriteBytes(dest,v.data(),sizeof(v));
+    }
+    static Affine AffineConcat(const Affine& a,const Affine& b){
+        return Affine{
+            a.a*b.a+a.c*b.b,
+            a.b*b.a+a.d*b.b,
+            a.a*b.c+a.c*b.d,
+            a.b*b.c+a.d*b.d,
+            a.a*b.tx+a.c*b.ty+a.tx,
+            a.b*b.tx+a.d*b.ty+a.ty
+        };
+    }
+
     u32 EnsureImport(const std::string& name){ auto it=import_by_name_.find(name); if(it!=import_by_name_.end())return imports_[it->second].stub; const std::size_t idx=imports_.size(); if((idx+1u)*8u>kImportSize)throw std::runtime_error("too many iOS imports"); Import imp{name,kImportBase+static_cast<u32>(idx*8u),static_cast<u32>(idx+1u),0}; WriteArmSvc(imp.stub,imp.svc); imports_.push_back(imp);import_by_name_[name]=idx;return imp.stub; }
     u32 ResolveSymbol(const std::string& symbol){
         constexpr std::string_view cls="_OBJC_CLASS_$_"; constexpr std::string_view meta="_OBJC_METACLASS_$_";
         if(symbol.starts_with(cls))return EnsureExternalClass(symbol.substr(cls.size()),false);
         if(symbol.starts_with(meta))return EnsureExternalClass(symbol.substr(meta.size()),true);
         if(symbol=="___CFConstantStringClassReference")return EnsureExternalClass("NSConstantString",false);
+        if(symbol=="_CGAffineTransformIdentity")return EnsureFloatData(symbol,{1.0f,0.0f,0.0f,1.0f,0.0f,0.0f});
+        if(symbol=="_CGPointZero"||symbol=="_CGSizeZero")return EnsureFloatData(symbol,{0.0f,0.0f});
+        if(symbol=="_CGRectZero")return EnsureFloatData(symbol,{0.0f,0.0f,0.0f,0.0f});
         static const std::set<std::string> known_data={"_NSDefaultRunLoopMode","_NSRunLoopCommonModes","_NSLocaleCountryCode","_NSLocaleLanguageCode","_NSLocalizedDescriptionKey","_UIApplicationDidBecomeActiveNotification","_UIApplicationDidFinishLaunchingNotification","_AVAudioSessionCategoryAmbient","_AVAudioSessionCategoryPlayback","_AVAudioSessionCategorySoloAmbient","_AVAudioSessionCategoryPlayAndRecord"};
         if(known_data.count(symbol)){ auto it=data_symbols_.find(symbol); if(it!=data_symbols_.end())return it->second; const u32 obj=NewFakeString(symbol.substr(1)); data_symbols_[symbol]=obj; return obj; }
         return EnsureImport(symbol);
@@ -1044,10 +1238,11 @@ private:
         return false;
     }
     bool ShouldTraceSceneMessage(std::string_view class_name,std::string_view selector)const{
-        return class_name=="BootScene"||class_name=="CCScene"||class_name=="CCNode"||
-               selector=="node"||selector=="runWithScene:"||selector=="replaceScene:"||
+        (void)class_name;
+        return selector=="node"||selector=="runWithScene:"||selector=="replaceScene:"||
                selector=="pushScene:"||selector=="popScene"||selector=="runningScene"||
-               selector=="schedule:"||selector=="scheduleUpdate"||selector=="methodForSelector:";
+               selector=="schedule:"||selector=="scheduleUpdate"||selector=="methodForSelector:"||
+               selector=="onEnter"||selector=="onEnterTransitionDidFinish";
     }
     void TraceSceneMessage(std::string_view kind,std::string_view class_name,std::string_view selector,u32 value=0u){
         if(++scene_trace_count_<=128u)
@@ -1416,7 +1611,7 @@ private:
         if(guest_class_receiver){
             const GuestMethod* method=FindClassMethodRecursive(guest_class_receiver,selector);
             if(method){
-                if(++guest_dispatch_logs_<=256u||ShouldTraceSceneMessage(guest_class_receiver->name,selector))
+                if(++guest_dispatch_logs_<=160u||ShouldTraceSceneMessage(guest_class_receiver->name,selector))
                     log_<<"IOS: objc guest class dispatch "<<guest_class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
                 if(ShouldTraceSceneMessage(guest_class_receiver->name,selector))
                     TraceSceneMessage("class-dispatch",guest_class_receiver->name,selector,method->imp);
@@ -1459,7 +1654,7 @@ private:
             }
             const GuestMethod* method=FindInstanceMethodRecursive(instance_class,selector);
             if(method){
-                if(++guest_dispatch_logs_<=256u||ShouldTraceSceneMessage(instance_class->name,selector))
+                if(++guest_dispatch_logs_<=160u||ShouldTraceSceneMessage(instance_class->name,selector))
                     log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
                 if(ShouldTraceSceneMessage(instance_class->name,selector))
                     TraceSceneMessage("instance-dispatch",instance_class->name,selector,method->imp);
@@ -1484,14 +1679,35 @@ private:
             if(fo.is_class&&fo.class_name=="NSString"&&(selector=="stringWithCString:encoding:"||selector=="stringWithUTF8String:")){
                 std::string value;env_.ReadCString(cpu_.Regs()[2],value,1u<<20);cpu_.Regs()[0]=NewFakeString(value);return true;
             }
+            if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
+                cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
+            }
             if(fo.is_class&&(selector.starts_with("numberWith")||selector.starts_with("valueWith")||selector.starts_with("arrayWith")||selector.starts_with("dictionaryWith")||selector.starts_with("setWith")||selector.starts_with("URLWith")||selector.starts_with("dataWith")||selector.starts_with("colorWith")||selector.starts_with("fontWith")||selector.starts_with("imageNamed"))){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
             if(fo.is_class&&selector=="setCurrentContext:"){cpu_.Regs()[0]=1u;return true;}
+            if(!fo.is_class&&fo.class_name=="NSBundle"&&(selector=="pathForResource:ofType:"||selector=="pathForResource:ofType:inDirectory:")){
+                std::string base=DescribeString(cpu_.Regs()[2]),ext=DescribeString(cpu_.Regs()[3]);
+                std::string candidate=base;
+                if(!ext.empty()&&!candidate.ends_with("."+ext))candidate+="."+ext;
+                if(selector=="pathForResource:ofType:inDirectory:"){
+                    const std::string dir=DescribeString(StackArg(0));
+                    if(!dir.empty())candidate=dir+"/"+candidate;
+                }
+                const std::string rel=ResolveAssetRelative(candidate);
+                cpu_.Regs()[0]=rel.empty()?0u:NewFakeString("ipa://"+rel);
+                if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: NSBundle "<<candidate<<" -> "<<rel<<"\n";
+                return true;
+            }
+            if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="initWithContentsOfFile:"){
+                fake_objects_[receiver].resource_value=ResolveAssetRelative(DescribeString(cpu_.Regs()[2]));
+                cpu_.Regs()[0]=receiver;return true;
+            }
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
             if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
             if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="presentRenderbuffer:"){host_window_.Present();cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="renderbufferStorage:fromDrawable:"){cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="CGImage"){
                 cpu_.Regs()[0]=AssociatedExternal(receiver,"cgimage","CGImage");
+                fake_objects_[cpu_.Regs()[0]].resource_value=fo.resource_value;
                 fake_cgimages_.insert(cpu_.Regs()[0]);
                 return true;
             }
@@ -1567,7 +1783,7 @@ private:
                 if(host_window_.PresentCount()==frame_present_start_)host_window_.Present();
                 host_window_.Pace60();
             }
-            if(frame_count_>=kFrameProbeCount){
+            if(kFrameProbeCount!=0u&&frame_count_>=kFrameProbeCount){
                 frame_probe_completed_=true;done_=true;
                 log_<<"IOS: cocos2d visible-host probe completed frames="<<frame_count_<<"\n";
                 return true;
@@ -1622,9 +1838,59 @@ private:
             else result=std::pow(a,FloatFromBits(cpu_.Regs()[1]));
             cpu_.Regs()[0]=FloatToBits(result);return true;
         }
-        if(name=="CGImageGetWidth"||name=="CGImageGetHeight"){cpu_.Regs()[0]=2u;return true;}
-        if(name=="CGImageGetBitsPerComponent"){cpu_.Regs()[0]=8u;return true;}
-        if(name=="CGImageGetBytesPerRow"){cpu_.Regs()[0]=8u;return true;}
+        if(name=="CGAffineTransformMakeRotation"){
+            const float angle=FloatFromBits(cpu_.Regs()[1]);const float c=std::cos(angle),s=std::sin(angle);
+            WriteAffine(cpu_.Regs()[0],Affine{c,s,-s,c,0.0f,0.0f});cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformMakeScale"){
+            WriteAffine(cpu_.Regs()[0],Affine{FloatFromBits(cpu_.Regs()[1]),0.0f,0.0f,FloatFromBits(cpu_.Regs()[2]),0.0f,0.0f});cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformTranslate"){
+            Affine t=ReadAffineCallArg();const float x=FloatFromBits(StackArg(3)),y=FloatFromBits(StackArg(4));
+            t.tx+=x*t.a+y*t.c;t.ty+=x*t.b+y*t.d;WriteAffine(cpu_.Regs()[0],t);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformScale"){
+            Affine t=ReadAffineCallArg();const float x=FloatFromBits(StackArg(3)),y=FloatFromBits(StackArg(4));
+            t.a*=x;t.b*=x;t.c*=y;t.d*=y;WriteAffine(cpu_.Regs()[0],t);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformRotate"){
+            const Affine t=ReadAffineCallArg();const float angle=FloatFromBits(StackArg(3)),c=std::cos(angle),s=std::sin(angle);
+            WriteAffine(cpu_.Regs()[0],Affine{t.a*c+t.c*s,t.b*c+t.d*s,-t.a*s+t.c*c,-t.b*s+t.d*c,t.tx,t.ty});
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformInvert"){
+            const Affine t=ReadAffineCallArg();const float det=t.a*t.d-t.b*t.c;
+            Affine v{};
+            if(std::abs(det)>1.0e-12f){
+                v.a=t.d/det;v.b=-t.b/det;v.c=-t.c/det;v.d=t.a/det;
+                v.tx=(t.c*t.ty-t.d*t.tx)/det;v.ty=(t.b*t.tx-t.a*t.ty)/det;
+            }
+            WriteAffine(cpu_.Regs()[0],v);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGAffineTransformConcat"){
+            const Affine a=ReadAffineCallArg();
+            const Affine b{FloatFromBits(StackArg(3)),FloatFromBits(StackArg(4)),FloatFromBits(StackArg(5)),
+                           FloatFromBits(StackArg(6)),FloatFromBits(StackArg(7)),FloatFromBits(StackArg(8))};
+            WriteAffine(cpu_.Regs()[0],AffineConcat(a,b));cpu_.Regs()[0]=0u;return true;
+        }
+
+        if(name=="CGImageGetWidth"||name=="CGImageGetHeight"){
+            last_cgimage_=cpu_.Regs()[0];
+            u32 value=2u;
+            auto fit=fake_objects_.find(last_cgimage_);
+            if(fit!=fake_objects_.end()&&!fit->second.resource_value.empty())
+                if(const DecodedPng* img=DecodeAsset(fit->second.resource_value))
+                    value=name=="CGImageGetWidth"?img->width:img->height;
+            cpu_.Regs()[0]=value;return true;
+        }
+        if(name=="CGImageGetBitsPerComponent"){last_cgimage_=cpu_.Regs()[0];cpu_.Regs()[0]=8u;return true;}
+        if(name=="CGImageGetBytesPerRow"){
+            last_cgimage_=cpu_.Regs()[0];u32 width=2u;
+            auto fit=fake_objects_.find(last_cgimage_);
+            if(fit!=fake_objects_.end()&&!fit->second.resource_value.empty())
+                if(const DecodedPng* img=DecodeAsset(fit->second.resource_value))width=img->width;
+            cpu_.Regs()[0]=width*4u;return true;
+        }
         if(name=="CGImageGetAlphaInfo"){cpu_.Regs()[0]=1u;return true;}
         if(name=="CGImageGetColorSpace"||name=="CGColorSpaceCreateDeviceRGB"||name=="CGColorSpaceCreateDeviceGray"){
             cpu_.Regs()[0]=Allocate(16u);return true;
@@ -1634,27 +1900,34 @@ private:
             const u32 data=cpu_.Regs()[0],width=cpu_.Regs()[1],height=cpu_.Regs()[2],bits=cpu_.Regs()[3];
             const u32 bytes_per_row=StackArg(0);
             const u32 ctx=Allocate(32u);
-            bitmap_contexts_[ctx]=std::array<u32,5>{data,width,height,bits,bytes_per_row};
+            bitmap_contexts_[ctx]=std::array<u32,6>{data,width,height,bits,bytes_per_row,last_cgimage_};
             cpu_.Regs()[0]=ctx;return true;
         }
         if(name=="CGContextDrawImage"){
             const u32 ctx=cpu_.Regs()[0];
             auto it=bitmap_contexts_.find(ctx);
             if(it!=bitmap_contexts_.end()){
-                const u32 data=it->second[0],width=it->second[1],height=it->second[2],bpr=it->second[4];
-                if(data&&width&&height&&bpr&&u64(bpr)*height<=16u*1024u*1024u&&env_.IsMapped(data,std::size_t(bpr)*height)){
+                const u32 data=it->second[0],width=it->second[1],height=it->second[2],bpr=it->second[4],cgimage=it->second[5];
+                if(data&&width&&height&&bpr&&u64(bpr)*height<=64u*1024u*1024u&&env_.IsMapped(data,std::size_t(bpr)*height)){
+                    const DecodedPng* source=nullptr;
+                    auto fit=fake_objects_.find(cgimage);
+                    if(fit!=fake_objects_.end()&&!fit->second.resource_value.empty())source=DecodeAsset(fit->second.resource_value);
                     std::vector<u8> pixels(std::size_t(bpr)*height,0);
                     for(u32 y=0;y<height;++y)for(u32 x=0;x<width;++x){
                         const std::size_t o=std::size_t(y)*bpr+x*4u;
-                        if(o+3u<pixels.size()){
-                            const bool mag=((x^y)&1u)==0u;
-                            pixels[o+0]=mag?255u:255u;
-                            pixels[o+1]=mag?0u:255u;
-                            pixels[o+2]=mag?255u:255u;
-                            pixels[o+3]=255u;
+                        if(o+3u>=pixels.size())continue;
+                        if(source&&!source->rgba.empty()){
+                            const u32 sx=std::min<u32>(source->width-1u,u32((u64(x)*source->width)/std::max<u32>(width,1u)));
+                            const u32 sy=std::min<u32>(source->height-1u,u32((u64(y)*source->height)/std::max<u32>(height,1u)));
+                            const std::size_t so=(std::size_t(sy)*source->width+sx)*4u;
+                            std::memcpy(pixels.data()+o,source->rgba.data()+so,4u);
+                        }else{
+                            const bool mag=(((x>>4u)^(y>>4u))&1u)==0u;
+                            pixels[o+0]=255u;pixels[o+1]=mag?0u:255u;pixels[o+2]=255u;pixels[o+3]=255u;
                         }
                     }
                     env_.WriteBytes(data,pixels.data(),pixels.size());
+                    if(source)++real_asset_draws_;
                 }
             }
             cpu_.Regs()[0]=0u;return true;
@@ -1717,21 +1990,23 @@ private:
 
     enum class HostCallStage { None, Delegate, AcquireDirector, QueryRunningScene, Frame };
 
-    MachImage image_; Logger& log_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
+    MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
+    std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
     std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
     HostOpenGLWindow host_window_;
     std::set<u32> fake_cgimages_;
-    std::unordered_map<u32,std::array<u32,5>> bitmap_contexts_;
+    u32 last_cgimage_=0;
+    std::unordered_map<u32,std::array<u32,6>> bitmap_contexts_;
     std::string delegate_name_;
 };
 
@@ -1750,7 +2025,9 @@ int main(int argc,char** argv){
         log<<"Executable member: "<<exe.member<<" ("<<exe.bytes.size()<<" bytes)\n";
         auto image=SelectAndParseArmv7(exe.bytes);
         log<<"Mach-O: "<<image.arch<<" entry=0x"<<std::hex<<image.entry<<std::dec<<" encrypted="<<(image.encrypted?1:0)<<"\n";
-        IosBootstrap runtime(std::move(image),log);
+        const auto slash=exe.member.find_last_of('/');
+        const std::string app_root=slash==std::string::npos?std::string{}:exe.member.substr(0,slash+1u);
+        IosBootstrap runtime(std::move(image),log,ipa,app_root);
         if(!runtime.Prepare())return 3;
         return runtime.Run()?0:4;
     }catch(const std::exception& e){log<<"RESULT: IOS_BOOTSTRAP_FATAL error="<<e.what()<<"\n";return 5;}
