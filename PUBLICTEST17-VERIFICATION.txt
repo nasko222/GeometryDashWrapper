@@ -1,0 +1,66 @@
+Geometry Dash Wrapper 0.9.6-publictest17 verification
+
+Latest supplied PublicTest16 logs:
+  PASS: Forlorn 1.9c reaches MenuScene.
+  PASS: real PLAY button is rendered.
+  PASS: CCMenu ccTouchBegan executes.
+  PASS: CGRectContainsPoint returns HIT on the 153x67 item.
+  PASS: CCMenuItemSprite selected executes.
+  PASS: claimed touch is added to NSMutableSet.
+  PASS: touchesEnded finds that claimed touch.
+  PASS: claimed touch is then removed.
+  FAIL: CCMenu ccTouchEnded never executes.
+  FAIL: CCMenuItem activate never executes.
+
+Exact dispatch diagnosis:
+  Cocos2d's CCTouchDispatcher uses
+    performSelector:withObject:withObject:
+  for the non-began targeted touch callbacks.
+  PublicTest16 only implemented the 0/1-object performSelector forms.
+
+PublicTest17:
+  PASS: performSelector:withObject:withObject: implemented.
+  PASS: second object argument is read from ARMv7 StackArg(0).
+  PASS: target guest IMP receives _cmd, object1 and object2 normally.
+  PASS: dedicated IOS PERFORM2 diagnostics.
+  PASS: CCMenu ccTouchEnded / CCMenuItem activate / MenuScene onPlay traces retained.
+
+Direct PNG cutoff diagnosis:
+  PublicTest10-16 scaled decoded PNGs across the entire POT backing context.
+  Example:
+    source logo = 334x142
+    backing texture = 512x256
+  Cocos2d samples the 334x142 content rectangle, so that old behavior exposed
+  only the upper-left portion of the stretched source.
+
+PublicTest17:
+  PASS: CGContextDrawImage decodes ARMv7 CGRect as r1/r2/r3 + StackArg(0).
+  PASS: CGImageRef read from StackArg(1), with previous-image fallback.
+  PASS: source is drawn only inside the requested destination rectangle.
+  PASS: remaining POT backing pixels stay transparent.
+  PASS: exact 334x142-in-512x256 coverage unit check.
+
+Regression:
+  PASS: PublicTest16 NSSet/NSMutableSet touch ownership retained.
+  PASS: PublicTest15 CGRectContainsPoint + packed RGBA conversion retained.
+  PASS: PublicTest15 Windows GL enum build fix retained.
+  PASS: PublicTest14 binary plist/Foundation containers retained.
+  PASS: PublicTest13 IPA stdio/CCZ/zlib retained.
+  PASS: PublicTest12 loading thread + Win32/UIKit input retained.
+  PASS: PublicTest11 landscape presentation retained.
+  PASS: x86/shared Android runtime source unchanged.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+
+Syntax:
+  PASS: C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected successful click:
+  IOS INPUT HITTEST: ... -> HIT
+  IOS INPUT CLAIM: NSMutableSet addObject ...
+  IOS PERFORM2: CCMenu -> ccTouchEnded:withEvent: ...
+  IOS MENU: CCMenu -ccTouchEnded:withEvent: ...
+  IOS MENU: CCMenuItemSprite -activate ...
+  IOS MENU: MenuScene -onPlay: ...
+
+Expected logo draw:
+  IOS CG: DrawImage context=512x256 rect=(0,0,334,142) source=334x142 padding=transparent

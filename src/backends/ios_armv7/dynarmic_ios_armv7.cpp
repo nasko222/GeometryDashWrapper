@@ -1273,7 +1273,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest15 runs the real Forlorn cocos2d MenuScene with packed-texture conversion and UIKit/cocos2d hit-testing until the user closes the window.\n";
+            log_<<"Execution status: PublicTest17 runs the real Forlorn cocos2d MenuScene with complete targeted-touch performSelector dispatch and CGRect-correct CoreGraphics image drawing until the user closes the window.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -2283,17 +2283,27 @@ private:
                 return true;
             }
             if(selector=="isEqual:"){cpu_.Regs()[0]=receiver==cpu_.Regs()[2]?1u:0u;return true;}
-            if(selector=="performSelector:"||selector=="performSelector:withObject:"||selector=="performSelectorOnMainThread:withObject:waitUntilDone:"){
+            if(selector=="performSelector:"||selector=="performSelector:withObject:"||
+               selector=="performSelector:withObject:withObject:"||
+               selector=="performSelectorOnMainThread:withObject:waitUntilDone:"){
                 const u32 target_sel=cpu_.Regs()[2];
                 const std::string target_name=SelectorName(target_sel);
                 const GuestMethod* target=FindInstanceMethodRecursive(instance_class,target_name);
                 if(target){
-                    const u32 object_arg=(selector=="performSelector:")?0u:cpu_.Regs()[3];
-                    cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
+                    const u32 object_arg1=(selector=="performSelector:")?0u:cpu_.Regs()[3];
+                    const u32 object_arg2=(selector=="performSelector:withObject:withObject:")?StackArg(0):0u;
+                    cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg1;cpu_.Regs()[3]=object_arg2;
                     if(ShouldTraceSceneMessage(instance_class->name,target_name))
                         TraceSceneMessage("perform-selector",instance_class->name,target_name,target->imp);
+                    if(selector=="performSelector:withObject:withObject:"&&++perform2_logs_<=48u)
+                        log_<<"IOS PERFORM2: "<<instance_class->name<<" -> "<<target_name
+                            <<" arg1=0x"<<Hex(object_arg1)<<" arg2=0x"<<Hex(object_arg2)
+                            <<" imp=0x"<<Hex(target->imp)<<"\n";
                     EnterGuestMethod(*target);return true;
                 }
+                if(selector=="performSelector:withObject:withObject:"&&++perform2_logs_<=48u)
+                    log_<<"IOS PERFORM2: missing target class="<<instance_class->name
+                        <<" selector="<<target_name<<"\n";
                 cpu_.Regs()[0]=0u;return true;
             }
             const GuestMethod* method=FindInstanceMethodRecursive(instance_class,selector);
@@ -2852,27 +2862,69 @@ private:
             const u32 ctx=cpu_.Regs()[0];
             auto it=bitmap_contexts_.find(ctx);
             if(it!=bitmap_contexts_.end()){
-                const u32 data=it->second[0],width=it->second[1],height=it->second[2],bpr=it->second[4],cgimage=it->second[5];
+                const u32 data=it->second[0],width=it->second[1],height=it->second[2],bpr=it->second[4];
+                const u32 passed_image=StackArg(1);
+                const u32 cgimage=passed_image?passed_image:it->second[5];
                 if(data&&width&&height&&bpr&&u64(bpr)*height<=64u*1024u*1024u&&env_.IsMapped(data,std::size_t(bpr)*height)){
                     const DecodedPng* source=nullptr;
                     auto fit=fake_objects_.find(cgimage);
                     if(fit!=fake_objects_.end()&&!fit->second.resource_value.empty())source=DecodeAsset(fit->second.resource_value);
-                    std::vector<u8> pixels(std::size_t(bpr)*height,0);
-                    for(u32 y=0;y<height;++y)for(u32 x=0;x<width;++x){
-                        const std::size_t o=std::size_t(y)*bpr+x*4u;
-                        if(o+3u>=pixels.size())continue;
-                        if(source&&!source->rgba.empty()){
-                            const u32 sx=std::min<u32>(source->width-1u,u32((u64(x)*source->width)/std::max<u32>(width,1u)));
-                            const u32 sy=std::min<u32>(source->height-1u,u32((u64(y)*source->height)/std::max<u32>(height,1u)));
-                            const std::size_t so=(std::size_t(sy)*source->width+sx)*4u;
-                            std::memcpy(pixels.data()+o,source->rgba.data()+so,4u);
-                        }else{
-                            const bool mag=(((x>>4u)^(y>>4u))&1u)==0u;
-                            pixels[o+0]=255u;pixels[o+1]=mag?0u:255u;pixels[o+2]=255u;pixels[o+3]=255u;
+
+                    float rx=FloatFromBits(cpu_.Regs()[1]);
+                    float ry=FloatFromBits(cpu_.Regs()[2]);
+                    float rw=FloatFromBits(cpu_.Regs()[3]);
+                    float rh=FloatFromBits(StackArg(0));
+
+                    // Old cocos2d normally passes CGRectMake(0,0,imageW,imageH).
+                    // Fall back to the decoded source size only if the guest
+                    // rectangle is unusable.
+                    if(!std::isfinite(rx)||!std::isfinite(ry))rx=ry=0.0f;
+                    if(!std::isfinite(rw)||rw<=0.0f||rw>16384.0f)rw=source?float(source->width):float(width);
+                    if(!std::isfinite(rh)||rh<=0.0f||rh>16384.0f)rh=source?float(source->height):float(height);
+
+                    const int dx0=static_cast<int>(std::floor(rx));
+                    const int dy0=static_cast<int>(std::floor(ry));
+                    const int dw=std::max(1,static_cast<int>(std::lround(rw)));
+                    const int dh=std::max(1,static_cast<int>(std::lround(rh)));
+
+                    std::vector<u8> pixels(std::size_t(bpr)*height,0u);
+                    if(source&&!source->rgba.empty()){
+                        for(int dy=0;dy<dh;++dy){
+                            const int y=dy0+dy;
+                            if(y<0||y>=static_cast<int>(height))continue;
+                            const u32 sy=std::min<u32>(source->height-1u,
+                                static_cast<u32>((u64(dy)*source->height)/std::max(1,dh)));
+                            for(int dx=0;dx<dw;++dx){
+                                const int x=dx0+dx;
+                                if(x<0||x>=static_cast<int>(width))continue;
+                                const u32 sx=std::min<u32>(source->width-1u,
+                                    static_cast<u32>((u64(dx)*source->width)/std::max(1,dw)));
+                                const std::size_t o=std::size_t(y)*bpr+std::size_t(x)*4u;
+                                const std::size_t so=(std::size_t(sy)*source->width+sx)*4u;
+                                if(o+3u<pixels.size())std::memcpy(pixels.data()+o,source->rgba.data()+so,4u);
+                            }
+                        }
+                        ++real_asset_draws_;
+                    }else{
+                        // Keep the diagnostic fallback confined to the draw
+                        // rectangle instead of contaminating POT padding.
+                        for(int dy=0;dy<dh;++dy){
+                            const int y=dy0+dy;if(y<0||y>=static_cast<int>(height))continue;
+                            for(int dx=0;dx<dw;++dx){
+                                const int x=dx0+dx;if(x<0||x>=static_cast<int>(width))continue;
+                                const std::size_t o=std::size_t(y)*bpr+std::size_t(x)*4u;
+                                if(o+3u>=pixels.size())continue;
+                                const bool mag=((((dx>>4)^(dy>>4))&1)==0);
+                                pixels[o+0]=255u;pixels[o+1]=mag?0u:255u;pixels[o+2]=255u;pixels[o+3]=255u;
+                            }
                         }
                     }
                     env_.WriteBytes(data,pixels.data(),pixels.size());
-                    if(source)++real_asset_draws_;
+                    if(++cg_draw_logs_<=24u)
+                        log_<<"IOS CG: DrawImage context="<<width<<"x"<<height
+                            <<" rect=("<<rx<<","<<ry<<","<<rw<<","<<rh<<")"
+                            <<" source="<<(source?std::to_string(source->width)+"x"+std::to_string(source->height):"missing")
+                            <<" padding=transparent\\n";
                 }
             }
             cpu_.Regs()[0]=0u;return true;
@@ -3016,7 +3068,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
