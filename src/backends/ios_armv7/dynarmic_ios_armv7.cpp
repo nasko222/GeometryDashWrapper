@@ -32,6 +32,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winhttp.h>
 #include <GL/gl.h>
 
 #ifndef GL_UNSIGNED_SHORT_4_4_4_4
@@ -122,6 +123,87 @@ static void DoubleToRegs(double value, u32& lo, u32& hi) {
     lo = static_cast<u32>(bits);
     hi = static_cast<u32>(bits >> 32);
 }
+
+#ifdef _WIN32
+static std::wstring Utf8ToWide(std::string_view input){
+    if(input.empty())return {};
+    const int needed=MultiByteToWideChar(CP_UTF8,0,input.data(),static_cast<int>(input.size()),nullptr,0);
+    if(needed<=0)return {};
+    std::wstring out(static_cast<std::size_t>(needed),L'\0');
+    MultiByteToWideChar(CP_UTF8,0,input.data(),static_cast<int>(input.size()),out.data(),needed);
+    return out;
+}
+static bool WinHttpGetBytes(const std::string& url,std::vector<u8>& out,u32& status,std::string& error){
+    status=0u;out.clear();error.clear();
+    const std::wstring wide=Utf8ToWide(url);
+    if(wide.empty()){error="invalid UTF-8 URL";return false;}
+
+    URL_COMPONENTS parts{};
+    parts.dwStructSize=sizeof(parts);
+    parts.dwSchemeLength=static_cast<DWORD>(-1);
+    parts.dwHostNameLength=static_cast<DWORD>(-1);
+    parts.dwUrlPathLength=static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength=static_cast<DWORD>(-1);
+    if(!WinHttpCrackUrl(wide.c_str(),0u,0u,&parts)){error="WinHttpCrackUrl";return false;}
+
+    std::wstring host(parts.lpszHostName,parts.dwHostNameLength);
+    std::wstring path;
+    if(parts.lpszUrlPath&&parts.dwUrlPathLength)path.assign(parts.lpszUrlPath,parts.dwUrlPathLength);
+    if(parts.lpszExtraInfo&&parts.dwExtraInfoLength)path.append(parts.lpszExtraInfo,parts.dwExtraInfoLength);
+    if(path.empty())path=L"/";
+
+    HINTERNET session=WinHttpOpen(L"GeometryDashWrapper-iOS/0.9.6",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0u);
+    if(!session){error="WinHttpOpen";return false;}
+    WinHttpSetTimeouts(session,5000,5000,10000,10000);
+
+    HINTERNET connect=WinHttpConnect(session,host.c_str(),parts.nPort,0u);
+    if(!connect){WinHttpCloseHandle(session);error="WinHttpConnect";return false;}
+
+    const DWORD flags=parts.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0u;
+    HINTERNET request=WinHttpOpenRequest(connect,L"GET",path.c_str(),nullptr,
+        WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,flags);
+    if(!request){
+        WinHttpCloseHandle(connect);WinHttpCloseHandle(session);
+        error="WinHttpOpenRequest";return false;
+    }
+
+    bool ok=WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0u,
+        WINHTTP_NO_REQUEST_DATA,0u,0u,0u)!=FALSE &&
+        WinHttpReceiveResponse(request,nullptr)!=FALSE;
+
+    if(ok){
+        DWORD value=0u,value_size=sizeof(value);
+        if(WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
+                               WINHTTP_HEADER_NAME_BY_INDEX,&value,&value_size,WINHTTP_NO_HEADER_INDEX))
+            status=static_cast<u32>(value);
+
+        constexpr std::size_t kMaxDownload=32u*1024u*1024u;
+        while(ok){
+            DWORD available=0u;
+            if(!WinHttpQueryDataAvailable(request,&available)){ok=false;error="WinHttpQueryDataAvailable";break;}
+            if(!available)break;
+            if(out.size()+available>kMaxDownload){ok=false;error="response too large";break;}
+            const std::size_t old=out.size();
+            out.resize(old+available);
+            DWORD got=0u;
+            if(!WinHttpReadData(request,out.data()+old,available,&got)){ok=false;error="WinHttpReadData";break;}
+            out.resize(old+got);
+            if(!got)break;
+        }
+    }else error="send/receive failed";
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok&&status>=200u&&status<300u;
+}
+#else
+static bool WinHttpGetBytes(const std::string&,std::vector<u8>& out,u32& status,std::string& error){
+    out.clear();status=0u;error="WinHTTP unavailable on this host";return false;
+}
+#endif
+
 static std::vector<u8> ReadFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("could not open " + path);
@@ -470,6 +552,188 @@ private:
     std::vector<std::optional<PlistValue>> cache_;
     std::vector<bool> active_;
 };
+
+
+static std::string XmlDecode(std::string_view input){
+    std::string out;
+    out.reserve(input.size());
+    for(std::size_t i=0;i<input.size();){
+        if(input[i]!='&'){out.push_back(input[i++]);continue;}
+        const std::size_t semi=input.find(';',i+1u);
+        if(semi==std::string_view::npos){out.push_back(input[i++]);continue;}
+        const std::string_view entity=input.substr(i+1u,semi-i-1u);
+        if(entity=="amp")out.push_back('&');
+        else if(entity=="lt")out.push_back('<');
+        else if(entity=="gt")out.push_back('>');
+        else if(entity=="quot")out.push_back('"');
+        else if(entity=="apos")out.push_back('\'');
+        else if(!entity.empty()&&entity.front()=='#'){
+            u32 cp=0u;
+            try{
+                if(entity.size()>2u&&(entity[1]=='x'||entity[1]=='X'))cp=static_cast<u32>(std::stoul(std::string(entity.substr(2u)),nullptr,16));
+                else cp=static_cast<u32>(std::stoul(std::string(entity.substr(1u)),nullptr,10));
+            }catch(...){cp=0u;}
+            if(cp<=0x7fu)out.push_back(static_cast<char>(cp));
+            else if(cp<=0x7ffu){
+                out.push_back(static_cast<char>(0xc0u|(cp>>6u)));
+                out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
+            }else if(cp<=0xffffu){
+                out.push_back(static_cast<char>(0xe0u|(cp>>12u)));
+                out.push_back(static_cast<char>(0x80u|((cp>>6u)&0x3fu)));
+                out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
+            }
+        }else{
+            out.append(input.substr(i,semi-i+1u));
+        }
+        i=semi+1u;
+    }
+    return out;
+}
+
+class XmlPlistParser {
+public:
+    explicit XmlPlistParser(const std::vector<u8>& bytes)
+        : text_(reinterpret_cast<const char*>(bytes.data()),bytes.size()) {}
+
+    bool Parse(PlistValue& out){
+        pos_=0u;
+        SkipJunk();
+        const std::size_t plist=text_.find("<plist",pos_);
+        if(plist!=std::string_view::npos){
+            pos_=plist;
+            if(!ConsumeOpenTag("plist"))return false;
+        }
+        SkipJunk();
+        return ParseValue(out,0u);
+    }
+
+private:
+    void SkipWhitespace(){
+        while(pos_<text_.size()&&std::isspace(static_cast<unsigned char>(text_[pos_])))++pos_;
+    }
+    void SkipJunk(){
+        while(true){
+            SkipWhitespace();
+            if(text_.substr(pos_,5u)=="<?xml"){
+                const auto end=text_.find("?>",pos_+5u);
+                if(end==std::string_view::npos){pos_=text_.size();return;}
+                pos_=end+2u;continue;
+            }
+            if(text_.substr(pos_,4u)=="<!--"){
+                const auto end=text_.find("-->",pos_+4u);
+                if(end==std::string_view::npos){pos_=text_.size();return;}
+                pos_=end+3u;continue;
+            }
+            if(text_.substr(pos_,9u)=="<!DOCTYPE"){
+                const auto end=text_.find('>',pos_+9u);
+                if(end==std::string_view::npos){pos_=text_.size();return;}
+                pos_=end+1u;continue;
+            }
+            break;
+        }
+    }
+    bool ConsumeOpenTag(std::string_view tag){
+        SkipJunk();
+        if(pos_>=text_.size()||text_[pos_]!='<')return false;
+        const auto end=text_.find('>',pos_+1u);
+        if(end==std::string_view::npos)return false;
+        std::string_view inside=text_.substr(pos_+1u,end-pos_-1u);
+        const auto ws=inside.find_first_of(" \t\r\n/");
+        if((ws==std::string_view::npos?inside:inside.substr(0,ws))!=tag)return false;
+        pos_=end+1u;return true;
+    }
+    bool ConsumeCloseTag(std::string_view tag){
+        SkipJunk();
+        const std::string close="</"+std::string(tag)+">";
+        if(text_.substr(pos_,close.size())!=close)return false;
+        pos_+=close.size();return true;
+    }
+    bool ConsumeEmptyTag(std::string_view tag){
+        SkipJunk();
+        const std::string a="<"+std::string(tag)+"/>";
+        if(text_.substr(pos_,a.size())==a){pos_+=a.size();return true;}
+        const std::string b="<"+std::string(tag)+" />";
+        if(text_.substr(pos_,b.size())==b){pos_+=b.size();return true;}
+        return false;
+    }
+    bool ReadTextTag(std::string_view tag,std::string& out){
+        if(!ConsumeOpenTag(tag))return false;
+        const std::string close="</"+std::string(tag)+">";
+        const auto end=text_.find(close,pos_);
+        if(end==std::string_view::npos)return false;
+        out=XmlDecode(text_.substr(pos_,end-pos_));
+        pos_=end+close.size();return true;
+    }
+    bool ParseValue(PlistValue& out,u32 depth){
+        if(depth>96u)return false;
+        SkipJunk();
+        if(ConsumeEmptyTag("true")){out.kind=PlistValue::Kind::Boolean;out.boolean=true;return true;}
+        if(ConsumeEmptyTag("false")){out.kind=PlistValue::Kind::Boolean;out.boolean=false;return true;}
+        if(text_.substr(pos_,8u)=="<string>"){
+            out.kind=PlistValue::Kind::String;return ReadTextTag("string",out.string);
+        }
+        if(text_.substr(pos_,9u)=="<integer>"){
+            std::string value;if(!ReadTextTag("integer",value))return false;
+            try{out.integer=std::stoll(value,nullptr,0);}catch(...){return false;}
+            out.kind=PlistValue::Kind::Integer;return true;
+        }
+        if(text_.substr(pos_,6u)=="<real>"){
+            std::string value;if(!ReadTextTag("real",value))return false;
+            try{out.real=std::stod(value);}catch(...){return false;}
+            out.kind=PlistValue::Kind::Real;return true;
+        }
+        if(text_.substr(pos_,6u)=="<date>"){
+            out.kind=PlistValue::Kind::String;return ReadTextTag("date",out.string);
+        }
+        if(text_.substr(pos_,6u)=="<data>"){
+            out.kind=PlistValue::Kind::String;return ReadTextTag("data",out.string);
+        }
+        if(text_.substr(pos_,8u)=="<array/>"){pos_+=8u;out.kind=PlistValue::Kind::Array;return true;}
+        if(text_.substr(pos_,9u)=="<array />"){pos_+=9u;out.kind=PlistValue::Kind::Array;return true;}
+        if(text_.substr(pos_,7u)=="<array>"){
+            if(!ConsumeOpenTag("array"))return false;
+            out.kind=PlistValue::Kind::Array;
+            while(true){
+                SkipJunk();
+                if(text_.substr(pos_,8u)=="</array>"){pos_+=8u;return true;}
+                PlistValue child;if(!ParseValue(child,depth+1u))return false;
+                out.array.push_back(std::move(child));
+            }
+        }
+        if(text_.substr(pos_,7u)=="<dict/>"){pos_+=7u;out.kind=PlistValue::Kind::Dict;return true;}
+        if(text_.substr(pos_,8u)=="<dict />"){pos_+=8u;out.kind=PlistValue::Kind::Dict;return true;}
+        if(text_.substr(pos_,6u)=="<dict>"){
+            if(!ConsumeOpenTag("dict"))return false;
+            out.kind=PlistValue::Kind::Dict;
+            while(true){
+                SkipJunk();
+                if(text_.substr(pos_,7u)=="</dict>"){pos_+=7u;return true;}
+                std::string key;if(!ReadTextTag("key",key))return false;
+                PlistValue child;if(!ParseValue(child,depth+1u))return false;
+                out.dict_keys.push_back(std::move(key));
+                out.dict_values.push_back(std::move(child));
+            }
+        }
+        return false;
+    }
+
+    std::string_view text_;
+    std::size_t pos_=0u;
+};
+
+static bool ParseAnyPlist(const std::vector<u8>& bytes,PlistValue& out,std::string* format=nullptr){
+    BinaryPlistParser binary(bytes);
+    if(binary.Parse(out)){
+        if(format)*format="binary";
+        return true;
+    }
+    XmlPlistParser xml(bytes);
+    if(xml.Parse(out)){
+        if(format)*format="xml";
+        return true;
+    }
+    return false;
+}
 
 static bool ExtractFloats(std::string_view text,float* out,std::size_t count){
     std::string copy(text);
@@ -1279,7 +1543,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest20 runs the real Forlorn cocos2d flow with NPOT texture support, UIKit text sizing/rasterization, NSInvocation actions, libc realloc, plist-backed scenery, targeted touches, and corrected CoreGraphics image drawing.\n";
+            log_<<"Execution status: PublicTest21 runs the real Forlorn cocos2d flow with local/remote level plist loading, NSString formatting, WinHTTP URL plists, NPOT textures, UIKit text, NSInvocation actions, libc realloc, scenery and targeted touches.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1487,6 +1751,79 @@ private:
         file->pos+=amount;
         return static_cast<u32>(amount);
     }
+    std::string FormatFakeNSString(std::string format){
+        std::vector<u32> words;
+        words.push_back(cpu_.Regs()[3]);
+        for(u32 i=0;i<24u;++i)words.push_back(StackArg(i));
+        std::size_t arg=0u;
+        std::ostringstream out;
+
+        for(std::size_t i=0;i<format.size();){
+            if(format[i]!='%'){out<<format[i++];continue;}
+            if(i+1u<format.size()&&format[i+1u]=='%'){out<<'%';i+=2u;continue;}
+            ++i;
+            bool zero_pad=false;
+            if(i<format.size()&&format[i]=='0'){zero_pad=true;++i;}
+            int width=0;
+            while(i<format.size()&&std::isdigit(static_cast<unsigned char>(format[i]))){
+                width=width*10+(format[i]-'0');++i;
+            }
+            while(i<format.size()&&(format[i]=='l'||format[i]=='h'||format[i]=='z'||format[i]=='t'))++i;
+            if(i>=format.size())break;
+            const char spec=format[i++];
+            const u32 word=arg<words.size()?words[arg++]:0u;
+
+            std::ostringstream piece;
+            if(zero_pad&&width>0)piece<<std::setfill('0')<<std::setw(width);
+            else if(width>0)piece<<std::setw(width);
+
+            switch(spec){
+            case '@': piece<<DescribeString(word);break;
+            case 'd': case 'i': piece<<static_cast<s32>(word);break;
+            case 'u': piece<<word;break;
+            case 'x': piece<<std::hex<<std::nouppercase<<word;break;
+            case 'X': piece<<std::hex<<std::uppercase<<word;break;
+            case 'c': piece<<static_cast<char>(word&0xffu);break;
+            case 's': {
+                std::string value;if(word)env_.ReadCString(word,value,1u<<20);piece<<value;break;
+            }
+            case 'p': piece<<"0x"<<Hex(word);break;
+            default:
+                piece<<'%'<<spec;break;
+            }
+            out<<piece.str();
+        }
+        return out.str();
+    }
+
+    u32 LoadRemotePlist(const std::string& url){
+        if(url.empty())return 0u;
+        auto cached=remote_plist_roots_.find(url);
+        if(cached!=remote_plist_roots_.end())return cached->second;
+
+        std::vector<u8> bytes;u32 status=0u;std::string error;
+        const bool fetched=WinHttpGetBytes(url,bytes,status,error);
+        if(++network_plist_logs_<=32u)
+            log_<<"IOS NET PLIST: GET "<<url<<" status="<<status
+                <<" bytes="<<bytes.size()<<" result="<<(fetched?"ok":"failed")
+                <<(error.empty()?"":(" error="+error))<<"\\n";
+        if(!fetched)return 0u;
+
+        PlistValue root;std::string format;
+        if(!ParseAnyPlist(bytes,root,&format)||root.kind!=PlistValue::Kind::Dict){
+            if(++network_plist_logs_<=32u)
+                log_<<"IOS NET PLIST: parse failed url="<<url<<" bytes="<<bytes.size()<<"\\n";
+            return 0u;
+        }
+        const u32 obj=MakeFakePlistObject(root);
+        remote_plist_roots_[url]=obj;
+        const auto dit=fake_dictionaries_.find(obj);
+        if(++network_plist_logs_<=32u)
+            log_<<"IOS NET PLIST: parsed url="<<url<<" format="<<format
+                <<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\\n";
+        return obj;
+    }
+
     u32 NewFakeNumber(double value){
         const u32 obj=NewExternalInstance("NSNumber");
         fake_numbers_[obj]=value;return obj;
@@ -1524,14 +1861,16 @@ private:
         if(cached!=plist_roots_.end())return cached->second;
         std::string resolved;std::vector<u8> bytes;
         if(!ReadAssetBytes(relative,resolved,bytes))return 0u;
-        PlistValue root;BinaryPlistParser parser(bytes);
-        if(!parser.Parse(root)||root.kind!=PlistValue::Kind::Dict){
-            if(++plist_failure_logs_<=8u)log_<<"IOS PLIST: parse failed "<<relative<<"\n";
+        PlistValue root;std::string plist_format;
+        if(!ParseAnyPlist(bytes,root,&plist_format)||root.kind!=PlistValue::Kind::Dict){
+            if(++plist_failure_logs_<=12u)log_<<"IOS PLIST: parse failed "<<relative<<"\n";
             return 0u;
         }
         const u32 obj=MakeFakePlistObject(root);plist_roots_[relative]=obj;
         const auto dit=fake_dictionaries_.find(obj);
-        if(++plist_load_logs_<=24u)log_<<"IOS PLIST: loaded "<<relative<<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\n";
+        if(++plist_load_logs_<=32u)log_<<"IOS PLIST: loaded "<<relative
+            <<" format="<<plist_format
+            <<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\n";
         return obj;
     }
     const std::vector<u32>* FastEnumerationValues(u32 receiver,std::vector<u32>& scratch){
@@ -2475,7 +2814,7 @@ private:
 
         const auto fit=fake_objects_.find(receiver);
         if(fit!=fake_objects_.end()){
-            const auto& fo=fit->second;
+            auto& fo=fit->second;
             if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){
                 cpu_.Regs()[0]=NewExternalInstance(fo.class_name);
                 if(fo.class_name=="UIWindow")window_instance_=cpu_.Regs()[0];
@@ -2521,6 +2860,18 @@ private:
             if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithString:"){
                 cpu_.Regs()[0]=NewFakeString(DescribeString(cpu_.Regs()[2]));return true;
             }
+            if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithFormat:"){
+                const std::string format=DescribeString(cpu_.Regs()[2]);
+                const std::string value=FormatFakeNSString(format);
+                cpu_.Regs()[0]=NewFakeString(value);
+                if(++string_format_logs_<=32u)log_<<"IOS STRING FORMAT: '"<<format<<"' -> '"<<value<<"'\n";
+                return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSURL"&&(selector=="URLWithString:"||selector=="fileURLWithPath:")){
+                const u32 obj=NewExternalInstance("NSURL");
+                fake_objects_[obj].string_value=DescribeString(cpu_.Regs()[2]);
+                cpu_.Regs()[0]=obj;return true;
+            }
             if(fo.is_class&&fo.class_name=="UIFont"&&(selector=="systemFontOfSize:"||selector=="boldSystemFontOfSize:")){
                 cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[2]),selector=="boldSystemFontOfSize:");return true;
             }
@@ -2532,6 +2883,9 @@ private:
             }
             if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&selector=="dictionaryWithContentsOfFile:"){
                 cpu_.Regs()[0]=LoadFakePlist(DescribeString(cpu_.Regs()[2]));return true;
+            }
+            if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&selector=="dictionaryWithContentsOfURL:"){
+                cpu_.Regs()[0]=LoadRemotePlist(DescribeString(cpu_.Regs()[2]));return true;
             }
             if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
                (selector=="dictionary"||selector=="dictionaryWithCapacity:")){
@@ -2584,6 +2938,23 @@ private:
                 cpu_.Regs()[0]=receiver;return true;
             }
             if(!fo.is_class&&fo.class_name=="NSString"){
+                if(selector=="initWithString:"){
+                    fo.string_value=DescribeString(cpu_.Regs()[2]);
+                    cpu_.Regs()[0]=receiver;
+                    if(++string_format_logs_<=32u)log_<<"IOS STRING INIT: '"<<fo.string_value<<"'\n";
+                    return true;
+                }
+                if(selector=="initWithCString:encoding:"||selector=="initWithUTF8String:"){
+                    std::string value;if(cpu_.Regs()[2])env_.ReadCString(cpu_.Regs()[2],value,1u<<20);
+                    fo.string_value=std::move(value);cpu_.Regs()[0]=receiver;return true;
+                }
+                if(selector=="initWithFormat:"){
+                    const std::string format=DescribeString(cpu_.Regs()[2]);
+                    fo.string_value=FormatFakeNSString(format);
+                    cpu_.Regs()[0]=receiver;
+                    if(++string_format_logs_<=32u)log_<<"IOS STRING FORMAT INIT: '"<<format<<"' -> '"<<fo.string_value<<"'\n";
+                    return true;
+                }
                 const std::string current=!fo.string_value.empty()?fo.string_value:fo.resource_value;
                 if(selector=="stringByAppendingPathComponent:"){
                     std::string lhs=current,rhs=DescribeString(cpu_.Regs()[2]);
@@ -2611,6 +2982,9 @@ private:
                     const auto slash=current.find_last_of("/\\");const auto dot=current.find_last_of('.');
                     cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?current.substr(0,dot):current);return true;
                 }
+                if(selector=="copy"||selector=="mutableCopy"){
+                    cpu_.Regs()[0]=NewFakeString(current);return true;
+                }
                 if(selector=="componentsSeparatedByString:"){
                     const std::string delim=DescribeString(cpu_.Regs()[2]);
                     const u32 array=NewExternalInstance("NSArray");auto& out=fake_collections_[array];
@@ -2630,6 +3004,23 @@ private:
             if(!fo.is_class&&fo.class_name=="UIFont"){
                 if(selector=="pointSize"||selector=="lineHeight"){cpu_.Regs()[0]=FloatToBits(FakeFontSize(receiver)*(selector=="lineHeight"?1.20f:1.0f));return true;}
                 if(selector=="fontName"){cpu_.Regs()[0]=NewFakeString("Arial");return true;}
+            }
+            if(!fo.is_class&&fo.class_name=="NSURL"){
+                if(selector=="initWithString:"||selector=="initFileURLWithPath:"){
+                    fo.string_value=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=receiver;return true;
+                }
+                if(selector=="absoluteString"||selector=="relativeString"||selector=="description"){
+                    cpu_.Regs()[0]=NewFakeString(fo.string_value);return true;
+                }
+                if(selector=="path"){
+                    std::string value=fo.string_value;
+                    const auto scheme=value.find("://");
+                    if(scheme!=std::string::npos){
+                        const auto slash=value.find('/',scheme+3u);
+                        value=slash==std::string::npos?std::string{}:value.substr(slash);
+                    }
+                    cpu_.Regs()[0]=NewFakeString(value);return true;
+                }
             }
             if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="initWithTarget:selector:object:"){
                 fake_objects_[receiver].aux0=cpu_.Regs()[2];
@@ -2806,6 +3197,27 @@ private:
                selector=="initWithContentsOfFile:"){
                 const std::string request=DescribeString(cpu_.Regs()[2]);
                 const u32 loaded=LoadFakePlist(request);
+                if(!loaded){
+                    if(++level_load_logs_<=32u)log_<<"IOS LEVEL LOAD: file plist failed request='"<<request<<"'\n";
+                    cpu_.Regs()[0]=0u;return true;
+                }
+                auto dit=fake_dictionaries_.find(loaded);
+                if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
+                fake_dictionaries_[receiver]=dit->second;
+                auto kit=fake_dictionary_keys_.find(loaded);
+                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
+                else fake_dictionary_keys_[receiver].clear();
+                cpu_.Regs()[0]=receiver;
+                if(++plist_init_logs_<=32u)log_<<"IOS PLIST INIT: "<<fo.class_name
+                    <<" initWithContentsOfFile '"<<request<<"' keys="<<fake_dictionaries_[receiver].size()
+                    <<" receiver=0x"<<Hex(receiver)<<"\n";
+                return true;
+            }
+            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               selector=="initWithContentsOfURL:"){
+                const std::string url=DescribeString(cpu_.Regs()[2]);
+                if(++level_load_logs_<=32u)log_<<"IOS LEVEL LOAD: URL request='"<<url<<"'\n";
+                const u32 loaded=LoadRemotePlist(url);
                 if(!loaded){cpu_.Regs()[0]=0u;return true;}
                 auto dit=fake_dictionaries_.find(loaded);
                 if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
@@ -2814,8 +3226,8 @@ private:
                 if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
                 else fake_dictionary_keys_[receiver].clear();
                 cpu_.Regs()[0]=receiver;
-                if(++plist_init_logs_<=24u)log_<<"IOS PLIST INIT: "<<fo.class_name
-                    <<" initWithContentsOfFile '"<<request<<"' keys="<<fake_dictionaries_[receiver].size()
+                if(++plist_init_logs_<=32u)log_<<"IOS PLIST INIT: "<<fo.class_name
+                    <<" initWithContentsOfURL '"<<url<<"' keys="<<fake_dictionaries_[receiver].size()
                     <<" receiver=0x"<<Hex(receiver)<<"\n";
                 return true;
             }
@@ -3385,7 +3797,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<std::string,u32> remote_plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
@@ -3394,7 +3806,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,string_format_logs_=0,network_plist_logs_=0,level_load_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
