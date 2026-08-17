@@ -1783,11 +1783,14 @@ private:
         return false;
     }
     bool ShouldTraceSceneMessage(std::string_view class_name,std::string_view selector)const{
-        (void)class_name;
         return selector=="node"||selector=="runWithScene:"||selector=="replaceScene:"||
                selector=="pushScene:"||selector=="popScene"||selector=="runningScene"||
                selector=="schedule:"||selector=="scheduleUpdate"||selector=="methodForSelector:"||
-               selector=="onEnter"||selector=="onEnterTransitionDidFinish"||selector=="loadingFinished"||selector=="loadManagers";
+               selector=="onEnter"||selector=="onEnterTransitionDidFinish"||selector=="loadingFinished"||selector=="loadManagers"||
+               selector=="ccTouchBegan:withEvent:"||selector=="ccTouchMoved:withEvent:"||
+               selector=="ccTouchEnded:withEvent:"||selector=="ccTouchCancelled:withEvent:"||
+               selector=="selected"||selector=="unselected"||selector=="activate"||
+               (class_name=="MenuScene"&&(selector=="onPlay:"||selector=="onContinue:"));
     }
     void TraceSceneMessage(std::string_view kind,std::string_view class_name,std::string_view selector,u32 value=0u){
         if(++scene_trace_count_<=128u)
@@ -2297,8 +2300,11 @@ private:
             if(method){
                 if(++guest_dispatch_logs_<=160u||ShouldTraceSceneMessage(instance_class->name,selector))
                     log_<<"IOS: objc guest instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
-                if(ShouldTraceSceneMessage(instance_class->name,selector))
+                if(ShouldTraceSceneMessage(instance_class->name,selector)){
                     TraceSceneMessage("instance-dispatch",instance_class->name,selector,method->imp);
+                    if(selector=="activate"||selector=="onPlay:"||selector=="onContinue:"||selector=="ccTouchEnded:withEvent:")
+                        log_<<"IOS MENU: "<<instance_class->name<<" -"<<selector<<" receiver=0x"<<Hex(receiver)<<" arg=0x"<<Hex(cpu_.Regs()[2])<<"\n";
+                }
                 EnterGuestMethod(*method);return true;
             }
             if(selector=="class"){cpu_.Regs()[0]=instance_class->class_addr;return true;}
@@ -2361,6 +2367,13 @@ private:
                (selector=="array"||selector=="arrayWithCapacity:")){
                 const u32 obj=NewExternalInstance(fo.class_name);fake_collections_[obj];cpu_.Regs()[0]=obj;return true;
             }
+            if(fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSMutableSet")&&
+               (selector=="set"||selector=="setWithCapacity:")){
+                const u32 obj=NewExternalInstance(fo.class_name);fake_collections_[obj];cpu_.Regs()[0]=obj;return true;
+            }
+            if(fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSMutableSet")&&selector=="setWithObject:"){
+                const u32 obj=NewExternalInstance(fo.class_name);fake_collections_[obj].push_back(cpu_.Regs()[2]);cpu_.Regs()[0]=obj;return true;
+            }
             if(fo.is_class&&fo.class_name=="NSNumber"&&selector.starts_with("numberWith")){
                 double value=0.0;
                 if(selector=="numberWithFloat:")value=FloatFromBits(cpu_.Regs()[2]);
@@ -2386,6 +2399,50 @@ private:
             if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="initWithContentsOfFile:"){
                 fake_objects_[receiver].resource_value=ResolveAssetRelative(DescribeString(cpu_.Regs()[2]));
                 cpu_.Regs()[0]=receiver;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSString"){
+                const std::string current=!fo.string_value.empty()?fo.string_value:fo.resource_value;
+                if(selector=="stringByAppendingPathComponent:"){
+                    std::string lhs=current,rhs=DescribeString(cpu_.Regs()[2]);
+                    std::replace(lhs.begin(),lhs.end(),'\\','/');
+                    std::replace(rhs.begin(),rhs.end(),'\\','/');
+                    while(!rhs.empty()&&rhs.front()=='/')rhs.erase(rhs.begin());
+                    if(lhs.empty())cpu_.Regs()[0]=NewFakeString(rhs);
+                    else{if(lhs.back()!='/')lhs.push_back('/');cpu_.Regs()[0]=NewFakeString(lhs+rhs);}
+                    if(++path_string_logs_<=24u)log_<<"IOS FOUNDATION PATH: append base='"<<current<<"' component='"<<rhs<<"' -> '"<<DescribeString(cpu_.Regs()[0])<<"'\n";
+                    return true;
+                }
+                if(selector=="stringByDeletingLastPathComponent"){
+                    const auto p=current.find_last_of("/\\");
+                    cpu_.Regs()[0]=NewFakeString(p==std::string::npos?std::string{}:current.substr(0,p));return true;
+                }
+                if(selector=="lastPathComponent"){
+                    const auto p=current.find_last_of("/\\");
+                    cpu_.Regs()[0]=NewFakeString(p==std::string::npos?current:current.substr(p+1u));return true;
+                }
+                if(selector=="pathExtension"){
+                    const auto slash=current.find_last_of("/\\");const auto dot=current.find_last_of('.');
+                    cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?current.substr(dot+1u):std::string{});return true;
+                }
+                if(selector=="stringByDeletingPathExtension"){
+                    const auto slash=current.find_last_of("/\\");const auto dot=current.find_last_of('.');
+                    cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?current.substr(0,dot):current);return true;
+                }
+                if(selector=="componentsSeparatedByString:"){
+                    const std::string delim=DescribeString(cpu_.Regs()[2]);
+                    const u32 array=NewExternalInstance("NSArray");auto& out=fake_collections_[array];
+                    if(delim.empty())out.push_back(NewFakeString(current));
+                    else{
+                        std::size_t pos=0;
+                        while(true){
+                            const auto next=current.find(delim,pos);
+                            out.push_back(NewFakeString(current.substr(pos,next==std::string::npos?std::string::npos:next-pos)));
+                            if(next==std::string::npos)break;
+                            pos=next+delim.size();
+                        }
+                    }
+                    cpu_.Regs()[0]=array;return true;
+                }
             }
             if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="initWithTarget:selector:object:"){
                 fake_objects_[receiver].aux0=cpu_.Regs()[2];
@@ -2443,7 +2500,7 @@ private:
                 }
                 if(selector=="countByEnumeratingWithState:objects:count:")return HandleFastEnumeration(receiver);
             }
-            if(!fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")){
+            if(!fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSMutableSet"||fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")){
                 auto it=fake_collections_.find(receiver);
                 const std::vector<u32>* values=it==fake_collections_.end()?nullptr:&it->second;
                 if(selector=="count"){cpu_.Regs()[0]=values?static_cast<u32>(values->size()):0u;return true;}
@@ -2451,13 +2508,24 @@ private:
                 if(selector=="objectAtIndex:"||selector=="objectAtIndexedSubscript:"){
                     const u32 idx=cpu_.Regs()[2];cpu_.Regs()[0]=(values&&idx<values->size())?(*values)[idx]:0u;return true;
                 }
-                if(selector=="addObject:"){fake_collections_[receiver].push_back(cpu_.Regs()[2]);cpu_.Regs()[0]=0u;return true;}
+                if(selector=="addObject:"){
+                    auto& v=fake_collections_[receiver];
+                    if(fo.class_name=="NSSet"||fo.class_name=="NSMutableSet"){
+                        if(std::find(v.begin(),v.end(),cpu_.Regs()[2])==v.end())v.push_back(cpu_.Regs()[2]);
+                    }else v.push_back(cpu_.Regs()[2]);
+                    if(fo.class_name=="NSMutableSet"&&++claimed_touch_logs_<=32u)
+                        log_<<"IOS INPUT CLAIM: NSMutableSet addObject touch=0x"<<Hex(cpu_.Regs()[2])<<" count="<<v.size()<<"\n";
+                    cpu_.Regs()[0]=0u;return true;
+                }
                 if(selector=="insertObject:atIndex:"){
                     auto& v=fake_collections_[receiver];const u32 idx=cpu_.Regs()[3];
                     v.insert(v.begin()+std::min<std::size_t>(idx,v.size()),cpu_.Regs()[2]);cpu_.Regs()[0]=0u;return true;
                 }
                 if(selector=="removeObject:"){
-                    auto& v=fake_collections_[receiver];v.erase(std::remove(v.begin(),v.end(),cpu_.Regs()[2]),v.end());cpu_.Regs()[0]=0u;return true;
+                    auto& v=fake_collections_[receiver];v.erase(std::remove(v.begin(),v.end(),cpu_.Regs()[2]),v.end());
+                    if(fo.class_name=="NSMutableSet"&&++claimed_touch_logs_<=32u)
+                        log_<<"IOS INPUT CLAIM: NSMutableSet removeObject touch=0x"<<Hex(cpu_.Regs()[2])<<" count="<<v.size()<<"\n";
+                    cpu_.Regs()[0]=0u;return true;
                 }
                 if(selector=="removeObjectAtIndex:"){
                     auto& v=fake_collections_[receiver];const u32 idx=cpu_.Regs()[2];if(idx<v.size())v.erase(v.begin()+idx);cpu_.Regs()[0]=0u;return true;
@@ -2472,7 +2540,10 @@ private:
                     const u32 enumerator=NewExternalInstance("NSEnumerator");if(values)fake_collections_[enumerator]=*values;fake_objects_[enumerator].aux0=0u;cpu_.Regs()[0]=enumerator;return true;
                 }
                 if(selector=="containsObject:"){
-                    cpu_.Regs()[0]=(values&&std::find(values->begin(),values->end(),cpu_.Regs()[2])!=values->end())?1u:0u;return true;
+                    const bool found=values&&std::find(values->begin(),values->end(),cpu_.Regs()[2])!=values->end();
+                    if(fo.class_name=="NSMutableSet"&&++claimed_touch_logs_<=32u)
+                        log_<<"IOS INPUT CLAIM: NSMutableSet containsObject touch=0x"<<Hex(cpu_.Regs()[2])<<" -> "<<(found?"YES":"NO")<<"\n";
+                    cpu_.Regs()[0]=found?1u:0u;return true;
                 }
                 if(selector=="countByEnumeratingWithState:objects:count:")return HandleFastEnumeration(receiver);
             }
@@ -2945,7 +3016,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;

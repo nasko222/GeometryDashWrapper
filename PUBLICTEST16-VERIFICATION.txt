@@ -1,0 +1,45 @@
+Geometry Dash Wrapper 0.9.6-publictest16 verification
+
+Latest PublicTest15 runtime:
+  PASS: real EAGLView receives mouse-down/move/up.
+  PASS: _CGRectContainsPoint executes.
+  PASS: first tested CCMenu item returns HIT.
+  FAIL: no CCMenuItem activation follows.
+
+Cocos2d runtime metadata:
+  PASS: CCTargetedTouchHandler.claimedTouches exists.
+  PASS: claimedTouches is NSMutableSet.
+
+PublicTest16:
+  PASS: backed NSSet/NSMutableSet constructors.
+  PASS: unique addObject persistence.
+  PASS: containsObject/removeObject persistence.
+  PASS: claimed-touch logging.
+  PASS: CCMenu touch lifecycle tracing.
+  PASS: CCMenuItem selected/unselected/activate tracing.
+  PASS: MenuScene onPlay:/onContinue: tracing.
+  PASS: fake NSString path operations work on empty fake string instances.
+  PASS: componentsSeparatedByString:.
+
+Regression:
+  PASS: PublicTest15 CGRectContainsPoint retained.
+  PASS: PublicTest15 packed RGBA4444 conversion retained.
+  PASS: PublicTest15 Windows GL enum compile fix retained.
+  PASS: PublicTest14 plist/Foundation retained.
+  PASS: PublicTest13 IPA stdio/CCZ/zlib retained.
+  PASS: PublicTest12 loading thread + mouse/UIKit bridge retained.
+  PASS: PublicTest11 landscape presentation retained.
+  PASS: x86/shared Android runtime unchanged.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+
+Syntax:
+  PASS: C++20 syntax-only compile using the local Dynarmic interface stub.
+
+Expected successful click chain:
+  IOS INPUT HITTEST: ... -> HIT
+  IOS INPUT CLAIM: NSMutableSet addObject ...
+  IOS INPUT CLAIM: NSMutableSet containsObject ... -> YES
+  IOS MENU: CCMenu -ccTouchEnded:withEvent: ...
+  IOS MENU: CCMenuItemSprite -activate ...
+  IOS MENU: MenuScene -onPlay: ... OR -onContinue: ...
+  IOS INPUT CLAIM: NSMutableSet removeObject ...
