@@ -1279,7 +1279,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest18 runs the real Forlorn cocos2d MenuScene with Foundation NSInvocation action dispatch, targeted touches, and corrected CoreGraphics image drawing until the user closes the window.\n";
+            log_<<"Execution status: PublicTest19 runs the real Forlorn cocos2d flow with NSInvocation actions, libc realloc support, plist-backed MenuSceneBackground scenery, targeted touches, and corrected CoreGraphics image drawing.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1314,7 +1314,15 @@ private:
         Dynarmic::A32::UserConfig c; c.callbacks=&env_; c.arch_version=DynarmicArmv7ArchVersion<Dynarmic::A32::ArchVersion>(); c.global_monitor=&monitor_; c.processor_id=0; c.check_halt_on_memory_access=true; return c;
     }
     void WriteArmSvc(u32 addr,u32 svc){ env_.MemoryWrite32(addr,0xef000000u|(svc&0x00ffffffu)); env_.MemoryWrite32(addr+4u,0xe12fff1eu); }
-    u32 Allocate(u32 size,u32 align=8u){ heap_cursor_=AlignUp(heap_cursor_,align); if(u64(heap_cursor_)+size>u64(kHeapBase)+kHeapSize)throw std::runtime_error("iOS guest heap exhausted");u32 a=heap_cursor_;heap_cursor_+=AlignUp(std::max<u32>(size,1u),8u);return a; }
+    u32 Allocate(u32 size,u32 align=8u){
+        const u32 requested=std::max<u32>(size,1u);
+        heap_cursor_=AlignUp(heap_cursor_,align);
+        if(u64(heap_cursor_)+requested>u64(kHeapBase)+kHeapSize)throw std::runtime_error("iOS guest heap exhausted");
+        const u32 a=heap_cursor_;
+        heap_cursor_+=AlignUp(requested,8u);
+        heap_allocation_sizes_[a]=requested;
+        return a;
+    }
     u32 AllocateObjectBytes(u32 size){ object_cursor_=AlignUp(object_cursor_,8u); if(u64(object_cursor_)+size>u64(kObjectBase)+kObjectSize)throw std::runtime_error("iOS fake object region exhausted");u32 a=object_cursor_;object_cursor_+=AlignUp(size,8u);return a; }
     u32 AllocateCString(const std::string& s){ u32 a=Allocate(static_cast<u32>(s.size()+1u),1u); env_.WriteBytes(a,s.c_str(),s.size()+1u); return a; }
 
@@ -2414,6 +2422,15 @@ private:
                (selector=="dictionary"||selector=="dictionaryWithCapacity:")){
                 const u32 obj=NewExternalInstance(fo.class_name);fake_dictionaries_[obj];fake_dictionary_keys_[obj];cpu_.Regs()[0]=obj;return true;
             }
+            if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               selector=="dictionaryWithDictionary:"){
+                const u32 obj=NewExternalInstance(fo.class_name),source=cpu_.Regs()[2];
+                auto dit=fake_dictionaries_.find(source);
+                if(dit!=fake_dictionaries_.end())fake_dictionaries_[obj]=dit->second;
+                auto kit=fake_dictionary_keys_.find(source);
+                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[obj]=kit->second;
+                cpu_.Regs()[0]=obj;return true;
+            }
             if(fo.is_class&&(fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")&&
                (selector=="array"||selector=="arrayWithCapacity:")){
                 const u32 obj=NewExternalInstance(fo.class_name);fake_collections_[obj];cpu_.Regs()[0]=obj;return true;
@@ -2665,6 +2682,39 @@ private:
                         <<" selector="<<target_name<<"\\n";
                     cpu_.Regs()[0]=0u;return true;
                 }
+            }
+            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               selector=="initWithContentsOfFile:"){
+                const std::string request=DescribeString(cpu_.Regs()[2]);
+                const u32 loaded=LoadFakePlist(request);
+                if(!loaded){cpu_.Regs()[0]=0u;return true;}
+                auto dit=fake_dictionaries_.find(loaded);
+                if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
+                fake_dictionaries_[receiver]=dit->second;
+                auto kit=fake_dictionary_keys_.find(loaded);
+                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
+                else fake_dictionary_keys_[receiver].clear();
+                cpu_.Regs()[0]=receiver;
+                if(++plist_init_logs_<=24u)log_<<"IOS PLIST INIT: "<<fo.class_name
+                    <<" initWithContentsOfFile '"<<request<<"' keys="<<fake_dictionaries_[receiver].size()
+                    <<" receiver=0x"<<Hex(receiver)<<"\n";
+                return true;
+            }
+            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               selector=="initWithDictionary:"){
+                const u32 source=cpu_.Regs()[2];
+                auto dit=fake_dictionaries_.find(source);
+                if(dit!=fake_dictionaries_.end())fake_dictionaries_[receiver]=dit->second;
+                auto kit=fake_dictionary_keys_.find(source);
+                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
+                cpu_.Regs()[0]=receiver;return true;
+            }
+            if(!fo.is_class&&(fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")&&
+               selector=="initWithArray:"){
+                const u32 source=cpu_.Regs()[2];
+                auto it=fake_collections_.find(source);
+                if(it!=fake_collections_.end())fake_collections_[receiver]=it->second;
+                cpu_.Regs()[0]=receiver;return true;
             }
             if(!fo.is_class&&fo.class_name=="NSNumber"){
                 const double value=fake_numbers_.count(receiver)?fake_numbers_[receiver]:0.0;
@@ -3145,8 +3195,50 @@ private:
         if(name=="usleep"){virtual_time_usec_+=cpu_.Regs()[0];cpu_.Regs()[0]=0u;return true;}
         if(name=="exit"||name=="_exit"){done_=true;exit_code_=cpu_.Regs()[0];return true;}
         if(name=="malloc"){cpu_.Regs()[0]=Allocate(std::max<u32>(cpu_.Regs()[0],1u));return true;}
-        if(name=="calloc"){const u64 n=u64(cpu_.Regs()[0])*cpu_.Regs()[1];if(n>0x1000000u){cpu_.Regs()[0]=0;return true;}const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)));std::vector<u8> z(static_cast<std::size_t>(n));if(n)env_.WriteBytes(a,z.data(),z.size());cpu_.Regs()[0]=a;return true;}
-        if(name=="free"){cpu_.Regs()[0]=0;return true;}
+        if(name=="calloc"){
+            const u64 n=u64(cpu_.Regs()[0])*cpu_.Regs()[1];
+            if(n>0x1000000u){cpu_.Regs()[0]=0;return true;}
+            const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)));
+            std::vector<u8> z(static_cast<std::size_t>(n));
+            if(n)env_.WriteBytes(a,z.data(),z.size());
+            cpu_.Regs()[0]=a;return true;
+        }
+        if(name=="realloc"||name=="reallocf"){
+            const u32 old_ptr=cpu_.Regs()[0];
+            const u32 new_size=cpu_.Regs()[1];
+            if(!old_ptr){
+                cpu_.Regs()[0]=new_size?Allocate(new_size):0u;
+                if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name<<" null old new-size="<<new_size
+                    <<" -> 0x"<<Hex(cpu_.Regs()[0])<<"\n";
+                return true;
+            }
+            if(!new_size){
+                heap_allocation_sizes_.erase(old_ptr);
+                cpu_.Regs()[0]=0u;
+                if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name<<" free old=0x"<<Hex(old_ptr)<<"\n";
+                return true;
+            }
+            const auto old_it=heap_allocation_sizes_.find(old_ptr);
+            const u32 old_size=old_it==heap_allocation_sizes_.end()?0u:old_it->second;
+            const u32 new_ptr=Allocate(new_size);
+            const u32 copy_size=std::min(old_size,new_size);
+            if(copy_size&&env_.IsMapped(old_ptr,copy_size)&&env_.IsMapped(new_ptr,copy_size)){
+                std::vector<u8> tmp(copy_size);
+                env_.ReadBytes(old_ptr,tmp.data(),copy_size);
+                env_.WriteBytes(new_ptr,tmp.data(),copy_size);
+            }
+            heap_allocation_sizes_.erase(old_ptr);
+            cpu_.Regs()[0]=new_ptr;
+            if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name
+                <<" old=0x"<<Hex(old_ptr)<<" old-size="<<old_size
+                <<" new-size="<<new_size<<" -> 0x"<<Hex(new_ptr)
+                <<" copied="<<copy_size<<"\n";
+            return true;
+        }
+        if(name=="free"){
+            heap_allocation_sizes_.erase(cpu_.Regs()[0]);
+            cpu_.Regs()[0]=0;return true;
+        }
         if(name=="memset"){const u32 dst=cpu_.Regs()[0],value=cpu_.Regs()[1]&0xffu,n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)){std::vector<u8> v(n,static_cast<u8>(value));env_.WriteBytes(dst,v.data(),v.size());}cpu_.Regs()[0]=dst;return true;}
         if(name=="memcpy"||name=="memmove"){const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1],n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)&&env_.IsMapped(src,n)){std::vector<u8> tmp(n);env_.ReadBytes(src,tmp.data(),n);env_.WriteBytes(dst,tmp.data(),n);}cpu_.Regs()[0]=dst;return true;}
         if(name=="strlen"){std::string s;if(!env_.ReadCString(cpu_.Regs()[0],s,1u<<20)){cpu_.Regs()[0]=0;}else cpu_.Regs()[0]=static_cast<u32>(s.size());return true;}
@@ -3164,7 +3256,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
@@ -3173,7 +3265,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
