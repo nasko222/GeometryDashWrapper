@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +33,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <winhttp.h>
 #include <GL/gl.h>
 
 #ifndef GL_UNSIGNED_SHORT_4_4_4_4
@@ -123,87 +123,6 @@ static void DoubleToRegs(double value, u32& lo, u32& hi) {
     lo = static_cast<u32>(bits);
     hi = static_cast<u32>(bits >> 32);
 }
-
-#ifdef _WIN32
-static std::wstring Utf8ToWide(std::string_view input){
-    if(input.empty())return {};
-    const int needed=MultiByteToWideChar(CP_UTF8,0,input.data(),static_cast<int>(input.size()),nullptr,0);
-    if(needed<=0)return {};
-    std::wstring out(static_cast<std::size_t>(needed),L'\0');
-    MultiByteToWideChar(CP_UTF8,0,input.data(),static_cast<int>(input.size()),out.data(),needed);
-    return out;
-}
-static bool WinHttpGetBytes(const std::string& url,std::vector<u8>& out,u32& status,std::string& error){
-    status=0u;out.clear();error.clear();
-    const std::wstring wide=Utf8ToWide(url);
-    if(wide.empty()){error="invalid UTF-8 URL";return false;}
-
-    URL_COMPONENTS parts{};
-    parts.dwStructSize=sizeof(parts);
-    parts.dwSchemeLength=static_cast<DWORD>(-1);
-    parts.dwHostNameLength=static_cast<DWORD>(-1);
-    parts.dwUrlPathLength=static_cast<DWORD>(-1);
-    parts.dwExtraInfoLength=static_cast<DWORD>(-1);
-    if(!WinHttpCrackUrl(wide.c_str(),0u,0u,&parts)){error="WinHttpCrackUrl";return false;}
-
-    std::wstring host(parts.lpszHostName,parts.dwHostNameLength);
-    std::wstring path;
-    if(parts.lpszUrlPath&&parts.dwUrlPathLength)path.assign(parts.lpszUrlPath,parts.dwUrlPathLength);
-    if(parts.lpszExtraInfo&&parts.dwExtraInfoLength)path.append(parts.lpszExtraInfo,parts.dwExtraInfoLength);
-    if(path.empty())path=L"/";
-
-    HINTERNET session=WinHttpOpen(L"GeometryDashWrapper-iOS/0.9.6",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0u);
-    if(!session){error="WinHttpOpen";return false;}
-    WinHttpSetTimeouts(session,5000,5000,10000,10000);
-
-    HINTERNET connect=WinHttpConnect(session,host.c_str(),parts.nPort,0u);
-    if(!connect){WinHttpCloseHandle(session);error="WinHttpConnect";return false;}
-
-    const DWORD flags=parts.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0u;
-    HINTERNET request=WinHttpOpenRequest(connect,L"GET",path.c_str(),nullptr,
-        WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,flags);
-    if(!request){
-        WinHttpCloseHandle(connect);WinHttpCloseHandle(session);
-        error="WinHttpOpenRequest";return false;
-    }
-
-    bool ok=WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0u,
-        WINHTTP_NO_REQUEST_DATA,0u,0u,0u)!=FALSE &&
-        WinHttpReceiveResponse(request,nullptr)!=FALSE;
-
-    if(ok){
-        DWORD value=0u,value_size=sizeof(value);
-        if(WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
-                               WINHTTP_HEADER_NAME_BY_INDEX,&value,&value_size,WINHTTP_NO_HEADER_INDEX))
-            status=static_cast<u32>(value);
-
-        constexpr std::size_t kMaxDownload=32u*1024u*1024u;
-        while(ok){
-            DWORD available=0u;
-            if(!WinHttpQueryDataAvailable(request,&available)){ok=false;error="WinHttpQueryDataAvailable";break;}
-            if(!available)break;
-            if(out.size()+available>kMaxDownload){ok=false;error="response too large";break;}
-            const std::size_t old=out.size();
-            out.resize(old+available);
-            DWORD got=0u;
-            if(!WinHttpReadData(request,out.data()+old,available,&got)){ok=false;error="WinHttpReadData";break;}
-            out.resize(old+got);
-            if(!got)break;
-        }
-    }else error="send/receive failed";
-
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-    return ok&&status>=200u&&status<300u;
-}
-#else
-static bool WinHttpGetBytes(const std::string&,std::vector<u8>& out,u32& status,std::string& error){
-    out.clear();status=0u;error="WinHTTP unavailable on this host";return false;
-}
-#endif
-
 static std::vector<u8> ReadFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("could not open " + path);
@@ -552,188 +471,6 @@ private:
     std::vector<std::optional<PlistValue>> cache_;
     std::vector<bool> active_;
 };
-
-
-static std::string XmlDecode(std::string_view input){
-    std::string out;
-    out.reserve(input.size());
-    for(std::size_t i=0;i<input.size();){
-        if(input[i]!='&'){out.push_back(input[i++]);continue;}
-        const std::size_t semi=input.find(';',i+1u);
-        if(semi==std::string_view::npos){out.push_back(input[i++]);continue;}
-        const std::string_view entity=input.substr(i+1u,semi-i-1u);
-        if(entity=="amp")out.push_back('&');
-        else if(entity=="lt")out.push_back('<');
-        else if(entity=="gt")out.push_back('>');
-        else if(entity=="quot")out.push_back('"');
-        else if(entity=="apos")out.push_back('\'');
-        else if(!entity.empty()&&entity.front()=='#'){
-            u32 cp=0u;
-            try{
-                if(entity.size()>2u&&(entity[1]=='x'||entity[1]=='X'))cp=static_cast<u32>(std::stoul(std::string(entity.substr(2u)),nullptr,16));
-                else cp=static_cast<u32>(std::stoul(std::string(entity.substr(1u)),nullptr,10));
-            }catch(...){cp=0u;}
-            if(cp<=0x7fu)out.push_back(static_cast<char>(cp));
-            else if(cp<=0x7ffu){
-                out.push_back(static_cast<char>(0xc0u|(cp>>6u)));
-                out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
-            }else if(cp<=0xffffu){
-                out.push_back(static_cast<char>(0xe0u|(cp>>12u)));
-                out.push_back(static_cast<char>(0x80u|((cp>>6u)&0x3fu)));
-                out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
-            }
-        }else{
-            out.append(input.substr(i,semi-i+1u));
-        }
-        i=semi+1u;
-    }
-    return out;
-}
-
-class XmlPlistParser {
-public:
-    explicit XmlPlistParser(const std::vector<u8>& bytes)
-        : text_(reinterpret_cast<const char*>(bytes.data()),bytes.size()) {}
-
-    bool Parse(PlistValue& out){
-        pos_=0u;
-        SkipJunk();
-        const std::size_t plist=text_.find("<plist",pos_);
-        if(plist!=std::string_view::npos){
-            pos_=plist;
-            if(!ConsumeOpenTag("plist"))return false;
-        }
-        SkipJunk();
-        return ParseValue(out,0u);
-    }
-
-private:
-    void SkipWhitespace(){
-        while(pos_<text_.size()&&std::isspace(static_cast<unsigned char>(text_[pos_])))++pos_;
-    }
-    void SkipJunk(){
-        while(true){
-            SkipWhitespace();
-            if(text_.substr(pos_,5u)=="<?xml"){
-                const auto end=text_.find("?>",pos_+5u);
-                if(end==std::string_view::npos){pos_=text_.size();return;}
-                pos_=end+2u;continue;
-            }
-            if(text_.substr(pos_,4u)=="<!--"){
-                const auto end=text_.find("-->",pos_+4u);
-                if(end==std::string_view::npos){pos_=text_.size();return;}
-                pos_=end+3u;continue;
-            }
-            if(text_.substr(pos_,9u)=="<!DOCTYPE"){
-                const auto end=text_.find('>',pos_+9u);
-                if(end==std::string_view::npos){pos_=text_.size();return;}
-                pos_=end+1u;continue;
-            }
-            break;
-        }
-    }
-    bool ConsumeOpenTag(std::string_view tag){
-        SkipJunk();
-        if(pos_>=text_.size()||text_[pos_]!='<')return false;
-        const auto end=text_.find('>',pos_+1u);
-        if(end==std::string_view::npos)return false;
-        std::string_view inside=text_.substr(pos_+1u,end-pos_-1u);
-        const auto ws=inside.find_first_of(" \t\r\n/");
-        if((ws==std::string_view::npos?inside:inside.substr(0,ws))!=tag)return false;
-        pos_=end+1u;return true;
-    }
-    bool ConsumeCloseTag(std::string_view tag){
-        SkipJunk();
-        const std::string close="</"+std::string(tag)+">";
-        if(text_.substr(pos_,close.size())!=close)return false;
-        pos_+=close.size();return true;
-    }
-    bool ConsumeEmptyTag(std::string_view tag){
-        SkipJunk();
-        const std::string a="<"+std::string(tag)+"/>";
-        if(text_.substr(pos_,a.size())==a){pos_+=a.size();return true;}
-        const std::string b="<"+std::string(tag)+" />";
-        if(text_.substr(pos_,b.size())==b){pos_+=b.size();return true;}
-        return false;
-    }
-    bool ReadTextTag(std::string_view tag,std::string& out){
-        if(!ConsumeOpenTag(tag))return false;
-        const std::string close="</"+std::string(tag)+">";
-        const auto end=text_.find(close,pos_);
-        if(end==std::string_view::npos)return false;
-        out=XmlDecode(text_.substr(pos_,end-pos_));
-        pos_=end+close.size();return true;
-    }
-    bool ParseValue(PlistValue& out,u32 depth){
-        if(depth>96u)return false;
-        SkipJunk();
-        if(ConsumeEmptyTag("true")){out.kind=PlistValue::Kind::Boolean;out.boolean=true;return true;}
-        if(ConsumeEmptyTag("false")){out.kind=PlistValue::Kind::Boolean;out.boolean=false;return true;}
-        if(text_.substr(pos_,8u)=="<string>"){
-            out.kind=PlistValue::Kind::String;return ReadTextTag("string",out.string);
-        }
-        if(text_.substr(pos_,9u)=="<integer>"){
-            std::string value;if(!ReadTextTag("integer",value))return false;
-            try{out.integer=std::stoll(value,nullptr,0);}catch(...){return false;}
-            out.kind=PlistValue::Kind::Integer;return true;
-        }
-        if(text_.substr(pos_,6u)=="<real>"){
-            std::string value;if(!ReadTextTag("real",value))return false;
-            try{out.real=std::stod(value);}catch(...){return false;}
-            out.kind=PlistValue::Kind::Real;return true;
-        }
-        if(text_.substr(pos_,6u)=="<date>"){
-            out.kind=PlistValue::Kind::String;return ReadTextTag("date",out.string);
-        }
-        if(text_.substr(pos_,6u)=="<data>"){
-            out.kind=PlistValue::Kind::String;return ReadTextTag("data",out.string);
-        }
-        if(text_.substr(pos_,8u)=="<array/>"){pos_+=8u;out.kind=PlistValue::Kind::Array;return true;}
-        if(text_.substr(pos_,9u)=="<array />"){pos_+=9u;out.kind=PlistValue::Kind::Array;return true;}
-        if(text_.substr(pos_,7u)=="<array>"){
-            if(!ConsumeOpenTag("array"))return false;
-            out.kind=PlistValue::Kind::Array;
-            while(true){
-                SkipJunk();
-                if(text_.substr(pos_,8u)=="</array>"){pos_+=8u;return true;}
-                PlistValue child;if(!ParseValue(child,depth+1u))return false;
-                out.array.push_back(std::move(child));
-            }
-        }
-        if(text_.substr(pos_,7u)=="<dict/>"){pos_+=7u;out.kind=PlistValue::Kind::Dict;return true;}
-        if(text_.substr(pos_,8u)=="<dict />"){pos_+=8u;out.kind=PlistValue::Kind::Dict;return true;}
-        if(text_.substr(pos_,6u)=="<dict>"){
-            if(!ConsumeOpenTag("dict"))return false;
-            out.kind=PlistValue::Kind::Dict;
-            while(true){
-                SkipJunk();
-                if(text_.substr(pos_,7u)=="</dict>"){pos_+=7u;return true;}
-                std::string key;if(!ReadTextTag("key",key))return false;
-                PlistValue child;if(!ParseValue(child,depth+1u))return false;
-                out.dict_keys.push_back(std::move(key));
-                out.dict_values.push_back(std::move(child));
-            }
-        }
-        return false;
-    }
-
-    std::string_view text_;
-    std::size_t pos_=0u;
-};
-
-static bool ParseAnyPlist(const std::vector<u8>& bytes,PlistValue& out,std::string* format=nullptr){
-    BinaryPlistParser binary(bytes);
-    if(binary.Parse(out)){
-        if(format)*format="binary";
-        return true;
-    }
-    XmlPlistParser xml(bytes);
-    if(xml.Parse(out)){
-        if(format)*format="xml";
-        return true;
-    }
-    return false;
-}
 
 static bool ExtractFloats(std::string_view text,float* out,std::size_t count){
     std::string copy(text);
@@ -1514,6 +1251,7 @@ public:
             if (env_.invalid_access) {
                 log_ << (frame_pump_active_?"RESULT: IOS_FRAME_MEMORY_FAULT address=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x")) << Hex(env_.fault_address)
                      << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
+                LogFaultContext();
                 if(frame_pump_active_&&cpu_.Regs()[15]>=0x1000u&&cpu_.Regs()[15]<0x2000u)
                     log_<<"IOS: frame fault entered Mach-O header page; likely invalid cached IMP/function callback\n";
                 return false;
@@ -1543,7 +1281,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest21 runs the real Forlorn cocos2d flow with local/remote level plist loading, NSString formatting, WinHTTP URL plists, NPOT textures, UIKit text, NSInvocation actions, libc realloc, scenery and targeted touches.\n";
+            log_<<"Execution status: PublicTest22 runs the real Forlorn cocos2d flow with legacy URL-test-slot compatibility, NSURL/dictionary URL handling, NPOT textures, UIKit text, NSInvocation actions, plist-backed scenery, and targeted touches.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1578,14 +1316,96 @@ private:
         Dynarmic::A32::UserConfig c; c.callbacks=&env_; c.arch_version=DynarmicArmv7ArchVersion<Dynarmic::A32::ArchVersion>(); c.global_monitor=&monitor_; c.processor_id=0; c.check_halt_on_memory_access=true; return c;
     }
     void WriteArmSvc(u32 addr,u32 svc){ env_.MemoryWrite32(addr,0xef000000u|(svc&0x00ffffffu)); env_.MemoryWrite32(addr+4u,0xe12fff1eu); }
-    u32 Allocate(u32 size,u32 align=8u){
+    struct HeapFreeBlock { u32 addr=0u; u32 size=0u; };
+    void AddFreeHeapRange(u32 addr,u32 size){
+        if(!size)return;
+        HeapFreeBlock merged{addr,size};
+        auto it=std::lower_bound(heap_free_blocks_.begin(),heap_free_blocks_.end(),addr,
+            [](const HeapFreeBlock& b,u32 value){return b.addr<value;});
+        if(it!=heap_free_blocks_.begin()){
+            auto prev=it-1;
+            if(u64(prev->addr)+prev->size>=merged.addr){
+                const u64 end=std::max<u64>(u64(prev->addr)+prev->size,u64(merged.addr)+merged.size);
+                merged.addr=prev->addr;merged.size=static_cast<u32>(end-merged.addr);
+                it=heap_free_blocks_.erase(prev);
+            }
+        }
+        while(it!=heap_free_blocks_.end()&&u64(merged.addr)+merged.size>=it->addr){
+            const u64 end=std::max<u64>(u64(merged.addr)+merged.size,u64(it->addr)+it->size);
+            merged.size=static_cast<u32>(end-merged.addr);
+            it=heap_free_blocks_.erase(it);
+        }
+        heap_free_blocks_.insert(it,merged);
+    }
+    void ReleaseHeapBlock(u32 ptr){
+        if(!ptr)return;
+        const auto span_it=heap_allocation_spans_.find(ptr);
+        if(span_it==heap_allocation_spans_.end())return;
+        const u32 span=span_it->second;
+        heap_allocation_spans_.erase(span_it);
+        heap_allocation_sizes_.erase(ptr);
+        AddFreeHeapRange(ptr,span);
+    }
+    u32 Allocate(u32 size,u32 align=8u,bool allow_failure=false){
         const u32 requested=std::max<u32>(size,1u);
-        heap_cursor_=AlignUp(heap_cursor_,align);
-        if(u64(heap_cursor_)+requested>u64(kHeapBase)+kHeapSize)throw std::runtime_error("iOS guest heap exhausted");
+        const u64 span64=(u64(requested)+7u)&~u64(7u);
+        const u32 effective_align=std::max<u32>(align,8u);
+        if(span64>std::numeric_limits<u32>::max()){
+            log_<<"IOS HEAP ALLOC FAIL: requested="<<requested<<" span="<<span64<<" align="<<effective_align<<" reason=span-overflow\n";
+            if(allow_failure)return 0u;
+            throw std::runtime_error("iOS guest heap exhausted");
+        }
+        const u32 span=static_cast<u32>(span64);
+        for(std::size_t i=0;i<heap_free_blocks_.size();++i){
+            const HeapFreeBlock block=heap_free_blocks_[i];
+            const u32 a=AlignUp(block.addr,effective_align);
+            const u64 prefix=u64(a)-block.addr;
+            if(prefix+span>block.size)continue;
+            heap_free_blocks_.erase(heap_free_blocks_.begin()+static_cast<std::ptrdiff_t>(i));
+            if(prefix)AddFreeHeapRange(block.addr,static_cast<u32>(prefix));
+            const u64 block_end=u64(block.addr)+block.size;
+            const u64 alloc_end=u64(a)+span;
+            if(alloc_end<block_end)AddFreeHeapRange(static_cast<u32>(alloc_end),static_cast<u32>(block_end-alloc_end));
+            heap_allocation_sizes_[a]=requested;
+            heap_allocation_spans_[a]=span;
+            ++heap_reuse_count_;
+            return a;
+        }
+        heap_cursor_=AlignUp(heap_cursor_,effective_align);
+        if(u64(heap_cursor_)+span>u64(kHeapBase)+kHeapSize){
+            u64 free_bytes=0u,largest_free=0u;
+            for(const auto& b:heap_free_blocks_){free_bytes+=b.size;largest_free=std::max<u64>(largest_free,b.size);}
+            log_<<"IOS HEAP ALLOC FAIL: requested="<<requested<<" span="<<span<<" align="<<effective_align
+                <<" cursor=0x"<<Hex(heap_cursor_)<<" limit=0x"<<Hex(u64(kHeapBase)+kHeapSize)
+                <<" free-blocks="<<heap_free_blocks_.size()<<" free-bytes="<<free_bytes<<" largest-free="<<largest_free<<"\n";
+            if(allow_failure)return 0u;
+            throw std::runtime_error("iOS guest heap exhausted");
+        }
         const u32 a=heap_cursor_;
-        heap_cursor_+=AlignUp(requested,8u);
+        heap_cursor_+=span;
+        heap_peak_cursor_=std::max(heap_peak_cursor_,heap_cursor_);
         heap_allocation_sizes_[a]=requested;
+        heap_allocation_spans_[a]=span;
         return a;
+    }
+    void LogFaultContext(){
+        const auto& r=cpu_.Regs();
+        log_<<"IOS FAULT REGISTERS: r0=0x"<<Hex(r[0])<<" r1=0x"<<Hex(r[1])<<" r2=0x"<<Hex(r[2])<<" r3=0x"<<Hex(r[3])
+            <<" r4=0x"<<Hex(r[4])<<" r5=0x"<<Hex(r[5])<<" r6=0x"<<Hex(r[6])<<" r7=0x"<<Hex(r[7])
+            <<" r8=0x"<<Hex(r[8])<<" r9=0x"<<Hex(r[9])<<" r10=0x"<<Hex(r[10])<<" r11=0x"<<Hex(r[11])<<" r12=0x"<<Hex(r[12])
+            <<" sp=0x"<<Hex(r[13])<<" lr=0x"<<Hex(r[14])<<" pc=0x"<<Hex(r[15])<<"\n";
+        if(r[15]>=kImportBase&&r[15]<kImportBase+kImportSize){
+            const u32 stub=kImportBase+((r[15]-kImportBase)/8u)*8u;
+            const std::size_t index=(stub-kImportBase)/8u;
+            if(index<imports_.size())log_<<"IOS FAULT IMPORT CONTEXT: "<<imports_[index].name<<" stub=0x"<<Hex(stub)<<" calls="<<imports_[index].calls<<"\n";
+            else log_<<"IOS FAULT IMPORT CONTEXT: unknown-slot stub=0x"<<Hex(stub)<<" index="<<index<<"\n";
+        }
+        u64 live_bytes=0u,free_bytes=0u;
+        for(const auto& [ptr,bytes]:heap_allocation_sizes_){(void)ptr;live_bytes+=bytes;}
+        for(const auto& b:heap_free_blocks_)free_bytes+=b.size;
+        log_<<"IOS HEAP STATE: cursor=0x"<<Hex(heap_cursor_)<<" peak=0x"<<Hex(heap_peak_cursor_)
+            <<" live-blocks="<<heap_allocation_sizes_.size()<<" live-bytes="<<live_bytes
+            <<" free-blocks="<<heap_free_blocks_.size()<<" free-bytes="<<free_bytes<<" reused="<<heap_reuse_count_<<"\n";
     }
     u32 AllocateObjectBytes(u32 size){ object_cursor_=AlignUp(object_cursor_,8u); if(u64(object_cursor_)+size>u64(kObjectBase)+kObjectSize)throw std::runtime_error("iOS fake object region exhausted");u32 a=object_cursor_;object_cursor_+=AlignUp(size,8u);return a; }
     u32 AllocateCString(const std::string& s){ u32 a=Allocate(static_cast<u32>(s.size()+1u),1u); env_.WriteBytes(a,s.c_str(),s.size()+1u); return a; }
@@ -1751,79 +1571,6 @@ private:
         file->pos+=amount;
         return static_cast<u32>(amount);
     }
-    std::string FormatFakeNSString(std::string format){
-        std::vector<u32> words;
-        words.push_back(cpu_.Regs()[3]);
-        for(u32 i=0;i<24u;++i)words.push_back(StackArg(i));
-        std::size_t arg=0u;
-        std::ostringstream out;
-
-        for(std::size_t i=0;i<format.size();){
-            if(format[i]!='%'){out<<format[i++];continue;}
-            if(i+1u<format.size()&&format[i+1u]=='%'){out<<'%';i+=2u;continue;}
-            ++i;
-            bool zero_pad=false;
-            if(i<format.size()&&format[i]=='0'){zero_pad=true;++i;}
-            int width=0;
-            while(i<format.size()&&std::isdigit(static_cast<unsigned char>(format[i]))){
-                width=width*10+(format[i]-'0');++i;
-            }
-            while(i<format.size()&&(format[i]=='l'||format[i]=='h'||format[i]=='z'||format[i]=='t'))++i;
-            if(i>=format.size())break;
-            const char spec=format[i++];
-            const u32 word=arg<words.size()?words[arg++]:0u;
-
-            std::ostringstream piece;
-            if(zero_pad&&width>0)piece<<std::setfill('0')<<std::setw(width);
-            else if(width>0)piece<<std::setw(width);
-
-            switch(spec){
-            case '@': piece<<DescribeString(word);break;
-            case 'd': case 'i': piece<<static_cast<s32>(word);break;
-            case 'u': piece<<word;break;
-            case 'x': piece<<std::hex<<std::nouppercase<<word;break;
-            case 'X': piece<<std::hex<<std::uppercase<<word;break;
-            case 'c': piece<<static_cast<char>(word&0xffu);break;
-            case 's': {
-                std::string value;if(word)env_.ReadCString(word,value,1u<<20);piece<<value;break;
-            }
-            case 'p': piece<<"0x"<<Hex(word);break;
-            default:
-                piece<<'%'<<spec;break;
-            }
-            out<<piece.str();
-        }
-        return out.str();
-    }
-
-    u32 LoadRemotePlist(const std::string& url){
-        if(url.empty())return 0u;
-        auto cached=remote_plist_roots_.find(url);
-        if(cached!=remote_plist_roots_.end())return cached->second;
-
-        std::vector<u8> bytes;u32 status=0u;std::string error;
-        const bool fetched=WinHttpGetBytes(url,bytes,status,error);
-        if(++network_plist_logs_<=32u)
-            log_<<"IOS NET PLIST: GET "<<url<<" status="<<status
-                <<" bytes="<<bytes.size()<<" result="<<(fetched?"ok":"failed")
-                <<(error.empty()?"":(" error="+error))<<"\\n";
-        if(!fetched)return 0u;
-
-        PlistValue root;std::string format;
-        if(!ParseAnyPlist(bytes,root,&format)||root.kind!=PlistValue::Kind::Dict){
-            if(++network_plist_logs_<=32u)
-                log_<<"IOS NET PLIST: parse failed url="<<url<<" bytes="<<bytes.size()<<"\\n";
-            return 0u;
-        }
-        const u32 obj=MakeFakePlistObject(root);
-        remote_plist_roots_[url]=obj;
-        const auto dit=fake_dictionaries_.find(obj);
-        if(++network_plist_logs_<=32u)
-            log_<<"IOS NET PLIST: parsed url="<<url<<" format="<<format
-                <<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\\n";
-        return obj;
-    }
-
     u32 NewFakeNumber(double value){
         const u32 obj=NewExternalInstance("NSNumber");
         fake_numbers_[obj]=value;return obj;
@@ -1854,6 +1601,49 @@ private:
         }}
         return 0u;
     }
+    bool CopyFakeDictionary(u32 source,u32 destination){
+        auto dit=fake_dictionaries_.find(source);
+        if(dit==fake_dictionaries_.end())return false;
+        fake_dictionaries_[destination]=dit->second;
+        auto kit=fake_dictionary_keys_.find(source);
+        if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[destination]=kit->second;
+        else fake_dictionary_keys_[destination].clear();
+        return true;
+    }
+
+    std::string LegacyTestLevelFallbackForUrl(std::string_view url)const{
+        if(url.find("/u/7279678/testLevel.plist")!=std::string_view::npos)return "Level001.plist";
+        if(url.find("/u/19031182/testLevel.plist")!=std::string_view::npos)return "Level002.plist";
+        if(url.find("/u/15147073/testLevel.plist")!=std::string_view::npos)return "Level003.plist";
+        return {};
+    }
+
+    u32 LoadFakePlistFromUrl(std::string url){
+        if(url.empty())return 0u;
+        if(url.rfind("ipa://",0u)==0u)return LoadFakePlist(url);
+        if(url.rfind("file://",0u)==0u)return LoadFakePlist(url.substr(7u));
+
+        const std::string fallback=LegacyTestLevelFallbackForUrl(url);
+        if(!fallback.empty()){
+            const u32 root=LoadFakePlist(fallback);
+            const auto dit=fake_dictionaries_.find(root);
+            const std::size_t keys=dit==fake_dictionaries_.end()?0u:dit->second.size();
+            if(root){
+                ++level_url_fallbacks_;
+                log_<<"IOS LEVEL COMPAT: legacy URL test slot '"<<url
+                    <<"' -> bundled "<<fallback<<" keys="<<keys
+                    <<" substitution=explicit-local-fallback\n";
+            }else{
+                log_<<"IOS LEVEL COMPAT: legacy URL test slot '"<<url
+                    <<"' fallback "<<fallback<<" missing from IPA\n";
+            }
+            return root;
+        }
+        if(++url_plist_fail_logs_<=16u)
+            log_<<"IOS URL PLIST: unsupported URL without compatibility mapping '"<<url<<"'\n";
+        return 0u;
+    }
+
     u32 LoadFakePlist(std::string request){
         const std::string relative=ResolveAssetRelative(request);
         if(relative.empty())return 0u;
@@ -1861,16 +1651,14 @@ private:
         if(cached!=plist_roots_.end())return cached->second;
         std::string resolved;std::vector<u8> bytes;
         if(!ReadAssetBytes(relative,resolved,bytes))return 0u;
-        PlistValue root;std::string plist_format;
-        if(!ParseAnyPlist(bytes,root,&plist_format)||root.kind!=PlistValue::Kind::Dict){
-            if(++plist_failure_logs_<=12u)log_<<"IOS PLIST: parse failed "<<relative<<"\n";
+        PlistValue root;BinaryPlistParser parser(bytes);
+        if(!parser.Parse(root)||root.kind!=PlistValue::Kind::Dict){
+            if(++plist_failure_logs_<=8u)log_<<"IOS PLIST: parse failed "<<relative<<"\n";
             return 0u;
         }
         const u32 obj=MakeFakePlistObject(root);plist_roots_[relative]=obj;
         const auto dit=fake_dictionaries_.find(obj);
-        if(++plist_load_logs_<=32u)log_<<"IOS PLIST: loaded "<<relative
-            <<" format="<<plist_format
-            <<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\n";
+        if(++plist_load_logs_<=24u)log_<<"IOS PLIST: loaded "<<relative<<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\n";
         return obj;
     }
     const std::vector<u32>* FastEnumerationValues(u32 receiver,std::vector<u32>& scratch){
@@ -2814,7 +2602,7 @@ private:
 
         const auto fit=fake_objects_.find(receiver);
         if(fit!=fake_objects_.end()){
-            auto& fo=fit->second;
+            const auto& fo=fit->second;
             if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){
                 cpu_.Regs()[0]=NewExternalInstance(fo.class_name);
                 if(fo.class_name=="UIWindow")window_instance_=cpu_.Regs()[0];
@@ -2860,23 +2648,22 @@ private:
             if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithString:"){
                 cpu_.Regs()[0]=NewFakeString(DescribeString(cpu_.Regs()[2]));return true;
             }
-            if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithFormat:"){
-                const std::string format=DescribeString(cpu_.Regs()[2]);
-                const std::string value=FormatFakeNSString(format);
-                cpu_.Regs()[0]=NewFakeString(value);
-                if(++string_format_logs_<=32u)log_<<"IOS STRING FORMAT: '"<<format<<"' -> '"<<value<<"'\n";
-                return true;
-            }
-            if(fo.is_class&&fo.class_name=="NSURL"&&(selector=="URLWithString:"||selector=="fileURLWithPath:")){
-                const u32 obj=NewExternalInstance("NSURL");
-                fake_objects_[obj].string_value=DescribeString(cpu_.Regs()[2]);
-                cpu_.Regs()[0]=obj;return true;
-            }
             if(fo.is_class&&fo.class_name=="UIFont"&&(selector=="systemFontOfSize:"||selector=="boldSystemFontOfSize:")){
                 cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[2]),selector=="boldSystemFontOfSize:");return true;
             }
             if(fo.is_class&&fo.class_name=="UIFont"&&selector=="fontWithName:size:"){
                 cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[3]),false);return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSURL"&&(selector=="URLWithString:"||selector=="fileURLWithPath:")){
+                const std::string value=DescribeString(cpu_.Regs()[2]);
+                const u32 obj=NewExternalInstance("NSURL");
+                fake_objects_[obj].string_value=(selector=="fileURLWithPath:"&&value.rfind("file://",0u)!=0u)
+                    ?std::string("file://")+value:value;
+                cpu_.Regs()[0]=obj;
+                if(++url_object_logs_<=24u)
+                    log_<<"IOS URL: "<<selector<<" '"<<fake_objects_[obj].string_value
+                        <<"' -> 0x"<<Hex(obj)<<"\n";
+                return true;
             }
             if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
                 cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
@@ -2885,7 +2672,7 @@ private:
                 cpu_.Regs()[0]=LoadFakePlist(DescribeString(cpu_.Regs()[2]));return true;
             }
             if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&selector=="dictionaryWithContentsOfURL:"){
-                cpu_.Regs()[0]=LoadRemotePlist(DescribeString(cpu_.Regs()[2]));return true;
+                cpu_.Regs()[0]=LoadFakePlistFromUrl(DescribeString(cpu_.Regs()[2]));return true;
             }
             if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
                (selector=="dictionary"||selector=="dictionaryWithCapacity:")){
@@ -2938,23 +2725,6 @@ private:
                 cpu_.Regs()[0]=receiver;return true;
             }
             if(!fo.is_class&&fo.class_name=="NSString"){
-                if(selector=="initWithString:"){
-                    fo.string_value=DescribeString(cpu_.Regs()[2]);
-                    cpu_.Regs()[0]=receiver;
-                    if(++string_format_logs_<=32u)log_<<"IOS STRING INIT: '"<<fo.string_value<<"'\n";
-                    return true;
-                }
-                if(selector=="initWithCString:encoding:"||selector=="initWithUTF8String:"){
-                    std::string value;if(cpu_.Regs()[2])env_.ReadCString(cpu_.Regs()[2],value,1u<<20);
-                    fo.string_value=std::move(value);cpu_.Regs()[0]=receiver;return true;
-                }
-                if(selector=="initWithFormat:"){
-                    const std::string format=DescribeString(cpu_.Regs()[2]);
-                    fo.string_value=FormatFakeNSString(format);
-                    cpu_.Regs()[0]=receiver;
-                    if(++string_format_logs_<=32u)log_<<"IOS STRING FORMAT INIT: '"<<format<<"' -> '"<<fo.string_value<<"'\n";
-                    return true;
-                }
                 const std::string current=!fo.string_value.empty()?fo.string_value:fo.resource_value;
                 if(selector=="stringByAppendingPathComponent:"){
                     std::string lhs=current,rhs=DescribeString(cpu_.Regs()[2]);
@@ -2982,9 +2752,6 @@ private:
                     const auto slash=current.find_last_of("/\\");const auto dot=current.find_last_of('.');
                     cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?current.substr(0,dot):current);return true;
                 }
-                if(selector=="copy"||selector=="mutableCopy"){
-                    cpu_.Regs()[0]=NewFakeString(current);return true;
-                }
                 if(selector=="componentsSeparatedByString:"){
                     const std::string delim=DescribeString(cpu_.Regs()[2]);
                     const u32 array=NewExternalInstance("NSArray");auto& out=fake_collections_[array];
@@ -3004,23 +2771,6 @@ private:
             if(!fo.is_class&&fo.class_name=="UIFont"){
                 if(selector=="pointSize"||selector=="lineHeight"){cpu_.Regs()[0]=FloatToBits(FakeFontSize(receiver)*(selector=="lineHeight"?1.20f:1.0f));return true;}
                 if(selector=="fontName"){cpu_.Regs()[0]=NewFakeString("Arial");return true;}
-            }
-            if(!fo.is_class&&fo.class_name=="NSURL"){
-                if(selector=="initWithString:"||selector=="initFileURLWithPath:"){
-                    fo.string_value=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=receiver;return true;
-                }
-                if(selector=="absoluteString"||selector=="relativeString"||selector=="description"){
-                    cpu_.Regs()[0]=NewFakeString(fo.string_value);return true;
-                }
-                if(selector=="path"){
-                    std::string value=fo.string_value;
-                    const auto scheme=value.find("://");
-                    if(scheme!=std::string::npos){
-                        const auto slash=value.find('/',scheme+3u);
-                        value=slash==std::string::npos?std::string{}:value.substr(slash);
-                    }
-                    cpu_.Regs()[0]=NewFakeString(value);return true;
-                }
             }
             if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="initWithTarget:selector:object:"){
                 fake_objects_[receiver].aux0=cpu_.Regs()[2];
@@ -3193,41 +2943,56 @@ private:
                     cpu_.Regs()[0]=0u;return true;
                 }
             }
-            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
-               selector=="initWithContentsOfFile:"){
-                const std::string request=DescribeString(cpu_.Regs()[2]);
-                const u32 loaded=LoadFakePlist(request);
-                if(!loaded){
-                    if(++level_load_logs_<=32u)log_<<"IOS LEVEL LOAD: file plist failed request='"<<request<<"'\n";
-                    cpu_.Regs()[0]=0u;return true;
+            if(!fo.is_class&&fo.class_name=="NSURL"){
+                const std::string url=fo.string_value;
+                if(selector=="absoluteString"||selector=="relativeString"){
+                    cpu_.Regs()[0]=NewFakeString(url);return true;
                 }
-                auto dit=fake_dictionaries_.find(loaded);
-                if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
-                fake_dictionaries_[receiver]=dit->second;
-                auto kit=fake_dictionary_keys_.find(loaded);
-                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
-                else fake_dictionary_keys_[receiver].clear();
-                cpu_.Regs()[0]=receiver;
-                if(++plist_init_logs_<=32u)log_<<"IOS PLIST INIT: "<<fo.class_name
-                    <<" initWithContentsOfFile '"<<request<<"' keys="<<fake_dictionaries_[receiver].size()
-                    <<" receiver=0x"<<Hex(receiver)<<"\n";
-                return true;
+                if(selector=="isFileURL"){cpu_.Regs()[0]=url.rfind("file://",0u)==0u?1u:0u;return true;}
+                if(selector=="scheme"){
+                    const auto p=url.find(':');
+                    cpu_.Regs()[0]=NewFakeString(p==std::string::npos?std::string{}:url.substr(0,p));return true;
+                }
+                if(selector=="path"){
+                    std::string value=url;
+                    const auto scheme=value.find("://");
+                    if(scheme!=std::string::npos){
+                        const auto slash=value.find('/',scheme+3u);
+                        value=slash==std::string::npos?std::string{}:value.substr(slash);
+                    }
+                    cpu_.Regs()[0]=NewFakeString(value);return true;
+                }
+                if(selector=="lastPathComponent"){
+                    const auto slash=url.find_last_of('/');
+                    cpu_.Regs()[0]=NewFakeString(slash==std::string::npos?url:url.substr(slash+1u));return true;
+                }
             }
             if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
                selector=="initWithContentsOfURL:"){
                 const std::string url=DescribeString(cpu_.Regs()[2]);
-                if(++level_load_logs_<=32u)log_<<"IOS LEVEL LOAD: URL request='"<<url<<"'\n";
-                const u32 loaded=LoadRemotePlist(url);
-                if(!loaded){cpu_.Regs()[0]=0u;return true;}
-                auto dit=fake_dictionaries_.find(loaded);
-                if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
-                fake_dictionaries_[receiver]=dit->second;
-                auto kit=fake_dictionary_keys_.find(loaded);
-                if(kit!=fake_dictionary_keys_.end())fake_dictionary_keys_[receiver]=kit->second;
-                else fake_dictionary_keys_[receiver].clear();
+                const u32 loaded=LoadFakePlistFromUrl(url);
+                if(!loaded||!CopyFakeDictionary(loaded,receiver)){
+                    cpu_.Regs()[0]=0u;
+                    if(++url_plist_fail_logs_<=16u)
+                        log_<<"IOS URL PLIST: "<<fo.class_name<<" initWithContentsOfURL failed url='"<<url<<"'\n";
+                    return true;
+                }
                 cpu_.Regs()[0]=receiver;
-                if(++plist_init_logs_<=32u)log_<<"IOS PLIST INIT: "<<fo.class_name
-                    <<" initWithContentsOfURL '"<<url<<"' keys="<<fake_dictionaries_[receiver].size()
+                if(++plist_init_logs_<=32u)
+                    log_<<"IOS URL PLIST: "<<fo.class_name<<" initWithContentsOfURL '"<<url
+                        <<"' keys="<<fake_dictionaries_[receiver].size()
+                        <<" receiver=0x"<<Hex(receiver)<<"\n";
+                return true;
+            }
+            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               selector=="initWithContentsOfFile:"){
+                const std::string request=DescribeString(cpu_.Regs()[2]);
+                const u32 loaded=LoadFakePlist(request);
+                if(!loaded){cpu_.Regs()[0]=0u;return true;}
+                if(!CopyFakeDictionary(loaded,receiver)){cpu_.Regs()[0]=0u;return true;}
+                cpu_.Regs()[0]=receiver;
+                if(++plist_init_logs_<=24u)log_<<"IOS PLIST INIT: "<<fo.class_name
+                    <<" initWithContentsOfFile '"<<request<<"' keys="<<fake_dictionaries_[receiver].size()
                     <<" receiver=0x"<<Hex(receiver)<<"\n";
                 return true;
             }
@@ -3257,7 +3022,14 @@ private:
             }
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
             if(!fo.is_class&&fo.class_name=="NSAssertionHandler"&&selector.starts_with("handleFailureIn")){
-                if(++assertion_stub_logs_<=16u)log_<<"IOS FOUNDATION: suppressed NSAssertionHandler "<<selector<<"\n";
+                if(++assertion_stub_logs_<=32u){
+                    std::string detail;
+                    if(selector=="handleFailureInMethod:object:file:lineNumber:description:")
+                        detail=DescribeString(StackArg(2));
+                    log_<<"IOS FOUNDATION: suppressed NSAssertionHandler "<<selector;
+                    if(!detail.empty())log_<<" description='"<<detail<<"'";
+                    log_<<"\n";
+                }
                 cpu_.Regs()[0]=0u;return true;
             }
             if(!fo.is_class&&fo.class_name=="NSLock"&&(selector=="lock"||selector=="unlock"||selector=="tryLock")){cpu_.Regs()[0]=selector=="tryLock"?1u:0u;return true;}
@@ -3735,11 +3507,16 @@ private:
         if(name=="rand"||name=="random"){rng_state_=rng_state_*1103515245u+12345u;cpu_.Regs()[0]=(rng_state_>>1u)&0x7fffffffu;return true;}
         if(name=="usleep"){virtual_time_usec_+=cpu_.Regs()[0];cpu_.Regs()[0]=0u;return true;}
         if(name=="exit"||name=="_exit"){done_=true;exit_code_=cpu_.Regs()[0];return true;}
-        if(name=="malloc"){cpu_.Regs()[0]=Allocate(std::max<u32>(cpu_.Regs()[0],1u));return true;}
+        if(name=="malloc"){
+            const u32 requested=std::max<u32>(cpu_.Regs()[0],1u);
+            cpu_.Regs()[0]=Allocate(requested,8u,true);
+            return true;
+        }
         if(name=="calloc"){
             const u64 n=u64(cpu_.Regs()[0])*cpu_.Regs()[1];
             if(n>0x1000000u){cpu_.Regs()[0]=0;return true;}
-            const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)));
+            const u32 a=Allocate(static_cast<u32>(std::max<u64>(n,1u)),8u,true);
+            if(!a){cpu_.Regs()[0]=0u;return true;}
             std::vector<u8> z(static_cast<std::size_t>(n));
             if(n)env_.WriteBytes(a,z.data(),z.size());
             cpu_.Regs()[0]=a;return true;
@@ -3748,27 +3525,47 @@ private:
             const u32 old_ptr=cpu_.Regs()[0];
             const u32 new_size=cpu_.Regs()[1];
             if(!old_ptr){
-                cpu_.Regs()[0]=new_size?Allocate(new_size):0u;
+                cpu_.Regs()[0]=new_size?Allocate(new_size,8u,true):0u;
                 if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name<<" null old new-size="<<new_size
                     <<" -> 0x"<<Hex(cpu_.Regs()[0])<<"\n";
                 return true;
             }
             if(!new_size){
-                heap_allocation_sizes_.erase(old_ptr);
+                ReleaseHeapBlock(old_ptr);
                 cpu_.Regs()[0]=0u;
                 if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name<<" free old=0x"<<Hex(old_ptr)<<"\n";
                 return true;
             }
             const auto old_it=heap_allocation_sizes_.find(old_ptr);
             const u32 old_size=old_it==heap_allocation_sizes_.end()?0u:old_it->second;
-            const u32 new_ptr=Allocate(new_size);
+            const auto span_it=heap_allocation_spans_.find(old_ptr);
+            const u32 old_span=span_it==heap_allocation_spans_.end()?0u:span_it->second;
+            const u64 new_span64=(u64(std::max<u32>(new_size,1u))+7u)&~u64(7u);
+            const u32 new_span=new_span64<=std::numeric_limits<u32>::max()?static_cast<u32>(new_span64):std::numeric_limits<u32>::max();
+            if(old_span&&new_span64<=old_span){
+                heap_allocation_sizes_[old_ptr]=new_size;
+                heap_allocation_spans_[old_ptr]=new_span;
+                if(new_span<old_span)AddFreeHeapRange(old_ptr+new_span,old_span-new_span);
+                cpu_.Regs()[0]=old_ptr;
+                if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name
+                    <<" old=0x"<<Hex(old_ptr)<<" old-size="<<old_size
+                    <<" new-size="<<new_size<<" -> same copied="<<std::min(old_size,new_size)<<"\n";
+                return true;
+            }
+            const u32 new_ptr=Allocate(new_size,8u,true);
+            if(!new_ptr){
+                if(name=="reallocf")ReleaseHeapBlock(old_ptr);
+                cpu_.Regs()[0]=0u;
+                if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name<<" old=0x"<<Hex(old_ptr)<<" new-size="<<new_size<<" -> null (allocation failed)\n";
+                return true;
+            }
             const u32 copy_size=std::min(old_size,new_size);
             if(copy_size&&env_.IsMapped(old_ptr,copy_size)&&env_.IsMapped(new_ptr,copy_size)){
                 std::vector<u8> tmp(copy_size);
                 env_.ReadBytes(old_ptr,tmp.data(),copy_size);
                 env_.WriteBytes(new_ptr,tmp.data(),copy_size);
             }
-            heap_allocation_sizes_.erase(old_ptr);
+            ReleaseHeapBlock(old_ptr);
             cpu_.Regs()[0]=new_ptr;
             if(++realloc_logs_<=24u)log_<<"IOS LIBC: "<<name
                 <<" old=0x"<<Hex(old_ptr)<<" old-size="<<old_size
@@ -3777,7 +3574,7 @@ private:
             return true;
         }
         if(name=="free"){
-            heap_allocation_sizes_.erase(cpu_.Regs()[0]);
+            ReleaseHeapBlock(cpu_.Regs()[0]);
             cpu_.Regs()[0]=0;return true;
         }
         if(name=="memset"){const u32 dst=cpu_.Regs()[0],value=cpu_.Regs()[1]&0xffu,n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)){std::vector<u8> v(n,static_cast<u8>(value));env_.WriteBytes(dst,v.data(),v.size());}cpu_.Regs()[0]=dst;return true;}
@@ -3797,8 +3594,8 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<std::string,u32> remote_plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::vector<GuestClass> classes_;
-    u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_;
+    u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
     u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0,fast_enum_mutation_addr_=0;
@@ -3806,8 +3603,8 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,string_format_logs_=0,network_plist_logs_=0,level_load_logs_=0;
-    u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
+    u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;

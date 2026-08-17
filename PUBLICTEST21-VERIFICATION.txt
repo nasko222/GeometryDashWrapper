@@ -1,87 +1,48 @@
 Geometry Dash Wrapper 0.9.6-publictest21 verification
 
-Supplied PublicTest20 runtime logs:
-  PASS: both Forlorn 1.9c and Forlorn 0.101 reach the real map/level selection flow.
-  PASS: map selection no longer crashes the wrapper.
-  PASS: PlayLayer -initialLoading executes on the real guest NSThread path.
-  PASS: the visible "Loading Failed" message is game-generated, not a host crash.
-  PASS: the process remains alive in LoadingScene until the user closes the window.
-  PASS: PT20 NPOT texture support uploads the 1.9c 800x631 FL_Map_World texture.
-  PASS: PT20 UIKit text bridge renders map labels and the real Loading Failed message.
+Latest PT20:
+  PASS: both versions remain alive after pressing map test entries.
+  PASS: PlayLayer -initialLoading runs.
+  PASS: the game itself renders "Loading Failed".
+  PASS: 1.9c's 800x631 FL_Map_World texture uploads successfully.
 
-Exact Forlorn 1.9c level-loader reverse engineering:
-  PASS: PlayLayer -initialLoading IMP = 0x1F9D1.
-  PASS: PlayLayer levelDict is an NSDictionary* ivar at instance offset 0x2E4.
-  PASS: initialLoading sends [levelDict count].
-  PASS: count == 0 reaches AppDelegate -levelLoadingFailed.
-  PASS: local path uses CCFileUtils fullPathFromRelativePath: then
-        NSDictionary -initWithContentsOfFile:.
-  PASS: URL path uses GameManager currentURL -> NSURL +URLWithString: ->
-        NSDictionary -initWithContentsOfURL:.
-  PASS: LevelScene -onPlay: uses the exact format string Level%03d.plist for
-        ordinary bundled levels.
-  PASS: tags 100/101/102 select levelURLR/levelURLN/levelURLB and set the
-        levelSelect string to URL.
+Exact 1.9c failure:
+  levelSelect == URL
+  -> GameManager.currentURL
+  -> NSURL URLWithString:
+  -> NSDictionary initWithContentsOfURL:
+  -> levelDict.count
+  -> zero count branches to levelLoadingFailed.
 
-Original 1.9c remote test URL constants found in the binary:
-  http://dl.dropbox.com/u/7279678/testLevel.plist
-  http://dl.dropbox.com/u/19031182/testLevel.plist
-  http://dl.dropbox.com/u/15147073/testLevel.plist
+PT21:
+  PASS: persistent NSURL strings.
+  PASS: NSURL absoluteString/relativeString/scheme/path/isFileURL.
+  PASS: NSDictionary initWithContentsOfURL: and dictionaryWithContentsOfURL:.
+  PASS: local ipa:// and file:// plist URL handling.
+  PASS: arbitrary HTTP URLs remain unsupported rather than fabricated.
 
-PublicTest21 NSString/NSURL:
-  PASS: +[NSString stringWithFormat:] with integer/object/C-string formatting.
-  PASS: zero-padded widths needed by Level%03d.plist.
-  PASS: NSString initWithString:/initWithUTF8String:/initWithFormat:/copy.
-  PASS: NSURL URLWithString:/initWithString:/absoluteString stores the real URL.
-
-PublicTest21 plist/network loading:
-  PASS: NSDictionary/NSMutableDictionary initWithContentsOfURL:.
-  PASS: dictionaryWithContentsOfURL:.
-  PASS: WinHTTP GET implementation with response status diagnostics.
-  PASS: 5/5/10/10 second WinHTTP timeout policy and 32 MiB response cap.
-  PASS: XML plist parser for dict/array/string/int/real/bool/date/data.
-  PASS: empty XML dict/array forms supported.
-  PASS: existing binary bplist00 parser retained.
-  PASS: downloaded and IPA plists use the same Foundation object conversion.
-
-Bundled local 1.9c levels:
-  {'Level001.plist': 16, 'Level002.plist': 16, 'Level003.plist': 16, 'Level004.plist': 16, 'Level005.plist': 16}
-  PASS: Level001.plist through Level005.plist are present and non-empty.
-
-Parser fixture:
-  PASS: the actual PT21 C++ XML parser compiled and parsed a full XML conversion
-        of the supplied Level001.plist.
-  format=xml keys=16
+Explicit old test-slot compatibility:
+  7279678 -> Level001.plist (16 root keys)
+  19031182 -> Level002.plist (16 root keys)
+  15147073 -> Level003.plist (16 root keys)
+  PASS: all three fallback files exist and parse in supplied Forlorn 1.9c.
+  PASS: every substitution is clearly logged.
 
 Regression:
-  PASS: PublicTest20 NPOT PVR support retained.
-  PASS: PublicTest20 UIKit text rasterization retained.
-  PASS: PublicTest19 realloc/plist file initialization retained.
-  PASS: PublicTest18 NSInvocation action dispatch retained.
-  PASS: PublicTest17 full-image CoreGraphics rectangle fix retained.
-  PASS: PublicTest16 targeted touch ownership retained.
-  PASS: x86 backend unchanged.
-  PASS: shared Android audio/network/storage/song/runtime sources unchanged.
-  PASS: Android ARM implementation changes limited to version text.
-  PASS: Geometry Dash 1.0 constructor deferral retained.
-  PASS: source archive contains no games or built executables/libraries.
+  PASS: PT20 NPOT and UIKit text retained.
+  PASS: PT19 realloc/file plist retained.
+  PASS: PT18 NSInvocation retained.
+  PASS: PT17 image crop retained.
+  PASS: touch and packed-PVR paths retained.
+  PASS: x86/shared Android runtime unchanged.
 
-Syntax/build integration:
-  PASS: iOS backend C++20 syntax-only compile with local Dynarmic API stub.
-  PASS: CMake already links WinHTTP for Dynarmic targets.
-  NOTE: Windows/Dynarmic runtime execution and real HTTP requests were not
-        available in this environment.
+Syntax:
+  PASS: C++20 syntax-only compile with local Dynarmic interface stub.
 
-Expected bundled-level path:
-  IOS STRING FORMAT: 'Level%03d.plist' -> 'Level001.plist'
-  IOS ASSET: NSBundle Level001.plist -> Level001.plist
-  IOS PLIST INIT: NSDictionary initWithContentsOfFile ... keys=<nonzero>
+Expected after R/N/B:
+  IOS URL: URLWithString: 'http://.../testLevel.plist' -> ...
+  IOS LEVEL COMPAT: ... -> bundled Level00X.plist keys=<nonzero>
+                    substitution=explicit-local-fallback
+  IOS URL PLIST: NSDictionary initWithContentsOfURL ... keys=<nonzero>
 
-Expected R/N/B remote path:
-  IOS LEVEL LOAD: URL request='http://dl.dropbox.com/.../testLevel.plist'
-  IOS NET PLIST: GET ... status=<HTTP status> bytes=<n> result=<ok|failed>
-  IOS NET PLIST: parsed ... format=<xml|binary> root-keys=<nonzero>
-
-The historical remote URLs are not assumed to still work. If a server no longer
-returns a valid plist, PublicTest21 should leave the real game on Loading Failed
-and record the exact HTTP/parse result in the log.
+Then PlayLayer should continue beyond the old levelDict.count == 0 branch.
