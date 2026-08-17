@@ -73,7 +73,7 @@ constexpr ArchVersion DynarmicArmv7ArchVersion() {
 
 constexpr u32 kPageSize = 0x1000u;
 constexpr u32 kHeapBase = 0x30000000u;
-constexpr u32 kHeapSize = 0x08000000u;
+constexpr u32 kHeapSize = 0x10000000u;
 constexpr u32 kImportBase = 0x50000000u;
 constexpr u32 kImportSize = 0x00100000u;
 constexpr u32 kControlBase = 0x51000000u;
@@ -1236,6 +1236,7 @@ public:
         u64 budget = kRunBudget;
         while (budget && !done_) {
             env_.ResetStopState();
+            RepairPlayLayerSelfBoundary();
             const u64 chunk = std::min<u64>(budget, kRunChunk);
             env_.ticks_left = chunk;
             const auto reason = cpu_.Run();
@@ -1281,7 +1282,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest22 runs the real Forlorn cocos2d flow with legacy URL-test-slot compatibility, NSURL/dictionary URL handling, NPOT textures, UIKit text, NSInvocation actions, plist-backed scenery, and targeted touches.\n";
+            log_<<"Execution status: PublicTest23 expands the iOS guest heap and adds a narrowly scoped PlayLayer addSpriteSheets self-register guard plus diagnostics on the real level-loading path.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1373,11 +1374,14 @@ private:
         }
         heap_cursor_=AlignUp(heap_cursor_,effective_align);
         if(u64(heap_cursor_)+span>u64(kHeapBase)+kHeapSize){
-            u64 free_bytes=0u,largest_free=0u;
+            u64 free_bytes=0u,largest_free=0u,live_bytes=0u;
             for(const auto& b:heap_free_blocks_){free_bytes+=b.size;largest_free=std::max<u64>(largest_free,b.size);}
+            for(const auto& [ptr,bytes]:heap_allocation_sizes_){(void)ptr;live_bytes+=bytes;}
             log_<<"IOS HEAP ALLOC FAIL: requested="<<requested<<" span="<<span<<" align="<<effective_align
                 <<" cursor=0x"<<Hex(heap_cursor_)<<" limit=0x"<<Hex(u64(kHeapBase)+kHeapSize)
-                <<" free-blocks="<<heap_free_blocks_.size()<<" free-bytes="<<free_bytes<<" largest-free="<<largest_free<<"\n";
+                <<" live-blocks="<<heap_allocation_sizes_.size()<<" live-bytes="<<live_bytes
+                <<" free-blocks="<<heap_free_blocks_.size()<<" free-bytes="<<free_bytes<<" largest-free="<<largest_free
+                <<" reused="<<heap_reuse_count_<<"\n";
             if(allow_failure)return 0u;
             throw std::runtime_error("iOS guest heap exhausted");
         }
@@ -1898,8 +1902,64 @@ private:
             MergeCategoryMethods(cls->class_methods,ParseMethods(env_.MemoryRead32(cat+12u)));
         }
     }
-    u32 NewGuestInstance(const GuestClass& cls){const u32 bytes=std::max<u32>(cls.instance_size,4u);const u32 object=Allocate(bytes,8u);std::vector<u8> zero(bytes);env_.WriteBytes(object,zero.data(),zero.size());env_.MemoryWrite32(object,cls.class_addr);return object;}
+    u32 NewGuestInstance(const GuestClass& cls){
+        const u32 bytes=std::max<u32>(cls.instance_size,4u);
+        const u32 object=Allocate(bytes,8u);
+        std::vector<u8> zero(bytes);
+        env_.WriteBytes(object,zero.data(),zero.size());
+        env_.MemoryWrite32(object,cls.class_addr);
+        if(cls.name=="PlayLayer"){
+            active_play_layer_=object;
+            if(++playlayer_track_logs_<=16u)
+                log_<<"IOS PLAYLAYER: allocated instance=0x"<<Hex(object)<<" bytes="<<bytes<<"\n";
+        }
+        return object;
+    }
     void EnterGuestMethod(const GuestMethod& method){cpu_.Regs()[15]=method.imp&~1u;cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((method.imp&1u)?0x20u:0u));}
+    bool GuestPcInsideMethod(const GuestClass* cls,const GuestMethod* method,u32 address) const {
+        if(!cls||!method)return false;
+        const u32 start=method->imp&~1u;
+        u32 end=start+0x1000u;
+        for(const auto& candidate:cls->instance_methods){
+            const u32 next=candidate.imp&~1u;
+            if(next>start&&next<end)end=next;
+        }
+        return address>=start&&address<end;
+    }
+    void RepairPlayLayerSelfBoundary(){
+        if(!active_play_layer_)return;
+        const GuestClass* cls=FindGuestClassForInstance(active_play_layer_);
+        if(!cls||cls->name!="PlayLayer")return;
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,"addSpriteSheets");
+        if(!method)return;
+        const u32 pc=cpu_.Regs()[15]&~1u,lr=cpu_.Regs()[14]&~1u;
+        const u32 start=method->imp&~1u;
+        const bool pc_inside=GuestPcInsideMethod(cls,method,pc);
+        const bool lr_inside=GuestPcInsideMethod(cls,method,lr);
+        if(!pc_inside&&!lr_inside)return;
+        if(++playlayer_boundary_logs_<=96u)
+            log_<<"IOS PLAYLAYER BOUNDARY: method=addSpriteSheets pc=0x"<<Hex(pc)<<" lr=0x"<<Hex(lr)
+                <<" r0=0x"<<Hex(cpu_.Regs()[0])<<" r4=0x"<<Hex(cpu_.Regs()[4])
+                <<" tracked-self=0x"<<Hex(active_play_layer_)<<"\n";
+        // In ARM EABI r4 is callee-saved. addSpriteSheets saves self in r4 at
+        // +0x0c and never intentionally replaces it. PT22 proved r4 becomes zero
+        // later in this method after nested Objective-C calls. Repair only this
+        // known invariant, and only while execution is in/returning to this one
+        // PlayLayer method.
+        if(pc_inside&&pc<=start+0x0cu&&cpu_.Regs()[0]==0u){
+            cpu_.Regs()[0]=active_play_layer_;
+            ++playlayer_self_repairs_;
+            log_<<"IOS PLAYLAYER SELF REPAIR: register=r0 method=addSpriteSheets pc=0x"<<Hex(pc)
+                <<" restored=0x"<<Hex(active_play_layer_)<<" count="<<playlayer_self_repairs_<<"\n";
+        }
+        if((pc_inside||lr_inside)&&cpu_.Regs()[4]==0u){
+            cpu_.Regs()[4]=active_play_layer_;
+            ++playlayer_self_repairs_;
+            log_<<"IOS PLAYLAYER SELF REPAIR: register=r4 method=addSpriteSheets pc=0x"<<Hex(pc)
+                <<" lr=0x"<<Hex(lr)<<" restored=0x"<<Hex(active_play_layer_)
+                <<" count="<<playlayer_self_repairs_<<"\n";
+        }
+    }
     std::string ResolveDelegateName(u32 object){const std::string candidate=DescribeString(object);if(!candidate.empty()&&FindGuestClassByName(candidate))return candidate;for(std::string_view preferred:{std::string_view("AppDelegate"),std::string_view("AppController")})if(FindGuestClassByName(preferred))return std::string(preferred);return {};}
     std::string SelectorName(u32 selector_addr){
         std::string selector;
@@ -2592,6 +2652,7 @@ private:
                     if(selector=="activate"||selector=="onPlay:"||selector=="onContinue:"||selector=="ccTouchEnded:withEvent:")
                         log_<<"IOS MENU: "<<instance_class->name<<" -"<<selector<<" receiver=0x"<<Hex(receiver)<<" arg=0x"<<Hex(cpu_.Regs()[2])<<"\n";
                 }
+                cpu_.Regs()[0]=receiver;
                 EnterGuestMethod(*method);return true;
             }
             if(selector=="class"){cpu_.Regs()[0]=instance_class->class_addr;return true;}
@@ -2783,6 +2844,11 @@ private:
                 if(const GuestClass* target_cls=FindGuestClassForInstance(target_obj)){
                     const std::string target_name=SelectorName(target_sel);
                     if(const GuestMethod* target=FindInstanceMethodRecursive(target_cls,target_name)){
+                        if(target_cls->name=="PlayLayer"){
+                            active_play_layer_=target_obj;
+                            if(++playlayer_track_logs_<=16u)
+                                log_<<"IOS PLAYLAYER: NSThread target instance=0x"<<Hex(target_obj)<<" selector="<<target_name<<"\n";
+                        }
                         log_<<"IOS THREAD: NSThread start selector="<<target_name<<" target="<<target_cls->name<<" policy=synchronous\n";
                         cpu_.Regs()[0]=target_obj;cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
                         EnterGuestMethod(*target);return true;
@@ -3598,6 +3664,7 @@ private:
     u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
+    u32 active_play_layer_=0;
     u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0,fast_enum_mutation_addr_=0;
     u32 touch_object_=0,touch_set_=0,touch_event_=0,touch_phase_=0;
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
@@ -3605,6 +3672,7 @@ private:
     u64 virtual_time_usec_=1350000000000000ull;
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
+    u64 playlayer_track_logs_=0,playlayer_boundary_logs_=0,playlayer_self_repairs_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
