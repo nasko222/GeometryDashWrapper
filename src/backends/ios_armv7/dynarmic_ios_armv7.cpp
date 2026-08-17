@@ -1279,7 +1279,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest19 runs the real Forlorn cocos2d flow with NSInvocation actions, libc realloc support, plist-backed MenuSceneBackground scenery, targeted touches, and corrected CoreGraphics image drawing.\n";
+            log_<<"Execution status: PublicTest20 runs the real Forlorn cocos2d flow with NPOT texture support, UIKit text sizing/rasterization, NSInvocation actions, libc realloc, plist-backed scenery, targeted touches, and corrected CoreGraphics image drawing.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -2184,6 +2184,89 @@ private:
     std::string ClassNameForAddress(u32 addr)const{auto it=fake_objects_.find(addr);if(it!=fake_objects_.end())return it->second.class_name;for(const auto& c:classes_)if(c.class_addr==addr||c.meta_addr==addr)return c.name;const GuestClass* instance=FindGuestClassForInstance(addr);return instance?instance->name:std::string{};}
     std::string DescribeString(u32 obj){if(!obj)return {};auto it=fake_objects_.find(obj);if(it!=fake_objects_.end()&&!it->second.string_value.empty())return it->second.string_value;std::string direct;if(env_.ReadCString(obj,direct,512u)&&!direct.empty()&&std::all_of(direct.begin(),direct.end(),[](unsigned char c){return c>=0x20&&c<0x7f;}))return direct;if(env_.IsMapped(obj,16u)){const u32 chars=env_.MemoryRead32(obj+8u);std::string s;if(chars&&env_.ReadCString(chars,s,512u))return s;}return {};}
 
+    float FakeFontSize(u32 font)const{
+        auto it=fake_objects_.find(font);
+        if(it!=fake_objects_.end()&&it->second.class_name=="UIFont"&&it->second.aux0){
+            const float v=FloatFromBits(it->second.aux0);
+            if(std::isfinite(v)&&v>=4.0f&&v<=256.0f)return v;
+        }
+        return 16.0f;
+    }
+    u32 NewFakeFont(float size,bool bold=false){
+        if(!std::isfinite(size)||size<4.0f||size>256.0f)size=16.0f;
+        const u32 obj=NewExternalInstance("UIFont");
+        fake_objects_[obj].aux0=FloatToBits(size);
+        fake_objects_[obj].aux1=bold?1u:0u;
+        return obj;
+    }
+    std::pair<float,float> MeasureHostText(const std::string& text,float font_size){
+        if(text.empty())return {1.0f,std::max(1.0f,std::ceil(font_size*1.25f))};
+#ifdef _WIN32
+        HDC dc=CreateCompatibleDC(nullptr);
+        if(dc){
+            const int px=std::max(6,static_cast<int>(std::lround(font_size*96.0f/72.0f)));
+            HFONT font=CreateFontW(-px,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Arial");
+            HGDIOBJ old=font?SelectObject(dc,font):nullptr;
+            std::wstring w;
+            if(!text.empty()){
+                const int need=MultiByteToWideChar(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0);
+                if(need>0){w.resize(static_cast<std::size_t>(need));MultiByteToWideChar(CP_UTF8,0,text.data(),static_cast<int>(text.size()),w.data(),need);}
+            }
+            SIZE sz{};
+            if(!w.empty()&&GetTextExtentPoint32W(dc,w.c_str(),static_cast<int>(w.size()),&sz)){
+                if(old)SelectObject(dc,old);if(font)DeleteObject(font);DeleteDC(dc);
+                return {std::max(1.0f,float(sz.cx+2)),std::max(1.0f,float(sz.cy+2))};
+            }
+            if(old)SelectObject(dc,old);if(font)DeleteObject(font);DeleteDC(dc);
+        }
+#endif
+        return {std::max(1.0f,std::ceil(float(text.size())*font_size*0.58f)+2.0f),
+                std::max(1.0f,std::ceil(font_size*1.25f)+2.0f)};
+    }
+    bool RasterizeTextToBitmapContext(u32 ctx,const std::string& text,float font_size,int alignment){
+        auto it=bitmap_contexts_.find(ctx);
+        if(it==bitmap_contexts_.end())return false;
+        const u32 data=it->second[0],width=it->second[1],height=it->second[2],bits=it->second[3],bpr=it->second[4];
+        if(!data||!width||!height||width>4096u||height>4096u||!bpr||!env_.IsMapped(data,std::size_t(bpr)*height))return false;
+        std::vector<u8> out(std::size_t(bpr)*height,0u);
+#ifdef _WIN32
+        BITMAPINFO bmi{};bmi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bmi.bmiHeader.biWidth=static_cast<LONG>(width);
+        bmi.bmiHeader.biHeight=-static_cast<LONG>(height);bmi.bmiHeader.biPlanes=1;bmi.bmiHeader.biBitCount=32;bmi.bmiHeader.biCompression=BI_RGB;
+        void* dib_bits=nullptr;HDC dc=CreateCompatibleDC(nullptr);HBITMAP dib=dc?CreateDIBSection(dc,&bmi,DIB_RGB_COLORS,&dib_bits,nullptr,0):nullptr;
+        if(dc&&dib&&dib_bits){
+            HGDIOBJ old_bmp=SelectObject(dc,dib);PatBlt(dc,0,0,static_cast<int>(width),static_cast<int>(height),BLACKNESS);
+            const int px=std::max(6,static_cast<int>(std::lround(font_size*96.0f/72.0f)));
+            HFONT font=CreateFontW(-px,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Arial");
+            HGDIOBJ old_font=font?SelectObject(dc,font):nullptr;SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
+            std::wstring w;const int need=MultiByteToWideChar(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0);
+            if(need>0){w.resize(static_cast<std::size_t>(need));MultiByteToWideChar(CP_UTF8,0,text.data(),static_cast<int>(text.size()),w.data(),need);}
+            RECT rc{0,0,static_cast<LONG>(width),static_cast<LONG>(height)};
+            UINT flags=DT_TOP|DT_NOPREFIX|DT_SINGLELINE;
+            if(alignment==1)flags|=DT_CENTER;else if(alignment==2)flags|=DT_RIGHT;else flags|=DT_LEFT;
+            if(!w.empty())DrawTextW(dc,w.c_str(),static_cast<int>(w.size()),&rc,flags);
+            const auto* bgra=static_cast<const u8*>(dib_bits);
+            for(u32 y=0;y<height;++y)for(u32 x=0;x<width;++x){
+                const std::size_t so=(std::size_t(y)*width+x)*4u;
+                const u8 a=std::max({bgra[so+0],bgra[so+1],bgra[so+2]});
+                if(bits<=8u){const std::size_t o=std::size_t(y)*bpr+x;if(o<out.size())out[o]=a;}
+                else{const std::size_t o=std::size_t(y)*bpr+x*4u;if(o+3u<out.size()){out[o]=255u;out[o+1]=255u;out[o+2]=255u;out[o+3]=a;}}
+            }
+            if(old_font)SelectObject(dc,old_font);if(font)DeleteObject(font);SelectObject(dc,old_bmp);DeleteObject(dib);DeleteDC(dc);
+            env_.WriteBytes(data,out.data(),out.size());return true;
+        }
+        if(dib)DeleteObject(dib);if(dc)DeleteDC(dc);
+#endif
+        const auto measured=MeasureHostText(text,font_size);const u32 glyph_h=std::max<u32>(1u,std::min<u32>(height,static_cast<u32>(std::ceil(measured.second))));
+        const u32 glyph_w=std::max<u32>(1u,static_cast<u32>(std::ceil(font_size*0.45f)));
+        const u32 gap=std::max<u32>(1u,glyph_w/4u);u32 total=static_cast<u32>(text.size())*(glyph_w+gap);
+        u32 x0=alignment==1&&total<width?(width-total)/2u:(alignment==2&&total<width?width-total:0u);
+        for(std::size_t ci=0;ci<text.size();++ci){if(text[ci]==' ')continue;const u32 gx=x0+static_cast<u32>(ci)*(glyph_w+gap);
+            for(u32 y=1;y+1<glyph_h&&y<height;++y)for(u32 x=0;x<glyph_w&&gx+x<width;++x){const std::size_t o=std::size_t(y)*bpr+gx+x;if(o<out.size())out[o]=255u;}}
+        env_.WriteBytes(data,out.data(),out.size());return true;
+    }
+
     bool HandleObjcMsgSendStret(){
         const u32 dest=cpu_.Regs()[0],receiver=cpu_.Regs()[1],selector_addr=cpu_.Regs()[2];
         std::string selector;if(selector_addr)env_.ReadCString(selector_addr,selector,1024u);
@@ -2211,6 +2294,27 @@ private:
         }
 
         const std::string cls=ClassNameForAddress(receiver);
+        const std::string receiver_text=DescribeString(receiver);
+        if(!receiver_text.empty()&&(selector=="sizeWithFont:"||selector=="sizeWithFont:forWidth:lineBreakMode:"||
+                                    selector=="sizeWithFont:constrainedToSize:"||selector=="sizeWithFont:constrainedToSize:lineBreakMode:")){
+            const float font_size=FakeFontSize(cpu_.Regs()[3]);
+            auto [w,h]=MeasureHostText(receiver_text,font_size);
+            w=std::clamp(w,1.0f,2048.0f);h=std::clamp(h,1.0f,2048.0f);
+            WriteCGPoint(dest,w,h);
+            if(++text_bridge_logs_<=48u)log_<<"IOS TEXT: size '"<<receiver_text<<"' font="<<font_size<<" -> "<<w<<"x"<<h<<"\n";
+            return true;
+        }
+        if(!receiver_text.empty()&&(selector=="drawInRect:withFont:lineBreakMode:alignment:"||selector=="drawInRect:withFont:"||selector=="drawAtPoint:withFont:")){
+            float font_size=16.0f;int alignment=0;
+            if(selector=="drawInRect:withFont:lineBreakMode:alignment:"){
+                font_size=FakeFontSize(StackArg(3));alignment=static_cast<int>(StackArg(5));
+            }else if(selector=="drawInRect:withFont:")font_size=FakeFontSize(StackArg(3));
+            else font_size=FakeFontSize(StackArg(1));
+            const bool drew=current_uigraphics_context_&&RasterizeTextToBitmapContext(current_uigraphics_context_,receiver_text,font_size,alignment);
+            auto [w,h]=MeasureHostText(receiver_text,font_size);WriteCGPoint(dest,std::clamp(w,1.0f,2048.0f),std::clamp(h,1.0f,2048.0f));
+            if(++text_bridge_logs_<=48u)log_<<"IOS TEXT: draw '"<<receiver_text<<"' ctx=0x"<<Hex(current_uigraphics_context_)<<" font="<<font_size<<" rendered="<<(drew?"yes":"no")<<"\n";
+            return true;
+        }
         if(selector=="bounds"||selector=="frame"||selector=="applicationFrame"){
             WriteCGRect(dest,0.0f,0.0f,320.0f,480.0f);
             if(++stret_stub_logs_<=16u)
@@ -2287,6 +2391,11 @@ private:
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            if(instance_class->name=="CCConfiguration"&&selector=="supportsNPOT"){
+                cpu_.Regs()[0]=1u;
+                if(++capability_override_logs_<=16u)log_<<"IOS HOSTGL: CCConfiguration supportsNPOT -> YES (desktop GL bridge)\n";
+                return true;
+            }
             if(selector=="setOpenGLView:"&&cpu_.Regs()[2]){
                 eagl_view_instance_=cpu_.Regs()[2];
                 log_<<"IOS INPUT: captured EAGLView=0x"<<Hex(eagl_view_instance_)<<"\n";
@@ -2412,6 +2521,12 @@ private:
             if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithString:"){
                 cpu_.Regs()[0]=NewFakeString(DescribeString(cpu_.Regs()[2]));return true;
             }
+            if(fo.is_class&&fo.class_name=="UIFont"&&(selector=="systemFontOfSize:"||selector=="boldSystemFontOfSize:")){
+                cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[2]),selector=="boldSystemFontOfSize:");return true;
+            }
+            if(fo.is_class&&fo.class_name=="UIFont"&&selector=="fontWithName:size:"){
+                cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[3]),false);return true;
+            }
             if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
                 cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
             }
@@ -2511,6 +2626,10 @@ private:
                     }
                     cpu_.Regs()[0]=array;return true;
                 }
+            }
+            if(!fo.is_class&&fo.class_name=="UIFont"){
+                if(selector=="pointSize"||selector=="lineHeight"){cpu_.Regs()[0]=FloatToBits(FakeFontSize(receiver)*(selector=="lineHeight"?1.20f:1.0f));return true;}
+                if(selector=="fontName"){cpu_.Regs()[0]=NewFakeString("Arial");return true;}
             }
             if(!fo.is_class&&fo.class_name=="NSThread"&&selector=="initWithTarget:selector:object:"){
                 fake_objects_[receiver].aux0=cpu_.Regs()[2];
@@ -3084,6 +3203,16 @@ private:
             }
             cpu_.Regs()[0]=0u;return true;
         }
+        if(name=="UIGraphicsPushContext"){
+            current_uigraphics_context_=cpu_.Regs()[0];cpu_.Regs()[0]=0u;
+            if(++text_context_logs_<=24u)log_<<"IOS TEXT: UIGraphicsPushContext ctx=0x"<<Hex(current_uigraphics_context_)<<"\n";
+            return true;
+        }
+        if(name=="UIGraphicsPopContext"){
+            if(++text_context_logs_<=24u)log_<<"IOS TEXT: UIGraphicsPopContext ctx=0x"<<Hex(current_uigraphics_context_)<<"\n";
+            current_uigraphics_context_=0u;cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="UIGraphicsGetCurrentContext"){cpu_.Regs()[0]=current_uigraphics_context_;return true;}
         if(name=="CGContextClearRect"||name=="CGContextSaveGState"||name=="CGContextRestoreGState"||name=="CGContextScaleCTM"||
            name=="CGContextTranslateCTM"||name=="CGContextSetRGBFillColor"||name=="CGContextSetGrayFillColor"||
            name=="CGContextSetRGBStrokeColor"||name=="CGContextSetLineWidth"||name=="CGContextBeginPath"||
@@ -3265,14 +3394,14 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
     HostOpenGLWindow host_window_;
     std::set<u32> fake_cgimages_;
-    u32 last_cgimage_=0;
+    u32 last_cgimage_=0,current_uigraphics_context_=0;
     std::unordered_map<u32,std::array<u32,6>> bitmap_contexts_;
     std::string delegate_name_;
 };
