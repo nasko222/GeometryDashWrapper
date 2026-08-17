@@ -33,6 +33,16 @@
 #endif
 #include <windows.h>
 #include <GL/gl.h>
+
+#ifndef GL_UNSIGNED_SHORT_4_4_4_4
+#define GL_UNSIGNED_SHORT_4_4_4_4 0x8033
+#endif
+#ifndef GL_UNSIGNED_SHORT_5_5_5_1
+#define GL_UNSIGNED_SHORT_5_5_5_1 0x8034
+#endif
+#ifndef GL_UNSIGNED_SHORT_5_6_5
+#define GL_UNSIGNED_SHORT_5_6_5 0x8363
+#endif
 #endif
 
 #include "dynarmic/interface/A32/a32.h"
@@ -1263,7 +1273,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest13 runs the real Forlorn cocos2d loop with IPA-backed stdio/resource loading until the user closes the window.\n";
+            log_<<"Execution status: PublicTest15 runs the real Forlorn cocos2d MenuScene with packed-texture conversion and UIKit/cocos2d hit-testing until the user closes the window.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1895,10 +1905,62 @@ private:
             const GLenum format=static_cast<GLenum>(StackArg(2));
             const GLenum type=static_cast<GLenum>(StackArg(3));
             const u32 pixels_addr=StackArg(4);
-            const std::size_t approx=(width>0&&height>0&&width<16384&&height<16384)?std::size_t(width)*height*4u:1u;
-            const void* pixels=pixels_addr?env_.HostPointer(pixels_addr,std::min<std::size_t>(approx,64u*1024u*1024u)):nullptr;
-            glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),static_cast<GLint>(r[2]),width,height,border,format,type,pixels);
-            if(++texture_upload_logs_<=24u)log_<<"IOS TEX: glTexImage2D bound="<<bound_texture_<<" "<<width<<"x"<<height<<" format=0x"<<Hex(format)<<" type=0x"<<Hex(type)<<" pixels=0x"<<Hex(pixels_addr)<<"\n";
+            const bool sane=width>0&&height>0&&width<16384&&height<16384;
+            const std::size_t pixel_count=sane?std::size_t(width)*height:0u;
+            std::size_t bytes_per_pixel=4u;
+            if(type==GL_UNSIGNED_SHORT_4_4_4_4||type==GL_UNSIGNED_SHORT_5_5_5_1||type==GL_UNSIGNED_SHORT_5_6_5)bytes_per_pixel=2u;
+            else if(type==GL_UNSIGNED_BYTE){
+                if(format==GL_RGB)bytes_per_pixel=3u;
+                else if(format==GL_LUMINANCE_ALPHA)bytes_per_pixel=2u;
+                else if(format==GL_ALPHA||format==GL_LUMINANCE)bytes_per_pixel=1u;
+            }
+            const std::size_t byte_count=pixel_count?pixel_count*bytes_per_pixel:1u;
+            const void* pixels=pixels_addr?env_.HostPointer(pixels_addr,std::min<std::size_t>(byte_count,64u*1024u*1024u)):nullptr;
+
+            bool converted=false;
+            std::vector<GLubyte> converted_rgba;
+            if(pixels&&pixel_count&&format==GL_RGBA&&
+               (type==GL_UNSIGNED_SHORT_4_4_4_4||type==GL_UNSIGNED_SHORT_5_5_5_1)){
+                converted_rgba.resize(pixel_count*4u);
+                const auto* src=static_cast<const u8*>(pixels);
+                for(std::size_t i=0;i<pixel_count;++i){
+                    const u16 p=u16(src[i*2u])|(u16(src[i*2u+1u])<<8u);
+                    if(type==GL_UNSIGNED_SHORT_4_4_4_4){
+                        converted_rgba[i*4u+0u]=static_cast<u8>(((p>>12u)&0x0fu)*17u);
+                        converted_rgba[i*4u+1u]=static_cast<u8>(((p>>8u)&0x0fu)*17u);
+                        converted_rgba[i*4u+2u]=static_cast<u8>(((p>>4u)&0x0fu)*17u);
+                        converted_rgba[i*4u+3u]=static_cast<u8>((p&0x0fu)*17u);
+                    }else{
+                        converted_rgba[i*4u+0u]=static_cast<u8>(((p>>11u)&0x1fu)*255u/31u);
+                        converted_rgba[i*4u+1u]=static_cast<u8>(((p>>6u)&0x1fu)*255u/31u);
+                        converted_rgba[i*4u+2u]=static_cast<u8>(((p>>1u)&0x1fu)*255u/31u);
+                        converted_rgba[i*4u+3u]=(p&1u)?255u:0u;
+                    }
+                }
+                glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),GL_RGBA,width,height,border,GL_RGBA,GL_UNSIGNED_BYTE,converted_rgba.data());
+                converted=true;
+            }else if(pixels&&pixel_count&&format==GL_RGB&&type==GL_UNSIGNED_SHORT_5_6_5){
+                converted_rgba.resize(pixel_count*4u);
+                const auto* src=static_cast<const u8*>(pixels);
+                for(std::size_t i=0;i<pixel_count;++i){
+                    const u16 p=u16(src[i*2u])|(u16(src[i*2u+1u])<<8u);
+                    converted_rgba[i*4u+0u]=static_cast<u8>(((p>>11u)&0x1fu)*255u/31u);
+                    converted_rgba[i*4u+1u]=static_cast<u8>(((p>>5u)&0x3fu)*255u/63u);
+                    converted_rgba[i*4u+2u]=static_cast<u8>((p&0x1fu)*255u/31u);
+                    converted_rgba[i*4u+3u]=255u;
+                }
+                glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),GL_RGBA,width,height,border,GL_RGBA,GL_UNSIGNED_BYTE,converted_rgba.data());
+                converted=true;
+            }else{
+                glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),static_cast<GLint>(r[2]),width,height,border,format,type,pixels);
+            }
+
+            if(++texture_upload_logs_<=32u)
+                log_<<"IOS TEX: glTexImage2D bound="<<bound_texture_<<" "<<width<<"x"<<height
+                    <<" format=0x"<<Hex(format)<<" type=0x"<<Hex(type)
+                    <<" pixels=0x"<<Hex(pixels_addr)<<" bytes="<<byte_count
+                    <<" host="<<(pixels?"ok":"null")
+                    <<" converted="<<(converted?"RGBA8":"no")<<"\\n";
             r[0]=0u;return true;
         }
         if(name=="glCompressedTexImage2D"){
@@ -2258,6 +2320,9 @@ private:
                 if(!application_instance_)application_instance_=NewExternalInstance("UIApplication");
                 cpu_.Regs()[0]=application_instance_;return true;
             }
+            if(fo.is_class&&fo.class_name=="NSAssertionHandler"&&selector=="currentHandler"){
+                cpu_.Regs()[0]=NewExternalInstance("NSAssertionHandler");return true;
+            }
             if(fo.is_class&&fo.class_name=="NSThread"&&selector=="currentThread"){
                 if(!main_thread_instance_)main_thread_instance_=NewExternalInstance("NSThread");
                 cpu_.Regs()[0]=main_thread_instance_;return true;
@@ -2278,6 +2343,9 @@ private:
             if(fo.is_class&&(selector=="sharedInstance"||selector=="defaultManager"||selector=="defaultCenter"||selector=="standardUserDefaults"||selector=="mainBundle"||selector=="mainScreen"||selector=="currentDevice")){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
             if(fo.is_class&&fo.class_name=="NSString"&&(selector=="stringWithCString:encoding:"||selector=="stringWithUTF8String:")){
                 std::string value;env_.ReadCString(cpu_.Regs()[2],value,1u<<20);cpu_.Regs()[0]=NewFakeString(value);return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithString:"){
+                cpu_.Regs()[0]=NewFakeString(DescribeString(cpu_.Regs()[2]));return true;
             }
             if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
                 cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
@@ -2421,6 +2489,10 @@ private:
                 if(selector=="stringValue"){cpu_.Regs()[0]=NewFakeString(std::to_string(value));return true;}
             }
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
+            if(!fo.is_class&&fo.class_name=="NSAssertionHandler"&&selector.starts_with("handleFailureIn")){
+                if(++assertion_stub_logs_<=16u)log_<<"IOS FOUNDATION: suppressed NSAssertionHandler "<<selector<<"\n";
+                cpu_.Regs()[0]=0u;return true;
+            }
             if(!fo.is_class&&fo.class_name=="NSLock"&&(selector=="lock"||selector=="unlock"||selector=="tryLock")){cpu_.Regs()[0]=selector=="tryLock"?1u:0u;return true;}
             if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
             if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="presentRenderbuffer:"){host_window_.Present();cpu_.Regs()[0]=1u;return true;}
@@ -2464,6 +2536,30 @@ private:
             if(selector=="hasPrefix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=string_value.rfind(rhs,0u)==0u?1u:0u;return true;}
             if(selector=="hasSuffix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=(rhs.size()<=string_value.size()&&string_value.compare(string_value.size()-rhs.size(),rhs.size(),rhs)==0)?1u:0u;return true;}
             if(selector=="stringByAppendingString:"){cpu_.Regs()[0]=NewFakeString(string_value+DescribeString(cpu_.Regs()[2]));return true;}
+            if(selector=="stringByAppendingPathComponent:"){
+                std::string lhs=string_value,rhs=DescribeString(cpu_.Regs()[2]);
+                std::replace(lhs.begin(),lhs.end(),'\\','/');
+                std::replace(rhs.begin(),rhs.end(),'\\','/');
+                while(!rhs.empty()&&rhs.front()=='/')rhs.erase(rhs.begin());
+                if(lhs.empty())cpu_.Regs()[0]=NewFakeString(rhs);
+                else{
+                    if(lhs.back()!='/')lhs.push_back('/');
+                    cpu_.Regs()[0]=NewFakeString(lhs+rhs);
+                }
+                return true;
+            }
+            if(selector=="pathExtension"){
+                const auto slash=string_value.find_last_of("/\\");
+                const auto dot=string_value.find_last_of('.');
+                cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?string_value.substr(dot+1u):std::string{});
+                return true;
+            }
+            if(selector=="stringByDeletingPathExtension"){
+                const auto slash=string_value.find_last_of("/\\");
+                const auto dot=string_value.find_last_of('.');
+                cpu_.Regs()[0]=NewFakeString(dot!=std::string::npos&&(slash==std::string::npos||dot>slash)?string_value.substr(0,dot):string_value);
+                return true;
+            }
             if(selector=="isAbsolutePath"){cpu_.Regs()[0]=(!string_value.empty()&&(string_value[0]=='/'||(string_value.size()>2&&string_value[1]==':')))?1u:0u;return true;}
             if(selector=="lastPathComponent"){const auto p=string_value.find_last_of("/\\");cpu_.Regs()[0]=NewFakeString(p==std::string::npos?string_value:string_value.substr(p+1u));return true;}
             if(selector=="stringByDeletingLastPathComponent"){const auto p=string_value.find_last_of("/\\");cpu_.Regs()[0]=NewFakeString(p==std::string::npos?std::string{}:string_value.substr(0,p));return true;}
@@ -2572,6 +2668,37 @@ private:
             else result=std::pow(a,FloatFromBits(cpu_.Regs()[1]));
             cpu_.Regs()[0]=FloatToBits(result);return true;
         }
+        if(name=="CGRectContainsPoint"){
+            float x=FloatFromBits(cpu_.Regs()[0]),y=FloatFromBits(cpu_.Regs()[1]);
+            float w=FloatFromBits(cpu_.Regs()[2]),h=FloatFromBits(cpu_.Regs()[3]);
+            const float px=FloatFromBits(StackArg(0)),py=FloatFromBits(StackArg(1));
+            if(w<0.0f){x+=w;w=-w;} if(h<0.0f){y+=h;h=-h;}
+            const bool hit=px>=x&&py>=y&&px<=x+w&&py<=y+h;
+            cpu_.Regs()[0]=hit?1u:0u;
+            if(++rect_hit_logs_<=48u)
+                log_<<"IOS INPUT HITTEST: rect=("<<x<<","<<y<<","<<w<<","<<h<<") point=("
+                    <<px<<","<<py<<") -> "<<(hit?"HIT":"MISS")<<"\\n";
+            return true;
+        }
+        if(name=="CGRectIntersectsRect"){
+            float ax=FloatFromBits(cpu_.Regs()[0]),ay=FloatFromBits(cpu_.Regs()[1]);
+            float aw=FloatFromBits(cpu_.Regs()[2]),ah=FloatFromBits(cpu_.Regs()[3]);
+            float bx=FloatFromBits(StackArg(0)),by=FloatFromBits(StackArg(1));
+            float bw=FloatFromBits(StackArg(2)),bh=FloatFromBits(StackArg(3));
+            if(aw<0){ax+=aw;aw=-aw;} if(ah<0){ay+=ah;ah=-ah;}
+            if(bw<0){bx+=bw;bw=-bw;} if(bh<0){by+=bh;bh=-bh;}
+            cpu_.Regs()[0]=(ax<bx+bw&&bx<ax+aw&&ay<by+bh&&by<ay+ah)?1u:0u;return true;
+        }
+        if(name=="CGRectContainsRect"){
+            float ax=FloatFromBits(cpu_.Regs()[0]),ay=FloatFromBits(cpu_.Regs()[1]);
+            float aw=FloatFromBits(cpu_.Regs()[2]),ah=FloatFromBits(cpu_.Regs()[3]);
+            float bx=FloatFromBits(StackArg(0)),by=FloatFromBits(StackArg(1));
+            float bw=FloatFromBits(StackArg(2)),bh=FloatFromBits(StackArg(3));
+            if(aw<0){ax+=aw;aw=-aw;} if(ah<0){ay+=ah;ah=-ah;}
+            if(bw<0){bx+=bw;bw=-bw;} if(bh<0){by+=bh;bh=-bh;}
+            cpu_.Regs()[0]=(bx>=ax&&by>=ay&&bx+bw<=ax+aw&&by+bh<=ay+ah)?1u:0u;return true;
+        }
+
         if(name=="CGPointFromString"||name=="CGSizeFromString"){
             float v[2]{};
             if(ExtractFloats(DescribeString(cpu_.Regs()[1]),v,2u))WriteCGPoint(cpu_.Regs()[0],v[0],v[1]);
@@ -2818,7 +2945,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
