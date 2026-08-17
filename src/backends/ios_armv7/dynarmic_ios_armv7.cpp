@@ -762,6 +762,12 @@ private:
 
 struct Import { std::string name; u32 stub=0; u32 svc=0; u64 calls=0; };
 struct FakeObject { std::string class_name; bool is_class=false; bool is_meta=false; std::string string_value; std::string resource_value; u32 aux0=0,aux1=0,aux2=0; };
+struct FakeInvocation {
+    u32 signature=0;
+    u32 target=0;
+    u32 selector=0;
+    std::array<u32,8> arguments{};
+};
 struct GuestMethod { std::string selector; u32 selector_addr=0; u32 imp=0; };
 struct GuestClass { std::string name; u32 class_addr=0; u32 meta_addr=0; u32 superclass_addr=0; u32 instance_size=0; std::vector<GuestMethod> instance_methods; std::vector<GuestMethod> class_methods; };
 
@@ -1273,7 +1279,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest17 runs the real Forlorn cocos2d MenuScene with complete targeted-touch performSelector dispatch and CGRect-correct CoreGraphics image drawing until the user closes the window.\n";
+            log_<<"Execution status: PublicTest18 runs the real Forlorn cocos2d MenuScene with Foundation NSInvocation action dispatch, targeted touches, and corrected CoreGraphics image drawing until the user closes the window.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1790,6 +1796,7 @@ private:
                selector=="ccTouchBegan:withEvent:"||selector=="ccTouchMoved:withEvent:"||
                selector=="ccTouchEnded:withEvent:"||selector=="ccTouchCancelled:withEvent:"||
                selector=="selected"||selector=="unselected"||selector=="activate"||
+               selector=="methodSignatureForSelector:"||selector=="invoke"||
                (class_name=="MenuScene"&&(selector=="onPlay:"||selector=="onContinue:"));
     }
     void TraceSceneMessage(std::string_view kind,std::string_view class_name,std::string_view selector,u32 value=0u){
@@ -2247,6 +2254,19 @@ private:
                 TraceSceneMessage("class-runtime",guest_class_receiver->name,selector,cpu_.Regs()[0]);
             return true;
         }
+        if(guest_class_receiver&&selector=="methodSignatureForSelector:"){
+            const u32 target_sel=cpu_.Regs()[2];
+            const std::string target_name=SelectorName(target_sel);
+            const GuestMethod* method=FindClassMethodRecursive(guest_class_receiver,target_name);
+            if(!method){cpu_.Regs()[0]=0u;return true;}
+            const u32 sig=NewExternalInstance("NSMethodSignature");
+            fake_method_signature_args_[sig]=2u+static_cast<u32>(std::count(target_name.begin(),target_name.end(),':'));
+            fake_objects_[sig].aux0=target_sel;
+            cpu_.Regs()[0]=sig;
+            if(++invocation_logs_<=32u)log_<<"IOS INVOCATION: class signature "<<guest_class_receiver->name
+                <<" +"<<target_name<<" argc="<<fake_method_signature_args_[sig]<<" sig=0x"<<Hex(sig)<<"\n";
+            return true;
+        }
         if(guest_class_receiver&&!guest_meta_receiver&&(selector=="alloc"||selector=="new")){cpu_.Regs()[0]=NewGuestInstance(*guest_class_receiver);return true;}
         if(guest_class_receiver){
             const GuestMethod* method=FindClassMethodRecursive(guest_class_receiver,selector);
@@ -2271,6 +2291,19 @@ private:
             if(selector=="methodForSelector:"){
                 cpu_.Regs()[0]=GuestMethodImpForSelector(instance_class,false,cpu_.Regs()[2]);
                 TraceSceneMessage("instance-runtime",instance_class->name,selector,cpu_.Regs()[0]);
+                return true;
+            }
+            if(selector=="methodSignatureForSelector:"){
+                const u32 target_sel=cpu_.Regs()[2];
+                const std::string target_name=SelectorName(target_sel);
+                const GuestMethod* method=FindInstanceMethodRecursive(instance_class,target_name);
+                if(!method){cpu_.Regs()[0]=0u;return true;}
+                const u32 sig=NewExternalInstance("NSMethodSignature");
+                fake_method_signature_args_[sig]=2u+static_cast<u32>(std::count(target_name.begin(),target_name.end(),':'));
+                fake_objects_[sig].aux0=target_sel;
+                cpu_.Regs()[0]=sig;
+                if(++invocation_logs_<=32u)log_<<"IOS INVOCATION: instance signature "<<instance_class->name
+                    <<" -"<<target_name<<" argc="<<fake_method_signature_args_[sig]<<" sig=0x"<<Hex(sig)<<"\n";
                 return true;
             }
             if(selector=="respondsToSelector:"){
@@ -2335,6 +2368,14 @@ private:
             if(fo.is_class&&fo.class_name=="UIApplication"&&selector=="sharedApplication"){
                 if(!application_instance_)application_instance_=NewExternalInstance("UIApplication");
                 cpu_.Regs()[0]=application_instance_;return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSInvocation"&&selector=="invocationWithMethodSignature:"){
+                const u32 invocation=NewExternalInstance("NSInvocation");
+                fake_invocations_[invocation].signature=cpu_.Regs()[2];
+                cpu_.Regs()[0]=invocation;
+                if(++invocation_logs_<=32u)log_<<"IOS INVOCATION: create invocation=0x"<<Hex(invocation)
+                    <<" signature=0x"<<Hex(cpu_.Regs()[2])<<"\n";
+                return true;
             }
             if(fo.is_class&&fo.class_name=="NSAssertionHandler"&&selector=="currentHandler"){
                 cpu_.Regs()[0]=NewExternalInstance("NSAssertionHandler");return true;
@@ -2560,6 +2601,70 @@ private:
             if(!fo.is_class&&fo.class_name=="NSEnumerator"&&selector=="nextObject"){
                 auto& values=fake_collections_[receiver];u32& index=fake_objects_[receiver].aux0;
                 cpu_.Regs()[0]=index<values.size()?values[index++]:0u;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSMethodSignature"){
+                const u32 argc=fake_method_signature_args_.count(receiver)?fake_method_signature_args_[receiver]:2u;
+                if(selector=="numberOfArguments"){cpu_.Regs()[0]=argc;return true;}
+                if(selector=="methodReturnLength"){cpu_.Regs()[0]=0u;return true;}
+                if(selector=="frameLength"){cpu_.Regs()[0]=argc*4u;return true;}
+                if(selector=="isOneway"){cpu_.Regs()[0]=0u;return true;}
+                if(selector=="methodReturnType"||selector=="getArgumentTypeAtIndex:"){
+                    cpu_.Regs()[0]=AllocateCString("@");return true;
+                }
+            }
+            if(!fo.is_class&&fo.class_name=="NSInvocation"){
+                auto& inv=fake_invocations_[receiver];
+                if(selector=="setTarget:"){inv.target=cpu_.Regs()[2];cpu_.Regs()[0]=0u;return true;}
+                if(selector=="target"){cpu_.Regs()[0]=inv.target;return true;}
+                if(selector=="setSelector:"){inv.selector=cpu_.Regs()[2];cpu_.Regs()[0]=0u;return true;}
+                if(selector=="selector"){cpu_.Regs()[0]=inv.selector;return true;}
+                if(selector=="methodSignature"){cpu_.Regs()[0]=inv.signature;return true;}
+                if(selector=="setArgument:atIndex:"){
+                    const u32 ptr=cpu_.Regs()[2],index=cpu_.Regs()[3];
+                    u32 value=0u;
+                    if(ptr&&env_.IsMapped(ptr,4u))value=env_.MemoryRead32(ptr);
+                    if(index<inv.arguments.size())inv.arguments[index]=value;
+                    if(++invocation_logs_<=32u)log_<<"IOS INVOCATION: setArgument invocation=0x"<<Hex(receiver)
+                        <<" index="<<index<<" value=0x"<<Hex(value)<<"\\n";
+                    cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="getArgument:atIndex:"){
+                    const u32 ptr=cpu_.Regs()[2],index=cpu_.Regs()[3];
+                    if(ptr&&env_.IsMapped(ptr,4u)&&index<inv.arguments.size())env_.MemoryWrite32(ptr,inv.arguments[index]);
+                    cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="retainArguments"){cpu_.Regs()[0]=0u;return true;}
+                if(selector=="argumentsRetained"){cpu_.Regs()[0]=1u;return true;}
+                if(selector=="invoke"||selector=="invokeWithTarget:"){
+                    const u32 target=selector=="invokeWithTarget:"?cpu_.Regs()[2]:inv.target;
+                    const u32 target_sel=inv.selector;
+                    const std::string target_name=SelectorName(target_sel);
+                    if(const GuestClass* target_cls=FindGuestClassForInstance(target)){
+                        if(const GuestMethod* method=FindInstanceMethodRecursive(target_cls,target_name)){
+                            cpu_.Regs()[0]=target;cpu_.Regs()[1]=target_sel;
+                            cpu_.Regs()[2]=inv.arguments[2];cpu_.Regs()[3]=inv.arguments[3];
+                            if(++invocation_logs_<=64u)log_<<"IOS INVOCATION: invoke "<<target_cls->name
+                                <<" -"<<target_name<<" target=0x"<<Hex(target)
+                                <<" arg2=0x"<<Hex(inv.arguments[2])<<" imp=0x"<<Hex(method->imp)<<"\\n";
+                            if(target_cls->name=="MenuScene"&&(target_name=="onPlay:"||target_name=="onContinue:"))
+                                log_<<"IOS MENU ACTION: "<<target_cls->name<<" -"<<target_name
+                                    <<" sender=0x"<<Hex(inv.arguments[2])<<"\\n";
+                            EnterGuestMethod(*method);return true;
+                        }
+                    }
+                    if(const GuestClass* target_cls=FindGuestClassByClassAddress(target)){
+                        if(const GuestMethod* method=FindClassMethodRecursive(target_cls,target_name)){
+                            cpu_.Regs()[0]=target;cpu_.Regs()[1]=target_sel;
+                            cpu_.Regs()[2]=inv.arguments[2];cpu_.Regs()[3]=inv.arguments[3];
+                            if(++invocation_logs_<=64u)log_<<"IOS INVOCATION: invoke class "<<target_cls->name
+                                <<" +"<<target_name<<" target=0x"<<Hex(target)<<" imp=0x"<<Hex(method->imp)<<"\\n";
+                            EnterGuestMethod(*method);return true;
+                        }
+                    }
+                    if(++invocation_logs_<=64u)log_<<"IOS INVOCATION: invoke missing target=0x"<<Hex(target)
+                        <<" selector="<<target_name<<"\\n";
+                    cpu_.Regs()[0]=0u;return true;
+                }
             }
             if(!fo.is_class&&fo.class_name=="NSNumber"){
                 const double value=fake_numbers_.count(receiver)?fake_numbers_[receiver]:0.0;
@@ -3059,7 +3164,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
@@ -3068,7 +3173,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;

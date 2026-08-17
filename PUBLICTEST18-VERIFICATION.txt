@@ -1,0 +1,61 @@
+Geometry Dash Wrapper 0.9.6-publictest18 verification
+
+Latest PublicTest17 Forlorn 1.9c log:
+  PASS: full direct-PNG Forlorn logo renders correctly.
+  PASS: CCMenu ccTouchBegan executes.
+  PASS: CGRectContainsPoint returns HIT.
+  PASS: CCMenuItemSprite selected executes.
+  PASS: targeted touch is claimed.
+  PASS: performSelector:withObject:withObject: dispatches ccTouchEnded.
+  PASS: CCMenuItemSprite unselected executes.
+  PASS: CCMenuItemSprite activate executes repeatedly.
+  FAIL: MenuScene onPlay:/onContinue: never executes.
+
+Latest PublicTest17 Forlorn 0.101 log:
+  PASS: same ccTouchEnded -> unselected -> activate chain.
+  FAIL: target menu action still never executes.
+
+Mach-O/cocos2d diagnosis:
+  PASS: CCMenuItem has invocation_ ivar of type NSInvocation.
+  PASS: CCMenuItem -activate sends `invoke` to invocation_.
+  PASS: initWithTarget:selector: uses methodSignatureForSelector,
+        invocationWithMethodSignature, setTarget, setSelector,
+        numberOfArguments and setArgument:atIndex:.
+  ROOT CAUSE: PublicTest17 did not implement NSMethodSignature/NSInvocation,
+              so invocation_ was never a functional action object.
+
+PublicTest18:
+  PASS: guest methodSignatureForSelector resolves real guest methods.
+  PASS: NSMethodSignature numberOfArguments = 2 + selector colon count.
+  PASS: NSInvocation creation and signature association.
+  PASS: setTarget/setSelector persistence.
+  PASS: setArgument/getArgument at Objective-C argument indices.
+  PASS: retainArguments/argumentsRetained.
+  PASS: invoke/invokeWithTarget tail-dispatch real guest methods.
+  PASS: one-object action sender is delivered from invocation index 2.
+  PASS: dedicated IOS INVOCATION and IOS MENU ACTION diagnostics.
+
+Regression:
+  PASS: PublicTest17 full-logo CGContextDrawImage rect/padding fix retained.
+  PASS: PublicTest17 two-object performSelector retained.
+  PASS: PublicTest16 NSMutableSet targeted touch ownership retained.
+  PASS: PublicTest15 CGRectContainsPoint / packed texture support retained.
+  PASS: PublicTest14 binary plist/Foundation containers retained.
+  PASS: PublicTest13 IPA stdio/CCZ/zlib retained.
+  PASS: PublicTest12 loading thread + Win32/UIKit input retained.
+  PASS: x86/shared Android runtime unchanged.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+
+Syntax:
+  PASS: C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected PLAY construction:
+  IOS INVOCATION: instance signature MenuScene -onPlay: argc=3 ...
+  IOS INVOCATION: create invocation=...
+  IOS INVOCATION: setArgument ... index=2 value=0x...
+
+Expected PLAY click:
+  IOS MENU: CCMenuItemSprite -activate ...
+  IOS INVOCATION: invoke MenuScene -onPlay: ... arg2=0x...
+  IOS MENU ACTION: MenuScene -onPlay: sender=0x...
+  IOS MENU: MenuScene -onPlay: ...
