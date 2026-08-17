@@ -1,0 +1,46 @@
+Geometry Dash Wrapper 0.9.6-publictest25 verification
+
+PublicTest24 runtime evidence supplied by the user
+--------------------------------------------------
+- Forlorn 0.101 reaches LoadingScene -> PlayScene and renders level scenery.
+- A real Player object reaches scheduleUpdate before PlayScene begins.
+- In one run the process later goes silent during gameplay/touch dispatch rather
+  than producing a normal RESULT marker.
+- The same level-load path reports invalid sprite-frame/texture assertions.
+- NSString rangeOfString: is observed through objc_msgSend_stret but PT24 returns
+  a generic zero CGRect instead of NSRange.
+- Forlorn 1.9c still reaches pathological allocation growth and can consume the
+  complete 256 MiB iOS guest heap.
+- Every PublicTest24 ABI repair observed in all supplied logs concerns r9; no
+  r4-r8/r10-r11/SP repair is observed.
+
+PublicTest25 fixes
+------------------
+PASS: synthetic Objective-C call frame excludes r9 from callee-saved state.
+PASS: r4-r8, r10-r11 and SP remain protected across guest Objective-C calls.
+PASS: NSString rangeOfString:/rangeOfString:options: return 32-bit NSRange.
+PASS: NSNotFound uses 0x7fffffff for the 32-bit guest.
+PASS: substringFromIndex:, substringToIndex:, substringWithRange: implemented.
+PASS: CGRectEqualToRect implemented.
+PASS: CGRectApplyAffineTransform writes a transformed bounding CGRect using the
+      observed ARMv7 hidden-structure-return argument layout.
+PASS: NSAssertionHandler logs first format object when it can be decoded.
+PASS: Touch/Frame no-SVC stall heartbeat flushes PC/LR/call depth to disk.
+PASS: prolonged gameplay host-call stall exits with IOS_HOSTCALL_STALL.
+PASS: iOS guest heap remains 0x10000000 bytes (256 MiB).
+PASS: no game IPA/APK/executable payload is included in the source package.
+PASS: C++20 syntax-only compile of the iOS backend succeeds with the local
+      Dynarmic interface stub used for earlier public-test verification.
+
+Expected useful runtime markers
+-------------------------------
+IOS FOUNDATION STRING: rangeOfString ... -> {...}
+IOS FOUNDATION: suppressed NSAssertionHandler ... arg1='...'
+IOS HOSTCALL STALL WATCH: stage=Touch|Frame ...
+RESULT: IOS_HOSTCALL_STALL ...          (only if a hard guest loop remains)
+
+Important interpretation
+------------------------
+A normal PT25 run should no longer emit ABI repairs merely because r9 changes.
+If ABI REPAIR still appears, it should identify a true protected register or SP
+change and therefore be substantially more actionable than PT24's r9 noise.

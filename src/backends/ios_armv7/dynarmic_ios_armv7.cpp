@@ -82,6 +82,8 @@ constexpr u32 kObjectSize = 0x00400000u;
 constexpr u32 kStackBase = 0x70000000u;
 constexpr u32 kStackSize = 0x01000000u;
 constexpr u32 kSvcReturn = 0x00fffffeu;
+constexpr u32 kSvcGuestCallReturn = 0x00fffffdu;
+constexpr u32 kGuestCallReturnStub = kControlBase + 0x8u;
 constexpr u64 kRunChunk = 5000000u;
 constexpr u64 kRunBudget = 600000000u;
 constexpr u32 kFrameProbeCount = 0u; // 0 = run until the user closes the host window
@@ -1208,6 +1210,7 @@ public:
         env_.Map(kObjectBase, kObjectSize, false);
         env_.Map(kStackBase, kStackSize, false);
         WriteArmSvc(kControlBase, kSvcReturn);
+        WriteArmSvc(kGuestCallReturnStub, kSvcGuestCallReturn);
         BindStream(image_.dyld.bind_off, image_.dyld.bind_size, "bind");
         BindStream(image_.dyld.weak_bind_off, image_.dyld.weak_bind_size, "weak-bind");
         BindStream(image_.dyld.lazy_bind_off, image_.dyld.lazy_bind_size, "lazy-bind");
@@ -1236,7 +1239,6 @@ public:
         u64 budget = kRunBudget;
         while (budget && !done_) {
             env_.ResetStopState();
-            RepairPlayLayerSelfBoundary();
             const u64 chunk = std::min<u64>(budget, kRunChunk);
             env_.ticks_left = chunk;
             const auto reason = cpu_.Run();
@@ -1267,9 +1269,27 @@ public:
                 return false;
             }
             if (env_.svc_pending) {
+                host_stage_no_svc_chunks_=0u;
                 if (!HandleSvc(env_.pending_svc)) return false;
                 continue;
             }
+            if(host_call_stage_==HostCallStage::Touch||host_call_stage_==HostCallStage::Frame){
+                ++host_stage_no_svc_chunks_;
+                if(host_stage_no_svc_chunks_==1u||host_stage_no_svc_chunks_%4u==0u){
+                    log_<<"IOS HOSTCALL STALL WATCH: stage="<<(host_call_stage_==HostCallStage::Touch?"Touch":"Frame")
+                        <<" chunks="<<host_stage_no_svc_chunks_<<" pc=0x"<<Hex(cpu_.Regs()[15])
+                        <<" lr=0x"<<Hex(cpu_.Regs()[14])<<" guest-depth="<<guest_call_frames_.size();
+                    if(!guest_call_frames_.empty())log_<<" top='"<<guest_call_frames_.back().label<<"'";
+                    log_<<"\n";
+                    log_.Flush();
+                }
+                if(host_stage_no_svc_chunks_>=20u){
+                    log_<<"RESULT: IOS_HOSTCALL_STALL stage="<<(host_call_stage_==HostCallStage::Touch?"Touch":"Frame")
+                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<"\n";
+                    LogFaultContext();
+                    return false;
+                }
+            }else host_stage_no_svc_chunks_=0u;
         }
         if(frame_probe_completed_){
             log_<<(host_window_closed_?"RESULT: IOS_HOST_WINDOW_CLOSED":"RESULT: IOS_HOST_OPENGL_PROBE_OK")
@@ -1282,7 +1302,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest23 expands the iOS guest heap and adds a narrowly scoped PlayLayer addSpriteSheets self-register guard plus diagnostics on the real level-loading path.\n";
+            log_<<"Execution status: PublicTest25 corrects the 32-bit iOS Objective-C call ABI (r9 caller-saved), implements NSString NSRange/slicing compatibility, and adds gameplay stall diagnostics.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1404,6 +1424,12 @@ private:
             if(index<imports_.size())log_<<"IOS FAULT IMPORT CONTEXT: "<<imports_[index].name<<" stub=0x"<<Hex(stub)<<" calls="<<imports_[index].calls<<"\n";
             else log_<<"IOS FAULT IMPORT CONTEXT: unknown-slot stub=0x"<<Hex(stub)<<" index="<<index<<"\n";
         }
+        const std::string fault_selector=SelectorName(r[1]);
+        if(!fault_selector.empty())log_<<"IOS FAULT SELECTOR: "<<fault_selector<<" selector=0x"<<Hex(r[1])<<"\n";
+        const std::string callsite=DescribeGuestCodeAddress(r[14]);
+        if(!callsite.empty())log_<<"IOS FAULT GUEST CALLSITE: "<<callsite<<" lr=0x"<<Hex(r[14])<<"\n";
+        if(!guest_call_frames_.empty())log_<<"IOS FAULT GUEST CALL STACK: depth="<<guest_call_frames_.size()
+            <<" top="<<guest_call_frames_.back().label<<" imp=0x"<<Hex(guest_call_frames_.back().imp)<<"\n";
         u64 live_bytes=0u,free_bytes=0u;
         for(const auto& [ptr,bytes]:heap_allocation_sizes_){(void)ptr;live_bytes+=bytes;}
         for(const auto& b:heap_free_blocks_)free_bytes+=b.size;
@@ -1705,6 +1731,12 @@ private:
         const std::array<float,6> v{t.a,t.b,t.c,t.d,t.tx,t.ty};
         return dest&&env_.IsMapped(dest,sizeof(v))&&env_.WriteBytes(dest,v.data(),sizeof(v));
     }
+    bool WriteNSRange(u32 dest,u32 location,u32 length){
+        if(!dest||!env_.IsMapped(dest,8u))return false;
+        env_.MemoryWrite32(dest,location);
+        env_.MemoryWrite32(dest+4u,length);
+        return true;
+    }
     static Affine AffineConcat(const Affine& a,const Affine& b){
         return Affine{
             a.a*b.a+a.c*b.b,
@@ -1915,56 +1947,100 @@ private:
         }
         return object;
     }
-    void EnterGuestMethod(const GuestMethod& method){cpu_.Regs()[15]=method.imp&~1u;cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((method.imp&1u)?0x20u:0u));}
-    bool GuestPcInsideMethod(const GuestClass* cls,const GuestMethod* method,u32 address) const {
-        if(!cls||!method)return false;
-        const u32 start=method->imp&~1u;
-        u32 end=start+0x1000u;
-        for(const auto& candidate:cls->instance_methods){
-            const u32 next=candidate.imp&~1u;
-            if(next>start&&next<end)end=next;
-        }
-        return address>=start&&address<end;
+    void EnterGuestMethod(const GuestMethod& method){
+        cpu_.Regs()[15]=method.imp&~1u;
+        cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((method.imp&1u)?0x20u:0u));
     }
-    void RepairPlayLayerSelfBoundary(){
-        if(!active_play_layer_)return;
-        const GuestClass* cls=FindGuestClassForInstance(active_play_layer_);
-        if(!cls||cls->name!="PlayLayer")return;
-        const GuestMethod* method=FindInstanceMethodRecursive(cls,"addSpriteSheets");
-        if(!method)return;
-        const u32 pc=cpu_.Regs()[15]&~1u,lr=cpu_.Regs()[14]&~1u;
-        const u32 start=method->imp&~1u;
-        const bool pc_inside=GuestPcInsideMethod(cls,method,pc);
-        const bool lr_inside=GuestPcInsideMethod(cls,method,lr);
-        if(!pc_inside&&!lr_inside)return;
-        if(++playlayer_boundary_logs_<=96u)
-            log_<<"IOS PLAYLAYER BOUNDARY: method=addSpriteSheets pc=0x"<<Hex(pc)<<" lr=0x"<<Hex(lr)
-                <<" r0=0x"<<Hex(cpu_.Regs()[0])<<" r4=0x"<<Hex(cpu_.Regs()[4])
-                <<" tracked-self=0x"<<Hex(active_play_layer_)<<"\n";
-        // In ARM EABI r4 is callee-saved. addSpriteSheets saves self in r4 at
-        // +0x0c and never intentionally replaces it. PT22 proved r4 becomes zero
-        // later in this method after nested Objective-C calls. Repair only this
-        // known invariant, and only while execution is in/returning to this one
-        // PlayLayer method.
-        if(pc_inside&&pc<=start+0x0cu&&cpu_.Regs()[0]==0u){
-            cpu_.Regs()[0]=active_play_layer_;
-            ++playlayer_self_repairs_;
-            log_<<"IOS PLAYLAYER SELF REPAIR: register=r0 method=addSpriteSheets pc=0x"<<Hex(pc)
-                <<" restored=0x"<<Hex(active_play_layer_)<<" count="<<playlayer_self_repairs_<<"\n";
-        }
-        if((pc_inside||lr_inside)&&cpu_.Regs()[4]==0u){
-            cpu_.Regs()[4]=active_play_layer_;
-            ++playlayer_self_repairs_;
-            log_<<"IOS PLAYLAYER SELF REPAIR: register=r4 method=addSpriteSheets pc=0x"<<Hex(pc)
-                <<" lr=0x"<<Hex(lr)<<" restored=0x"<<Hex(active_play_layer_)
-                <<" count="<<playlayer_self_repairs_<<"\n";
-        }
+
+    // Apple's 32-bit iOS PCS deliberately treats r9 as caller-saved.
+    // Preserve only the actual integer callee-saved set across a synthetic
+    // Objective-C call boundary: r4-r8, r10-r11 and SP.
+    static constexpr std::array<u32,7> kIosCalleeSavedRegs{4u,5u,6u,7u,8u,10u,11u};
+    struct GuestCallFrame {
+        std::array<u32,kIosCalleeSavedRegs.size()> callee_saved{};
+        u32 sp=0u;
+        u32 return_lr=0u;
+        u32 imp=0u;
+        std::string label;
+    };
+
+    void EnterGuestMethodCall(const GuestMethod& method,std::string label){
+        GuestCallFrame frame;
+        for(std::size_t i=0;i<frame.callee_saved.size();++i)frame.callee_saved[i]=cpu_.Regs()[kIosCalleeSavedRegs[i]];
+        frame.sp=cpu_.Regs()[13];
+        frame.return_lr=cpu_.Regs()[14];
+        frame.imp=method.imp;
+        frame.label=std::move(label);
+        guest_call_frames_.push_back(std::move(frame));
+        cpu_.Regs()[14]=kGuestCallReturnStub;
+        EnterGuestMethod(method);
     }
+
+    bool ReturnFromGuestMethodCall(){
+        if(guest_call_frames_.empty()){
+            log_<<"RESULT: IOS_GUEST_CALL_RETURN_WITHOUT_FRAME pc=0x"<<Hex(cpu_.Regs()[15])<<"\\n";
+            return false;
+        }
+        GuestCallFrame frame=std::move(guest_call_frames_.back());
+        guest_call_frames_.pop_back();
+        const u32 return_value=cpu_.Regs()[0];
+        bool repaired=false;
+        std::ostringstream changed;
+        for(std::size_t i=0;i<frame.callee_saved.size();++i){
+            const u32 reg=kIosCalleeSavedRegs[i];
+            if(cpu_.Regs()[reg]!=frame.callee_saved[i]){
+                if(repaired)changed<<",";
+                changed<<"r"<<reg<<":0x"<<Hex(cpu_.Regs()[reg])<<"->0x"<<Hex(frame.callee_saved[i]);
+                repaired=true;
+            }
+        }
+        if(cpu_.Regs()[13]!=frame.sp){
+            if(repaired)changed<<",";
+            changed<<"sp:0x"<<Hex(cpu_.Regs()[13])<<"->0x"<<Hex(frame.sp);
+            repaired=true;
+        }
+        if(repaired){
+            ++guest_call_abi_repairs_;
+            if(guest_call_abi_repairs_<=96u)
+                log_<<"IOS ABI REPAIR: "<<frame.label<<" imp=0x"<<Hex(frame.imp)
+                    <<" depth="<<(guest_call_frames_.size()+1u)<<" "<<changed.str()<<"\\n";
+        }
+        for(std::size_t i=0;i<frame.callee_saved.size();++i)cpu_.Regs()[kIosCalleeSavedRegs[i]]=frame.callee_saved[i];
+        cpu_.Regs()[13]=frame.sp;
+        cpu_.Regs()[14]=frame.return_lr;
+        cpu_.Regs()[0]=return_value;
+        cpu_.Regs()[15]=frame.return_lr&~1u;
+        cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((frame.return_lr&1u)?0x20u:0u));
+        return true;
+    }
+
     std::string ResolveDelegateName(u32 object){const std::string candidate=DescribeString(object);if(!candidate.empty()&&FindGuestClassByName(candidate))return candidate;for(std::string_view preferred:{std::string_view("AppDelegate"),std::string_view("AppController")})if(FindGuestClassByName(preferred))return std::string(preferred);return {};}
     std::string SelectorName(u32 selector_addr){
         std::string selector;
         if(selector_addr)env_.ReadCString(selector_addr,selector,1024u);
         return selector;
+    }
+    std::string DescribeGuestCodeAddress(u32 address)const{
+        const u32 pc=address&~1u;
+        u32 best_delta=0x2000u;
+        std::string best;
+        for(const auto& cls:classes_){
+            for(const auto& method:cls.instance_methods){
+                const u32 start=method.imp&~1u;
+                if(pc>=start&&pc-start<best_delta){
+                    best_delta=pc-start;
+                    best=cls.name+" -"+method.selector+"+0x"+Hex(best_delta);
+                }
+            }
+            for(const auto& method:cls.class_methods){
+                const u32 start=method.imp&~1u;
+                if(pc>=start&&pc-start<best_delta){
+                    best_delta=pc-start;
+                    best=cls.name+" +"+method.selector+"+0x"+Hex(best_delta);
+                }
+            }
+        }
+        return best;
     }
     u32 GuestMethodImpForSelector(const GuestClass* cls,bool class_method,u32 selector_addr){
         if(!cls||!selector_addr)return 0u;
@@ -2470,18 +2546,29 @@ private:
         if(class_receiver){
             if(const GuestMethod* method=FindClassMethodRecursive(class_receiver,selector)){
                 if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret class dispatch "<<class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
-                EnterGuestMethod(*method);return true;
+                EnterGuestMethodCall(*method,"stret "+class_receiver->name+" +"+selector);return true;
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
             if(const GuestMethod* method=FindInstanceMethodRecursive(instance_class,selector)){
                 if(++guest_dispatch_logs_<=64u)log_<<"IOS: objc guest stret instance dispatch "<<instance_class->name<<" -"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
-                EnterGuestMethod(*method);return true;
+                EnterGuestMethodCall(*method,"stret "+instance_class->name+" -"+selector);return true;
             }
         }
 
         const std::string cls=ClassNameForAddress(receiver);
         const std::string receiver_text=DescribeString(receiver);
+        if(!receiver_text.empty()&&(selector=="rangeOfString:"||selector=="rangeOfString:options:")){
+            const std::string search=DescribeString(cpu_.Regs()[3]);
+            const auto pos=receiver_text.find(search);
+            const u32 location=pos==std::string::npos?0x7fffffffu:static_cast<u32>(pos);
+            const u32 length=pos==std::string::npos?0u:static_cast<u32>(search.size());
+            WriteNSRange(dest,location,length);
+            if(++string_range_logs_<=32u)
+                log_<<"IOS FOUNDATION STRING: rangeOfString receiver='"<<receiver_text<<"' search='"<<search
+                    <<"' -> {"<<(location==0x7fffffffu?std::string("NSNotFound"):std::to_string(location))<<","<<length<<"}\n";
+            return true;
+        }
         if(!receiver_text.empty()&&(selector=="sizeWithFont:"||selector=="sizeWithFont:forWidth:lineBreakMode:"||
                                     selector=="sizeWithFont:constrainedToSize:"||selector=="sizeWithFont:constrainedToSize:lineBreakMode:")){
             const float font_size=FakeFontSize(cpu_.Regs()[3]);
@@ -2574,7 +2661,7 @@ private:
                     log_<<"IOS: objc guest class dispatch "<<guest_class_receiver->name<<" +"<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
                 if(ShouldTraceSceneMessage(guest_class_receiver->name,selector))
                     TraceSceneMessage("class-dispatch",guest_class_receiver->name,selector,method->imp);
-                EnterGuestMethod(*method);return true;
+                EnterGuestMethodCall(*method,guest_class_receiver->name+" +"+selector);return true;
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
@@ -2636,7 +2723,7 @@ private:
                         log_<<"IOS PERFORM2: "<<instance_class->name<<" -> "<<target_name
                             <<" arg1=0x"<<Hex(object_arg1)<<" arg2=0x"<<Hex(object_arg2)
                             <<" imp=0x"<<Hex(target->imp)<<"\n";
-                    EnterGuestMethod(*target);return true;
+                    EnterGuestMethodCall(*target,instance_class->name+" -"+target_name+" via "+selector);return true;
                 }
                 if(selector=="performSelector:withObject:withObject:"&&++perform2_logs_<=48u)
                     log_<<"IOS PERFORM2: missing target class="<<instance_class->name
@@ -2653,7 +2740,7 @@ private:
                         log_<<"IOS MENU: "<<instance_class->name<<" -"<<selector<<" receiver=0x"<<Hex(receiver)<<" arg=0x"<<Hex(cpu_.Regs()[2])<<"\n";
                 }
                 cpu_.Regs()[0]=receiver;
-                EnterGuestMethod(*method);return true;
+                EnterGuestMethodCall(*method,instance_class->name+" -"+selector);return true;
             }
             if(selector=="class"){cpu_.Regs()[0]=instance_class->class_addr;return true;}
             if(selector=="layer"&&(instance_class->name=="EAGLView"||instance_class->name=="UIView")){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
@@ -2697,7 +2784,7 @@ private:
                     if(const GuestMethod* target=FindInstanceMethodRecursive(target_cls,target_name)){
                         log_<<"IOS THREAD: detach selector="<<target_name<<" target="<<target_cls->name<<" policy=synchronous\n";
                         cpu_.Regs()[0]=target_obj;cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
-                        EnterGuestMethod(*target);return true;
+                        EnterGuestMethodCall(*target,target_cls->name+" -"+target_name+" via detach");return true;
                     }
                 }
                 cpu_.Regs()[0]=0u;return true;
@@ -2851,7 +2938,7 @@ private:
                         }
                         log_<<"IOS THREAD: NSThread start selector="<<target_name<<" target="<<target_cls->name<<" policy=synchronous\n";
                         cpu_.Regs()[0]=target_obj;cpu_.Regs()[1]=target_sel;cpu_.Regs()[2]=object_arg;
-                        EnterGuestMethod(*target);return true;
+                        EnterGuestMethodCall(*target,target_cls->name+" -"+target_name+" via NSThread");return true;
                     }
                 }
                 cpu_.Regs()[0]=0u;return true;
@@ -2992,7 +3079,7 @@ private:
                             if(target_cls->name=="MenuScene"&&(target_name=="onPlay:"||target_name=="onContinue:"))
                                 log_<<"IOS MENU ACTION: "<<target_cls->name<<" -"<<target_name
                                     <<" sender=0x"<<Hex(inv.arguments[2])<<"\\n";
-                            EnterGuestMethod(*method);return true;
+                            EnterGuestMethodCall(*method,target_cls->name+" -"+target_name+" via NSInvocation");return true;
                         }
                     }
                     if(const GuestClass* target_cls=FindGuestClassByClassAddress(target)){
@@ -3001,7 +3088,7 @@ private:
                             cpu_.Regs()[2]=inv.arguments[2];cpu_.Regs()[3]=inv.arguments[3];
                             if(++invocation_logs_<=64u)log_<<"IOS INVOCATION: invoke class "<<target_cls->name
                                 <<" +"<<target_name<<" target=0x"<<Hex(target)<<" imp=0x"<<Hex(method->imp)<<"\\n";
-                            EnterGuestMethod(*method);return true;
+                            EnterGuestMethodCall(*method,target_cls->name+" +"+target_name+" via NSInvocation");return true;
                         }
                     }
                     if(++invocation_logs_<=64u)log_<<"IOS INVOCATION: invoke missing target=0x"<<Hex(target)
@@ -3094,6 +3181,10 @@ private:
                         detail=DescribeString(StackArg(2));
                     log_<<"IOS FOUNDATION: suppressed NSAssertionHandler "<<selector;
                     if(!detail.empty())log_<<" description='"<<detail<<"'";
+                    if(selector=="handleFailureInMethod:object:file:lineNumber:description:"){
+                        const std::string arg1=DescribeString(StackArg(3));
+                        if(!arg1.empty())log_<<" arg1='"<<arg1<<"'";
+                    }
                     log_<<"\n";
                 }
                 cpu_.Regs()[0]=0u;return true;
@@ -3140,6 +3231,9 @@ private:
             if(selector=="floatValue"){cpu_.Regs()[0]=FloatToBits(std::strtof(string_value.c_str(),nullptr));return true;}
             if(selector=="hasPrefix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=string_value.rfind(rhs,0u)==0u?1u:0u;return true;}
             if(selector=="hasSuffix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=(rhs.size()<=string_value.size()&&string_value.compare(string_value.size()-rhs.size(),rhs.size(),rhs)==0)?1u:0u;return true;}
+            if(selector=="substringFromIndex:"){const std::size_t i=std::min<std::size_t>(cpu_.Regs()[2],string_value.size());cpu_.Regs()[0]=NewFakeString(string_value.substr(i));return true;}
+            if(selector=="substringToIndex:"){const std::size_t i=std::min<std::size_t>(cpu_.Regs()[2],string_value.size());cpu_.Regs()[0]=NewFakeString(string_value.substr(0,i));return true;}
+            if(selector=="substringWithRange:"){const std::size_t i=std::min<std::size_t>(cpu_.Regs()[2],string_value.size());const std::size_t n=std::min<std::size_t>(cpu_.Regs()[3],string_value.size()-i);cpu_.Regs()[0]=NewFakeString(string_value.substr(i,n));return true;}
             if(selector=="stringByAppendingString:"){cpu_.Regs()[0]=NewFakeString(string_value+DescribeString(cpu_.Regs()[2]));return true;}
             if(selector=="stringByAppendingPathComponent:"){
                 std::string lhs=string_value,rhs=DescribeString(cpu_.Regs()[2]);
@@ -3178,7 +3272,7 @@ private:
         if(!super_ptr||!env_.IsMapped(super_ptr,8u)){cpu_.Regs()[0]=0;return true;}
         const u32 receiver=env_.MemoryRead32(super_ptr);const u32 current_class=env_.MemoryRead32(super_ptr+4u);
         const GuestClass* current=FindGuestClassByClassAddress(current_class);
-        if(current){if(const GuestClass* parent=FindGuestClassByClassAddress(current->superclass_addr)){if(const GuestMethod* method=FindInstanceMethodRecursive(parent,selector)){cpu_.Regs()[0]=receiver;EnterGuestMethod(*method);return true;}}}
+        if(current){if(const GuestClass* parent=FindGuestClassByClassAddress(current->superclass_addr)){if(const GuestMethod* method=FindInstanceMethodRecursive(parent,selector)){cpu_.Regs()[0]=receiver;EnterGuestMethodCall(*method,parent->name+" -"+selector+" via super");return true;}}}
         // The common superclass calls during bootstrap are NSObject/UIKit init,
         // retain and release operations. Returning the original receiver is the
         // safe Objective-C identity behavior for those initializers.
@@ -3188,7 +3282,8 @@ private:
         cpu_.Regs()[0]=receiver;return true;
     }
 
-    bool HandleSvc(u32 svc){if(svc==kSvcReturn){
+    bool HandleSvc(u32 svc){if(svc==kSvcGuestCallReturn)return ReturnFromGuestMethodCall();
+    if(svc==kSvcReturn){
         if(host_call_stage_==HostCallStage::Delegate){
             delegate_launch_active_=false;delegate_launch_returned_=true;delegate_return_value_=cpu_.Regs()[0];
             log_<<"IOS: real delegate launch returned r0=0x"<<Hex(delegate_return_value_)<<"\n";
@@ -3272,6 +3367,32 @@ private:
             else if(name=="atan2f")result=std::atan2(a,FloatFromBits(cpu_.Regs()[1]));
             else result=std::pow(a,FloatFromBits(cpu_.Regs()[1]));
             cpu_.Regs()[0]=FloatToBits(result);return true;
+        }
+        if(name=="CGRectEqualToRect"){
+            const float ax=FloatFromBits(cpu_.Regs()[0]),ay=FloatFromBits(cpu_.Regs()[1]);
+            const float aw=FloatFromBits(cpu_.Regs()[2]),ah=FloatFromBits(cpu_.Regs()[3]);
+            const float bx=FloatFromBits(StackArg(0)),by=FloatFromBits(StackArg(1));
+            const float bw=FloatFromBits(StackArg(2)),bh=FloatFromBits(StackArg(3));
+            cpu_.Regs()[0]=(ax==bx&&ay==by&&aw==bw&&ah==bh)?1u:0u;return true;
+        }
+        if(name=="CGRectApplyAffineTransform"){
+            const u32 dest=cpu_.Regs()[0];
+            const float x=FloatFromBits(cpu_.Regs()[1]),y=FloatFromBits(cpu_.Regs()[2]);
+            const float w=FloatFromBits(cpu_.Regs()[3]),h=FloatFromBits(StackArg(0));
+            const Affine t{FloatFromBits(StackArg(1)),FloatFromBits(StackArg(2)),FloatFromBits(StackArg(3)),
+                           FloatFromBits(StackArg(4)),FloatFromBits(StackArg(5)),FloatFromBits(StackArg(6))};
+            auto tx=[&](float px,float py){return std::pair<float,float>{px*t.a+py*t.c+t.tx,px*t.b+py*t.d+t.ty};};
+            const auto p0=tx(x,y),p1=tx(x+w,y),p2=tx(x,y+h),p3=tx(x+w,y+h);
+            const float minx=std::min({p0.first,p1.first,p2.first,p3.first});
+            const float maxx=std::max({p0.first,p1.first,p2.first,p3.first});
+            const float miny=std::min({p0.second,p1.second,p2.second,p3.second});
+            const float maxy=std::max({p0.second,p1.second,p2.second,p3.second});
+            WriteCGRect(dest,minx,miny,maxx-minx,maxy-miny);
+            if(++geometry_bridge_logs_<=16u)
+                log_<<"IOS COREGRAPHICS: CGRectApplyAffineTransform rect=("<<x<<","<<y<<","<<w<<","<<h
+                    <<") matrix=("<<t.a<<","<<t.b<<","<<t.c<<","<<t.d<<","<<t.tx<<","<<t.ty
+                    <<") -> ("<<minx<<","<<miny<<","<<(maxx-minx)<<","<<(maxy-miny)<<")\n";
+            cpu_.Regs()[0]=0u;return true;
         }
         if(name=="CGRectContainsPoint"){
             float x=FloatFromBits(cpu_.Regs()[0]),y=FloatFromBits(cpu_.Regs()[1]);
@@ -3660,7 +3781,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
     u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
@@ -3672,7 +3793,8 @@ private:
     u64 virtual_time_usec_=1350000000000000ull;
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
-    u64 playlayer_track_logs_=0,playlayer_boundary_logs_=0,playlayer_self_repairs_=0;
+    u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0;
+    u32 host_stage_no_svc_chunks_=0u;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
