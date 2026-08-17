@@ -1,0 +1,61 @@
+Geometry Dash Wrapper 0.9.6-publictest14 verification
+
+PublicTest13 supplied runtime log:
+  PASS: loadManagers completes.
+  PASS: MenuSheet.pvr.ccz opens from the IPA.
+  PASS: CCZ uncompress succeeds: src=36955, dst=262196.
+  PASS: MenuScene is constructed and replaces BootScene.
+  PASS: MenuScene onEnter/onEnterTransitionDidFinish execute.
+  PASS: runtime continues through frame 337.
+  PASS: 30 translated UIKit touch events are processed.
+  PASS: termination is user window-close, not a crash.
+
+Observed visual symptom:
+  Direct PNG forlorn_logo_menu.png is visible.
+  TexturePacker atlas-backed menu artwork/buttons are absent.
+
+Root cause addressed in PublicTest14:
+  PublicTest13's fake Foundation collections did not parse binary .plist files
+  and did not persist normal NSDictionary/NSMutableDictionary cache entries.
+  MenuSheet.plist therefore could not generate cocos2d CCSpriteFrame entries.
+
+PublicTest14:
+  PASS: bplist00 parser handles dict/array/string/bool/int/real.
+  PASS: +[NSDictionary dictionaryWithContentsOfFile:] reads IPA resources.
+  PASS: NSDictionary/NSMutableDictionary objectForKey/setObject persistence.
+  PASS: NSArray/NSMutableArray mutation and lookup.
+  PASS: Objective-C countByEnumeratingWithState:objects:count: fast enumeration.
+  PASS: NSEnumerator nextObject.
+  PASS: NSNumber constructors and numeric accessors.
+  PASS: CGRectFromString / CGSizeFromString / CGPointFromString.
+  PASS: NSLock lock/unlock behavior for cocos2d caches.
+  PASS: independent glTexImage2D upload diagnostics.
+
+Exact supplied Forlorn fixture:
+  PASS: the PublicTest14 C++ binary-plist parser was compiled and executed
+        against Payload/Forlorn.app/MenuSheet.plist.
+  PASS: parsed root dictionary has frames + metadata.
+  PASS: frames dictionary contains exactly 9 entries.
+  PASS: metadata format = 2.
+  PASS: textureFileName = MenuSheet.pvr.ccz.
+
+Regression:
+  PASS: PublicTest13 IPA stdio/CCZ/zlib retained.
+  PASS: PublicTest12 NSThread loading + mouse/UIKit bridge retained.
+  PASS: PublicTest11 landscape/pillarbox presentation retained.
+  PASS: PublicTest10 CgBI/PNG asset decoder retained.
+  PASS: x86 source unchanged.
+  PASS: shared Android runtime source unchanged.
+  PASS: Android ARM implementation changes limited to version text.
+  PASS: TestFlight bypass retained.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+
+Syntax:
+  PASS: iOS C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected markers:
+  IOS PLIST: loaded MenuSheet.plist root-keys=2
+  IOS TEX: glTexImage2D bound=... 256x512 ... type=0x8033 ...
+
+If the original cocos2d atlas path is now complete, MenuSheet-backed buttons
+and artwork should appear instead of only the direct PNG logo.

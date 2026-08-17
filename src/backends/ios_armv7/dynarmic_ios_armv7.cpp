@@ -305,6 +305,175 @@ static std::string LowerAscii(std::string s){
     return s;
 }
 
+
+struct PlistValue {
+    enum class Kind { Null, Boolean, Integer, Real, String, Array, Dict };
+    Kind kind = Kind::Null;
+    bool boolean = false;
+    s64 integer = 0;
+    double real = 0.0;
+    std::string string;
+    std::vector<PlistValue> array;
+    std::vector<std::string> dict_keys;
+    std::vector<PlistValue> dict_values;
+};
+
+class BinaryPlistParser {
+public:
+    explicit BinaryPlistParser(const std::vector<u8>& bytes):bytes_(bytes){}
+
+    bool Parse(PlistValue& out) {
+        if(bytes_.size()<40u||std::memcmp(bytes_.data(),"bplist00",8u)!=0)return false;
+        const std::size_t trailer=bytes_.size()-32u;
+        offset_size_=bytes_[trailer+6u];
+        ref_size_=bytes_[trailer+7u];
+        num_objects_=ReadUInt(trailer+8u,8u);
+        top_object_=ReadUInt(trailer+16u,8u);
+        offset_table_=ReadUInt(trailer+24u,8u);
+        if(!offset_size_||offset_size_>8u||!ref_size_||ref_size_>8u||!num_objects_||
+           top_object_>=num_objects_||offset_table_>=bytes_.size()||
+           num_objects_>(1u<<20))return false;
+        if(offset_table_>bytes_.size()||num_objects_>(bytes_.size()-offset_table_)/offset_size_)return false;
+        cache_.resize(static_cast<std::size_t>(num_objects_));
+        active_.resize(static_cast<std::size_t>(num_objects_),false);
+        return ParseObject(top_object_,out,0u);
+    }
+
+private:
+    u64 ReadUInt(std::size_t pos,std::size_t bytes)const {
+        if(!bytes||bytes>8u||!RangeFits(bytes_.size(),pos,bytes))return 0u;
+        u64 value=0u;
+        for(std::size_t i=0;i<bytes;++i)value=(value<<8u)|bytes_[pos+i];
+        return value;
+    }
+    bool ObjectOffset(u64 object,std::size_t& off)const {
+        if(object>=num_objects_)return false;
+        const u64 raw=ReadUInt(static_cast<std::size_t>(offset_table_+object*offset_size_),offset_size_);
+        if(raw>=bytes_.size())return false;
+        off=static_cast<std::size_t>(raw);return true;
+    }
+    bool Count(std::size_t object_off,u8 marker,u64& count,std::size_t& payload)const {
+        count=marker&0x0fu;payload=object_off+1u;
+        if(count!=0x0fu)return payload<=bytes_.size();
+        if(payload>=bytes_.size())return false;
+        const u8 int_marker=bytes_[payload++];
+        if((int_marker>>4u)!=0x1u)return false;
+        const u8 power=int_marker&0x0fu;
+        if(power>3u)return false;
+        const std::size_t int_bytes=std::size_t(1u)<<power;
+        if(!RangeFits(bytes_.size(),payload,int_bytes))return false;
+        count=ReadUInt(payload,int_bytes);payload+=int_bytes;
+        return true;
+    }
+    static void AppendUtf8(std::string& out,u32 cp){
+        if(cp<=0x7fu)out.push_back(static_cast<char>(cp));
+        else if(cp<=0x7ffu){
+            out.push_back(static_cast<char>(0xc0u|(cp>>6u)));
+            out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
+        }else{
+            out.push_back(static_cast<char>(0xe0u|(cp>>12u)));
+            out.push_back(static_cast<char>(0x80u|((cp>>6u)&0x3fu)));
+            out.push_back(static_cast<char>(0x80u|(cp&0x3fu)));
+        }
+    }
+    bool ParseObject(u64 object,PlistValue& out,u32 depth){
+        if(depth>64u||object>=num_objects_)return false;
+        if(cache_[object]){out=*cache_[object];return true;}
+        if(active_[object])return false;
+        active_[object]=true;
+
+        std::size_t off=0;
+        if(!ObjectOffset(object,off)){active_[object]=false;return false;}
+        const u8 marker=bytes_[off],type=marker>>4u,info=marker&0x0fu;
+        PlistValue value;
+
+        if(type==0x0u){
+            if(info==0x8u){value.kind=PlistValue::Kind::Boolean;value.boolean=false;}
+            else if(info==0x9u){value.kind=PlistValue::Kind::Boolean;value.boolean=true;}
+            else value.kind=PlistValue::Kind::Null;
+        }else if(type==0x1u){
+            if(info>3u){active_[object]=false;return false;}
+            const std::size_t n=std::size_t(1u)<<info;
+            if(!RangeFits(bytes_.size(),off+1u,n)){active_[object]=false;return false;}
+            u64 raw=ReadUInt(off+1u,n);
+            if(n<8u&&(raw&(u64(1)<<(n*8u-1u))))raw|=(~u64(0))<<(n*8u);
+            value.kind=PlistValue::Kind::Integer;value.integer=static_cast<s64>(raw);
+        }else if(type==0x2u){
+            const std::size_t n=std::size_t(1u)<<info;
+            if((n!=4u&&n!=8u)||!RangeFits(bytes_.size(),off+1u,n)){active_[object]=false;return false;}
+            if(n==4u){
+                const u32 bits=static_cast<u32>(ReadUInt(off+1u,4u));
+                float f=0.0f;std::memcpy(&f,&bits,sizeof(f));value.real=f;
+            }else{
+                const u64 bits=ReadUInt(off+1u,8u);
+                double d=0.0;std::memcpy(&d,&bits,sizeof(d));value.real=d;
+            }
+            value.kind=PlistValue::Kind::Real;
+        }else if(type==0x5u||type==0x6u){
+            u64 count=0;std::size_t payload=0;
+            if(!Count(off,marker,count,payload)||count>(1u<<24)){active_[object]=false;return false;}
+            value.kind=PlistValue::Kind::String;
+            if(type==0x5u){
+                if(count>bytes_.size()||!RangeFits(bytes_.size(),payload,static_cast<std::size_t>(count))){active_[object]=false;return false;}
+                value.string.assign(reinterpret_cast<const char*>(bytes_.data()+payload),static_cast<std::size_t>(count));
+            }else{
+                if(count>bytes_.size()/2u||!RangeFits(bytes_.size(),payload,static_cast<std::size_t>(count)*2u)){active_[object]=false;return false;}
+                for(u64 i=0;i<count;++i)AppendUtf8(value.string,static_cast<u32>(ReadUInt(payload+static_cast<std::size_t>(i)*2u,2u)));
+            }
+        }else if(type==0xau||type==0xcu){
+            u64 count=0;std::size_t payload=0;
+            if(!Count(off,marker,count,payload)||count>(1u<<20)||count>(bytes_.size()/ref_size_)){active_[object]=false;return false;}
+            if(!RangeFits(bytes_.size(),payload,static_cast<std::size_t>(count)*ref_size_)){active_[object]=false;return false;}
+            value.kind=PlistValue::Kind::Array;value.array.reserve(static_cast<std::size_t>(count));
+            for(u64 i=0;i<count;++i){
+                const u64 ref=ReadUInt(payload+static_cast<std::size_t>(i)*ref_size_,ref_size_);
+                PlistValue child;if(!ParseObject(ref,child,depth+1u)){active_[object]=false;return false;}
+                value.array.push_back(std::move(child));
+            }
+        }else if(type==0xdu){
+            u64 count=0;std::size_t payload=0;
+            if(!Count(off,marker,count,payload)||count>(1u<<20)||count>(bytes_.size()/(2u*ref_size_))){active_[object]=false;return false;}
+            const std::size_t refs=static_cast<std::size_t>(count)*ref_size_;
+            if(!RangeFits(bytes_.size(),payload,refs*2u)){active_[object]=false;return false;}
+            value.kind=PlistValue::Kind::Dict;value.dict_keys.reserve(static_cast<std::size_t>(count));value.dict_values.reserve(static_cast<std::size_t>(count));
+            for(u64 i=0;i<count;++i){
+                const u64 key_ref=ReadUInt(payload+static_cast<std::size_t>(i)*ref_size_,ref_size_);
+                const u64 val_ref=ReadUInt(payload+refs+static_cast<std::size_t>(i)*ref_size_,ref_size_);
+                PlistValue key,val;
+                if(!ParseObject(key_ref,key,depth+1u)||key.kind!=PlistValue::Kind::String||
+                   !ParseObject(val_ref,val,depth+1u)){active_[object]=false;return false;}
+                value.dict_keys.push_back(key.string);value.dict_values.push_back(std::move(val));
+            }
+        }else{
+            active_[object]=false;return false;
+        }
+
+        active_[object]=false;
+        cache_[object]=value;
+        out=std::move(value);
+        return true;
+    }
+
+    const std::vector<u8>& bytes_;
+    u8 offset_size_=0,ref_size_=0;
+    u64 num_objects_=0,top_object_=0,offset_table_=0;
+    std::vector<std::optional<PlistValue>> cache_;
+    std::vector<bool> active_;
+};
+
+static bool ExtractFloats(std::string_view text,float* out,std::size_t count){
+    std::string copy(text);
+    const char* p=copy.c_str();
+    for(std::size_t i=0;i<count;++i){
+        while(*p&&!(std::isdigit(static_cast<unsigned char>(*p))||*p=='-'||*p=='+'||*p=='.'))++p;
+        if(!*p)return false;
+        char* end=nullptr;out[i]=std::strtof(p,&end);
+        if(end==p)return false;
+        p=end;
+    }
+    return true;
+}
+
 static bool IsMachOMagic(const std::vector<u8>& bytes) {
     if (bytes.size() < 4u) return false;
     const u32 le = ReadLe32(bytes.data());
@@ -1294,6 +1463,77 @@ private:
         file->pos+=amount;
         return static_cast<u32>(amount);
     }
+    u32 NewFakeNumber(double value){
+        const u32 obj=NewExternalInstance("NSNumber");
+        fake_numbers_[obj]=value;return obj;
+    }
+    u32 MakeFakePlistObject(const PlistValue& value){
+        switch(value.kind){
+        case PlistValue::Kind::Null:return 0u;
+        case PlistValue::Kind::Boolean:return NewFakeNumber(value.boolean?1.0:0.0);
+        case PlistValue::Kind::Integer:return NewFakeNumber(static_cast<double>(value.integer));
+        case PlistValue::Kind::Real:return NewFakeNumber(value.real);
+        case PlistValue::Kind::String:return NewFakeString(value.string);
+        case PlistValue::Kind::Array:{
+            const u32 obj=NewExternalInstance("NSArray");
+            auto& values=fake_collections_[obj];values.reserve(value.array.size());
+            for(const auto& child:value.array)values.push_back(MakeFakePlistObject(child));
+            return obj;
+        }
+        case PlistValue::Kind::Dict:{
+            const u32 obj=NewExternalInstance("NSDictionary");
+            auto& dict=fake_dictionaries_[obj];
+            auto& keys=fake_dictionary_keys_[obj];
+            for(std::size_t i=0;i<value.dict_keys.size()&&i<value.dict_values.size();++i){
+                const std::string& key=value.dict_keys[i];
+                const u32 child_obj=MakeFakePlistObject(value.dict_values[i]);
+                dict[key]=child_obj;keys.push_back(NewFakeString(key));
+            }
+            return obj;
+        }}
+        return 0u;
+    }
+    u32 LoadFakePlist(std::string request){
+        const std::string relative=ResolveAssetRelative(request);
+        if(relative.empty())return 0u;
+        auto cached=plist_roots_.find(relative);
+        if(cached!=plist_roots_.end())return cached->second;
+        std::string resolved;std::vector<u8> bytes;
+        if(!ReadAssetBytes(relative,resolved,bytes))return 0u;
+        PlistValue root;BinaryPlistParser parser(bytes);
+        if(!parser.Parse(root)||root.kind!=PlistValue::Kind::Dict){
+            if(++plist_failure_logs_<=8u)log_<<"IOS PLIST: parse failed "<<relative<<"\n";
+            return 0u;
+        }
+        const u32 obj=MakeFakePlistObject(root);plist_roots_[relative]=obj;
+        const auto dit=fake_dictionaries_.find(obj);
+        if(++plist_load_logs_<=24u)log_<<"IOS PLIST: loaded "<<relative<<" root-keys="<<(dit==fake_dictionaries_.end()?0u:dit->second.size())<<"\n";
+        return obj;
+    }
+    const std::vector<u32>* FastEnumerationValues(u32 receiver,std::vector<u32>& scratch){
+        auto cit=fake_collections_.find(receiver);
+        if(cit!=fake_collections_.end())return &cit->second;
+        auto kit=fake_dictionary_keys_.find(receiver);
+        if(kit!=fake_dictionary_keys_.end())return &kit->second;
+        return nullptr;
+    }
+    bool HandleFastEnumeration(u32 receiver){
+        const u32 state=cpu_.Regs()[2],buffer=cpu_.Regs()[3],capacity=StackArg(0);
+        if(!state||!buffer||!capacity||capacity>4096u||!env_.IsMapped(state,32u)||!env_.IsMapped(buffer,std::size_t(capacity)*4u)){cpu_.Regs()[0]=0u;return true;}
+        std::vector<u32> scratch;
+        const std::vector<u32>* values=FastEnumerationValues(receiver,scratch);
+        if(!values){cpu_.Regs()[0]=0u;return true;}
+        const u32 start=env_.MemoryRead32(state);
+        if(start>=values->size()){cpu_.Regs()[0]=0u;return true;}
+        const u32 count=std::min<u32>(capacity,static_cast<u32>(values->size()-start));
+        env_.WriteBytes(buffer,values->data()+start,std::size_t(count)*4u);
+        if(!fast_enum_mutation_addr_){fast_enum_mutation_addr_=Allocate(4u,4u);env_.MemoryWrite32(fast_enum_mutation_addr_,1u);}
+        env_.MemoryWrite32(state,start+count);
+        env_.MemoryWrite32(state+4u,buffer);
+        env_.MemoryWrite32(state+8u,fast_enum_mutation_addr_);
+        cpu_.Regs()[0]=count;return true;
+    }
+
     u32 EnsureFloatData(const std::string& symbol,std::initializer_list<float> values){
         auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
         const u32 addr=Allocate(static_cast<u32>(values.size()*sizeof(float)),4u);
@@ -1658,6 +1898,7 @@ private:
             const std::size_t approx=(width>0&&height>0&&width<16384&&height<16384)?std::size_t(width)*height*4u:1u;
             const void* pixels=pixels_addr?env_.HostPointer(pixels_addr,std::min<std::size_t>(approx,64u*1024u*1024u)):nullptr;
             glTexImage2D(static_cast<GLenum>(r[0]),static_cast<GLint>(r[1]),static_cast<GLint>(r[2]),width,height,border,format,type,pixels);
+            if(++texture_upload_logs_<=24u)log_<<"IOS TEX: glTexImage2D bound="<<bound_texture_<<" "<<width<<"x"<<height<<" format=0x"<<Hex(format)<<" type=0x"<<Hex(type)<<" pixels=0x"<<Hex(pixels_addr)<<"\n";
             r[0]=0u;return true;
         }
         if(name=="glCompressedTexImage2D"){
@@ -2041,6 +2282,24 @@ private:
             if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
                 cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
             }
+            if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&selector=="dictionaryWithContentsOfFile:"){
+                cpu_.Regs()[0]=LoadFakePlist(DescribeString(cpu_.Regs()[2]));return true;
+            }
+            if(fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")&&
+               (selector=="dictionary"||selector=="dictionaryWithCapacity:")){
+                const u32 obj=NewExternalInstance(fo.class_name);fake_dictionaries_[obj];fake_dictionary_keys_[obj];cpu_.Regs()[0]=obj;return true;
+            }
+            if(fo.is_class&&(fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")&&
+               (selector=="array"||selector=="arrayWithCapacity:")){
+                const u32 obj=NewExternalInstance(fo.class_name);fake_collections_[obj];cpu_.Regs()[0]=obj;return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSNumber"&&selector.starts_with("numberWith")){
+                double value=0.0;
+                if(selector=="numberWithFloat:")value=FloatFromBits(cpu_.Regs()[2]);
+                else if(selector=="numberWithDouble:")value=DoubleFromRegs(cpu_.Regs()[2],cpu_.Regs()[3]);
+                else value=static_cast<s32>(cpu_.Regs()[2]);
+                cpu_.Regs()[0]=NewFakeNumber(value);return true;
+            }
             if(fo.is_class&&(selector.starts_with("numberWith")||selector.starts_with("valueWith")||selector.starts_with("arrayWith")||selector.starts_with("dictionaryWith")||selector.starts_with("setWith")||selector.starts_with("URLWith")||selector.starts_with("dataWith")||selector.starts_with("colorWith")||selector.starts_with("fontWith")||selector.starts_with("imageNamed"))){cpu_.Regs()[0]=NewExternalInstance(fo.class_name);return true;}
             if(fo.is_class&&selector=="setCurrentContext:"){cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&fo.class_name=="NSBundle"&&(selector=="pathForResource:ofType:"||selector=="pathForResource:ofType:inDirectory:")){
@@ -2087,6 +2346,35 @@ private:
                 if(selector=="window"){cpu_.Regs()[0]=window_instance_;return true;}
             }
             if(!fo.is_class&&fo.class_name=="UIEvent"&&selector=="allTouches"){cpu_.Regs()[0]=touch_set_;return true;}
+            if(!fo.is_class&&(fo.class_name=="NSDictionary"||fo.class_name=="NSMutableDictionary")){
+                auto dit=fake_dictionaries_.find(receiver);
+                if(selector=="count"){cpu_.Regs()[0]=dit==fake_dictionaries_.end()?0u:static_cast<u32>(dit->second.size());return true;}
+                if(selector=="objectForKey:"||selector=="valueForKey:"||selector=="objectForKeyedSubscript:"){
+                    const std::string key=DescribeString(cpu_.Regs()[2]);
+                    if(dit==fake_dictionaries_.end()){cpu_.Regs()[0]=0u;return true;}
+                    auto vit=dit->second.find(key);cpu_.Regs()[0]=vit==dit->second.end()?0u:vit->second;return true;
+                }
+                if(selector=="setObject:forKey:"||selector=="setValue:forKey:"||selector=="setObject:forKeyedSubscript:"){
+                    const u32 value=cpu_.Regs()[2];const std::string key=DescribeString(cpu_.Regs()[3]);
+                    auto& dict=fake_dictionaries_[receiver];
+                    if(!dict.count(key))fake_dictionary_keys_[receiver].push_back(NewFakeString(key));
+                    dict[key]=value;cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="removeObjectForKey:"){
+                    const std::string key=DescribeString(cpu_.Regs()[2]);fake_dictionaries_[receiver].erase(key);
+                    auto& keys=fake_dictionary_keys_[receiver];
+                    keys.erase(std::remove_if(keys.begin(),keys.end(),[&](u32 obj){return DescribeString(obj)==key;}),keys.end());
+                    cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="removeAllObjects"){fake_dictionaries_[receiver].clear();fake_dictionary_keys_[receiver].clear();cpu_.Regs()[0]=0u;return true;}
+                if(selector=="allKeys"){
+                    const u32 array=NewExternalInstance("NSArray");fake_collections_[array]=fake_dictionary_keys_[receiver];cpu_.Regs()[0]=array;return true;
+                }
+                if(selector=="keyEnumerator"){
+                    const u32 enumerator=NewExternalInstance("NSEnumerator");fake_collections_[enumerator]=fake_dictionary_keys_[receiver];fake_objects_[enumerator].aux0=0u;cpu_.Regs()[0]=enumerator;return true;
+                }
+                if(selector=="countByEnumeratingWithState:objects:count:")return HandleFastEnumeration(receiver);
+            }
             if(!fo.is_class&&(fo.class_name=="NSSet"||fo.class_name=="NSArray"||fo.class_name=="NSMutableArray")){
                 auto it=fake_collections_.find(receiver);
                 const std::vector<u32>* values=it==fake_collections_.end()?nullptr:&it->second;
@@ -2095,16 +2383,45 @@ private:
                 if(selector=="objectAtIndex:"||selector=="objectAtIndexedSubscript:"){
                     const u32 idx=cpu_.Regs()[2];cpu_.Regs()[0]=(values&&idx<values->size())?(*values)[idx]:0u;return true;
                 }
+                if(selector=="addObject:"){fake_collections_[receiver].push_back(cpu_.Regs()[2]);cpu_.Regs()[0]=0u;return true;}
+                if(selector=="insertObject:atIndex:"){
+                    auto& v=fake_collections_[receiver];const u32 idx=cpu_.Regs()[3];
+                    v.insert(v.begin()+std::min<std::size_t>(idx,v.size()),cpu_.Regs()[2]);cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="removeObject:"){
+                    auto& v=fake_collections_[receiver];v.erase(std::remove(v.begin(),v.end(),cpu_.Regs()[2]),v.end());cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="removeObjectAtIndex:"){
+                    auto& v=fake_collections_[receiver];const u32 idx=cpu_.Regs()[2];if(idx<v.size())v.erase(v.begin()+idx);cpu_.Regs()[0]=0u;return true;
+                }
+                if(selector=="removeAllObjects"){fake_collections_[receiver].clear();cpu_.Regs()[0]=0u;return true;}
                 if(selector=="allObjects"){
                     const u32 array=NewExternalInstance("NSArray");
                     if(values)fake_collections_[array]=*values;
                     cpu_.Regs()[0]=array;return true;
                 }
+                if(selector=="objectEnumerator"){
+                    const u32 enumerator=NewExternalInstance("NSEnumerator");if(values)fake_collections_[enumerator]=*values;fake_objects_[enumerator].aux0=0u;cpu_.Regs()[0]=enumerator;return true;
+                }
                 if(selector=="containsObject:"){
                     cpu_.Regs()[0]=(values&&std::find(values->begin(),values->end(),cpu_.Regs()[2])!=values->end())?1u:0u;return true;
                 }
+                if(selector=="countByEnumeratingWithState:objects:count:")return HandleFastEnumeration(receiver);
+            }
+            if(!fo.is_class&&fo.class_name=="NSEnumerator"&&selector=="nextObject"){
+                auto& values=fake_collections_[receiver];u32& index=fake_objects_[receiver].aux0;
+                cpu_.Regs()[0]=index<values.size()?values[index++]:0u;return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSNumber"){
+                const double value=fake_numbers_.count(receiver)?fake_numbers_[receiver]:0.0;
+                if(selector=="boolValue"){cpu_.Regs()[0]=value!=0.0?1u:0u;return true;}
+                if(selector=="intValue"||selector=="integerValue"||selector=="unsignedIntValue"||selector=="unsignedIntegerValue"||selector=="longValue"||selector=="shortValue"){cpu_.Regs()[0]=static_cast<u32>(static_cast<s32>(value));return true;}
+                if(selector=="floatValue"){cpu_.Regs()[0]=FloatToBits(static_cast<float>(value));return true;}
+                if(selector=="doubleValue"){DoubleToRegs(value,cpu_.Regs()[0],cpu_.Regs()[1]);return true;}
+                if(selector=="stringValue"){cpu_.Regs()[0]=NewFakeString(std::to_string(value));return true;}
             }
             if(!fo.is_class&&(selector=="init"||selector.starts_with("initWith"))){cpu_.Regs()[0]=receiver;return true;}
+            if(!fo.is_class&&fo.class_name=="NSLock"&&(selector=="lock"||selector=="unlock"||selector=="tryLock")){cpu_.Regs()[0]=selector=="tryLock"?1u:0u;return true;}
             if(!fo.is_class&&selector=="layer"){cpu_.Regs()[0]=AssociatedExternal(receiver,"layer","CAEAGLLayer");return true;}
             if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="presentRenderbuffer:"){host_window_.Present();cpu_.Regs()[0]=1u;return true;}
             if(!fo.is_class&&fo.class_name=="EAGLContext"&&selector=="renderbufferStorage:fromDrawable:"){cpu_.Regs()[0]=1u;return true;}
@@ -2134,6 +2451,16 @@ private:
             if(selector=="UTF8String"||selector=="cStringUsingEncoding:"){cpu_.Regs()[0]=AllocateCString(string_value);return true;}
             if(selector=="lowercaseString"){std::string v=string_value;std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});cpu_.Regs()[0]=NewFakeString(v);return true;}
             if(selector=="isEqualToString:"){cpu_.Regs()[0]=string_value==DescribeString(cpu_.Regs()[2])?1u:0u;return true;}
+            if(selector=="compare:"||selector=="caseInsensitiveCompare:"||selector=="compare:options:"){
+                std::string rhs=DescribeString(cpu_.Regs()[2]),lhs=string_value;
+                if(selector=="caseInsensitiveCompare:"||(selector=="compare:options:"&&(cpu_.Regs()[3]&1u))){
+                    lhs=LowerAscii(lhs);rhs=LowerAscii(rhs);
+                }
+                cpu_.Regs()[0]=lhs<rhs?static_cast<u32>(-1):(lhs>rhs?1u:0u);return true;
+            }
+            if(selector=="intValue"||selector=="integerValue"){cpu_.Regs()[0]=static_cast<u32>(std::strtol(string_value.c_str(),nullptr,10));return true;}
+            if(selector=="boolValue"){cpu_.Regs()[0]=(!string_value.empty()&&string_value!="0"&&LowerAscii(string_value)!="false")?1u:0u;return true;}
+            if(selector=="floatValue"){cpu_.Regs()[0]=FloatToBits(std::strtof(string_value.c_str(),nullptr));return true;}
             if(selector=="hasPrefix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=string_value.rfind(rhs,0u)==0u?1u:0u;return true;}
             if(selector=="hasSuffix:"){const std::string rhs=DescribeString(cpu_.Regs()[2]);cpu_.Regs()[0]=(rhs.size()<=string_value.size()&&string_value.compare(string_value.size()-rhs.size(),rhs.size(),rhs)==0)?1u:0u;return true;}
             if(selector=="stringByAppendingString:"){cpu_.Regs()[0]=NewFakeString(string_value+DescribeString(cpu_.Regs()[2]));return true;}
@@ -2245,6 +2572,19 @@ private:
             else result=std::pow(a,FloatFromBits(cpu_.Regs()[1]));
             cpu_.Regs()[0]=FloatToBits(result);return true;
         }
+        if(name=="CGPointFromString"||name=="CGSizeFromString"){
+            float v[2]{};
+            if(ExtractFloats(DescribeString(cpu_.Regs()[1]),v,2u))WriteCGPoint(cpu_.Regs()[0],v[0],v[1]);
+            else WriteCGPoint(cpu_.Regs()[0],0.0f,0.0f);
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="CGRectFromString"){
+            float v[4]{};
+            if(ExtractFloats(DescribeString(cpu_.Regs()[1]),v,4u))WriteCGRect(cpu_.Regs()[0],v[0],v[1],v[2],v[3]);
+            else WriteCGRect(cpu_.Regs()[0],0.0f,0.0f,0.0f,0.0f);
+            cpu_.Regs()[0]=0u;return true;
+        }
+
         if(name=="CGAffineTransformMakeRotation"){
             const float angle=FloatFromBits(cpu_.Regs()[1]);const float c=std::cos(angle),s=std::sin(angle);
             WriteAffine(cpu_.Regs()[0],Affine{c,s,-s,c,0.0f,0.0f});cpu_.Regs()[0]=0u;return true;
@@ -2469,16 +2809,16 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
-    u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0;
+    u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0,fast_enum_mutation_addr_=0;
     u32 touch_object_=0,touch_set_=0,touch_event_=0,touch_phase_=0;
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
