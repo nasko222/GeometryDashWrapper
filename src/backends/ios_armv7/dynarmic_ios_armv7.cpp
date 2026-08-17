@@ -1094,7 +1094,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest10 forwarded the real Forlorn cocos2d fixed-function OpenGL ES draw loop to a Win32 OpenGL window until the user closed it.\n";
+            log_<<"Execution status: PublicTest13 runs the real Forlorn cocos2d loop with IPA-backed stdio/resource loading until the user closes the window.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1238,6 +1238,61 @@ private:
         fake_objects_[image].resource_value=rel;
         if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: UIImage "<<request<<" -> "<<rel<<"\n";
         return image;
+    }
+    struct VirtualFile {
+        std::string relative;
+        std::vector<u8> bytes;
+        std::size_t pos=0;
+        bool gzip=false;
+    };
+    bool ReadAssetBytes(std::string request,std::string& relative,std::vector<u8>& bytes){
+        relative=ResolveAssetRelative(std::move(request));
+        if(relative.empty()||!ipa_)return false;
+        auto it=asset_lookup_.find(LowerAscii(relative));
+        if(it==asset_lookup_.end())return false;
+        try{bytes=ExtractZip(*ipa_,asset_entries_[it->second]);return true;}
+        catch(const std::exception& e){
+            if(++asset_failure_logs_<=8u)log_<<"IOS FILE: extract failed "<<relative<<" error="<<e.what()<<"\\n";
+            return false;
+        }
+    }
+    bool InflateGzip(const std::vector<u8>& compressed,std::vector<u8>& output){
+        z_stream stream{};
+        stream.next_in=const_cast<Bytef*>(reinterpret_cast<const Bytef*>(compressed.data()));
+        stream.avail_in=static_cast<uInt>(compressed.size());
+        if(inflateInit2(&stream,15+32)!=Z_OK)return false;
+        std::array<u8,32768> chunk{};
+        int rc=Z_OK;
+        while(rc==Z_OK){
+            stream.next_out=reinterpret_cast<Bytef*>(chunk.data());
+            stream.avail_out=static_cast<uInt>(chunk.size());
+            rc=inflate(&stream,Z_NO_FLUSH);
+            const std::size_t produced=chunk.size()-stream.avail_out;
+            if(produced)output.insert(output.end(),chunk.data(),chunk.data()+produced);
+            if(output.size()>128u*1024u*1024u){inflateEnd(&stream);return false;}
+        }
+        inflateEnd(&stream);
+        return rc==Z_STREAM_END;
+    }
+    u32 OpenVirtualAsset(std::string request,bool gzip){
+        std::string relative;std::vector<u8> bytes;
+        if(!ReadAssetBytes(std::move(request),relative,bytes))return 0u;
+        if(gzip){std::vector<u8> decoded;if(!InflateGzip(bytes,decoded))return 0u;bytes=std::move(decoded);}
+        const u32 handle=AllocateObjectBytes(16u);
+        virtual_files_[handle]=VirtualFile{relative,std::move(bytes),0u,gzip};
+        if(++file_open_logs_<=32u)log_<<"IOS FILE: open "<<relative<<" bytes="<<virtual_files_[handle].bytes.size()<<" handle=0x"<<Hex(handle)<<(gzip?" gzip":"")<<"\\n";
+        return handle;
+    }
+    VirtualFile* FindVirtualFile(u32 handle){auto it=virtual_files_.find(handle);return it==virtual_files_.end()?nullptr:&it->second;}
+    u32 ReadVirtualFile(u32 handle,u32 dest,u32 bytes_requested){
+        VirtualFile* file=FindVirtualFile(handle);
+        if(!file||!dest||!bytes_requested)return 0u;
+        const std::size_t remaining=file->pos<file->bytes.size()?file->bytes.size()-file->pos:0u;
+        const std::size_t amount=std::min<std::size_t>(remaining,bytes_requested);
+        if(amount&&!env_.IsMapped(dest,amount))return 0u;
+        if(amount)env_.WriteBytes(dest,file->bytes.data()+file->pos,amount);
+        file->pos+=amount;
+        return static_cast<u32>(amount);
     }
     u32 EnsureFloatData(const std::string& symbol,std::initializer_list<float> values){
         auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
@@ -1607,15 +1662,17 @@ private:
         }
         if(name=="glCompressedTexImage2D"){
             const GLint level=static_cast<GLint>(r[1]);
-            const int dim=std::max(1,4>>std::min(level,2));
-            static const GLubyte checker[4*4*4]={
-                255,0,255,255, 255,255,255,255, 255,0,255,255, 255,255,255,255,
-                255,255,255,255, 255,0,255,255, 255,255,255,255, 255,0,255,255,
-                255,0,255,255, 255,255,255,255, 255,0,255,255, 255,255,255,255,
-                255,255,255,255, 255,0,255,255, 255,255,255,255, 255,0,255,255
-            };
-            glTexImage2D(static_cast<GLenum>(r[0]),level,GL_RGBA,dim,dim,0,GL_RGBA,GL_UNSIGNED_BYTE,checker);
-            if(++placeholder_texture_uploads_<=8u)log_<<"IOS HOSTGL: substituted unsupported compressed texture with 4x4 checker level="<<level<<" bound="<<bound_texture_<<"\n";
+            const GLsizei width=static_cast<GLsizei>(r[3]);
+            const GLsizei height=static_cast<GLsizei>(StackArg(0));
+            const GLsizei safe_w=(width>0&&width<=4096)?width:4;
+            const GLsizei safe_h=(height>0&&height<=4096)?height:4;
+            std::vector<GLubyte> checker(std::size_t(safe_w)*safe_h*4u);
+            for(GLsizei y=0;y<safe_h;++y)for(GLsizei x=0;x<safe_w;++x){
+                const bool mag=(((x>>4)^(y>>4))&1)==0;const std::size_t o=(std::size_t(y)*safe_w+x)*4u;
+                checker[o+0]=255u;checker[o+1]=mag?0u:255u;checker[o+2]=255u;checker[o+3]=255u;
+            }
+            glTexImage2D(static_cast<GLenum>(r[0]),level,GL_RGBA,safe_w,safe_h,0,GL_RGBA,GL_UNSIGNED_BYTE,checker.data());
+            if(++placeholder_texture_uploads_<=8u)log_<<"IOS HOSTGL: substituted unsupported compressed texture with sized checker "<<safe_w<<"x"<<safe_h<<" level="<<level<<" bound="<<bound_texture_<<"\n";
             r[0]=0u;return true;
         }
         if(name=="glGenerateMipmapOES"){
@@ -2308,6 +2365,76 @@ private:
             cpu_.Regs()[0]=0u;return true;
         }
 
+        // Read-only stdio backed directly by files inside Payload/<app>.app/.
+        // cocos2d's CCZ/PVR loaders use the C FILE API even when NSBundle has
+        // already resolved the resource path, so returning null from fopen was
+        // the exact PublicTest12 MenuScene crash.
+        if(name=="fopen"){
+            std::string path,mode;
+            env_.ReadCString(cpu_.Regs()[0],path,1u<<20);
+            env_.ReadCString(cpu_.Regs()[1],mode,64u);
+            if(mode.find('w')!=std::string::npos||mode.find('a')!=std::string::npos||mode.find('+')!=std::string::npos){cpu_.Regs()[0]=0u;return true;}
+            cpu_.Regs()[0]=OpenVirtualAsset(path,false);
+            if(!cpu_.Regs()[0]&&++file_failure_logs_<=16u)log_<<"IOS FILE: fopen miss path="<<path<<" mode="<<mode<<"\\n";
+            return true;
+        }
+        if(name=="fread"){
+            const u32 dst=cpu_.Regs()[0],size=cpu_.Regs()[1],count=cpu_.Regs()[2],handle=cpu_.Regs()[3];
+            if(!size||!count){cpu_.Regs()[0]=0u;return true;}
+            const u64 requested=u64(size)*count;
+            if(requested>128u*1024u*1024u){cpu_.Regs()[0]=0u;return true;}
+            const u32 bytes=ReadVirtualFile(handle,dst,static_cast<u32>(requested));
+            cpu_.Regs()[0]=bytes/size;return true;
+        }
+        if(name=="fseek"){
+            VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]);
+            if(!file){cpu_.Regs()[0]=static_cast<u32>(-1);return true;}
+            const s64 off=static_cast<s32>(cpu_.Regs()[1]);const u32 whence=cpu_.Regs()[2];
+            s64 base=whence==0u?0:(whence==1u?static_cast<s64>(file->pos):(whence==2u?static_cast<s64>(file->bytes.size()):-1));
+            const s64 next=base<0?-1:base+off;
+            if(next<0||static_cast<u64>(next)>0xffffffffull){cpu_.Regs()[0]=static_cast<u32>(-1);return true;}
+            file->pos=static_cast<std::size_t>(next);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="ftell"){
+            VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]);
+            cpu_.Regs()[0]=file&&file->pos<=0x7fffffffu?static_cast<u32>(file->pos):static_cast<u32>(-1);return true;
+        }
+        if(name=="rewind"){
+            if(VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]))file->pos=0u;
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="feof"){
+            VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]);cpu_.Regs()[0]=(!file||file->pos>=file->bytes.size())?1u:0u;return true;
+        }
+        if(name=="fclose"){
+            const u32 handle=cpu_.Regs()[0];virtual_files_.erase(handle);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="gzopen"){
+            std::string path,mode;env_.ReadCString(cpu_.Regs()[0],path,1u<<20);env_.ReadCString(cpu_.Regs()[1],mode,64u);
+            cpu_.Regs()[0]=OpenVirtualAsset(path,true);return true;
+        }
+        if(name=="gzread"){
+            cpu_.Regs()[0]=ReadVirtualFile(cpu_.Regs()[0],cpu_.Regs()[1],cpu_.Regs()[2]);return true;
+        }
+        if(name=="gzclose"){
+            virtual_files_.erase(cpu_.Regs()[0]);cpu_.Regs()[0]=Z_OK;return true;
+        }
+        if(name=="gzeof"){
+            VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]);cpu_.Regs()[0]=(!file||file->pos>=file->bytes.size())?1u:0u;return true;
+        }
+        if(name=="uncompress"){
+            const u32 dest=cpu_.Regs()[0],dest_len_ptr=cpu_.Regs()[1],source=cpu_.Regs()[2],source_len=cpu_.Regs()[3];
+            if(!dest_len_ptr||!env_.IsMapped(dest_len_ptr,4u)||!source||!source_len||!env_.IsMapped(source,source_len)){cpu_.Regs()[0]=Z_STREAM_ERROR;return true;}
+            const u32 capacity=env_.MemoryRead32(dest_len_ptr);
+            if(!dest||!capacity||capacity>128u*1024u*1024u||!env_.IsMapped(dest,capacity)){cpu_.Regs()[0]=Z_BUF_ERROR;return true;}
+            std::vector<u8> in(source_len),out(capacity);env_.ReadBytes(source,in.data(),in.size());
+            uLongf out_len=capacity;const int rc=::uncompress(reinterpret_cast<Bytef*>(out.data()),&out_len,reinterpret_cast<const Bytef*>(in.data()),source_len);
+            if(rc==Z_OK&&out_len)env_.WriteBytes(dest,out.data(),static_cast<std::size_t>(out_len));
+            env_.MemoryWrite32(dest_len_ptr,static_cast<u32>(out_len));cpu_.Regs()[0]=static_cast<u32>(rc);
+            if(++zlib_logs_<=16u)log_<<"IOS ZLIB: uncompress src="<<source_len<<" dst="<<out_len<<" rc="<<rc<<"\\n";
+            return true;
+        }
+
         if(name=="gettimeofday"){
             const u32 tv=cpu_.Regs()[0];
             if(tv&&env_.IsMapped(tv,8u)){env_.MemoryWrite32(tv,static_cast<u32>(virtual_time_usec_/1000000u));env_.MemoryWrite32(tv+4u,static_cast<u32>(virtual_time_usec_%1000000u));}
@@ -2342,7 +2469,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::vector<GuestClass> classes_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,VirtualFile> virtual_files_; std::vector<GuestClass> classes_;
     u32 heap_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
@@ -2351,7 +2478,7 @@ private:
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0;
     u64 unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;

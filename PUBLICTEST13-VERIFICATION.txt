@@ -1,0 +1,43 @@
+Geometry Dash Wrapper 0.9.6-publictest13 verification
+
+PublicTest12 log bundle diagnosis:
+  PASS: Forlorn 1.9c loadManagers executes through the new NSThread shim.
+  PASS: frame 2 sees AppDelegate loadingFinished and BootLayer loadingFinished.
+  PASS: BootLayer begins constructing MenuScene.
+  PASS: NSBundle resolves MenuSheet.pvr.ccz.
+  FAIL: _fopen was still an unknown import and returned 0.
+  FAIL: both independent 1.9c runs fault identically immediately afterward:
+        address=0x0 pc=0xe4e96 lr=0xe3d3d.
+
+PublicTest13:
+  PASS: IPA-backed read-only fopen/fread/fseek/ftell/rewind/feof/fclose.
+  PASS: gzip-backed gzopen/gzread/gzclose/gzeof.
+  PASS: guest-buffer zlib uncompress.
+  PASS: FILE handles are opaque guest-region tokens and never expose host FILE*.
+  PASS: existing NSBundle/IPA index supplies resource bytes without extraction to disk.
+  PASS: compressed-texture checker fallback preserves requested width/height.
+  PASS: PublicTest12 NSThread loading fix retained.
+  PASS: PublicTest12 mouse->UIKit touch bridge retained.
+  PASS: exact 320x480 iOS FBO / landscape presentation retained.
+
+Forlorn 1.9c fixture:
+  PASS: MenuSheet.pvr.ccz = 36,971-byte CCZ v1 zlib asset.
+  PASS: decompressed size = 262,196 bytes.
+  PASS: PVR payload = 256x512, 16-bpp, 262,144 bytes image data.
+
+Older builds in the supplied logs:
+  Forlorn 0.101: runs MenuScene for at least 330 frames and accepts real mouse/touch input.
+  Forlorn 1.02: stops during Prepare with imports bound=0; this older Mach-O needs a
+  pre-dyld-info symbol/indirect-table binding path and is intentionally not changed here.
+
+Regression:
+  PASS: x86 source unchanged.
+  PASS: shared Android runtime source unchanged.
+  PASS: Android ARM implementation changes limited to version text.
+  PASS: Geometry Dash 1.0 constructor deferral retained.
+  PASS: C++20 syntax-only compile with local Dynarmic interface stub.
+
+Expected 1.9c progression:
+  IOS FILE: open MenuSheet.pvr.ccz bytes=36971 handle=0x...
+  IOS ZLIB: uncompress src=36955 dst=262196 rc=0
+  then MenuScene should continue past the PublicTest12 frame-2 crash.
