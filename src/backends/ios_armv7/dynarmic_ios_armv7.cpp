@@ -522,6 +522,7 @@ constexpr u32 CPU_SUBTYPE_ARM_V7 = 9u;
 constexpr u32 LC_SEGMENT = 0x1u;
 constexpr u32 LC_SYMTAB = 0x2u;
 constexpr u32 LC_UNIXTHREAD = 0x5u;
+constexpr u32 LC_MAIN = 0x80000028u;
 constexpr u32 LC_DYSYMTAB = 0xbu;
 constexpr u32 LC_DYLD_INFO_ONLY = 0x80000022u;
 constexpr u32 LC_DYLD_INFO = 0x22u;
@@ -552,13 +553,18 @@ struct DyldInfo {
     u32 weak_bind_off = 0, weak_bind_size = 0;
     u32 lazy_bind_off = 0, lazy_bind_size = 0;
 };
+enum class MachEntryKind { UnixThread, Main };
+
 struct MachImage {
     std::vector<u8> bytes;
     std::string arch;
     u32 entry = 0;
+    MachEntryKind entry_kind = MachEntryKind::UnixThread;
+    u64 main_entryoff = 0;
     bool encrypted = false;
     std::vector<MachSegment> segments;
     DyldInfo dyld;
+    std::vector<u32> constructors;
     u32 constructor_count = 0;
 };
 
@@ -640,7 +646,15 @@ static MachImage SelectAndParseArmv7(const std::vector<u8>& full) {
                 s.flags = ReadLe32(image.bytes.data() + so + 56u);
                 s.reserved1 = ReadLe32(image.bytes.data() + so + 60u);
                 s.reserved2 = ReadLe32(image.bytes.data() + so + 64u);
-                if (s.sectname == "__mod_init_func") image.constructor_count = s.size / 4u;
+                if (s.sectname == "__mod_init_func") {
+                    if ((s.size & 3u) != 0u || !RangeFits(image.bytes.size(), s.offset, s.size))
+                        throw std::runtime_error("invalid __mod_init_func section");
+                    for (u32 po = 0; po < s.size; po += 4u) {
+                        const u32 fn = ReadLe32(image.bytes.data() + s.offset + po);
+                        if (fn) image.constructors.push_back(fn);
+                    }
+                    image.constructor_count = static_cast<u32>(image.constructors.size());
+                }
                 seg.sections.push_back(std::move(s));
             }
             image.segments.push_back(std::move(seg));
@@ -648,8 +662,15 @@ static MachImage SelectAndParseArmv7(const std::vector<u8>& full) {
             if (cmdsize >= 8u + 8u + 17u * 4u) {
                 const u32 flavor = ReadLe32(image.bytes.data() + off + 8u);
                 const u32 count = ReadLe32(image.bytes.data() + off + 12u);
-                if (flavor == 1u && count >= 17u) image.entry = ReadLe32(image.bytes.data() + off + 16u + 15u * 4u);
+                if (flavor == 1u && count >= 17u && image.main_entryoff == 0u) {
+                    image.entry = ReadLe32(image.bytes.data() + off + 16u + 15u * 4u);
+                    image.entry_kind = MachEntryKind::UnixThread;
+                }
             }
+        } else if (cmd == LC_MAIN) {
+            if (cmdsize < 24u) throw std::runtime_error("short LC_MAIN");
+            image.main_entryoff = ReadLe64(image.bytes.data() + off + 8u);
+            image.entry_kind = MachEntryKind::Main;
         } else if (cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY) {
             if (cmdsize >= 48u) {
                 image.dyld.rebase_off = ReadLe32(image.bytes.data() + off + 8u);
@@ -666,7 +687,19 @@ static MachImage SelectAndParseArmv7(const std::vector<u8>& full) {
         }
         off += cmdsize;
     }
-    if (!image.entry) throw std::runtime_error("LC_UNIXTHREAD ARM entry PC was not found");
+    if (image.main_entryoff != 0u) {
+        const MachSegment* text = nullptr;
+        for (const auto& seg : image.segments) if (seg.name == "__TEXT") { text = &seg; break; }
+        if (!text) throw std::runtime_error("LC_MAIN executable has no __TEXT segment");
+        if (image.main_entryoff < text->fileoff ||
+            image.main_entryoff >= static_cast<u64>(text->fileoff) + text->filesize)
+            throw std::runtime_error("LC_MAIN entryoff is outside __TEXT");
+        const u64 vm = static_cast<u64>(text->vmaddr) + (image.main_entryoff - text->fileoff);
+        if (vm > std::numeric_limits<u32>::max()) throw std::runtime_error("LC_MAIN entry address exceeds ARM32");
+        image.entry = static_cast<u32>(vm);
+        image.entry_kind = MachEntryKind::Main;
+    }
+    if (!image.entry) throw std::runtime_error("Mach-O ARM entry PC was not found (no usable LC_MAIN or LC_UNIXTHREAD)");
     return image;
 }
 
@@ -1228,14 +1261,13 @@ public:
 
     bool Run() {
         BuildInitialStack();
-        cpu_.Regs().fill(0);
-        cpu_.ExtRegs().fill(0);
-        cpu_.Regs()[13] = initial_sp_;
-        cpu_.Regs()[15] = image_.entry & ~1u;
-        cpu_.SetCpsr(0x10u | ((image_.entry & 1u) ? 0x20u : 0u));
-        cpu_.SetFpscr(0u);
-        log_ << "IOS: starting real ARMv7 Mach-O execution PC=0x" << Hex(image_.entry)
-             << " SP=0x" << Hex(initial_sp_) << "\n";
+        if (!image_.constructors.empty()) {
+            log_ << "IOS DYLD: running " << image_.constructors.size()
+                 << " static constructors before app entry\n";
+            if (!BeginStaticConstructor()) return false;
+        } else {
+            BeginImageEntry();
+        }
         u64 budget = kRunBudget;
         while (budget && !done_) {
             env_.ResetStopState();
@@ -1252,20 +1284,35 @@ public:
             const u64 consumed = std::max<u64>(chunk - remaining, 1u);
             budget -= std::min<u64>(budget, consumed);
             if (env_.invalid_access) {
-                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_MEMORY_FAULT address=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x")) << Hex(env_.fault_address)
-                     << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
+                if(host_call_stage_==HostCallStage::Constructors){
+                    const u32 ctor=constructor_index_<image_.constructors.size()?image_.constructors[constructor_index_]:0u;
+                    log_<<"RESULT: IOS_CONSTRUCTOR_MEMORY_FAULT index="<<(constructor_index_+1u)<<"/"<<image_.constructors.size()
+                        <<" target=0x"<<Hex(ctor)<<" address=0x"<<Hex(env_.fault_address)
+                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<"\n";
+                }else{
+                    log_ << (frame_pump_active_?"RESULT: IOS_FRAME_MEMORY_FAULT address=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x")) << Hex(env_.fault_address)
+                         << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
+                }
                 LogFaultContext();
                 if(frame_pump_active_&&cpu_.Regs()[15]>=0x1000u&&cpu_.Regs()[15]<0x2000u)
                     log_<<"IOS: frame fault entered Mach-O header page; likely invalid cached IMP/function callback\n";
                 return false;
             }
             if (env_.interpreter_fallback) {
-                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_INTERPRETER_FALLBACK pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_INTERPRETER_FALLBACK pc=0x":"RESULT: IOS_BOOTSTRAP_INTERPRETER_FALLBACK pc=0x")) << Hex(env_.fallback_pc)
-                     << " count=" << env_.fallback_count << "\n";
+                if(host_call_stage_==HostCallStage::Constructors)
+                    log_<<"RESULT: IOS_CONSTRUCTOR_INTERPRETER_FALLBACK index="<<(constructor_index_+1u)<<"/"<<image_.constructors.size()
+                        <<" pc=0x"<<Hex(env_.fallback_pc)<<" count="<<env_.fallback_count<<"\n";
+                else
+                    log_ << (frame_pump_active_?"RESULT: IOS_FRAME_INTERPRETER_FALLBACK pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_INTERPRETER_FALLBACK pc=0x":"RESULT: IOS_BOOTSTRAP_INTERPRETER_FALLBACK pc=0x")) << Hex(env_.fallback_pc)
+                         << " count=" << env_.fallback_count << "\n";
                 return false;
             }
             if (env_.exception_seen) {
-                log_ << (frame_pump_active_?"RESULT: IOS_FRAME_EXCEPTION pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_EXCEPTION pc=0x":"RESULT: IOS_BOOTSTRAP_EXCEPTION pc=0x")) << Hex(env_.exception_pc) << "\n";
+                if(host_call_stage_==HostCallStage::Constructors)
+                    log_<<"RESULT: IOS_CONSTRUCTOR_EXCEPTION index="<<(constructor_index_+1u)<<"/"<<image_.constructors.size()
+                        <<" pc=0x"<<Hex(env_.exception_pc)<<"\n";
+                else
+                    log_ << (frame_pump_active_?"RESULT: IOS_FRAME_EXCEPTION pc=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_EXCEPTION pc=0x":"RESULT: IOS_BOOTSTRAP_EXCEPTION pc=0x")) << Hex(env_.exception_pc) << "\n";
                 return false;
             }
             if (env_.svc_pending) {
@@ -1302,7 +1349,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest25 corrects the 32-bit iOS Objective-C call ABI (r9 caller-saved), implements NSString NSRange/slicing compatibility, and adds gameplay stall diagnostics.\n";
+            log_<<"Execution status: PublicTest26 adds LC_MAIN startup, real __mod_init_func execution, and the C++ runtime primitives needed by Geometry Dash static constructors.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -2354,6 +2401,73 @@ private:
 #endif
     }
 
+    void ResetCpuForEntryCall() {
+        cpu_.Regs().fill(0);
+        cpu_.ExtRegs().fill(0);
+        cpu_.SetFpscr(0u);
+    }
+
+    void SetPcAndMode(u32 target) {
+        cpu_.Regs()[15] = target & ~1u;
+        cpu_.SetCpsr(0x10u | ((target & 1u) ? 0x20u : 0u));
+    }
+
+    bool BeginImageEntry() {
+        host_call_stage_ = HostCallStage::None;
+        ResetCpuForEntryCall();
+        cpu_.Regs()[13] = initial_sp_;
+        cpu_.Regs()[14] = kControlBase;
+        if (image_.entry_kind == MachEntryKind::Main) {
+            // LC_MAIN is entered by dyld as main(argc, argv, envp, apple).
+            cpu_.Regs()[0] = 1u;
+            cpu_.Regs()[1] = argv_ptr_;
+            cpu_.Regs()[2] = envp_ptr_;
+            cpu_.Regs()[3] = apple_ptr_;
+        }
+        SetPcAndMode(image_.entry);
+        log_ << "IOS: starting real ARMv7 Mach-O execution PC=0x" << Hex(image_.entry)
+             << " source=" << (image_.entry_kind == MachEntryKind::Main ? "LC_MAIN" : "LC_UNIXTHREAD")
+             << " SP=0x" << Hex(initial_sp_);
+        if (image_.entry_kind == MachEntryKind::Main)
+            log_ << " argc=1 argv=0x" << Hex(argv_ptr_);
+        log_ << "\n";
+        log_.Flush();
+        return true;
+    }
+
+    bool BeginStaticConstructor() {
+        if (constructor_index_ >= image_.constructors.size()) {
+            log_ << "IOS DYLD: static constructors complete count=" << constructor_index_ << "\n";
+            log_.Flush();
+            return BeginImageEntry();
+        }
+        const u32 target = image_.constructors[constructor_index_];
+        const u32 code = target & ~1u;
+        if (!target || !env_.IsMapped(code, 2u)) {
+            log_ << "RESULT: IOS_CONSTRUCTOR_BAD_ADDRESS index=" << constructor_index_
+                 << " target=0x" << Hex(target) << "\n";
+            done_ = true;
+            return false;
+        }
+        ResetCpuForEntryCall();
+        cpu_.Regs()[0] = 1u;
+        cpu_.Regs()[1] = argv_ptr_;
+        cpu_.Regs()[2] = envp_ptr_;
+        cpu_.Regs()[3] = apple_ptr_;
+        cpu_.Regs()[13] = constructor_sp_;
+        cpu_.Regs()[14] = kControlBase;
+        env_.MemoryWrite32(constructor_sp_, 0u); // ProgramVars / fifth dyld initializer argument.
+        SetPcAndMode(target);
+        host_call_stage_ = HostCallStage::Constructors;
+        if (constructor_index_ < 12u || constructor_index_ % 32u == 0u ||
+            constructor_index_ + 1u == image_.constructors.size()) {
+            log_ << "IOS DYLD: constructor " << (constructor_index_ + 1u) << "/"
+                 << image_.constructors.size() << " target=0x" << Hex(target) << "\n";
+            log_.Flush();
+        }
+        return true;
+    }
+
     void EnsureTouchObjects(){
         if(touch_object_)return;
         touch_object_=NewExternalInstance("UITouch");
@@ -3284,6 +3398,10 @@ private:
 
     bool HandleSvc(u32 svc){if(svc==kSvcGuestCallReturn)return ReturnFromGuestMethodCall();
     if(svc==kSvcReturn){
+        if(host_call_stage_==HostCallStage::Constructors){
+            ++constructor_index_;
+            return BeginStaticConstructor();
+        }
         if(host_call_stage_==HostCallStage::Delegate){
             delegate_launch_active_=false;delegate_launch_returned_=true;delegate_return_value_=cpu_.Regs()[0];
             log_<<"IOS: real delegate launch returned r0=0x"<<Hex(delegate_return_value_)<<"\n";
@@ -3593,8 +3711,9 @@ private:
         }
         if(name=="UIApplicationMain"){
             reached_ui_application_main_=true;delegate_name_=ResolveDelegateName(cpu_.Regs()[3]);
-            log_<<"IOS: UIApplicationMain reached argc="<<cpu_.Regs()[0]<<" delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)<<" constructors="<<image_.constructor_count<<"\n";
-            if(image_.constructor_count!=0u){delegate_launch_deferred_=true;done_=true;cpu_.Regs()[0]=0;log_<<"IOS: delegate launch deferred until Mach-O static constructors are implemented\n";return true;}
+            log_<<"IOS: UIApplicationMain reached argc="<<cpu_.Regs()[0]
+                <<" delegate="<<(delegate_name_.empty()?"unknown":delegate_name_)
+                <<" constructors-run="<<constructor_index_<<"/"<<image_.constructor_count<<"\n";
             return BeginDelegateLaunch();
         }
         if(name.starts_with("gl")&&HandleHostGraphicsImport(name))return true;
@@ -3764,6 +3883,49 @@ private:
             ReleaseHeapBlock(cpu_.Regs()[0]);
             cpu_.Regs()[0]=0;return true;
         }
+        // C++ runtime primitives used heavily by Geometry Dash's __mod_init_func
+        // constructors. Returning nil from operator new (PublicTest25 behavior)
+        // makes the first constructor that allocates an STL/FMOD object write
+        // through address zero before UIApplicationMain can ever be reached.
+        if(name=="_Znwm"||name=="_Znam"||name=="_ZnwmRKSt9nothrow_t"){
+            const u32 size=cpu_.Regs()[0];
+            cpu_.Regs()[0]=Allocate(size?size:1u,8u,true);
+            if(++cpp_runtime_logs_<=32u)
+                log_<<"IOS CXX: "<<name<<" size="<<size<<" -> 0x"<<Hex(cpu_.Regs()[0])<<"\n";
+            return true;
+        }
+        if(name=="_ZdlPv"||name=="_ZdaPv"||name=="_ZdlPvRKSt9nothrow_t"){
+            const u32 ptr=cpu_.Regs()[0];
+            ReleaseHeapBlock(ptr);
+            cpu_.Regs()[0]=0u;
+            if(++cpp_runtime_logs_<=32u)
+                log_<<"IOS CXX: "<<name<<" ptr=0x"<<Hex(ptr)<<"\n";
+            return true;
+        }
+        if(name=="__cxa_atexit"||name=="atexit"){
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="__cxa_guard_acquire"){
+            const u32 guard=cpu_.Regs()[0];
+            const u8 initialized=(guard&&env_.IsMapped(guard,1u))?env_.MemoryRead8(guard):1u;
+            cpu_.Regs()[0]=initialized?0u:1u;
+            return true;
+        }
+        if(name=="__cxa_guard_release"){
+            const u32 guard=cpu_.Regs()[0];
+            if(guard&&env_.IsMapped(guard,1u))env_.MemoryWrite8(guard,1u);
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="__cxa_guard_abort"){
+            const u32 guard=cpu_.Regs()[0];
+            if(guard&&env_.IsMapped(guard,1u))env_.MemoryWrite8(guard,0u);
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="__cxa_begin_catch"){return true;}
+        if(name=="__cxa_end_catch"){cpu_.Regs()[0]=0u;return true;}
         if(name=="memset"){const u32 dst=cpu_.Regs()[0],value=cpu_.Regs()[1]&0xffu,n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)){std::vector<u8> v(n,static_cast<u8>(value));env_.WriteBytes(dst,v.data(),v.size());}cpu_.Regs()[0]=dst;return true;}
         if(name=="memcpy"||name=="memmove"){const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1],n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)&&env_.IsMapped(src,n)){std::vector<u8> tmp(n);env_.ReadBytes(src,tmp.data(),n);env_.WriteBytes(dst,tmp.data(),n);}cpu_.Regs()[0]=dst;return true;}
         if(name=="strlen"){std::string s;if(!env_.ReadCString(cpu_.Regs()[0],s,1u<<20)){cpu_.Regs()[0]=0;}else cpu_.Regs()[0]=static_cast<u32>(s.size());return true;}
@@ -3775,14 +3937,34 @@ private:
         return true;
     }
 
-    void BuildInitialStack(){const std::string argv0="GeometryDashWrapper-iOS";const u32 arg=AllocateCString(argv0);u32 sp=kStackBase+kStackSize-0x1000u;sp&=~7u;sp-=24u;env_.MemoryWrite32(sp+0u,1u);env_.MemoryWrite32(sp+4u,arg);env_.MemoryWrite32(sp+8u,0u);env_.MemoryWrite32(sp+12u,0u);env_.MemoryWrite32(sp+16u,0u);env_.MemoryWrite32(sp+20u,0u);initial_sp_=sp;}
+    void BuildInitialStack(){
+        const std::string argv0="GeometryDashWrapper-iOS";
+        const u32 arg=AllocateCString(argv0);
+        u32 sp=kStackBase+kStackSize-0x1000u;
+        sp&=~7u;
+        sp-=24u;
+        env_.MemoryWrite32(sp+0u,1u);
+        env_.MemoryWrite32(sp+4u,arg);
+        env_.MemoryWrite32(sp+8u,0u);
+        env_.MemoryWrite32(sp+12u,0u);
+        env_.MemoryWrite32(sp+16u,0u);
+        env_.MemoryWrite32(sp+20u,0u);
+        initial_sp_=sp;
+        argv_ptr_=sp+4u;
+        envp_ptr_=sp+12u;
+        apple_ptr_=sp+16u;
+        constructor_sp_=(sp-0x100u)&~7u;
+        env_.MemoryWrite32(constructor_sp_,0u);
+    }
 
-    enum class HostCallStage { None, Delegate, AcquireDirector, QueryRunningScene, Touch, Frame };
+    enum class HostCallStage { None, Constructors, Delegate, AcquireDirector, QueryRunningScene, Touch, Frame };
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
     std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
     u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
+    u32 argv_ptr_=0,envp_ptr_=0,apple_ptr_=0,constructor_sp_=0;
+    std::size_t constructor_index_=0;
     u32 exit_code_=0,delegate_instance_=0,application_instance_=0,delegate_return_value_=0,gl_object_counter_=1u;
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
     u32 active_play_layer_=0;
@@ -3793,7 +3975,7 @@ private:
     u64 virtual_time_usec_=1350000000000000ull;
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
-    u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0;
+    u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0;
     u32 host_stage_no_svc_chunks_=0u;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
@@ -3819,7 +4001,10 @@ int main(int argc,char** argv){
         auto exe=FindAppExecutable(ipa);
         log<<"Executable member: "<<exe.member<<" ("<<exe.bytes.size()<<" bytes)\n";
         auto image=SelectAndParseArmv7(exe.bytes);
-        log<<"Mach-O: "<<image.arch<<" entry=0x"<<std::hex<<image.entry<<std::dec<<" encrypted="<<(image.encrypted?1:0)<<"\n";
+        log<<"Mach-O: "<<image.arch<<" entry=0x"<<std::hex<<image.entry<<std::dec
+           <<" entry-source="<<(image.entry_kind==MachEntryKind::Main?"LC_MAIN":"LC_UNIXTHREAD");
+        if(image.entry_kind==MachEntryKind::Main)log<<" entryoff=0x"<<std::hex<<image.main_entryoff<<std::dec;
+        log<<" encrypted="<<(image.encrypted?1:0)<<" constructors="<<image.constructor_count<<"\n";
         const auto slash=exe.member.find_last_of('/');
         const std::string app_root=slash==std::string::npos?std::string{}:exe.member.substr(0,slash+1u);
         IosBootstrap runtime(std::move(image),log,ipa,app_root);

@@ -1,0 +1,62 @@
+Geometry Dash Wrapper 0.9.6-publictest26 verification
+=====================================================
+
+Scope
+-----
+Primary target for this iteration: launching Geometry Dash iOS ARMv7 builds.
+Forlorn gameplay compatibility is not the focus of PublicTest26.
+
+Static source checks
+--------------------
+- iOS backend C++20 syntax-only compile: PASS
+- Existing warnings only (FakeObject aggregate initializer / unused parameters/locals): PASS
+- No IPA/APK/EXE/DLL/SO game payloads in source tree: PASS
+
+Mach-O startup checks against the five supplied IPAs
+----------------------------------------------------
+Geometry Dash 1.81:
+  entry kind: LC_UNIXTHREAD
+  entry: 0x9350
+  __mod_init_func count: 261
+
+Geometry Dash 1.90:
+  entry kind: LC_UNIXTHREAD
+  entry: 0xA5B0
+  __mod_init_func count: 251
+
+Geometry Dash 1.91:
+  entry kind: LC_UNIXTHREAD
+  entry: 0x8C10
+  __mod_init_func count: 252
+
+Geometry Dash 2.11:
+  entry kind: LC_MAIN
+  entryoff: 0x1C8D91
+  __TEXT vmaddr: 0x4000
+  computed guest entry: 0x1CCD91
+  __mod_init_func count: 305
+  disassembly check: computed address lands on Thumb function prologue: PASS
+
+Geometry Dash SubZero 1.0:
+  entry kind: LC_MAIN
+  entryoff: 0x1E5165
+  __TEXT vmaddr: 0x4000
+  computed guest entry: 0x1E9165
+  __mod_init_func count: 311
+
+Constructor pointer validation:
+  1.81: 261/261 inside executable __TEXT, Thumb
+  1.90: 251/251 inside executable __TEXT, Thumb
+  1.91: 252/252 inside executable __TEXT, Thumb
+  2.11: 305/305 inside executable __TEXT, Thumb
+  SubZero: 311/311 inside executable __TEXT, Thumb
+
+Important runtime limitation
+----------------------------
+This environment does not execute the Windows/Dynarmic build, so actual Windows runtime behavior is not claimed as verified. PublicTest26 is designed so the first remaining constructor/bootstrap incompatibility is logged explicitly instead of being hidden behind the previous startup blockers.
+
+Patch/package source verification
+---------------------------------
+- PT25 -> PT26 patch applies cleanly: PASS
+- Patched clean PT25 tree matches PT26 byte-for-byte: PASS (159 files)
+- Source payload scan for .ipa/.apk/.exe/.dll/.so: PASS (none found)
