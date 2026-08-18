@@ -1350,7 +1350,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest28 bypasses unavailable Everyplay telemetry, implements Darwin errno/ARC helpers, and continues Geometry Dash startup toward the first cocos2d scene.\n";
+            log_<<"Execution status: PublicTest29 bypasses unavailable Everyplay telemetry, implements Darwin errno/ARC helpers, and continues Geometry Dash startup toward the first cocos2d scene.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -2834,31 +2834,35 @@ private:
         }
 
         // Geometry Dash 1.81-2.11 bundles the now-defunct Everyplay SDK.
-        // It is not part of gameplay and its startup probes filesystem/jailbreak,
-        // analytics, OAuth and networking services that do not exist in this
-        // Windows iOS compatibility environment.  Report the service as
-        // unavailable and skip registration rather than executing the obsolete
-        // telemetry stack before cocos2d can create the first scene.
-        if(guest_class_receiver && guest_class_receiver->name=="Everyplay"){
-            if(selector.starts_with("setClientId:clientSecret:redirectURI:")){
-                ++everyplay_bypass_count_;
-                if(everyplay_bypass_count_<=8u)
-                    log_<<"IOS: bypassing Everyplay +"<<selector<<" count="<<everyplay_bypass_count_
-                        <<" policy=service-unavailable\n";
+        // PublicTest28 only bypassed Everyplay itself, but the game immediately
+        // entered EveryplayAudioManager / EveryplaySoundEngine / notification
+        // helpers and crashed before cocos2d could present frame 1.  PublicTest29
+        // quarantines the whole Everyplay class family: do not execute any guest
+        // Everyplay IMP.  Singleton/constructor-style calls receive a stable
+        // inert object; capability queries report unavailable; everything else
+        // is a harmless no-op.
+        if(guest_class_receiver && guest_class_receiver->name.starts_with("Everyplay")){
+            const std::string& ep_class=guest_class_receiver->name;
+            auto inert_instance=[&](){
+                const std::string key="everyplay-instance:"+ep_class;
+                auto it=fake_named_.find(key);
+                if(it!=fake_named_.end())return it->second;
+                const u32 obj=NewExternalInstance(ep_class);
+                fake_named_[key]=obj;
+                return obj;
+            };
+            const bool returns_instance=
+                selector=="alloc"||selector=="new"||selector=="sharedInstance"||
+                selector=="sharedManager"||selector=="defaultManager"||
+                selector=="instance"||selector.starts_with("initWith");
+            if(returns_instance){
+                cpu_.Regs()[0]=inert_instance();
+            }else{
                 cpu_.Regs()[0]=0u;
-                return true;
             }
-            if(selector=="isSupported"){
-                if(++everyplay_capability_logs_<=8u)
-                    log_<<"IOS: Everyplay +isSupported -> NO (service unavailable)\n";
-                cpu_.Regs()[0]=0u;
-                return true;
-            }
-        }
-        if(guest_class_receiver && guest_class_receiver->name=="EveryplayFeatures" && selector=="isSupported"){
-            if(++everyplay_capability_logs_<=8u)
-                log_<<"IOS: EveryplayFeatures +isSupported -> NO (service unavailable)\n";
-            cpu_.Regs()[0]=0u;
+            if(++everyplay_bypass_count_<=64u)
+                log_<<"IOS EVERYPLAY QUARANTINE: class="<<ep_class<<" selector=+"<<selector
+                    <<" return=0x"<<Hex(cpu_.Regs()[0])<<" policy=service-unavailable\n";
             return true;
         }
 
@@ -2899,6 +2903,19 @@ private:
             }
         }
         if(const GuestClass* instance_class=FindGuestClassForInstance(receiver)){
+            if(instance_class->name.starts_with("Everyplay")){
+                if(selector=="init"||selector.starts_with("initWith")||
+                   selector=="retain"||selector=="autorelease"||
+                   selector=="copy"||selector=="mutableCopy")
+                    cpu_.Regs()[0]=receiver;
+                else
+                    cpu_.Regs()[0]=0u;
+                if(++everyplay_bypass_count_<=64u)
+                    log_<<"IOS EVERYPLAY QUARANTINE: class="<<instance_class->name
+                        <<" selector=-"<<selector<<" receiver=0x"<<Hex(receiver)
+                        <<" return=0x"<<Hex(cpu_.Regs()[0])<<"\n";
+                return true;
+            }
             if(instance_class->name=="CCConfiguration"&&selector=="supportsNPOT"){
                 cpu_.Regs()[0]=1u;
                 if(++capability_override_logs_<=16u)log_<<"IOS HOSTGL: CCConfiguration supportsNPOT -> YES (desktop GL bridge)\n";
@@ -2985,6 +3002,20 @@ private:
         const auto fit=fake_objects_.find(receiver);
         if(fit!=fake_objects_.end()){
             const auto& fo=fit->second;
+            if(fo.class_name.starts_with("Everyplay")){
+                if(!fo.is_class&&!fo.is_meta&&
+                   (selector=="init"||selector.starts_with("initWith")||
+                    selector=="retain"||selector=="autorelease"||
+                    selector=="copy"||selector=="mutableCopy"))
+                    cpu_.Regs()[0]=receiver;
+                else
+                    cpu_.Regs()[0]=0u;
+                if(++everyplay_bypass_count_<=64u)
+                    log_<<"IOS EVERYPLAY QUARANTINE: fake class="<<fo.class_name
+                        <<" selector="<<selector<<" receiver=0x"<<Hex(receiver)
+                        <<" return=0x"<<Hex(cpu_.Regs()[0])<<"\n";
+                return true;
+            }
             if((fo.is_class||fo.is_meta)&&(selector=="alloc"||selector=="new")){
                 cpu_.Regs()[0]=NewExternalInstance(fo.class_name);
                 if(fo.class_name=="UIWindow")window_instance_=cpu_.Regs()[0];
@@ -4293,6 +4324,36 @@ private:
         }
         if(name=="__cxa_begin_catch"){return true;}
         if(name=="__cxa_end_catch"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="dlsym"){
+            std::string symbol;
+            if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],symbol,512u);
+            if(symbol=="alcMacOSXMixerOutputRate"){
+                cpu_.Regs()[0]=EnsureImport("alcMacOSXMixerOutputRate");
+                if(++dynamic_symbol_logs_<=16u)
+                    log_<<"IOS DYNSYM: dlsym '"<<symbol<<"' -> synthetic stub 0x"<<Hex(cpu_.Regs()[0])<<"\n";
+            }else{
+                cpu_.Regs()[0]=0u;
+                if(++dynamic_symbol_logs_<=16u)
+                    log_<<"IOS DYNSYM: dlsym '"<<symbol<<"' -> null\n";
+            }
+            return true;
+        }
+        if(name=="alcMacOSXMixerOutputRate"){
+            // Obsolete Apple OpenAL extension used only to tune the mixer rate.
+            // Treat as a successful no-op; desktop OpenAL/host audio owns timing.
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="__tolower"||name=="tolower"){
+            const int c=static_cast<int>(cpu_.Regs()[0]&0xffu);
+            cpu_.Regs()[0]=static_cast<u32>(std::tolower(static_cast<unsigned char>(c)));
+            return true;
+        }
+        if(name=="__toupper"||name=="toupper"){
+            const int c=static_cast<int>(cpu_.Regs()[0]&0xffu);
+            cpu_.Regs()[0]=static_cast<u32>(std::toupper(static_cast<unsigned char>(c)));
+            return true;
+        }
         if(name=="memset"){const u32 dst=cpu_.Regs()[0],value=cpu_.Regs()[1]&0xffu,n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)){std::vector<u8> v(n,static_cast<u8>(value));env_.WriteBytes(dst,v.data(),v.size());}cpu_.Regs()[0]=dst;return true;}
         if(name=="memcpy"||name=="memmove"){const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1],n=cpu_.Regs()[2];if(n&&env_.IsMapped(dst,n)&&env_.IsMapped(src,n)){std::vector<u8> tmp(n);env_.ReadBytes(src,tmp.data(),n);env_.WriteBytes(dst,tmp.data(),n);}cpu_.Regs()[0]=dst;return true;}
         if(name=="strlen"){std::string s;if(!env_.ReadCString(cpu_.Regs()[0],s,1u<<20)){cpu_.Regs()[0]=0;}else cpu_.Regs()[0]=static_cast<u32>(s.size());return true;}
@@ -4344,7 +4405,7 @@ private:
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0,cpp_string_logs_=0,dispatch_once_logs_=0;
-    u64 everyplay_bypass_count_=0,everyplay_capability_logs_=0,errno_logs_=0;
+    u64 everyplay_bypass_count_=0,everyplay_capability_logs_=0,errno_logs_=0,dynamic_symbol_logs_=0;
     u32 host_stage_no_svc_chunks_=0u;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
