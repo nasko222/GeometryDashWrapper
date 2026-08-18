@@ -1,0 +1,30 @@
+Geometry Dash Wrapper 0.9.6-publictest28 verification
+======================================================
+
+Source target
+- iOS ARMv7 backend: src/backends/ios_armv7/dynarmic_ios_armv7.cpp
+- Focus: Geometry Dash 1.81/1.90/1.91/2.11 common post-bootstrap Everyplay crash.
+
+PT27 failure confirmed from supplied logs
+- GD 1.81, 1.90, 1.91 and 2.11 all fault in EveryplayCommon +isJailbroken.
+- The exact invalid access is address 0x0 immediately after Darwin ___error.
+- 1.91 exact fault PC: 0x4234d2, instruction `ldr r5, [r0]` after ___error.
+- PT27 returned r0=0 for ___error, making that dereference deterministic.
+
+PT28 source changes
+- Everyplay registration bypassed as unavailable telemetry/service.
+- Everyplay/EveryplayFeatures +isSupported returns NO.
+- guest errno cell + __error pointer semantics.
+- fopen missing path => errno 2 (ENOENT).
+- read-only fopen write modes => errno 13 (EACCES).
+- fclose(NULL) => errno 9 (EBADF), return -1.
+- objc_retainAutoreleaseReturnValue identity semantics.
+- objc_storeStrong + basic weak ARC helpers.
+- objc autorelease pool push/pop.
+- CFUUID and dispatch queue bootstrap objects.
+- libstdc++ ios_base::Init explicit no-op.
+
+Verification status
+- C++20 syntax-only compile: PASS (using local Dynarmic API stub; warnings are pre-existing style/initializer warnings).
+- Runtime verification on Windows: NOT AVAILABLE in this environment.
+- No game IPA is included in the source archive.

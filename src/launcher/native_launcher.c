@@ -40,7 +40,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.6-publictest27"
+#define LAUNCHER_VERSION "0.9.6-publictest28"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -1159,10 +1159,10 @@ static int AnalyzeIpaInput(const wchar_t *input_path) {
         printf("architecture needs a dedicated iOS loader/runtime path.\n");
     }
     if (encrypted) {
-        printf("Execution blocker: executable reports App Store encryption. PublicTest26 will not attempt to bypass it.\n");
+        printf("Execution blocker: executable reports App Store encryption. PublicTest28 will not attempt to bypass it.\n");
     }
     printf("RESULT: IPA_ANALYZER_OK arch=%s encrypted=%d\n", primary_arch, encrypted);
-    printf("Execution status: PublicTest26 will now attempt the separate ARMv7 iOS bootstrap; Android APK handling is unchanged.\n");
+    printf("Execution status: PublicTest28 will now attempt the separate ARMv7 iOS bootstrap; Android APK handling is unchanged.\n");
     free(executable);
     ApkArchiveClose(&archive);
     return 1;
@@ -1677,7 +1677,7 @@ static int CreateIpaRunDirectory(const wchar_t *base_directory,
     if (!EnsureDirectory(day_directory)) return 0;
 
     swprintf_s(folder_name, ARRAY_COUNT(folder_name),
-               L"%02u-%02u-%02u__ios-armv7__publictest27",
+               L"%02u-%02u-%02u__ios-armv7__publictest28",
                now.wHour, now.wMinute, now.wSecond);
     for (suffix = 1u; suffix < 1000u; ++suffix) {
         if (suffix == 1u) {
@@ -1755,7 +1755,7 @@ static DWORD LaunchIpaBootstrap(const wchar_t *input_path) {
         return 1u;
     }
 
-    wprintf(L"\nPublicTest26: starting real ARMv7 iOS bootstrap...\n");
+    wprintf(L"\nPublicTest28: starting real ARMv7 iOS bootstrap...\n");
     wprintf(L"iOS log: %ls\n", log_path);
     if (!CreateProcessW(backend_path, command, NULL, NULL, FALSE, 0,
                         NULL, base_directory, &startup, &process)) {

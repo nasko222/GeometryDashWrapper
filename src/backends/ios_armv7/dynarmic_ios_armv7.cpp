@@ -1350,7 +1350,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest26 adds LC_MAIN startup, real __mod_init_func execution, and the C++ runtime primitives needed by Geometry Dash static constructors.\n";
+            log_<<"Execution status: PublicTest28 bypasses unavailable Everyplay telemetry, implements Darwin errno/ARC helpers, and continues Geometry Dash startup toward the first cocos2d scene.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1487,6 +1487,15 @@ private:
     }
     u32 AllocateObjectBytes(u32 size){ object_cursor_=AlignUp(object_cursor_,8u); if(u64(object_cursor_)+size>u64(kObjectBase)+kObjectSize)throw std::runtime_error("iOS fake object region exhausted");u32 a=object_cursor_;object_cursor_+=AlignUp(size,8u);return a; }
     u32 AllocateCString(const std::string& s){ u32 a=Allocate(static_cast<u32>(s.size()+1u),1u); env_.WriteBytes(a,s.c_str(),s.size()+1u); return a; }
+    u32 GuestErrnoAddress(){
+        if(!errno_addr_){
+            errno_addr_=Allocate(4u,4u);
+            env_.MemoryWrite32(errno_addr_,0u);
+            log_<<"IOS LIBC: guest errno cell=0x"<<Hex(errno_addr_)<<"\n";
+        }
+        return errno_addr_;
+    }
+    void SetGuestErrno(u32 value){env_.MemoryWrite32(GuestErrnoAddress(),value);}
 
     u32 EnsureExternalClass(const std::string& name,bool meta=false){
         const std::string key=(meta?"meta:":"class:")+name;
@@ -2824,6 +2833,35 @@ private:
             return true;
         }
 
+        // Geometry Dash 1.81-2.11 bundles the now-defunct Everyplay SDK.
+        // It is not part of gameplay and its startup probes filesystem/jailbreak,
+        // analytics, OAuth and networking services that do not exist in this
+        // Windows iOS compatibility environment.  Report the service as
+        // unavailable and skip registration rather than executing the obsolete
+        // telemetry stack before cocos2d can create the first scene.
+        if(guest_class_receiver && guest_class_receiver->name=="Everyplay"){
+            if(selector.starts_with("setClientId:clientSecret:redirectURI:")){
+                ++everyplay_bypass_count_;
+                if(everyplay_bypass_count_<=8u)
+                    log_<<"IOS: bypassing Everyplay +"<<selector<<" count="<<everyplay_bypass_count_
+                        <<" policy=service-unavailable\n";
+                cpu_.Regs()[0]=0u;
+                return true;
+            }
+            if(selector=="isSupported"){
+                if(++everyplay_capability_logs_<=8u)
+                    log_<<"IOS: Everyplay +isSupported -> NO (service unavailable)\n";
+                cpu_.Regs()[0]=0u;
+                return true;
+            }
+        }
+        if(guest_class_receiver && guest_class_receiver->name=="EveryplayFeatures" && selector=="isSupported"){
+            if(++everyplay_capability_logs_<=8u)
+                log_<<"IOS: EveryplayFeatures +isSupported -> NO (service unavailable)\n";
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+
         if(guest_class_receiver&&selector=="class"){cpu_.Regs()[0]=receiver;return true;}
         if(guest_class_receiver&&(selector=="respondsToSelector:"||selector=="instancesRespondToSelector:")){
             const u32 imp=GuestMethodImpForSelector(guest_class_receiver,selector=="respondsToSelector:",cpu_.Regs()[2]);
@@ -3526,8 +3564,33 @@ private:
         if(name=="objc_msgSend_stret")return HandleObjcMsgSendStret();
         if(name=="objc_msgSendSuper2")return HandleObjcMsgSendSuper2();
         if(name=="objc_msgSendSuper2_stret"){if(cpu_.Regs()[0]&&env_.IsMapped(cpu_.Regs()[0],16u))WriteCGRect(cpu_.Regs()[0],0.0f,0.0f,0.0f,0.0f);return true;}
-        if(name=="objc_retain"||name=="objc_autorelease"||name=="objc_retainAutoreleasedReturnValue"||name=="objc_autoreleaseReturnValue"){return true;}
+        if(name=="objc_retain"||name=="objc_autorelease"||name=="objc_retainAutoreleasedReturnValue"||
+           name=="objc_retainAutoreleaseReturnValue"||name=="objc_autoreleaseReturnValue"||name=="objc_retainBlock"){return true;}
         if(name=="objc_release"){cpu_.Regs()[0]=0;return true;}
+        if(name=="objc_storeStrong"){
+            const u32 location=cpu_.Regs()[0],value=cpu_.Regs()[1];
+            if(location&&env_.IsMapped(location,4u))env_.MemoryWrite32(location,value);
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="objc_initWeak"||name=="objc_storeWeak"){
+            const u32 location=cpu_.Regs()[0],value=cpu_.Regs()[1];
+            if(location&&env_.IsMapped(location,4u))env_.MemoryWrite32(location,value);
+            cpu_.Regs()[0]=value;return true;
+        }
+        if(name=="objc_loadWeak"||name=="objc_loadWeakRetained"){
+            const u32 location=cpu_.Regs()[0];
+            cpu_.Regs()[0]=(location&&env_.IsMapped(location,4u))?env_.MemoryRead32(location):0u;return true;
+        }
+        if(name=="objc_destroyWeak"){
+            const u32 location=cpu_.Regs()[0];
+            if(location&&env_.IsMapped(location,4u))env_.MemoryWrite32(location,0u);
+            cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="objc_autoreleasePoolPush"){
+            if(!autorelease_pool_token_)autorelease_pool_token_=NewExternalInstance("NSAutoreleasePool");
+            cpu_.Regs()[0]=autorelease_pool_token_;return true;
+        }
+        if(name=="objc_autoreleasePoolPop"){cpu_.Regs()[0]=0u;return true;}
         if(name=="objc_getClass"){std::string n;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],n,512u);for(const auto& c:classes_)if(c.name==n){cpu_.Regs()[0]=c.class_addr;return true;}cpu_.Regs()[0]=EnsureExternalClass(n.empty()?"NSObject":n);return true;}
         if(name=="sel_registerName"||name=="sel_getUid"){return true;}
         if(name=="NSStringFromClass"){const std::string n=ClassNameForAddress(cpu_.Regs()[0]);cpu_.Regs()[0]=NewFakeString(n.empty()?"NSObject":n);return true;}
@@ -3989,6 +4052,36 @@ private:
             cpu_.Regs()[0]=0u;return true;
         }
 
+        // Darwin libc exposes errno through int *__error(void).  Everyplay's
+        // jailbreak probe deliberately fopen()s /bin/bash and immediately reads
+        // errno when that path is absent.  Returning NULL from __error was the
+        // exact PublicTest27 crash in GD 1.81, 1.90, 1.91 and 2.11.
+        if(name=="__error"){
+            cpu_.Regs()[0]=GuestErrnoAddress();
+            if(++errno_logs_<=16u)
+                log_<<"IOS LIBC: __error -> 0x"<<Hex(cpu_.Regs()[0])
+                    <<" value="<<env_.MemoryRead32(cpu_.Regs()[0])<<"\n";
+            return true;
+        }
+        if(name=="__ZNSt8ios_base4InitC1Ev"||name=="_ZNSt8ios_base4InitC1Ev"||
+           name=="__ZNSt8ios_base4InitD1Ev"||name=="_ZNSt8ios_base4InitD1Ev"){
+            return true;
+        }
+        if(name=="CFUUIDCreate"){
+            const u32 obj=NewExternalInstance("CFUUID");
+            fake_objects_[obj].string_value="00000000-0000-4000-8000-000000000001";
+            cpu_.Regs()[0]=obj;return true;
+        }
+        if(name=="CFUUIDCreateString"){
+            const u32 uuid=cpu_.Regs()[1];
+            std::string value="00000000-0000-4000-8000-000000000001";
+            auto it=fake_objects_.find(uuid);
+            if(it!=fake_objects_.end()&&!it->second.string_value.empty())value=it->second.string_value;
+            cpu_.Regs()[0]=NewFakeString(value);return true;
+        }
+        if(name=="CFRelease"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="dispatch_queue_create"){cpu_.Regs()[0]=NewExternalInstance("OS_dispatch_queue");return true;}
+
         // Read-only stdio backed directly by files inside Payload/<app>.app/.
         // cocos2d's CCZ/PVR loaders use the C FILE API even when NSBundle has
         // already resolved the resource path, so returning null from fopen was
@@ -3997,9 +4090,16 @@ private:
             std::string path,mode;
             env_.ReadCString(cpu_.Regs()[0],path,1u<<20);
             env_.ReadCString(cpu_.Regs()[1],mode,64u);
-            if(mode.find('w')!=std::string::npos||mode.find('a')!=std::string::npos||mode.find('+')!=std::string::npos){cpu_.Regs()[0]=0u;return true;}
+            SetGuestErrno(0u);
+            if(mode.find('w')!=std::string::npos||mode.find('a')!=std::string::npos||mode.find('+')!=std::string::npos){
+                SetGuestErrno(13u); // EACCES: the bootstrap VFS is read-only.
+                cpu_.Regs()[0]=0u;return true;
+            }
             cpu_.Regs()[0]=OpenVirtualAsset(path,false);
-            if(!cpu_.Regs()[0]&&++file_failure_logs_<=16u)log_<<"IOS FILE: fopen miss path="<<path<<" mode="<<mode<<"\\n";
+            if(!cpu_.Regs()[0]){
+                SetGuestErrno(2u); // ENOENT, matching a normal non-jailbroken iOS filesystem probe.
+                if(++file_failure_logs_<=16u)log_<<"IOS FILE: fopen miss path="<<path<<" mode="<<mode<<" errno=2\n";
+            }
             return true;
         }
         if(name=="fread"){
@@ -4030,8 +4130,15 @@ private:
         if(name=="feof"){
             VirtualFile* file=FindVirtualFile(cpu_.Regs()[0]);cpu_.Regs()[0]=(!file||file->pos>=file->bytes.size())?1u:0u;return true;
         }
+        if(name=="ferror"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="clearerr"){cpu_.Regs()[0]=0u;return true;}
+        if(name=="fileno"){
+            cpu_.Regs()[0]=FindVirtualFile(cpu_.Regs()[0])?3u:static_cast<u32>(-1);return true;
+        }
         if(name=="fclose"){
-            const u32 handle=cpu_.Regs()[0];virtual_files_.erase(handle);cpu_.Regs()[0]=0u;return true;
+            const u32 handle=cpu_.Regs()[0];
+            if(!handle){SetGuestErrno(9u);cpu_.Regs()[0]=static_cast<u32>(-1);return true;}
+            virtual_files_.erase(handle);cpu_.Regs()[0]=0u;return true;
         }
         if(name=="gzopen"){
             std::string path,mode;env_.ReadCString(cpu_.Regs()[0],path,1u<<20);env_.ReadCString(cpu_.Regs()[1],mode,64u);
@@ -4229,6 +4336,7 @@ private:
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
     u32 active_play_layer_=0;
     u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0,fast_enum_mutation_addr_=0;
+    u32 errno_addr_=0,autorelease_pool_token_=0;
     u32 touch_object_=0,touch_set_=0,touch_event_=0,touch_phase_=0;
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
@@ -4236,6 +4344,7 @@ private:
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0,cpp_string_logs_=0,dispatch_once_logs_=0;
+    u64 everyplay_bypass_count_=0,everyplay_capability_logs_=0,errno_logs_=0;
     u32 host_stage_no_svc_chunks_=0u;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
