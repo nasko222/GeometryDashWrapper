@@ -1,0 +1,40 @@
+Geometry Dash Wrapper 0.9.6-publictest27 verification
+
+Scope
+-----
+PublicTest27 targets the first common Geometry Dash iOS runtime blocker after
+PublicTest26 successfully ran Mach-O static constructors, UIApplicationMain,
+and the real AppController delegate far enough to create the OpenGL window.
+
+Implemented/checked
+-------------------
+- LC_UNIXTHREAD and LC_MAIN support from PT26 retained.
+- Static __mod_init_func execution from PT26 retained.
+- Legacy 32-bit libstdc++ std::string bridge added.
+- Later 32-bit libc++ std::__1::basic_string bridge added.
+- libc strcpy/strncpy/strcmp/strncmp/strcasecmp/strncasecmp/strchr/strrchr/
+  strstr/strcasestr/strpbrk/strlcat/memcmp/memchr/memset_pattern16 added.
+- dispatch_once now executes the guest block invoke function once per token.
+- objc_retainAutoreleaseReturnValue identity handling added.
+- SjLj register/unregister import spelling aliases added.
+- Exact invalid-memory callback PC/LR capture added as fault-pc/fault-lr.
+
+Static verification
+-------------------
+C++20 syntax-only compile:
+  g++ -std=c++20 -I/mnt/data/dyn_stub -Isrc/shared -Isrc/backends/ios_armv7 \
+      -fsyntax-only -Wall -Wextra src/backends/ios_armv7/dynarmic_ios_armv7.cpp
+Result: PASS (warnings only; no syntax errors).
+
+Packaging verification
+----------------------
+- Full source contains no IPA/APK/game executable payloads.
+- PT26 -> PT27 patch applies cleanly to a pristine PT26 source tree.
+- Applied patch tree is compared byte-for-byte with the PT27 source tree.
+- Full-source and hotfix ZIP archives are tested with unzip -t.
+
+Runtime note
+------------
+No Windows/Dynarmic runtime execution is available in this environment.
+The next Windows logs should show IOS CXXSTR / IOS DISPATCH activity and, on
+remaining memory faults, exact fault-pc/fault-lr fields.

@@ -22,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -709,7 +710,7 @@ public:
     ProbeEnvironment() : page_regions_(kGuestPageCount, kUnmappedPage) {}
     u64 ticks_left = 0;
     bool invalid_access = false, interpreter_fallback = false, exception_seen = false, svc_pending = false;
-    u32 pending_svc = 0, fault_address = 0, fallback_pc = 0, exception_pc = 0;
+    u32 pending_svc = 0, fault_address = 0, fault_pc = 0, fault_lr = 0, fallback_pc = 0, exception_pc = 0;
     std::size_t fallback_count = 0;
     void Map(u32 base, std::size_t size, bool executable) {
         if (!size || size > std::numeric_limits<u32>::max()) throw std::runtime_error("invalid guest mapping");
@@ -762,7 +763,7 @@ public:
         MemoryRegion* r=FindMutable(address,size);
         return r ? static_cast<void*>(r->data.data()+(address-r->base)) : nullptr;
     }
-    void ResetStopState() { invalid_access=false; interpreter_fallback=false; exception_seen=false; svc_pending=false; pending_svc=0; fault_address=0; fallback_pc=0; fallback_count=0; exception_pc=0; }
+    void ResetStopState() { invalid_access=false; interpreter_fallback=false; exception_seen=false; svc_pending=false; pending_svc=0; fault_address=0; fault_pc=0; fault_lr=0; fallback_pc=0; fallback_count=0; exception_pc=0; }
     u8 MemoryRead8(u32 a) override { auto* r=Find(a,1); if(!r)return ReadFault<u8>(a); return r->data[a-r->base]; }
     u16 MemoryRead16(u32 a) override { return ReadTyped<u16>(a); }
     u32 MemoryRead32(u32 a) override { return ReadTyped<u32>(a); }
@@ -788,8 +789,8 @@ private:
     MemoryRegion* FindContainingMutable(u32 a){ const auto i=page_regions_[a>>kShift];if(i<0)return nullptr;auto& r=regions_[static_cast<std::size_t>(i)];return u64(a)<u64(r.base)+r.data.size()&&a>=r.base?&r:nullptr; }
     const MemoryRegion* Find(u32 a,std::size_t s) const { const u64 e=u64(a)+s;if(e>0x100000000ull)return nullptr;const auto* r=FindContaining(a);return r&&e<=u64(r->base)+r->data.size()?r:nullptr; }
     MemoryRegion* FindMutable(u32 a,std::size_t s){ const u64 e=u64(a)+s;if(e>0x100000000ull)return nullptr;auto* r=FindContainingMutable(a);return r&&e<=u64(r->base)+r->data.size()?r:nullptr; }
-    template<class T>T ReadFault(u32 a){invalid_access=true;fault_address=a;RequestHalt();return T{};}
-    void WriteFault(u32 a){invalid_access=true;fault_address=a;RequestHalt();}
+    template<class T>T ReadFault(u32 a){invalid_access=true;fault_address=a;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();return T{};}
+    void WriteFault(u32 a){invalid_access=true;fault_address=a;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();}
     template<class T>T ReadTyped(u32 a){const auto* r=Find(a,sizeof(T));if(!r)return ReadFault<T>(a);T v{};std::memcpy(&v,r->data.data()+(a-r->base),sizeof(v));return v;}
     template<class T>void WriteTyped(u32 a,T v){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a);return;}std::memcpy(r->data.data()+(a-r->base),&v,sizeof(v));}
     template<class T>bool CompareExchange(u32 a,T v,T e){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a);return false;}T c{};u8* p=r->data.data()+(a-r->base);std::memcpy(&c,p,sizeof(c));if(c!=e)return false;std::memcpy(p,&v,sizeof(v));return true;}
@@ -1288,10 +1289,10 @@ public:
                     const u32 ctor=constructor_index_<image_.constructors.size()?image_.constructors[constructor_index_]:0u;
                     log_<<"RESULT: IOS_CONSTRUCTOR_MEMORY_FAULT index="<<(constructor_index_+1u)<<"/"<<image_.constructors.size()
                         <<" target=0x"<<Hex(ctor)<<" address=0x"<<Hex(env_.fault_address)
-                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<"\n";
+                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<" fault-pc=0x"<<Hex(env_.fault_pc)<<" fault-lr=0x"<<Hex(env_.fault_lr)<<"\n";
                 }else{
                     log_ << (frame_pump_active_?"RESULT: IOS_FRAME_MEMORY_FAULT address=0x":(delegate_launch_active_?"RESULT: IOS_DELEGATE_MEMORY_FAULT address=0x":"RESULT: IOS_BOOTSTRAP_MEMORY_FAULT address=0x")) << Hex(env_.fault_address)
-                         << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << "\n";
+                         << " pc=0x" << Hex(cpu_.Regs()[15]) << " lr=0x" << Hex(cpu_.Regs()[14]) << " fault-pc=0x" << Hex(env_.fault_pc) << " fault-lr=0x" << Hex(env_.fault_lr) << "\n";
                 }
                 LogFaultContext();
                 if(frame_pump_active_&&cpu_.Regs()[15]>=0x1000u&&cpu_.Regs()[15]<0x2000u)
@@ -1332,7 +1333,7 @@ public:
                 }
                 if(host_stage_no_svc_chunks_>=20u){
                     log_<<"RESULT: IOS_HOSTCALL_STALL stage="<<(host_call_stage_==HostCallStage::Touch?"Touch":"Frame")
-                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<"\n";
+                        <<" pc=0x"<<Hex(cpu_.Regs()[15])<<" lr=0x"<<Hex(cpu_.Regs()[14])<<" fault-pc=0x"<<Hex(env_.fault_pc)<<" fault-lr=0x"<<Hex(env_.fault_lr)<<"\n";
                     LogFaultContext();
                     return false;
                 }
@@ -2011,16 +2012,21 @@ private:
         std::string label;
     };
 
-    void EnterGuestMethodCall(const GuestMethod& method,std::string label){
+    void EnterGuestFunctionCall(u32 target,std::string label){
         GuestCallFrame frame;
         for(std::size_t i=0;i<frame.callee_saved.size();++i)frame.callee_saved[i]=cpu_.Regs()[kIosCalleeSavedRegs[i]];
         frame.sp=cpu_.Regs()[13];
         frame.return_lr=cpu_.Regs()[14];
-        frame.imp=method.imp;
+        frame.imp=target;
         frame.label=std::move(label);
         guest_call_frames_.push_back(std::move(frame));
         cpu_.Regs()[14]=kGuestCallReturnStub;
-        EnterGuestMethod(method);
+        cpu_.Regs()[15]=target&~1u;
+        cpu_.SetCpsr((cpu_.Cpsr()&~0x20u)|((target&1u)?0x20u:0u));
+    }
+
+    void EnterGuestMethodCall(const GuestMethod& method,std::string label){
+        EnterGuestFunctionCall(method.imp,std::move(label));
     }
 
     bool ReturnFromGuestMethodCall(){
@@ -2560,6 +2566,82 @@ private:
 
     std::string ClassNameForAddress(u32 addr)const{auto it=fake_objects_.find(addr);if(it!=fake_objects_.end())return it->second.class_name;for(const auto& c:classes_)if(c.class_addr==addr||c.meta_addr==addr)return c.name;const GuestClass* instance=FindGuestClassForInstance(addr);return instance?instance->name:std::string{};}
     std::string DescribeString(u32 obj){if(!obj)return {};auto it=fake_objects_.find(obj);if(it!=fake_objects_.end()&&!it->second.string_value.empty())return it->second.string_value;std::string direct;if(env_.ReadCString(obj,direct,512u)&&!direct.empty()&&std::all_of(direct.begin(),direct.end(),[](unsigned char c){return c>=0x20&&c<0x7f;}))return direct;if(env_.IsMapped(obj,16u)){const u32 chars=env_.MemoryRead32(obj+8u);std::string s;if(chars&&env_.ReadCString(chars,s,512u))return s;}return {};}
+
+
+    // libstdc++ (GCC-era iOS) std::string ABI: the object contains one
+    // character pointer.  A 12-byte _Rep header (length/capacity/refcount)
+    // sits immediately before the character data.
+    bool ReadGnuString(u32 object,std::string& out){
+        out.clear();
+        if(!object||!env_.IsMapped(object,4u))return false;
+        const u32 data=env_.MemoryRead32(object);
+        if(!data)return true;
+        if(data>=12u&&env_.IsMapped(data-12u,12u)){
+            const u32 len=env_.MemoryRead32(data-12u);
+            if(len<=(1u<<20)&&env_.IsMapped(data,std::size_t(len)+1u)){
+                out.resize(len);
+                if(len)env_.ReadBytes(data,out.data(),len);
+                return true;
+            }
+        }
+        return env_.ReadCString(data,out,1u<<20);
+    }
+    bool WriteGnuString(u32 object,std::string_view value){
+        if(!object||!env_.IsMapped(object,4u))return false;
+        if(value.size()>(1u<<20))return false;
+        const u32 bytes=static_cast<u32>(12u+value.size()+1u);
+        const u32 rep=Allocate(bytes,4u,true);
+        if(!rep)return false;
+        env_.MemoryWrite32(rep+0u,static_cast<u32>(value.size()));
+        env_.MemoryWrite32(rep+4u,static_cast<u32>(value.size()));
+        env_.MemoryWrite32(rep+8u,0u); // one unshared reference in old libstdc++
+        if(!value.empty())env_.WriteBytes(rep+12u,value.data(),value.size());
+        env_.MemoryWrite8(rep+12u+static_cast<u32>(value.size()),0u);
+        env_.MemoryWrite32(object,rep+12u);
+        return true;
+    }
+
+    // libc++ 32-bit default basic_string layout used by later ARMv7 iOS
+    // builds.  We deliberately materialize every host-created value in the
+    // long representation: [cap|long-bit, size, data*].  This is ABI-compatible
+    // with libc++'s little-endian 32-bit layout and avoids SSO corner cases.
+    bool ReadLibcxxString(u32 object,std::string& out){
+        out.clear();
+        if(!object||!env_.IsMapped(object,12u))return false;
+        const u8 tag=env_.MemoryRead8(object);
+        if(tag&1u){
+            const u32 len=env_.MemoryRead32(object+4u),data=env_.MemoryRead32(object+8u);
+            if(len>(1u<<20)||(!data&&len))return false;
+            if(len&&!env_.IsMapped(data,len))return false;
+            out.resize(len);
+            if(len)env_.ReadBytes(data,out.data(),len);
+            return true;
+        }
+        const u32 len=tag>>1u;
+        if(len>10u||!env_.IsMapped(object+1u,len))return false;
+        out.resize(len);
+        if(len)env_.ReadBytes(object+1u,out.data(),len);
+        return true;
+    }
+    bool WriteLibcxxString(u32 object,std::string_view value){
+        if(!object||!env_.IsMapped(object,12u)||value.size()>(1u<<20))return false;
+        u32 capacity=static_cast<u32>(value.size()+1u);
+        capacity=(capacity+1u)&~1u;
+        capacity=std::max<u32>(capacity,12u);
+        const u32 data=Allocate(capacity,4u,true);
+        if(!data)return false;
+        if(!value.empty())env_.WriteBytes(data,value.data(),value.size());
+        env_.MemoryWrite8(data+static_cast<u32>(value.size()),0u);
+        env_.MemoryWrite32(object+0u,capacity|1u);
+        env_.MemoryWrite32(object+4u,static_cast<u32>(value.size()));
+        env_.MemoryWrite32(object+8u,data);
+        return true;
+    }
+    u32 GnuStringData(u32 object){return object&&env_.IsMapped(object,4u)?env_.MemoryRead32(object):0u;}
+    u32 LibcxxStringData(u32 object){
+        if(!object||!env_.IsMapped(object,12u))return 0u;
+        return (env_.MemoryRead8(object)&1u)?env_.MemoryRead32(object+8u):(object+1u);
+    }
 
     float FakeFontSize(u32 font)const{
         auto it=fake_objects_.find(font);
@@ -3460,8 +3542,186 @@ private:
             if(self&&env_.IsMapped(self+offset,4u))env_.MemoryWrite32(self+offset,value);
             cpu_.Regs()[0]=value;return true;
         }
-        if(name=="objc_sync_enter"||name=="objc_sync_exit"||name=="__Unwind_SjLj_Register"||name=="__Unwind_SjLj_Unregister"){
+        if(name=="objc_sync_enter"||name=="objc_sync_exit"||name=="__Unwind_SjLj_Register"||name=="__Unwind_SjLj_Unregister"||name=="_Unwind_SjLj_Register"||name=="_Unwind_SjLj_Unregister"){
             cpu_.Regs()[0]=0u;return true;
+        }
+        // Objective-C ARC spellings in some later iOS binaries retain an
+        // extra leading underscore in the bind symbol.  They are identity ops
+        // for this bootstrap runtime and must not fall through to the nil stub.
+        if(name=="_objc_retain"||name=="_objc_autorelease"||name=="_objc_retainAutoreleasedReturnValue"||
+           name=="_objc_autoreleaseReturnValue"||name=="_objc_retainAutoreleaseReturnValue")return true;
+        if(name=="_objc_release"){cpu_.Regs()[0]=0u;return true;}
+
+        // libdispatch once.  Geometry Dash uses this pervasively for singleton
+        // creation.  PublicTest26 skipped every block, leaving managers nil.
+        if(name=="dispatch_once"){
+            const u32 predicate=cpu_.Regs()[0],block_obj=cpu_.Regs()[1];
+            if(!predicate||dispatch_once_done_.count(predicate))return true;
+            if(env_.IsMapped(predicate,4u)&&env_.MemoryRead32(predicate)!=0u){dispatch_once_done_.insert(predicate);return true;}
+            dispatch_once_done_.insert(predicate);
+            if(env_.IsMapped(predicate,4u))env_.MemoryWrite32(predicate,0xffffffffu);
+            if(!block_obj||!env_.IsMapped(block_obj+12u,4u)){
+                if(++dispatch_once_logs_<=32u)log_<<"IOS DISPATCH: dispatch_once predicate=0x"<<Hex(predicate)<<" has no readable block\n";
+                return true;
+            }
+            const u32 invoke=env_.MemoryRead32(block_obj+12u);
+            if(!invoke||!env_.IsMapped(invoke&~1u,2u)){
+                if(++dispatch_once_logs_<=32u)log_<<"IOS DISPATCH: dispatch_once predicate=0x"<<Hex(predicate)<<" invalid invoke=0x"<<Hex(invoke)<<"\n";
+                return true;
+            }
+            if(++dispatch_once_logs_<=32u)log_<<"IOS DISPATCH: dispatch_once predicate=0x"<<Hex(predicate)<<" block=0x"<<Hex(block_obj)<<" invoke=0x"<<Hex(invoke)<<"\n";
+            cpu_.Regs()[0]=block_obj;
+            EnterGuestFunctionCall(invoke,"dispatch_once block");
+            return true;
+        }
+
+        // Old libstdc++ std::string ABI used by GD 1.0-1.9x.
+        if(name=="_ZNSsC1ERKSs"){
+            std::string v;ReadGnuString(cpu_.Regs()[1],v);WriteGnuString(cpu_.Regs()[0],v);
+            if(++cpp_string_logs_<=48u)log_<<"IOS CXXSTR: libstdc++ copy-ctor len="<<v.size()<<"\n";return true;
+        }
+        if(name=="_ZNSsC1EPKcRKSaIcE"||name=="_ZNSsC1EPKcmRKSaIcE"){
+            const u32 self=cpu_.Regs()[0],src=cpu_.Regs()[1];
+            std::string v;
+            if(name=="_ZNSsC1EPKcmRKSaIcE"){
+                const u32 n=cpu_.Regs()[2];if(src&&n&&env_.IsMapped(src,n)){v.resize(n);env_.ReadBytes(src,v.data(),n);}
+            }else if(src)env_.ReadCString(src,v,1u<<20);
+            WriteGnuString(self,v);cpu_.Regs()[0]=self;
+            if(++cpp_string_logs_<=48u)log_<<"IOS CXXSTR: libstdc++ cstr-ctor len="<<v.size()<<"\n";return true;
+        }
+        if(name=="_ZNSs6assignEPKcm"||name=="_ZNSs6assignERKSs"){
+            const u32 self=cpu_.Regs()[0];std::string v;
+            if(name=="_ZNSs6assignERKSs")ReadGnuString(cpu_.Regs()[1],v);
+            else {const u32 src=cpu_.Regs()[1],n=cpu_.Regs()[2];if(src&&n&&env_.IsMapped(src,n)){v.resize(n);env_.ReadBytes(src,v.data(),n);}}
+            WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs6appendEPKcm"||name=="_ZNSs6appendERKSs"){
+            const u32 self=cpu_.Regs()[0];std::string v,add;ReadGnuString(self,v);
+            if(name=="_ZNSs6appendERKSs")ReadGnuString(cpu_.Regs()[1],add);
+            else {const u32 src=cpu_.Regs()[1],n=cpu_.Regs()[2];if(src&&n&&env_.IsMapped(src,n)){add.resize(n);env_.ReadBytes(src,add.data(),n);}}
+            v+=add;WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs9push_backEc"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadGnuString(self,v);v.push_back(static_cast<char>(cpu_.Regs()[1]&0xffu));WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs5eraseEmm"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadGnuString(self,v);const u32 pos=cpu_.Regs()[1],n=cpu_.Regs()[2];if(pos<v.size())v.erase(pos,std::min<std::size_t>(n,v.size()-pos));WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs7reserveEm"||name=="_ZNSs12_M_leak_hardEv"){return true;}
+        if(name=="_ZNSs4_Rep10_M_destroyERKSaIcE"){
+            const u32 rep=cpu_.Regs()[0];ReleaseHeapBlock(rep);cpu_.Regs()[0]=0u;return true;
+        }
+        if(name=="_ZNKSs7compareEPKc"||name=="_ZNKSs7compareERKSs"){
+            std::string a,b;ReadGnuString(cpu_.Regs()[0],a);if(name=="_ZNKSs7compareERKSs")ReadGnuString(cpu_.Regs()[1],b);else if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);
+            const int c=a.compare(b);cpu_.Regs()[0]=static_cast<u32>(c<0?-1:c>0?1:0);return true;
+        }
+        if(name=="_ZNKSs4findEcm"||name=="_ZNKSs5rfindEcm"){
+            std::string a;ReadGnuString(cpu_.Regs()[0],a);const char ch=static_cast<char>(cpu_.Regs()[1]&0xffu);const std::size_t pos=cpu_.Regs()[2];
+            const auto found=name=="_ZNKSs4findEcm"?a.find(ch,pos):a.rfind(ch,pos);cpu_.Regs()[0]=found==std::string::npos?0xffffffffu:static_cast<u32>(found);return true;
+        }
+        if(name=="_ZNSs2atEm"||name=="_ZNKSs2atEm"){
+            const u32 self=cpu_.Regs()[0],idx=cpu_.Regs()[1],data=GnuStringData(self);std::string a;ReadGnuString(self,a);cpu_.Regs()[0]=(data&&idx<a.size())?data+idx:0u;return true;
+        }
+
+        if(name=="_ZNKSs6substrEmm"){
+            const u32 dest=cpu_.Regs()[0],self=cpu_.Regs()[1],pos=cpu_.Regs()[2],n=cpu_.Regs()[3];std::string v;ReadGnuString(self,v);const std::string sub=pos<v.size()?v.substr(pos,std::min<std::size_t>(n,v.size()-pos)):std::string{};WriteGnuString(dest,sub);cpu_.Regs()[0]=dest;return true;
+        }
+        if(name=="_ZNKSs4findEPKcmm"){
+            std::string a,b;ReadGnuString(cpu_.Regs()[0],a);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);const u32 pos=cpu_.Regs()[2],n=cpu_.Regs()[3];if(n<b.size())b.resize(n);const auto f=a.find(b,pos);cpu_.Regs()[0]=f==std::string::npos?0xffffffffu:static_cast<u32>(f);return true;
+        }
+        if(name=="_ZNKSs13find_first_ofEPKcmm"||name=="_ZNKSs12find_last_ofEPKcmm"){
+            std::string a,b;ReadGnuString(cpu_.Regs()[0],a);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);const u32 pos=cpu_.Regs()[2],n=cpu_.Regs()[3];if(n<b.size())b.resize(n);const auto f=name.find("first")!=std::string::npos?a.find_first_of(b,pos):a.find_last_of(b,pos);cpu_.Regs()[0]=f==std::string::npos?0xffffffffu:static_cast<u32>(f);return true;
+        }
+        if(name=="_ZNSs7replaceEmmPKcm"){
+            const u32 self=cpu_.Regs()[0],pos=cpu_.Regs()[1],count=cpu_.Regs()[2],src=cpu_.Regs()[3],n=StackArg(0);std::string v,repl;ReadGnuString(self,v);if(src&&n&&env_.IsMapped(src,n)){repl.resize(n);env_.ReadBytes(src,repl.data(),n);}if(pos<=v.size())v.replace(pos,std::min<std::size_t>(count,v.size()-pos),repl);WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs6insertEmRKSsmm"){
+            const u32 self=cpu_.Regs()[0],pos=cpu_.Regs()[1],other=cpu_.Regs()[2],other_pos=cpu_.Regs()[3],n=StackArg(0);std::string v,o;ReadGnuString(self,v);ReadGnuString(other,o);if(other_pos<o.size())o=o.substr(other_pos,std::min<std::size_t>(n,o.size()-other_pos));else o.clear();if(pos<=v.size())v.insert(pos,o);WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+
+        // libc++ std::__1::basic_string ABI used by GD 2.11/SubZero.
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_"){
+            std::string v;ReadLibcxxString(cpu_.Regs()[1],v);WriteLibcxxString(cpu_.Regs()[0],v);if(++cpp_string_logs_<=48u)log_<<"IOS CXXSTR: libc++ copy-ctor len="<<v.size()<<"\n";return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_mmRKS4_"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadLibcxxString(cpu_.Regs()[1],v);const u32 pos=cpu_.Regs()[2],n=cpu_.Regs()[3];
+            const std::string sub=pos<v.size()?v.substr(pos,std::min<std::size_t>(n,v.size()-pos)):std::string{};WriteLibcxxString(self,sub);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadLibcxxString(cpu_.Regs()[1],v);WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc"){
+            const u32 self=cpu_.Regs()[0];std::string v;if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],v,1u<<20);WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc"||name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm"){
+            const u32 self=cpu_.Regs()[0];std::string v,add;ReadLibcxxString(self,v);const u32 src=cpu_.Regs()[1];
+            if(name.ends_with("EPKcm")){const u32 n=cpu_.Regs()[2];if(src&&n&&env_.IsMapped(src,n)){add.resize(n);env_.ReadBytes(src,add.data(),n);}}else if(src)env_.ReadCString(src,add,1u<<20);
+            v+=add;WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadLibcxxString(self,v);v.push_back(static_cast<char>(cpu_.Regs()[1]&0xffu));WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm"){
+            const u32 self=cpu_.Regs()[0];std::string v;ReadLibcxxString(self,v);const u32 pos=cpu_.Regs()[1],n=cpu_.Regs()[2];if(pos<v.size())v.erase(pos,std::min<std::size_t>(n,v.size()-pos));WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc"){
+            const u32 self=cpu_.Regs()[0],n=cpu_.Regs()[1];std::string v;ReadLibcxxString(self,v);v.resize(std::min<u32>(n,1u<<20),static_cast<char>(cpu_.Regs()[2]&0xffu));WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc"){
+            std::string a,b;ReadLibcxxString(cpu_.Regs()[0],a);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);const int c=a.compare(b);cpu_.Regs()[0]=static_cast<u32>(c<0?-1:c>0?1:0);return true;
+        }
+        if(name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm"||name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm"){
+            std::string a;ReadLibcxxString(cpu_.Regs()[0],a);const char ch=static_cast<char>(cpu_.Regs()[1]&0xffu);const std::size_t pos=cpu_.Regs()[2];const auto found=name.find("4find")!=std::string::npos?a.find(ch,pos):a.rfind(ch,pos);cpu_.Regs()[0]=found==std::string::npos?0xffffffffu:static_cast<u32>(found);return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm"||name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm"){
+            const u32 self=cpu_.Regs()[0],idx=cpu_.Regs()[1],data=LibcxxStringData(self);std::string a;ReadLibcxxString(self,a);cpu_.Regs()[0]=(data&&idx<a.size())?data+idx:0u;return true;
+        }
+
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm"){
+            const u32 self=cpu_.Regs()[0],pos=cpu_.Regs()[1],src=cpu_.Regs()[2],n=cpu_.Regs()[3];std::string v,add;ReadLibcxxString(self,v);if(src&&n&&env_.IsMapped(src,n)){add.resize(n);env_.ReadBytes(src,add.data(),n);}if(pos<=v.size())v.insert(pos,add);WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc"||name=="_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm"){
+            const u32 self=cpu_.Regs()[0],pos=cpu_.Regs()[1],count=cpu_.Regs()[2],src=cpu_.Regs()[3];std::string v,repl;ReadLibcxxString(self,v);if(src){if(name.ends_with("EPKcm")){const u32 n=StackArg(0);if(n&&env_.IsMapped(src,n)){repl.resize(n);env_.ReadBytes(src,repl.data(),n);}}else env_.ReadCString(src,repl,1u<<20);}if(pos<=v.size())v.replace(pos,std::min<std::size_t>(count,v.size()-pos),repl);WriteLibcxxString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc"||name=="_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm"){
+            std::string a,b;ReadLibcxxString(cpu_.Regs()[0],a);const u32 pos=cpu_.Regs()[1],count=cpu_.Regs()[2],src=cpu_.Regs()[3];if(src)env_.ReadCString(src,b,1u<<20);if(name.ends_with("EPKcm")){const u32 n=StackArg(0);if(n<b.size())b.resize(n);}const std::string sub=pos<a.size()?a.substr(pos,std::min<std::size_t>(count,a.size()-pos)):std::string{};const int c=sub.compare(b);cpu_.Regs()[0]=static_cast<u32>(c<0?-1:c>0?1:0);return true;
+        }
+
+        // libc string/memory routines that must preserve their real return
+        // semantics.  The generic PT26 zero stub corrupted pointers instantly.
+        if(name=="strcpy"){
+            const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1];std::string v;if(src)env_.ReadCString(src,v,1u<<20);
+            if(dst&&env_.IsMapped(dst,v.size()+1u)){if(!v.empty())env_.WriteBytes(dst,v.data(),v.size());env_.MemoryWrite8(dst+static_cast<u32>(v.size()),0u);}cpu_.Regs()[0]=dst;return true;
+        }
+        if(name=="strncpy"){
+            const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1],n=cpu_.Regs()[2];std::string v;if(src)env_.ReadCString(src,v,1u<<20);if(dst&&n&&env_.IsMapped(dst,n)){std::vector<u8> tmp(n,0u);const auto m=std::min<std::size_t>(n,v.size());if(m)std::memcpy(tmp.data(),v.data(),m);env_.WriteBytes(dst,tmp.data(),tmp.size());}cpu_.Regs()[0]=dst;return true;
+        }
+        if(name=="strcmp"||name=="strncmp"||name=="strcasecmp"||name=="strncasecmp"){
+            std::string a,b;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],a,1u<<20);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);
+            std::size_t n=(name=="strncmp"||name=="strncasecmp")?cpu_.Regs()[2]:std::max(a.size(),b.size())+1u;
+            auto fold=[](unsigned char c){return static_cast<char>(std::tolower(c));};
+            int c=0;for(std::size_t i=0;i<n;++i){const char ac=i<a.size()?a[i]:0,bc=i<b.size()?b[i]:0;const char aa=(name=="strcasecmp"||name=="strncasecmp")?fold(ac):ac,bb=(name=="strcasecmp"||name=="strncasecmp")?fold(bc):bc;if(aa!=bb){c=(static_cast<unsigned char>(aa)<static_cast<unsigned char>(bb))?-1:1;break;}if(!aa)break;}cpu_.Regs()[0]=static_cast<u32>(c);return true;
+        }
+        if(name=="strchr"||name=="strrchr"){
+            const u32 src=cpu_.Regs()[0];std::string a;if(src)env_.ReadCString(src,a,1u<<20);const char ch=static_cast<char>(cpu_.Regs()[1]&0xffu);const auto pos=name=="strchr"?a.find(ch):a.rfind(ch);cpu_.Regs()[0]=pos==std::string::npos?0u:src+static_cast<u32>(pos);return true;
+        }
+        if(name=="strstr"||name=="strcasestr"){
+            const u32 src=cpu_.Regs()[0];std::string a,b;if(src)env_.ReadCString(src,a,1u<<20);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);std::string aa=a,bb=b;if(name=="strcasestr"){std::transform(aa.begin(),aa.end(),aa.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});std::transform(bb.begin(),bb.end(),bb.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});}const auto pos=aa.find(bb);cpu_.Regs()[0]=pos==std::string::npos?0u:src+static_cast<u32>(pos);return true;
+        }
+        if(name=="strpbrk"){
+            const u32 src=cpu_.Regs()[0];std::string a,b;if(src)env_.ReadCString(src,a,1u<<20);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],b,1u<<20);const auto pos=a.find_first_of(b);cpu_.Regs()[0]=pos==std::string::npos?0u:src+static_cast<u32>(pos);return true;
+        }
+        if(name=="strlcat"){
+            const u32 dst=cpu_.Regs()[0],src=cpu_.Regs()[1],size=cpu_.Regs()[2];std::string d,s2;if(dst)env_.ReadCString(dst,d,1u<<20);if(src)env_.ReadCString(src,s2,1u<<20);const u32 result=static_cast<u32>(d.size()+s2.size());if(dst&&size){std::string out=d+s2;if(out.size()>=size)out.resize(size-1u);if(env_.IsMapped(dst,size)){if(!out.empty())env_.WriteBytes(dst,out.data(),out.size());env_.MemoryWrite8(dst+static_cast<u32>(out.size()),0u);}}cpu_.Regs()[0]=result;return true;
+        }
+        if(name=="memcmp"){
+            const u32 a=cpu_.Regs()[0],b=cpu_.Regs()[1],n=cpu_.Regs()[2];int c=0;if(n&&env_.IsMapped(a,n)&&env_.IsMapped(b,n)){std::vector<u8> av(n),bv(n);env_.ReadBytes(a,av.data(),n);env_.ReadBytes(b,bv.data(),n);c=std::memcmp(av.data(),bv.data(),n);}cpu_.Regs()[0]=static_cast<u32>(c<0?-1:c>0?1:0);return true;
+        }
+        if(name=="memchr"){
+            const u32 src=cpu_.Regs()[0],n=cpu_.Regs()[2];const u8 needle=static_cast<u8>(cpu_.Regs()[1]);u32 result=0u;if(n&&env_.IsMapped(src,n)){std::vector<u8> v(n);env_.ReadBytes(src,v.data(),n);auto it=std::find(v.begin(),v.end(),needle);if(it!=v.end())result=src+static_cast<u32>(it-v.begin());}cpu_.Regs()[0]=result;return true;
+        }
+        if(name=="memset_pattern16"){
+            const u32 dst=cpu_.Regs()[0],pat=cpu_.Regs()[1],n=cpu_.Regs()[2];if(dst&&pat&&n&&env_.IsMapped(dst,n)&&env_.IsMapped(pat,16u)){std::array<u8,16> pattern{};env_.ReadBytes(pat,pattern.data(),16u);std::vector<u8> v(n);for(u32 i=0;i<n;++i)v[i]=pattern[i&15u];env_.WriteBytes(dst,v.data(),v.size());}return true;
         }
         if(name=="floor"||name=="ceil"||name=="sin"||name=="cos"||name=="atan2"){
             const double a=DoubleFromRegs(cpu_.Regs()[0],cpu_.Regs()[1]);
@@ -3961,7 +4221,7 @@ private:
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_set<u32> dispatch_once_done_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
     u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 argv_ptr_=0,envp_ptr_=0,apple_ptr_=0,constructor_sp_=0;
     std::size_t constructor_index_=0;
@@ -3975,7 +4235,7 @@ private:
     u64 virtual_time_usec_=1350000000000000ull;
     u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
-    u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0;
+    u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0,cpp_string_logs_=0,dispatch_once_logs_=0;
     u32 host_stage_no_svc_chunks_=0u;
     bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
     bool host_window_attempted_=false,host_window_closed_=false;

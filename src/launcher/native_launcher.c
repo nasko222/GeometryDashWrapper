@@ -40,7 +40,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.6-publictest26"
+#define LAUNCHER_VERSION "0.9.6-publictest27"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -1677,7 +1677,7 @@ static int CreateIpaRunDirectory(const wchar_t *base_directory,
     if (!EnsureDirectory(day_directory)) return 0;
 
     swprintf_s(folder_name, ARRAY_COUNT(folder_name),
-               L"%02u-%02u-%02u__ios-armv7__publictest26",
+               L"%02u-%02u-%02u__ios-armv7__publictest27",
                now.wHour, now.wMinute, now.wSecond);
     for (suffix = 1u; suffix < 1000u; ++suffix) {
         if (suffix == 1u) {
