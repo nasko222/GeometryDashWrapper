@@ -1,0 +1,96 @@
+Geometry Dash Wrapper 0.9.6-gdpsfixes6 verification
+===================================================
+
+Scope
+-----
+This branch is a compatibility expansion from gdpsfixes5. Existing supported APK
+routing and gameplay code are intentionally left unchanged unless the APK has the
+new v7-packaged legacy-libgame shape.
+
+Supplied APK audit
+------------------
+Input: 1.3 GDPS v3.0.0f.apk
+Size: 180960008 bytes
+Native libraries:
+  - lib/armeabi-v7a/libascella.so
+  - lib/armeabi-v7a/libfmod.so
+  - lib/armeabi-v7a/libfmodL.so
+  - lib/armeabi-v7a/libgame.so
+
+PASS: no x86 native library is present; this is not actually an ARM+x86 package.
+PASS: libgame.so is packaged at lib/armeabi-v7a/libgame.so.
+PASS: no lib/armeabi-v7a/libcocos2dcpp.so is present, so the 2.2 ARMv7 backend is
+      not the correct primary runtime for this APK.
+PASS: libascella.so has a DT_NEEDED dependency on libgame.so.
+PASS: libascella.so undefined symbols: 938.
+PASS: libascella.so symbols directly satisfiable by libgame.so: 670.
+PASS: remaining Android/libc/OpenGL/FMOD/runtime imports: 268.
+PASS: libascella.so relocation types are limited to supported mapper types:
+  - R_ARM_ABS32: 3072
+  - R_ARM_GLOB_DAT: 61
+  - R_ARM_JUMP_SLOT: 830
+  - R_ARM_RELATIVE: 24890
+
+PASS: libascella.so .init_array is 340 bytes (85 constructor entries).
+PASS: libascella.so exports JNI_OnLoad.
+
+Launcher routing regression
+---------------------------
+PASS: x86 remains first priority when an x86 game library exists.
+PASS: lib/armeabi/libgame.so still routes to legacy ARM exactly as before.
+PASS: lib/armeabi-v7a/libcocos2dcpp.so still routes to the ARMv7/2.2 backend.
+PASS: lib/armeabi-v7a/libgame.so without libcocos2dcpp now routes to legacy ARM.
+PASS: a 2.2 APK that contains both libcocos2dcpp.so and an auxiliary libgame.so
+      still selects ARMv7, not the new legacy compatibility mode.
+
+Legacy-v7 compatibility implementation
+--------------------------------------
+PASS: legacy backend first tries lib/armeabi/libgame.so, preserving old behavior.
+PASS: it falls back to lib/armeabi-v7a/libgame.so only when the old path is absent.
+PASS: v7-packaged legacy games run the same legacy runtime with Dynarmic ARMv7
+      architecture enabled, rather than entering the 2.2-specific backend.
+PASS: an ExclusiveMonitor is configured for ARMv7 exclusive-memory instructions.
+PASS: additional v7 .so files are considered companions only when they are ELF
+      modules and reference/depend on libgame.so.
+PASS: auxiliary modules are mapped beginning at guest 0x18000000, below wrapper
+      object memory and separate from the primary game image.
+PASS: auxiliary relocations resolve defined symbols locally, game/cocos symbols
+      against the primary image, and remaining imports through the existing host
+      import bridge.
+PASS: primary constructors + primary JNI_OnLoad execute first; companion constructors
+      + companion JNI_OnLoad execute before nativeSetPaths/nativeInit.
+PASS: hybrid-only dlopen/dlsym can resolve mapped game/companion symbols.
+PASS: AEABI memcpy/memmove/memset/memclr helpers used by modern ARM companions are
+      implemented in the legacy import bridge.
+
+Regression boundary
+-------------------
+PASS: x86 backend source is unchanged apart from shared version/build identity.
+PASS: ARMv7 backend gameplay source is unchanged; only its displayed fixes6 version
+      string changed.
+PASS: color-picker fix remains in legacy source.
+PASS: EDITOR_CONTROLLS implementation remains present.
+PASS: EXTRAS_MENU implementation remains present.
+PASS: I_LOST_THE_GAME launch gate remains present.
+PASS: >4095-byte upload formatting fix remains present.
+PASS: no iOS backend is reintroduced.
+
+Syntax/static checks
+--------------------
+PASS: legacy ARM source passes clang C++20 syntax checking against the local Dynarmic
+      API stub with -Wall -Wextra -Werror (pre-existing unused-private fields suppressed).
+PASS: git diff --check reports no whitespace errors.
+PASS: supplied APK classifier result = arm-legacy (v7-packaged legacy game).
+PASS: known old 1.x classifier result = arm-legacy.
+PASS: known 2.2 beta classifier result = armv7.
+
+Runtime status
+--------------
+NOT LIVE-TESTED: this environment cannot run the pinned Windows Dynarmic build.
+The source is structured so ordinary fixes5 APKs do not enter the new module loader.
+The supplied mod APK is expected to log these markers when tested:
+  RESULT: DYNARMIC_LEGACY_V7_PACKAGE detected=1 companions=1 guest-arch=v7
+  RESULT: DYNARMIC_AUXILIARY_MODULE_MAPPED name=lib/armeabi-v7a/libascella.so ...
+  RESULT: DYNARMIC_LEGACY_HYBRID_READY companions=1 guest=v7
+  RESULT: DYNARMIC_AUXILIARY_CONSTRUCTORS_OK name=lib/armeabi-v7a/libascella.so
+  RESULT: DYNARMIC_AUXILIARY_JNI_ONLOAD_OK name=lib/armeabi-v7a/libascella.so ...

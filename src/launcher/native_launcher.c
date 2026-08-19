@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.6-gdpsfixes5"
+#define LAUNCHER_VERSION "0.9.6-gdpsfixes6"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -83,6 +83,7 @@ typedef struct ApkFeatures {
     int has_x86;
     int has_legacy_arm;
     int has_armv7;
+    int has_armv7_legacy_game;
     ZipEntry manifest_entry;
     int has_manifest;
 } ApkFeatures;
@@ -374,6 +375,11 @@ static int ScanApkEntry(const ZipEntry *entry, void *opaque) {
         features->has_legacy_arm = 1;
     } else if (ZipNameEquals(entry, "lib/armeabi-v7a/libcocos2dcpp.so")) {
         features->has_armv7 = 1;
+    } else if (ZipNameEquals(entry, "lib/armeabi-v7a/libgame.so")) {
+        /* Some modded 1.x APKs keep the old game core but package it in the
+         * v7 ABI directory next to a Thumb-2 companion module.  Do not call
+         * these 2.2 merely because of the directory name. */
+        features->has_armv7_legacy_game = 1;
     } else if (ZipNameEquals(entry, "AndroidManifest.xml")) {
         features->manifest_entry = *entry;
         features->has_manifest = 1;
@@ -614,6 +620,8 @@ static BackendKind ChooseBackend(const ApkFeatures *features) {
     /* Prefer x86 whenever an APK provides it, matching the historical launcher. */
     if (features->has_x86) return BACKEND_X86;
     if (features->has_legacy_arm) return BACKEND_LEGACY_ARM;
+    if (features->has_armv7) return BACKEND_ARMV7;
+    if (features->has_armv7_legacy_game) return BACKEND_LEGACY_ARM;
     return BACKEND_ARMV7;
 }
 
@@ -1003,7 +1011,8 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
             free(manifest);
         }
     }
-    if (!features.has_x86 && !features.has_legacy_arm && !features.has_armv7) {
+    if (!features.has_x86 && !features.has_legacy_arm && !features.has_armv7 &&
+        !features.has_armv7_legacy_game) {
         ApkArchiveClose(&archive);
         fwprintf(stderr, L"ERROR: APK has no supported x86, armeabi, or armeabi-v7a game library.\n");
         return 0;

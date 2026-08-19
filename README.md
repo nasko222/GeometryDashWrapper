@@ -1,6 +1,6 @@
-# Geometry Dash Wrapper 0.9.6-gdpsfixes5
+# Geometry Dash Wrapper 0.9.6-gdpsfixes6
 
-`gdpsfixes5` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
+`gdpsfixes6` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
 
 ## Confirmed carried fix
 

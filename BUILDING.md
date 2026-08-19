@@ -1,4 +1,4 @@
-# Building Geometry Dash Wrapper 0.9.6-gdpsfixes5
+# Building Geometry Dash Wrapper 0.9.6-gdpsfixes6
 
 Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use
 the project's pinned Zig 0.14.1, CMake, Ninja, Dynarmic and Boost dependencies
