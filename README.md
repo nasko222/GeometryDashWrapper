@@ -1,79 +1,62 @@
-# Geometry Dash Wrapper 0.9.6-gdpsfixes4
+# Geometry Dash Wrapper 0.9.6-gdpsfixes5
 
-`gdpsfixes4` keeps the Android-only GDPSFixes line and adds wrapper-level launch,
-editor, and Extras controls across the x86, legacy ARM, and ARMv7 backends.
-The abandoned iOS backend remains removed.
+`gdpsfixes5` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
 
-## New toggles
+## Confirmed carried fix
 
-The normal RUN batch files set all three toggles to `true`:
+The early Android color picker compatibility repair from GDPSFixes3 is retained.
+It is now live-confirmed on Geometry Dash 1.0: opening/editing the color picker no
+longer crashes the wrapper.
 
-- `I_LOST_THE_GAME=true` — mandatory joke launch gate. The launcher and every
-  backend default this setting to false and refuse direct execution when it is
-  not true.
-- `EDITOR_CONTROLLS=true` — enables host keyboard shortcuts in the level editor.
-- `EXTRAS_MENU=true` — enables a small native Extras button over menu screens.
+## Launch gate
 
-The environment variable name `EDITOR_CONTROLLS` intentionally keeps the
-requested spelling.
+Normal RUN batches set `I_LOST_THE_GAME=true`. The launcher and all three
+backends default it to false and refuse direct execution when it is not true.
 
 ## Editor controls
 
-When `EDITOR_CONTROLLS=true` and an EditorUI is active:
+`EDITOR_CONTROLLS=true` enables editor shortcuts on x86, legacy ARM, and ARMv7:
 
-- `W` / `A` / `S` / `D` — move the selection one editor step.
-- `Shift+W/A/S/D` — use the corresponding larger move command.
+- `W/A/S/D` — normal editor movement.
+- `Shift+W/A/S/D` — larger movement commands.
 - `Q` — rotate counter-clockwise.
 - `E` — rotate clockwise.
 
-The wrapper does not send these shortcuts through `EditorUI::keyDown`. Movement
-uses the game's own `EditorUI::moveObjectCall` callback and rotation uses
-`EditorUI::transformObjectCall`. Newer ARMv7 builds use the exported EditCommand
-overloads directly; older/x86-era builds can use the original sender/tag ABI and
-restore the original sender tag after the call. Rotation command values are kept
-backend-aware: old/x86-era editors use 11/12, while the audited 2.2 ARMv7 editor
-uses 0x13/0x14.
+GDPSFixes5 replaces the failed raw-pointer search for `EditorUI` with cocos2d
+scene/child traversal. It deliberately never routes these keys through the
+unsafe Android `EditorUI::keyDown` desktop path.
 
-## Extras menu
+## In-game Extras menu
 
-When `EXTRAS_MENU=true`, the wrapper adds an `Extras` button to the host game
-window while gameplay/editor activity is not detected. The popup is available
-on all wrapper backends, with version-specific actions where supported.
+`EXTRAS_MENU=true` now renders the Extras interface inside cocos2d. There is no
+Win32 BUTTON and no `TrackPopupMenu`. The visible controls are real game
+`ButtonSprite` nodes, with an in-game `CCLayerColor` overlay. Host hit testing is
+used only to activate the injected controls without inventing a guest callback.
 
-For full Geometry Dash versions beginning with 1.0, 1.1, 1.2, or 1.3:
+For full Geometry Dash 1.0x through 1.3x:
 
-- **Play Placeholder Level** — constructs the game's raw default `GJGameLevel`
-  and enters it through the original `PlayLayer::scene` path. Static auditing of
-  the supplied GD 1.0 binary confirms LevelTools ID 0 is not a placeholder; it
-  aliases level 1. Background music is suppressed for the raw placeholder run.
+- **Play Placeholder Level** uses the real early level table slot **ID 10** and
+  suppresses background music for that run.
 
-For full Geometry Dash version **1.02** only:
+For full Geometry Dash **1.02** only:
 
-- **Play Time Machine Beta** — obtains built-in level ID 8 through the game's
-  original `LevelTools::getLevel(8)` path and opens it normally.
+- **Play Time Machine Beta** uses built-in level **ID 8**. Scene creation now
+  has no artificial 100,000,000 guest-tick cap; a real wall-clock watchdog is
+  kept so an actual infinite loop can still be stopped.
 
-No APK data is bundled with these features.
+Later wrapper backends still receive the in-game Extras button/overlay, with a
+`No extras for this version` entry until version-specific extras are added.
 
-## GDPSFixes3 build repair
+## Other carried GDPS fixes
 
-The GDPSFixes3 ARMv7 source accidentally called a legacy-only
-`ApkMemberCache::LocateIndex` helper and failed to compile. GDPSFixes4 removes
-that call and uses the ARMv7 cache's real `Exists()` API for extension-resource
-existence checks.
-
-The GDPSFixes3 color-picker compatibility changes remain present; they still
-need a live gameplay retest because the fixes3 package could not complete the
-user's full build.
-
-## Carried fixes
-
-- Large ARM/GDPS level uploads are no longer chopped at 4095 formatted bytes.
-- MCI music seeks stop the alias before seeking for Wine/Proton compatibility.
-- Legacy ARM nonblocking sockets no longer synchronously stall on bad network.
-- Legacy color-picker extension-resource mirroring/fallback from GDPSFixes3 is
-  retained.
+- Large ARM/GDPS level uploads are no longer truncated at 4095 formatted bytes.
+- MCI music seeks stop before seeking for Wine/Proton compatibility.
+- Legacy ARM networking uses cooperative/nonblocking socket behavior.
+- Early color-picker extension resources are mirrored/resolved correctly.
+- The GDPSFixes3 ARMv7 build regression using a nonexistent `LocateIndex` method
+  remains repaired.
 
 ## Building
 
-Run `BUILD_ALL.cmd` on Windows. No APK, extracted proprietary game library,
-built game executable, or iOS backend is included in the source archive.
+Run `BUILD_ALL.cmd` on Windows. The source archive contains no APK, extracted
+proprietary game library, game executable, or iOS backend.

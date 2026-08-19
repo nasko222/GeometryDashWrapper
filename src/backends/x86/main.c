@@ -41,6 +41,17 @@ typedef void (__cdecl *EditorMoveObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
 typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
+typedef void *(__cdecl *CcDirectorSharedFunction)(void);
+typedef void *(__cdecl *CcNodeGetChildrenFunction)(void *self);
+typedef unsigned int (__cdecl *CcNodeGetChildrenCountFunction)(void *self);
+typedef void *(__cdecl *CcArrayObjectAtIndexFunction)(void *self, unsigned int index);
+typedef void *(__cdecl *ButtonSpriteCreateFunction)(const char *text);
+typedef void (__cdecl *CcNodeAddChildFunction)(void *self, void *child);
+typedef void (__cdecl *CcNodeAddChildZFunction)(void *self, void *child, int z);
+typedef void (__cdecl *CcNodeSetPositionFunction)(void *self, float x, float y);
+typedef void (__cdecl *CcNodeRemoveFunction)(void *self, int cleanup);
+typedef struct { unsigned char r, g, b, a; } GdCcColor4B;
+typedef void *(__cdecl *CcLayerColorCreateFunction)(const GdCcColor4B *color);
 
 typedef struct {
     HWND window;
@@ -85,6 +96,27 @@ typedef struct {
     EditorMoveEditCommandFunction editor_move_edit_command;
     EditorTransformObjectCallFunction editor_transform_object_call;
     EditorTransformEditCommandFunction editor_transform_edit_command;
+    CcDirectorSharedFunction cc_director_shared;
+    CcNodeGetChildrenFunction ccnode_get_children;
+    CcNodeGetChildrenCountFunction ccnode_get_children_count;
+    CcArrayObjectAtIndexFunction ccarray_object_at_index;
+    ButtonSpriteCreateFunction button_sprite_create;
+    CcNodeAddChildFunction ccnode_add_child;
+    CcNodeAddChildZFunction ccnode_add_child_z;
+    CcNodeSetPositionFunction ccnode_set_position;
+    CcNodeRemoveFunction ccnode_remove;
+    CcLayerColorCreateFunction cclayer_color_create;
+    void *active_editor_ui;
+    void *active_menu_layer;
+    void *active_scene_root;
+    void *extras_scene_root;
+    void *extras_main_button;
+    void *extras_overlay;
+    void *extras_placeholder_button;
+    void *extras_time_button;
+    void *extras_close_button;
+    void *extras_empty_button;
+    unsigned int editor_hotkey_miss_logs;
     GdExtrasMenu extras_menu;
     uint32_t practice_mode_offset;
     LARGE_INTEGER frame_clock_frequency;
@@ -644,32 +676,82 @@ static int object_type_contains(const void *object, const char *needle) {
     return strstr(name, needle) != NULL;
 }
 
+static void *find_running_scene(void) {
+    void *director;
+    size_t offset;
+    if (!g_host.cc_director_shared) return NULL;
+    director = g_host.cc_director_shared();
+    if (!director || !memory_range_is_readable(director, 0x500u)) return NULL;
+    for (offset = 0; offset + sizeof(void *) <= 0x500u; offset += sizeof(void *)) {
+        void *candidate = *(void **)((unsigned char *)director + offset);
+        if (object_type_contains(candidate, "CCScene")) return candidate;
+    }
+    return NULL;
+}
+
+static void walk_scene_tree(void *node, unsigned int depth, unsigned int *visited) {
+    unsigned int count, index;
+    void *children;
+    if (!node || !visited || depth > 12u || *visited >= 4096u ||
+        !object_type_contains(node, "")) return;
+    ++*visited;
+    {
+        const int is_menu = object_type_contains(node, "MenuLayer");
+        const int is_play = object_type_contains(node, "PlayLayer");
+        const int is_editor = object_type_contains(node, "LevelEditorLayer");
+        const int is_editor_ui = object_type_contains(node, "EditorUI");
+        if (!g_host.active_menu_layer && is_menu) g_host.active_menu_layer = node;
+        if (!g_host.active_play_layer && is_play) g_host.active_play_layer = node;
+        if (!g_host.active_editor_layer && is_editor) g_host.active_editor_layer = node;
+        if (!g_host.active_editor_ui && is_editor_ui) g_host.active_editor_ui = node;
+        if ((is_menu || is_play || is_editor_ui) && !is_editor) return;
+    }
+    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
+        !g_host.ccarray_object_at_index) return;
+    count = g_host.ccnode_get_children_count(node);
+    if (!count) return;
+    if (count > 512u) count = 512u;
+    children = g_host.ccnode_get_children(node);
+    if (!children) return;
+    for (index = 0; index < count && *visited < 4096u; ++index) {
+        void *child = g_host.ccarray_object_at_index(children, index);
+        if (child) walk_scene_tree(child, depth + 1u, visited);
+    }
+}
+
 static int detect_gameplay_active(void) {
     ULONGLONG now = GetTickCount64();
     void *manager;
     size_t offset;
-    if (!g_host.game_manager_shared_state) return 0;
-    if (now - g_host.gameplay_cache_time < 100u)
+    unsigned int visited = 0;
+    if (now - g_host.gameplay_cache_time < 500u)
         return g_host.gameplay_cache_value;
     g_host.gameplay_cache_time = now;
     g_host.gameplay_cache_value = 0;
     g_host.editor_cache_value = 0;
     g_host.active_play_layer = NULL;
     g_host.active_editor_layer = NULL;
-    manager = g_host.game_manager_shared_state();
-    if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
-    for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
-         offset += sizeof(void *)) {
-        void *candidate = *(void **)((unsigned char *)manager + offset);
-        if (object_type_contains(candidate, "LevelEditorLayer")) {
-            g_host.editor_cache_value = 1;
-            g_host.active_editor_layer = candidate;
-        }
-        if (object_type_contains(candidate, "PlayLayer")) {
-            g_host.gameplay_cache_value = 1;
-            g_host.active_play_layer = candidate;
+    g_host.active_editor_ui = NULL;
+    g_host.active_menu_layer = NULL;
+    g_host.active_scene_root = find_running_scene();
+    if (g_host.active_scene_root)
+        walk_scene_tree(g_host.active_scene_root, 0u, &visited);
+    if ((!g_host.active_play_layer && !g_host.active_editor_layer) &&
+        g_host.game_manager_shared_state) {
+        manager = g_host.game_manager_shared_state();
+        if (manager && memory_range_is_readable(manager, 0x600u)) {
+            for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
+                 offset += sizeof(void *)) {
+                void *candidate = *(void **)((unsigned char *)manager + offset);
+                if (!g_host.active_editor_layer && object_type_contains(candidate, "LevelEditorLayer"))
+                    g_host.active_editor_layer = candidate;
+                if (!g_host.active_play_layer && object_type_contains(candidate, "PlayLayer"))
+                    g_host.active_play_layer = candidate;
+            }
         }
     }
+    g_host.gameplay_cache_value = g_host.active_play_layer != NULL;
+    g_host.editor_cache_value = g_host.active_editor_layer != NULL;
     return g_host.gameplay_cache_value;
 }
 
@@ -690,23 +772,102 @@ static void *find_active_ui_layer(void) {
 }
 
 static void *find_active_editor_ui(void) {
-    size_t offset;
-    unsigned char *editor_layer;
-    /* detect_gameplay_active also refreshes the editor cache even when its
-       return value is false (editing is not normal PlayLayer gameplay). */
+    unsigned int visited = 0;
     g_host.gameplay_cache_time = 0;
     (void)detect_gameplay_active();
-    if (!g_host.editor_cache_value || !g_host.active_editor_layer) return NULL;
-    editor_layer = (unsigned char *)g_host.active_editor_layer;
-    for (offset = 0x40u; offset + sizeof(void *) <= 0x3000u;
-         offset += sizeof(void *)) {
-        void *candidate;
-        if (!memory_range_is_readable(editor_layer + offset, sizeof(void *)))
-            continue;
-        candidate = *(void **)(editor_layer + offset);
-        if (object_type_contains(candidate, "EditorUI")) return candidate;
+    if (g_host.active_editor_ui) return g_host.active_editor_ui;
+    if (g_host.active_editor_layer) {
+        walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
+        if (g_host.active_editor_ui) return g_host.active_editor_ui;
     }
+    if (g_host.editor_hotkey_miss_logs++ < 8u)
+        runtime_log("Editor controls: key ignored; no active EditorUI found (editor-layer=%s)",
+                    g_host.active_editor_layer ? "yes" : "no");
     return NULL;
+}
+
+static void remove_extras_node(void **node) {
+    if (!node || !*node) return;
+    if (g_host.ccnode_remove && memory_range_is_readable(*node, sizeof(void *)))
+        g_host.ccnode_remove(*node, 1);
+    *node = NULL;
+}
+
+static int add_extras_child(void *parent, void *child, int z) {
+    if (!parent || !child) return 0;
+    if (g_host.ccnode_add_child_z) { g_host.ccnode_add_child_z(parent, child, z); return 1; }
+    if (g_host.ccnode_add_child) { g_host.ccnode_add_child(parent, child); return 1; }
+    return 0;
+}
+
+static void *create_extras_button(const char *text, void *parent,
+                                  float x, float y, int z) {
+    void *button;
+    if (!g_host.button_sprite_create || !g_host.ccnode_set_position || !parent)
+        return NULL;
+    button = g_host.button_sprite_create(text);
+    if (!button) return NULL;
+    g_host.ccnode_set_position(button, x, y);
+    if (!add_extras_child(parent, button, z)) return NULL;
+    return button;
+}
+
+static void refresh_extras_visuals(void) {
+    GdExtrasLayout layout;
+    if (!g_host.extras_menu.enabled) return;
+    if (g_host.active_scene_root != g_host.extras_scene_root) {
+        g_host.extras_scene_root = g_host.active_scene_root;
+        g_host.extras_main_button = NULL;
+        g_host.extras_overlay = NULL;
+        g_host.extras_placeholder_button = NULL;
+        g_host.extras_time_button = NULL;
+        g_host.extras_close_button = NULL;
+        g_host.extras_empty_button = NULL;
+    }
+    if (!g_host.extras_menu.visible || !g_host.active_menu_layer ||
+        !g_host.active_scene_root) {
+        remove_extras_node(&g_host.extras_overlay);
+        return;
+    }
+    gd_extras_menu_get_layout(&g_host.extras_menu, g_host.native_width,
+                              g_host.native_height, &layout);
+    if (!g_host.extras_main_button) {
+        g_host.extras_main_button = create_extras_button(
+            "Extras", g_host.active_menu_layer, layout.main_x, layout.main_y, 10000);
+        if (g_host.extras_main_button)
+            runtime_log("RESULT: X86_EXTRAS_GD_BUTTON_READY");
+    }
+    if (!g_host.extras_menu.overlay_open) {
+        remove_extras_node(&g_host.extras_overlay);
+        g_host.extras_placeholder_button = g_host.extras_time_button = NULL;
+        g_host.extras_close_button = g_host.extras_empty_button = NULL;
+        return;
+    }
+    if (g_host.extras_overlay || !g_host.cclayer_color_create) return;
+    {
+        GdCcColor4B color = {0, 0, 0, 180};
+        g_host.extras_overlay = g_host.cclayer_color_create(&color);
+    }
+    if (!g_host.extras_overlay ||
+        !add_extras_child(g_host.active_scene_root, g_host.extras_overlay, 20000)) {
+        g_host.extras_overlay = NULL;
+        return;
+    }
+    if (g_host.extras_menu.early_full_version)
+        g_host.extras_placeholder_button = create_extras_button(
+            "Play Placeholder Level", g_host.extras_overlay,
+            layout.placeholder_x, layout.placeholder_y, 1);
+    if (g_host.extras_menu.time_machine_beta_available)
+        g_host.extras_time_button = create_extras_button(
+            "Play Time Machine Beta", g_host.extras_overlay,
+            layout.time_machine_x, layout.time_machine_y, 1);
+    if (!g_host.extras_menu.early_full_version)
+        g_host.extras_empty_button = create_extras_button(
+            "No extras for this version", g_host.extras_overlay,
+            layout.empty_x, layout.empty_y, 1);
+    g_host.extras_close_button = create_extras_button(
+        "Close", g_host.extras_overlay, layout.close_x, layout.close_y, 1);
+    runtime_log("RESULT: X86_EXTRAS_GD_OVERLAY_READY");
 }
 
 static int send_editor_hotkey(int tag, int virtual_key) {
@@ -978,28 +1139,60 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (wparam == UNICODE_NOCHAR) return TRUE;
         send_text_character(wparam);
         return 0;
-    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDOWN: {
+        int consumed = 0;
+        int action;
         SetFocus(window);
         g_host.mouse_down = 1;
         SetCapture(window);
-        send_touch_begin(x, y);
+        action = gd_extras_menu_pointer_event(&g_host.extras_menu,
+            GD_EXTRAS_POINTER_BEGIN, x, y, g_host.native_width,
+            g_host.native_height, &consumed);
+        if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
+        else if (action != GD_EXTRAS_ACTION_NONE)
+            runtime_log("Extras action %d is unavailable on x86", action);
+        if (!consumed) send_touch_begin(x, y);
         return 0;
+    }
     case WM_MOUSEMOVE:
         if (g_host.mouse_down) {
-            send_touch_move(x, y);
+            int consumed = 0;
+            int action = gd_extras_menu_pointer_event(&g_host.extras_menu,
+                GD_EXTRAS_POINTER_MOVE, x, y, g_host.native_width,
+                g_host.native_height, &consumed);
+            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
+            else if (action != GD_EXTRAS_ACTION_NONE)
+                runtime_log("Extras action %d is unavailable on x86", action);
+            if (!consumed) send_touch_move(x, y);
         }
         return 0;
     case WM_LBUTTONUP:
         if (g_host.mouse_down) {
+            int consumed = 0;
+            int action;
             g_host.mouse_down = 0;
             ReleaseCapture();
-            send_touch_end(x, y);
+            action = gd_extras_menu_pointer_event(&g_host.extras_menu,
+                GD_EXTRAS_POINTER_END, x, y, g_host.native_width,
+                g_host.native_height, &consumed);
+            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
+            else if (action != GD_EXTRAS_ACTION_NONE)
+                runtime_log("Extras action %d is unavailable on x86", action);
+            if (!consumed) send_touch_end(x, y);
         }
         return 0;
     case WM_CAPTURECHANGED:
         if (g_host.mouse_down) {
+            int consumed = 0;
+            int action;
             g_host.mouse_down = 0;
-            send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+            action = gd_extras_menu_pointer_event(&g_host.extras_menu,
+                GD_EXTRAS_POINTER_END, g_host.last_touch_x, g_host.last_touch_y,
+                g_host.native_width, g_host.native_height, &consumed);
+            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
+            else if (action != GD_EXTRAS_ACTION_NONE)
+                runtime_log("Extras action %d is unavailable on x86", action);
+            if (!consumed) send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
         }
         return 0;
     case WM_COMMAND: {
@@ -1095,7 +1288,7 @@ static int create_opengl_window(int client_width, int client_height) {
     gd_extras_menu_init(&g_host.extras_menu);
     if (g_host.extras_menu.enabled) {
         gd_extras_menu_attach(&g_host.extras_menu, g_host.window);
-        runtime_log("Extras menu: enabled host main-menu button");
+        runtime_log("Extras menu: enabled in-game cocos2d UI");
     }
 
     g_host.device = GetDC(g_host.window);
@@ -1196,7 +1389,9 @@ static int run_message_loop(void) {
         if (g_host.extras_menu.enabled) {
             (void)detect_gameplay_active();
             gd_extras_menu_set_visible(&g_host.extras_menu,
-                !g_host.gameplay_cache_value && !g_host.editor_cache_value);
+                g_host.active_menu_layer && !g_host.gameplay_cache_value &&
+                !g_host.editor_cache_value);
+            refresh_extras_visuals();
         }
         if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
@@ -1329,6 +1524,29 @@ int main(int argc, char **argv) {
     g_host.editor_transform_edit_command =
         (EditorTransformEditCommandFunction)elf_image_find_export(
             &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
+    g_host.cc_director_shared = (CcDirectorSharedFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
+    g_host.ccnode_get_children = (CcNodeGetChildrenFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode11getChildrenEv");
+    g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode16getChildrenCountEv");
+    if (!g_host.ccnode_get_children_count)
+        g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(
+            &image, "_ZNK7cocos2d6CCNode16getChildrenCountEv");
+    g_host.ccarray_object_at_index = (CcArrayObjectAtIndexFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d7CCArray13objectAtIndexEj");
+    g_host.button_sprite_create = (ButtonSpriteCreateFunction)elf_image_find_export(
+        &image, "_ZN12ButtonSprite6createEPKc");
+    g_host.ccnode_add_child = (CcNodeAddChildFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode8addChildEPS0_");
+    g_host.ccnode_add_child_z = (CcNodeAddChildZFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode8addChildEPS0_i");
+    g_host.ccnode_set_position = (CcNodeSetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode11setPositionEff");
+    g_host.ccnode_remove = (CcNodeRemoveFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb");
+    g_host.cclayer_color_create = (CcLayerColorCreateFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE");
     g_host.ui_on_check = (UiCheckpointFunction)elf_image_find_export(
         &image, "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
     g_host.ui_on_delete_check = (UiCheckpointFunction)elf_image_find_export(

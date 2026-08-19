@@ -1,0 +1,3 @@
+Remove these obsolete GDPSFixes4 files when applying the hotfix by hand:
+GDPSFIXES4-VERIFICATION.txt
+GDPSFIXES4.md

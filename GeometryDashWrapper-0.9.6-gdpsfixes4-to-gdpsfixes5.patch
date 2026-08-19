@@ -1,0 +1,2230 @@
+diff --git a/BRANCH.txt b/BRANCH.txt
+index 501eee4ed5368c13106f23c1998cb931ff0ac6f9..303e9b22e3ed317cac312286c417e131fe735c04 100644
+--- a/BRANCH.txt
++++ b/BRANCH.txt
+@@ -1 +1 @@
+-gdpsfixes4
++gdpsfixes5
+diff --git a/BUILDING.md b/BUILDING.md
+index 3b05b974aa31670b1c5ff8f1a572491e9d2ca3d2..af0b5929071799ced0dfb48299e3902adc6c79db 100644
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -1,14 +1,11 @@
+-# Building Geometry Dash Wrapper 0.9.6-gdpsfixes4
++# Building Geometry Dash Wrapper 0.9.6-gdpsfixes5
+ 
+-Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use the
+-project's pinned Zig, CMake, Ninja, Dynarmic and Boost dependencies and produce:
++Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use
++the project's pinned Zig 0.14.1, CMake, Ninja, Dynarmic and Boost dependencies
++and produce the launcher plus x86, legacy ARM and ARMv7 backends.
+ 
+-- the native launcher;
+-- x86-native backend files;
+-- `arm-legacy/GeometryDashArmLegacy.exe`;
+-- `armv7/GeometryDashArmV7.exe`.
++The normal RUN batches set `I_LOST_THE_GAME=true`, `EDITOR_CONTROLLS=true`, and
++`EXTRAS_MENU=true`. The executable-side defaults remain false.
+ 
+-This branch is Android-only.
+-
+-No APK, extracted game `.so`, built executable, or proprietary game asset is
+-included in the source archive.
++This branch is Android-only. No APK, extracted game `.so`, built executable,
++DLL, or proprietary game asset is included in the source archive.
+diff --git a/GDPSFIXES4-VERIFICATION.txt b/GDPSFIXES4-VERIFICATION.txt
+deleted file mode 100644
+index c1b3e659c1083f07ffaa3eeaee3fba716b33bfb6..0000000000000000000000000000000000000000
+--- a/GDPSFIXES4-VERIFICATION.txt
++++ /dev/null
+@@ -1,83 +0,0 @@
+-Geometry Dash Wrapper 0.9.6-gdpsfixes4 verification
+-===================================================
+-Branch: gdpsfixes4
+-Version: 0.9.6-gdpsfixes4
+-
+-Reported fixes3 build failure
+------------------------------
+-The supplied Windows build log failed in src/backends/armv7/dynarmic_armv7.cpp
+-because ApkMemberCache::LocateIndex did not exist on that backend.
+-
+-GDPSFixes4 build repair
+------------------------
+-PASS: ARMv7 contains no LocateIndex reference.
+-PASS: ARMv7 extension-resource existence fallback uses ApkMemberCache::Exists().
+-PASS: portable runtime_settings.c compiles with clang -std=c11 -Wall -Wextra -Werror.
+-PASS: portable extras_menu_win.c compiles with clang -std=c11 -Wall -Wextra -Werror.
+-NOTE: full Windows/Dynarmic compile is not available in this container, so the
+-      final Windows link still requires the user's normal BUILD_ALL.cmd test.
+-
+-Mandatory launch joke gate
+---------------------------
+-PASS: I_LOST_THE_GAME defaults to false.
+-PASS: native launcher refuses launch while false.
+-PASS: x86 backend refuses launch while false.
+-PASS: legacy ARM backend refuses launch while false.
+-PASS: ARMv7 backend refuses launch while false.
+-PASS: RUN_AUTO_GDPS.cmd sets I_LOST_THE_GAME=true.
+-PASS: RUN_AUTO_BOOMLINGS.cmd sets I_LOST_THE_GAME=true.
+-PASS: generated legacy/ARMv7 RUN.cmd and RUN_DEBUG.cmd set it true.
+-
+-Editor controls
+----------------
+-PASS: EDITOR_CONTROLLS defaults to false and normal RUN batches set it true.
+-PASS: all three runtime backends contain EditorUI move + transform callback resolution.
+-PASS: no new shortcut path calls EditorUI::keyDown.
+-PASS: W/A/S/D use move commands 3/1/4/2 respectively.
+-PASS: Shift+W/A/S/D use move commands 7/5/8/6 respectively.
+-PASS: legacy ARM uses E=11 clockwise, Q=12 counter-clockwise.
+-PASS: x86-era editor path uses E=11 clockwise, Q=12 counter-clockwise.
+-PASS: ARMv7 2.2 uses E=0x13 clockwise, Q=0x14 counter-clockwise.
+-
+-Real binary audit used for editor controls:
+-- supplied GD 1.0 exports EditorUI::moveObjectCall(CCNode*) and
+-  EditorUI::transformObjectCall(CCNode*), plus createMoveMenu().
+-- its editor resources contain edit_cwBtn_001.png / edit_ccwBtn_001.png and
+-  the audited createMoveMenu tag table uses 11/12 for those buttons.
+-- supplied 2.2 beta exports moveObjectCall(EditCommand) and
+-  transformObjectCall(EditCommand). Its createMoveMenu table associates
+-  edit_cwBtn_001.png with command 0x13 and edit_ccwBtn_001.png with 0x14.
+-
+-Extras menu
+------------
+-PASS: EXTRAS_MENU defaults to false and normal RUN batches set it true.
+-PASS: shared Win32 Extras button is compiled into x86, legacy ARM and ARMv7 builds.
+-PASS: button is hidden while gameplay/editor activity is detected.
+-PASS: version gating requires full Geometry Dash for early-level actions.
+-PASS: versions beginning 1.0/1.1/1.2/1.3 expose Play Placeholder Level.
+-PASS: exact version 1.02 additionally exposes Play Time Machine Beta.
+-PASS: Time Machine Beta calls LevelTools::getLevel(8), then normal PlayLayer::scene.
+-PASS: Placeholder does NOT use level ID 0.
+-PASS: Placeholder creates a raw default GJGameLevel and enters it via PlayLayer::scene.
+-PASS: placeholder run suppresses background music until the wrapper observes the run end.
+-
+-Real GD 1.0 binary audit used for Extras:
+-- LevelTools::getLevel(int) is present.
+-- GJGameLevel::create() is present.
+-- PlayLayer::scene(GJGameLevel*) is present.
+-- earlier disassembly confirmed LevelTools::getLevel(0) aliases official level 1,
+-  so ID 0 is deliberately not used as the placeholder implementation.
+-
+-Carried GDPSFixes fixes
+------------------------
+-PASS: >4095-byte formatted-string/GDPS upload repair remains present.
+-PASS: stop-before-seek music compatibility repair remains present.
+-PASS: legacy nonblocking network compatibility repair remains present.
+-PASS: GDPSFixes3 color-picker extension resource work remains present.
+-PASS: abandoned iOS backend remains removed.
+-
+-Runtime status
+---------------
+-NOT LIVE-TESTED in this container. In particular, the fixes3 color-picker fix
+-still needs its first successful Windows build/test because the supplied fixes3
+-build stopped at the ARMv7 compile error before the user could test it.
+diff --git a/GDPSFIXES4.md b/GDPSFIXES4.md
+deleted file mode 100644
+index eca6c56efd542403065d36419312875d764f89f8..0000000000000000000000000000000000000000
+--- a/GDPSFIXES4.md
++++ /dev/null
+@@ -1,52 +0,0 @@
+-# GDPSFixes4 notes
+-
+-Branch: `gdpsfixes4`
+-Version: `0.9.6-gdpsfixes4`
+-
+-## Build repair
+-
+-GDPSFixes3 did not complete a full Windows build because the ARMv7 backend
+-referenced `ApkMemberCache::LocateIndex`, a helper that exists only in the
+-legacy ARM cache implementation. The ARMv7 extension fallback now uses its
+-native `Exists()` method and contains no `LocateIndex` reference.
+-
+-## Launch gate
+-
+-`I_LOST_THE_GAME` defaults to false. The native launcher, x86 backend, legacy
+-ARM backend, and ARMv7 backend each refuse to start unless it is true. The
+-normal RUN batch files and generated backend RUN/RUN_DEBUG files set it true.
+-
+-## Editor controls
+-
+-`EDITOR_CONTROLLS` defaults to false. The normal RUN batch files enable it.
+-The host key mapping is:
+-
+-- A/D/W/S -> move commands 1/2/3/4
+-- Shift+A/D/W/S -> move commands 5/6/7/8
+-- E/Q -> rotate clockwise/counter-clockwise
+-
+-The implementation deliberately avoids `EditorUI::keyDown`. Movement uses the
+-game's real `EditorUI::moveObjectCall` path and rotation uses
+-`EditorUI::transformObjectCall`. Old/x86-era editors use rotation tags 11/12;
+-the ARMv7 2.2 editor uses its verified EditCommand values 0x13/0x14.
+-
+-## Extras
+-
+-`EXTRAS_MENU` defaults to false. The normal RUN batch files enable it. A native
+-Extras button is attached to each wrapper window and hidden while gameplay or
+-an editor is detected.
+-
+-Full Geometry Dash 1.0x-1.3x gets `Play Placeholder Level`. The early binary's
+-`LevelTools::getLevel(0)` path was disassembled and found to alias level 1, so
+-the wrapper instead creates a raw default `GJGameLevel`, passes it to
+-`PlayLayer::scene`, and suppresses background music for that placeholder run.
+-
+-Full Geometry Dash 1.02 additionally gets `Play Time Machine Beta`, which uses
+-`LevelTools::getLevel(8)` and the normal PlayLayer scene path.
+-
+-## Runtime test status
+-
+-The current environment does not contain the project's pinned Windows Zig /
+-Dynarmic toolchain, so a full Windows link and live gameplay test cannot be
+-performed here. Static source checks, focused C compilation, real-APK symbol
+-audits, patch application, and tree reconstruction are used instead.
+diff --git a/GDPSFIXES5-VERIFICATION.txt b/GDPSFIXES5-VERIFICATION.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..28f6daa2b0faa3e9e39da210c923c9a0192eaf1b
+--- /dev/null
++++ b/GDPSFIXES5-VERIFICATION.txt
+@@ -0,0 +1,111 @@
++Geometry Dash Wrapper 0.9.6-gdpsfixes5 verification
++===================================================
++Branch: gdpsfixes5
++Version: 0.9.6-gdpsfixes5
++
++User-confirmed carried fix
++--------------------------
++PASS: Geometry Dash 1.0 color picker no longer crashes in the wrapper.
++PASS: GDPSFixes3/4 early CCFileUtils + extension-resource compatibility code remains present.
++
++Fixes4 test evidence -> Fixes5 corrections
++-------------------------------------------
++1. Extras UI
++   - Fixes4 used a native Win32 BUTTON / TrackPopupMenu UI.
++   - PASS: shared Extras implementation contains no CreateWindowExA BUTTON,
++     TrackPopupMenu, CreatePopupMenu, or AppendMenu path.
++   - PASS: legacy ARM, x86, and ARMv7 build Extras visuals from game/cocos nodes:
++     ButtonSprite controls plus a CCLayerColor overlay.
++   - Host hit-testing only activates the injected cocos controls; clicks consumed by
++     the Extras overlay are not forwarded to the underlying game menu.
++
++2. Placeholder level
++   - The previous raw GJGameLevel::create() path produced an empty level.
++   - Actual early Android libgame.so disassembly of LevelTools::getLevel(int):
++       0x001a95c8: cmp r3, #0x0a
++       0x001a95ca: bls jump-table
++     Therefore IDs 0..10 are handled by the real built-in level table; only >10
++     takes the fallback path.
++   - PASS: Play Placeholder Level now calls LevelTools::getLevel(10).
++   - PASS: background music suppression remains enabled for the placeholder run.
++
++3. Time Machine Beta
++   - Supplied Fixes4 GD 1.02 log shows PlayLayer::scene reached the artificial
++     100,000,000 guest-tick guard after only about 66.3 ms; another extras scene
++     construction reached about 100,000,768 ticks after about 50.7 ms.
++   - This proves the failure was the wrapper scene-call tick ceiling rather than a
++     failed LevelTools::getLevel(8) lookup.
++   - PASS: PlayLayer::scene and CCDirector::replaceScene Extras transitions now use
++     unlimited guest ticks (tick_budget=0) with a real 15-second wall-clock watchdog.
++   - PASS: Play Time Machine Beta continues to use built-in level ID 8 on exact GD 1.02.
++
++4. Editor shortcuts
++   - Supplied Fixes4 logs contain zero successful DYNARMIC_EDITOR_COMMAND dispatches.
++   - The previous guessed-object-field EditorUI detector was therefore not reaching
++     the real editor UI.
++   - PASS: Fixes5 discovers MenuLayer / PlayLayer / LevelEditorLayer / EditorUI through
++     the live cocos scene and CCNode child arrays, with a GameManager fallback where
++     appropriate.
++   - PASS: a dropped shortcut is now logged explicitly as no-active-EditorUI.
++   - PASS: no backend routes these shortcuts through EditorUI::keyDown.
++   - Controls:
++       W/A/S/D         move
++       Shift+W/A/S/D   larger move
++       Q               rotate counter-clockwise
++       E               rotate clockwise
++   - Legacy/x86 sender command tags: move 1..8, rotate 11/12.
++   - ARMv7 2.2 direct EditCommand values: move 1..8, rotate 0x13/0x14.
++
++Actual game-binary symbol audit
++-------------------------------
++PASS: early ARM libgame.so exports LevelTools::getLevel and PlayLayer::scene.
++PASS: early ARM libgame.so exports CCDirector shared/running/replace scene entry points.
++PASS: early ARM libgame.so exports ButtonSprite::create, CCLayerColor::create,
++      CCNode child traversal/add/position/remove functions and CCArray::objectAtIndex.
++PASS: early ARM libgame.so exports old EditorUI moveObjectCall and transformObjectCall.
++PASS: audited x86 game library has ButtonSprite/cocos scene-tree/editor callback symbols.
++PASS: audited ARMv7 2.2 library has ButtonSprite/cocos scene-tree/editor callback symbols.
++
++Launch/toggle audit
++-------------------
++PASS: I_LOST_THE_GAME defaults false in runtime settings.
++PASS: launcher, x86, legacy ARM and ARMv7 refuse normal direct execution when false.
++PASS: RUN_AUTO_GDPS.cmd and RUN_AUTO_BOOMLINGS.cmd set I_LOST_THE_GAME=true.
++PASS: generated legacy/ARMv7 RUN.cmd and RUN_DEBUG.cmd templates set I_LOST_THE_GAME=true.
++PASS: EDITOR_CONTROLLS=true is set by normal/generated RUN batches.
++PASS: EXTRAS_MENU=true is set by normal/generated RUN batches.
++
++Build/source audit
++------------------
++PASS: VERSION.txt = 0.9.6-gdpsfixes5.
++PASS: BRANCH.txt = gdpsfixes5.
++PASS: shared Extras/settings C syntax check passed with clang -Wall -Wextra -Werror.
++PASS: legacy ARM C++20 syntax check passed against the local Dynarmic API syntax stub.
++PASS: ARMv7 C++20 syntax check passed against the local Dynarmic API syntax stub.
++PASS: x86 C11 syntax check passed against local Win32/OpenGL syntax headers.
++PASS: ARMv7 source contains no call to the nonexistent ApkMemberCache::LocateIndex method.
++PASS: no iOS backend source or launcher/build routing remains.
++PASS: no APK, IPA, extracted SO, EXE or DLL game/runtime payload is included in the source tree.
++
++Runtime/build status
++--------------------
++NOT LIVE-TESTED HERE: the pinned Windows Zig/CMake/Dynarmic build and real gameplay are
++not available in this environment. The syntax/static audits above pass, but the new
++in-game Extras visuals, level transitions and scene-tree editor discovery require the
++user's Windows runtime test.
++
++Expected useful runtime markers
++-------------------------------
++Legacy ARM:
++  RESULT: DYNARMIC_EXTRAS_GD_BUTTON_READY
++  RESULT: DYNARMIC_EXTRAS_GD_OVERLAY_READY
++  RESULT: DYNARMIC_SCENE_TREE_SCAN ... editor-ui=1
++  RESULT: DYNARMIC_EDITOR_COMMAND tag=...
++
++x86:
++  RESULT: X86_EXTRAS_GD_BUTTON_READY
++  RESULT: X86_EXTRAS_GD_OVERLAY_READY
++
++ARMv7:
++  RESULT: DYNARMIC_V22_EXTRAS_GD_BUTTON_READY
++  RESULT: DYNARMIC_V22_EXTRAS_GD_OVERLAY_READY
+diff --git a/GDPSFIXES5.md b/GDPSFIXES5.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..448b5f87f711471befdb5f705682ba87b14afa2b
+--- /dev/null
++++ b/GDPSFIXES5.md
+@@ -0,0 +1,50 @@
++# GDPSFixes5 notes
++
++Branch: `gdpsfixes5`
++Version: `0.9.6-gdpsfixes5`
++
++## User-confirmed result carried forward
++
++Geometry Dash 1.0 color-picker editing is confirmed fixed. The GDPSFixes3
++CCFileUtils/extension-resource compatibility work is frozen into this branch.
++
++## Fixes5 corrections
++
++### Extras is now a real in-game UI
++
++GDPSFixes4 used a Win32 child BUTTON and `TrackPopupMenu`. Both paths are gone.
++Backends now create cocos2d/GD nodes directly: `ButtonSprite` for controls and
++`CCLayerColor` for the popup overlay. Mouse events are host-hit-tested so the
++wrapper can trigger injected buttons without requiring a fake guest selector.
++
++### Placeholder level uses ID 10
++
++The previous raw `GJGameLevel::create()` interpretation only produced a blank
++level. Static auditing of the early Android `LevelTools::getLevel(int)` shows
++IDs 0 through 10 are real jump-table entries; only values above 10 fall back.
++The Placeholder action therefore uses `LevelTools::getLevel(10)` and suppresses
++background music.
++
++### Time Machine Beta scene budget
++
++The supplied fixes4 log showed `PlayLayer::scene(level 8)` hitting the wrapper's
++100,000,000 guest-tick guard after only roughly tens of milliseconds. This was
++not a failed level lookup. Extras scene construction/replacement now uses
++unlimited guest ticks plus a 15-second wall-clock watchdog.
++
++### Editor shortcut discovery
++
++The supplied fixes4 logs contained no successful editor-command dispatches.
++The previous code searched guessed object-field ranges and never found
++`EditorUI`. GDPSFixes5 traverses the actual cocos scene tree and child arrays,
++then invokes the same move/transform callbacks used by the editor buttons.
++Missed shortcuts are explicitly logged instead of silently disappearing.
++
++## Controls
++
++- W/A/S/D: move
++- Shift+W/A/S/D: larger move
++- Q: rotate counter-clockwise
++- E: rotate clockwise
++
++No backend uses `EditorUI::keyDown` for these shortcuts.
+diff --git a/README.md b/README.md
+index 6349dff15e5fe0008bc9373d27996d31d6848b98..4889c1e39c6199d398f905fbd16afe41bd0ffc41 100644
+--- a/README.md
++++ b/README.md
+@@ -1,79 +1,62 @@
+-# Geometry Dash Wrapper 0.9.6-gdpsfixes4
++# Geometry Dash Wrapper 0.9.6-gdpsfixes5
+ 
+-`gdpsfixes4` keeps the Android-only GDPSFixes line and adds wrapper-level launch,
+-editor, and Extras controls across the x86, legacy ARM, and ARMv7 backends.
+-The abandoned iOS backend remains removed.
++`gdpsfixes5` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
+ 
+-## New toggles
++## Confirmed carried fix
+ 
+-The normal RUN batch files set all three toggles to `true`:
++The early Android color picker compatibility repair from GDPSFixes3 is retained.
++It is now live-confirmed on Geometry Dash 1.0: opening/editing the color picker no
++longer crashes the wrapper.
+ 
+-- `I_LOST_THE_GAME=true` — mandatory joke launch gate. The launcher and every
+-  backend default this setting to false and refuse direct execution when it is
+-  not true.
+-- `EDITOR_CONTROLLS=true` — enables host keyboard shortcuts in the level editor.
+-- `EXTRAS_MENU=true` — enables a small native Extras button over menu screens.
++## Launch gate
+ 
+-The environment variable name `EDITOR_CONTROLLS` intentionally keeps the
+-requested spelling.
++Normal RUN batches set `I_LOST_THE_GAME=true`. The launcher and all three
++backends default it to false and refuse direct execution when it is not true.
+ 
+ ## Editor controls
+ 
+-When `EDITOR_CONTROLLS=true` and an EditorUI is active:
++`EDITOR_CONTROLLS=true` enables editor shortcuts on x86, legacy ARM, and ARMv7:
+ 
+-- `W` / `A` / `S` / `D` — move the selection one editor step.
+-- `Shift+W/A/S/D` — use the corresponding larger move command.
++- `W/A/S/D` — normal editor movement.
++- `Shift+W/A/S/D` — larger movement commands.
+ - `Q` — rotate counter-clockwise.
+ - `E` — rotate clockwise.
+ 
+-The wrapper does not send these shortcuts through `EditorUI::keyDown`. Movement
+-uses the game's own `EditorUI::moveObjectCall` callback and rotation uses
+-`EditorUI::transformObjectCall`. Newer ARMv7 builds use the exported EditCommand
+-overloads directly; older/x86-era builds can use the original sender/tag ABI and
+-restore the original sender tag after the call. Rotation command values are kept
+-backend-aware: old/x86-era editors use 11/12, while the audited 2.2 ARMv7 editor
+-uses 0x13/0x14.
++GDPSFixes5 replaces the failed raw-pointer search for `EditorUI` with cocos2d
++scene/child traversal. It deliberately never routes these keys through the
++unsafe Android `EditorUI::keyDown` desktop path.
+ 
+-## Extras menu
++## In-game Extras menu
+ 
+-When `EXTRAS_MENU=true`, the wrapper adds an `Extras` button to the host game
+-window while gameplay/editor activity is not detected. The popup is available
+-on all wrapper backends, with version-specific actions where supported.
++`EXTRAS_MENU=true` now renders the Extras interface inside cocos2d. There is no
++Win32 BUTTON and no `TrackPopupMenu`. The visible controls are real game
++`ButtonSprite` nodes, with an in-game `CCLayerColor` overlay. Host hit testing is
++used only to activate the injected controls without inventing a guest callback.
+ 
+-For full Geometry Dash versions beginning with 1.0, 1.1, 1.2, or 1.3:
++For full Geometry Dash 1.0x through 1.3x:
+ 
+-- **Play Placeholder Level** — constructs the game's raw default `GJGameLevel`
+-  and enters it through the original `PlayLayer::scene` path. Static auditing of
+-  the supplied GD 1.0 binary confirms LevelTools ID 0 is not a placeholder; it
+-  aliases level 1. Background music is suppressed for the raw placeholder run.
++- **Play Placeholder Level** uses the real early level table slot **ID 10** and
++  suppresses background music for that run.
+ 
+-For full Geometry Dash version **1.02** only:
++For full Geometry Dash **1.02** only:
+ 
+-- **Play Time Machine Beta** — obtains built-in level ID 8 through the game's
+-  original `LevelTools::getLevel(8)` path and opens it normally.
++- **Play Time Machine Beta** uses built-in level **ID 8**. Scene creation now
++  has no artificial 100,000,000 guest-tick cap; a real wall-clock watchdog is
++  kept so an actual infinite loop can still be stopped.
+ 
+-No APK data is bundled with these features.
++Later wrapper backends still receive the in-game Extras button/overlay, with a
++`No extras for this version` entry until version-specific extras are added.
+ 
+-## GDPSFixes3 build repair
++## Other carried GDPS fixes
+ 
+-The GDPSFixes3 ARMv7 source accidentally called a legacy-only
+-`ApkMemberCache::LocateIndex` helper and failed to compile. GDPSFixes4 removes
+-that call and uses the ARMv7 cache's real `Exists()` API for extension-resource
+-existence checks.
+-
+-The GDPSFixes3 color-picker compatibility changes remain present; they still
+-need a live gameplay retest because the fixes3 package could not complete the
+-user's full build.
+-
+-## Carried fixes
+-
+-- Large ARM/GDPS level uploads are no longer chopped at 4095 formatted bytes.
+-- MCI music seeks stop the alias before seeking for Wine/Proton compatibility.
+-- Legacy ARM nonblocking sockets no longer synchronously stall on bad network.
+-- Legacy color-picker extension-resource mirroring/fallback from GDPSFixes3 is
+-  retained.
++- Large ARM/GDPS level uploads are no longer truncated at 4095 formatted bytes.
++- MCI music seeks stop before seeking for Wine/Proton compatibility.
++- Legacy ARM networking uses cooperative/nonblocking socket behavior.
++- Early color-picker extension resources are mirrored/resolved correctly.
++- The GDPSFixes3 ARMv7 build regression using a nonexistent `LocateIndex` method
++  remains repaired.
+ 
+ ## Building
+ 
+-Run `BUILD_ALL.cmd` on Windows. No APK, extracted proprietary game library,
+-built game executable, or iOS backend is included in the source archive.
++Run `BUILD_ALL.cmd` on Windows. The source archive contains no APK, extracted
++proprietary game library, game executable, or iOS backend.
+diff --git a/SOURCE-CONTENTS.md b/SOURCE-CONTENTS.md
+index 6adda444769e13758b926fc7e0c4dc2a422c5eea..dbd57d96e34b58248c9a972e9288e7a7cb7e70eb 100644
+--- a/SOURCE-CONTENTS.md
++++ b/SOURCE-CONTENTS.md
+@@ -1,17 +1,16 @@
+-# Source contents — 0.9.6-gdpsfixes4
++# Source contents — 0.9.6-gdpsfixes5
+ 
+ Included:
+ 
+ - x86 Android wrapper source.
+ - Dynarmic legacy ARM and ARMv7 wrapper source.
+ - Shared Windows audio/network/storage/runtime bridges.
+-- `I_LOST_THE_GAME`, `EDITOR_CONTROLLS`, and `EXTRAS_MENU` runtime toggles.
+-- Native Extras popup implementation and editor-transform keyboard bridge.
+-- Early full-version placeholder / 1.02 Time Machine Beta Extras paths.
+-- GDPSFixes3 Android extension-resource mirror and ZIP-path compatibility fix.
+-- GDPSFixes4 ARMv7 compile repair for the extension-resource existence path.
++- `I_LOST_THE_GAME`, `EDITOR_CONTROLLS`, and `EXTRAS_MENU` toggles.
++- In-game cocos2d/GD Extras UI and host hit-testing.
++- Scene-tree based `EditorUI` discovery and editor keyboard bridge.
++- Early full-version placeholder ID 10 and 1.02 Time Machine Beta ID 8 paths.
++- GDPS large-upload, music, nonblocking-network, and color-picker fixes.
+ - Windows build/launcher scripts and vendored third-party source/licenses.
+-- GDPSFixes3 historical notes/verification plus GDPSFixes4 notes/verification.
+ 
+ Excluded:
+ 
+diff --git a/VERSION.txt b/VERSION.txt
+index c424848ab3b2d44e05c3200e89188d94682b4509..f290339f6517188a65ea3d8b5ffca9c73aefa346 100644
+--- a/VERSION.txt
++++ b/VERSION.txt
+@@ -1 +1 @@
+-0.9.6-gdpsfixes4
++0.9.6-gdpsfixes5
+diff --git a/build_dynarmic.ps1 b/build_dynarmic.ps1
+index a3f64c3b18b1d298be4bd67b126893e9d93fc852..84c00a6f9d6107f56f4cf7c30e3ffb5106a209eb 100644
+--- a/build_dynarmic.ps1
++++ b/build_dynarmic.ps1
+@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
+ $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
+ $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
+ $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
+-$BuilderRevision = "dynarmic-x64-builder91-0.9.6-gdpsfixes4"
++$BuilderRevision = "dynarmic-x64-builder92-0.9.6-gdpsfixes5"
+ $CompatibleBuilderRevisions = @($BuilderRevision)
+ 
+ function Invoke-External {
+diff --git a/src/backends/arm_legacy/dynarmic_legacy.cpp b/src/backends/arm_legacy/dynarmic_legacy.cpp
+index b94745d5087999539fcc7590a1e62f8773e44fa8..0f68e692310e7f5e581a6fbd6bfa847ac67e308b 100644
+--- a/src/backends/arm_legacy/dynarmic_legacy.cpp
++++ b/src/backends/arm_legacy/dynarmic_legacy.cpp
+@@ -1010,7 +1010,17 @@ struct ElfRuntime {
+     u32 gj_game_level_create = 0;
+     u32 play_layer_scene = 0;
+     u32 cc_director_shared = 0;
++    u32 cc_director_get_running_scene = 0;
+     u32 cc_director_replace_scene = 0;
++    u32 ccnode_get_children = 0;
++    u32 ccnode_get_children_count = 0;
++    u32 ccarray_object_at_index = 0;
++    u32 button_sprite_create = 0;
++    u32 ccnode_add_child = 0;
++    u32 ccnode_add_child_z = 0;
++    u32 ccnode_set_position_ff = 0;
++    u32 ccnode_remove_from_parent_cleanup = 0;
++    u32 cclayer_color_create = 0;
+     bool ui_on_check_has_sender = false;
+     bool ui_on_delete_check_has_sender = false;
+     std::vector<u32> constructors;
+@@ -1542,8 +1552,28 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
+                 runtime.play_layer_scene = address;
+             else if (name == "_ZN7cocos2d10CCDirector14sharedDirectorEv")
+                 runtime.cc_director_shared = address;
++            else if (name == "_ZN7cocos2d10CCDirector15getRunningSceneEv")
++                runtime.cc_director_get_running_scene = address;
+             else if (name == "_ZN7cocos2d10CCDirector12replaceSceneEPNS_7CCSceneE")
+                 runtime.cc_director_replace_scene = address;
++            else if (name == "_ZN7cocos2d6CCNode11getChildrenEv")
++                runtime.ccnode_get_children = address;
++            else if (name == "_ZN7cocos2d6CCNode16getChildrenCountEv")
++                runtime.ccnode_get_children_count = address;
++            else if (name == "_ZN7cocos2d7CCArray13objectAtIndexEj")
++                runtime.ccarray_object_at_index = address;
++            else if (name == "_ZN12ButtonSprite6createEPKc")
++                runtime.button_sprite_create = address;
++            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_")
++                runtime.ccnode_add_child = address;
++            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_i")
++                runtime.ccnode_add_child_z = address;
++            else if (name == "_ZN7cocos2d6CCNode11setPositionEff")
++                runtime.ccnode_set_position_ff = address;
++            else if (name == "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb")
++                runtime.ccnode_remove_from_parent_cleanup = address;
++            else if (name == "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE")
++                runtime.cclayer_color_create = address;
+             else if (name == "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE") {
+                 runtime.ui_on_check = address;
+                 runtime.ui_on_check_has_sender = true;
+@@ -1948,6 +1978,18 @@ public:
+     void SetExtrasVisible(bool visible) {
+         gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
+     }
++    bool ExtrasEnabled() const { return extras_menu_.enabled != 0; }
++    bool ExtrasVisible() const { return extras_menu_.visible != 0; }
++    bool ExtrasOverlayOpen() const { return extras_menu_.overlay_open != 0; }
++    bool ExtrasEarlyFullVersion() const { return extras_menu_.early_full_version != 0; }
++    bool ExtrasTimeMachineAvailable() const {
++        return extras_menu_.time_machine_beta_available != 0;
++    }
++    GdExtrasLayout ExtrasLayout() const {
++        GdExtrasLayout layout{};
++        gd_extras_menu_get_layout(&extras_menu_, native_width_, native_height_, &layout);
++        return layout;
++    }
+ 
+     void SetTextInputActive(bool active) {
+         text_input_active_ = active;
+@@ -2101,19 +2143,36 @@ private:
+         }
+         case WM_ERASEBKGND:
+             return 1;
+-        case WM_LBUTTONDOWN:
++        case WM_LBUTTONDOWN: {
+             self->ClientPoint(lparam, x, y);
+             self->last_x_ = x; self->last_y_ = y;
+             SetFocus(window);
+             self->mouse_down_ = true;
+             SetCapture(window);
+-            self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
++            int consumed = 0;
++            const int action = gd_extras_menu_pointer_event(
++                &self->extras_menu_, GD_EXTRAS_POINTER_BEGIN, x, y,
++                self->native_width_, self->native_height_, &consumed);
++            if (action != GD_EXTRAS_ACTION_NONE)
++                self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                      static_cast<u32>(action)});
++            if (!consumed)
++                self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
+             return 0;
++        }
+         case WM_MOUSEMOVE:
+             if (self->mouse_down_) {
+                 self->ClientPoint(lparam, x, y);
+                 self->last_x_ = x; self->last_y_ = y;
+-                self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_MOVE, x, y,
++                    self->native_width_, self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
+             }
+             return 0;
+         case WM_LBUTTONUP:
+@@ -2122,13 +2181,31 @@ private:
+                 self->last_x_ = x; self->last_y_ = y;
+                 self->mouse_down_ = false;
+                 ReleaseCapture();
+-                self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_END, x, y,
++                    self->native_width_, self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
+             }
+             return 0;
+         case WM_CAPTURECHANGED:
+             if (self->mouse_down_) {
+                 self->mouse_down_ = false;
+-                self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_END,
++                    self->last_x_, self->last_y_, self->native_width_,
++                    self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchEnd,
++                                          self->last_x_, self->last_y_, 0});
+             }
+             return 0;
+         case WM_COMMAND: {
+@@ -2254,6 +2331,12 @@ public:
+     void SetTitle(const std::string&) {}
+     void SetGameplayActive(bool, bool = false) {}
+     void SetExtrasVisible(bool) {}
++    bool ExtrasEnabled() const { return false; }
++    bool ExtrasVisible() const { return false; }
++    bool ExtrasOverlayOpen() const { return false; }
++    bool ExtrasEarlyFullVersion() const { return false; }
++    bool ExtrasTimeMachineAvailable() const { return false; }
++    GdExtrasLayout ExtrasLayout() const { return GdExtrasLayout{}; }
+     void SetTextInputActive(bool) {}
+     void RequestClose() {}
+ };
+@@ -2384,6 +2467,8 @@ public:
+     }
+ 
+     bool CreateOpenGlWindow(int width, int height) {
++        native_width_ = width;
++        native_height_ = height;
+         return gl_.Create(width, height, log_);
+     }
+     bool PumpMessages() { return gl_.PumpMessages(); }
+@@ -2404,10 +2489,193 @@ public:
+     bool WindowActive() const { return gl_.Active(); }
+     void SetWindowTitle(const std::string& title) { gl_.SetTitle(title); }
+ 
++    bool ResolveRunningScene(u32& scene) {
++        scene = 0u;
++        if (!runtime_.cc_director_shared) return true;
++        u32 director = 0u;
++        if (!RunFunction(runtime_.cc_director_shared, {}, &director,
++                         "CCDirector::sharedDirector scene scan", 0u,
++                         std::chrono::milliseconds(1000)) || !director)
++            return false;
++        if (runtime_.cc_director_get_running_scene) {
++            if (!RunFunction(runtime_.cc_director_get_running_scene, {director}, &scene,
++                             "CCDirector::getRunningScene scene scan", 0u,
++                             std::chrono::milliseconds(1000)))
++                return false;
++            if (GuestObjectTypeContains(scene, "CCScene")) return true;
++            scene = 0u;
++        }
++        if (!env_.IsMapped(director, 0x500u)) return true;
++        for (u32 offset = 0u; offset + 4u <= 0x500u; offset += 4u) {
++            const u32 candidate = env_.MemoryRead32(director + offset);
++            if (GuestObjectTypeContains(candidate, "CCScene")) {
++                scene = candidate;
++                break;
++            }
++        }
++        return true;
++    }
++
++    bool WalkSceneTree(u32 node, unsigned depth, unsigned& visited) {
++        if (!node || depth > 12u || visited >= 4096u ||
++            !GuestObjectTypeContains(node, "")) return true;
++        ++visited;
++        const bool is_menu = GuestObjectTypeContains(node, "MenuLayer");
++        const bool is_play = GuestObjectTypeContains(node, "PlayLayer");
++        const bool is_editor = GuestObjectTypeContains(node, "LevelEditorLayer");
++        const bool is_editor_ui = GuestObjectTypeContains(node, "EditorUI");
++        if (is_menu && !active_menu_layer_) active_menu_layer_ = node;
++        if (is_play && !active_play_layer_) {
++            gameplay_active_cache_ = true;
++            active_play_layer_ = node;
++        }
++        if (is_editor && !active_editor_layer_) {
++            editor_active_cache_ = true;
++            active_editor_layer_ = node;
++        }
++        if (is_editor_ui && !active_editor_ui_) active_editor_ui_ = node;
++        /* MenuLayer/PlayLayer/EditorUI do not need descendant inspection for
++           host state.  LevelEditorLayer is the exception because EditorUI is
++           one of its cocos children. */
++        if ((is_menu || is_play || is_editor_ui) && !is_editor) return true;
++        if (!runtime_.ccnode_get_children_count || !runtime_.ccnode_get_children ||
++            !runtime_.ccarray_object_at_index) return true;
++        u32 count = 0u;
++        if (!RunFunction(runtime_.ccnode_get_children_count, {node}, &count,
++                         "CCNode::getChildrenCount scene scan", 0u,
++                         std::chrono::milliseconds(500))) return false;
++        if (!count) return true;
++        count = std::min<u32>(count, 512u);
++        u32 children = 0u;
++        if (!RunFunction(runtime_.ccnode_get_children, {node}, &children,
++                         "CCNode::getChildren scene scan", 0u,
++                         std::chrono::milliseconds(500)) || !children) return true;
++        for (u32 index = 0u; index < count && visited < 4096u; ++index) {
++            u32 child = 0u;
++            if (!RunFunction(runtime_.ccarray_object_at_index, {children, index}, &child,
++                             "CCArray::objectAtIndex scene scan", 0u,
++                             std::chrono::milliseconds(500))) return false;
++            if (child && !WalkSceneTree(child, depth + 1u, visited)) return false;
++        }
++        return true;
++    }
++
++    bool AddExtrasChild(u32 parent, u32 child, int z) {
++        if (!parent || !child) return false;
++        if (runtime_.ccnode_add_child_z)
++            return RunFunction(runtime_.ccnode_add_child_z,
++                               {parent, child, static_cast<u32>(z)}, nullptr,
++                               "CCNode::addChild extras", 0u,
++                               std::chrono::milliseconds(1000));
++        if (runtime_.ccnode_add_child)
++            return RunFunction(runtime_.ccnode_add_child, {parent, child}, nullptr,
++                               "CCNode::addChild extras", 0u,
++                               std::chrono::milliseconds(1000));
++        return false;
++    }
++
++    u32 CreateExtrasButton(const char* text, u32 parent, float x, float y, int z) {
++        if (!runtime_.button_sprite_create || !runtime_.ccnode_set_position_ff || !parent)
++            return 0u;
++        const u32 label = AllocateString(text ? text : "Extras");
++        u32 button = 0u;
++        if (!label || !RunFunction(runtime_.button_sprite_create, {label}, &button,
++                                   "ButtonSprite::create extras", 0u,
++                                   std::chrono::milliseconds(1500)) || !button)
++            return 0u;
++        if (!RunFunction(runtime_.ccnode_set_position_ff,
++                         {button, FloatToWord(x), FloatToWord(y)}, nullptr,
++                         "CCNode::setPosition extras", 0u,
++                         std::chrono::milliseconds(1000)) ||
++            !AddExtrasChild(parent, button, z)) return 0u;
++        return button;
++    }
++
++    void RemoveExtrasNode(u32& node) {
++        if (!node) return;
++        if (runtime_.ccnode_remove_from_parent_cleanup && env_.IsMapped(node, 4u))
++            (void)RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
++                              {node, 1u}, nullptr,
++                              "CCNode::removeFromParentAndCleanup extras", 0u,
++                              std::chrono::milliseconds(1000));
++        node = 0u;
++    }
++
++    void ResetExtrasVisualPointers(u32 scene) {
++        extras_scene_root_ = scene;
++        extras_main_button_ = 0u;
++        extras_overlay_ = 0u;
++        extras_placeholder_button_ = 0u;
++        extras_time_button_ = 0u;
++        extras_close_button_ = 0u;
++        extras_empty_button_ = 0u;
++    }
++
++    bool RefreshExtrasVisuals() {
++        if (!gl_.ExtrasEnabled()) return true;
++        if (active_scene_root_ != extras_scene_root_)
++            ResetExtrasVisualPointers(active_scene_root_);
++        if (!gl_.ExtrasVisible() || !active_menu_layer_ || !active_scene_root_) {
++            RemoveExtrasNode(extras_overlay_);
++            extras_placeholder_button_ = extras_time_button_ = 0u;
++            extras_close_button_ = extras_empty_button_ = 0u;
++            return true;
++        }
++        const GdExtrasLayout layout = gl_.ExtrasLayout();
++        if (!extras_main_button_) {
++            extras_main_button_ = CreateExtrasButton(
++                "Extras", active_menu_layer_, layout.main_x, layout.main_y, 10000);
++            if (extras_main_button_) {
++                log_ << "RESULT: DYNARMIC_EXTRAS_GD_BUTTON_READY scene=0x"
++                     << std::hex << active_scene_root_ << std::dec << "\n";
++                log_.flush();
++            }
++        }
++        if (!gl_.ExtrasOverlayOpen()) {
++            RemoveExtrasNode(extras_overlay_);
++            extras_placeholder_button_ = extras_time_button_ = 0u;
++            extras_close_button_ = extras_empty_button_ = 0u;
++            return true;
++        }
++        if (extras_overlay_) return true;
++        if (!runtime_.cclayer_color_create) return true;
++        const u32 color = Allocate(4u);
++        if (!color) return false;
++        const std::array<u8,4> rgba{0u,0u,0u,180u};
++        env_.WriteBytes(color, rgba.data(), rgba.size());
++        if (!RunFunction(runtime_.cclayer_color_create, {color}, &extras_overlay_,
++                         "CCLayerColor::create extras", 0u,
++                         std::chrono::milliseconds(1500)) || !extras_overlay_)
++            return false;
++        if (!AddExtrasChild(active_scene_root_, extras_overlay_, 20000)) {
++            extras_overlay_ = 0u;
++            return false;
++        }
++        if (gl_.ExtrasEarlyFullVersion())
++            extras_placeholder_button_ = CreateExtrasButton(
++                "Play Placeholder Level", extras_overlay_,
++                layout.placeholder_x, layout.placeholder_y, 1);
++        if (gl_.ExtrasTimeMachineAvailable())
++            extras_time_button_ = CreateExtrasButton(
++                "Play Time Machine Beta", extras_overlay_,
++                layout.time_machine_x, layout.time_machine_y, 1);
++        if (!gl_.ExtrasEarlyFullVersion())
++            extras_empty_button_ = CreateExtrasButton(
++                "No extras for this version", extras_overlay_,
++                layout.empty_x, layout.empty_y, 1);
++        extras_close_button_ = CreateExtrasButton(
++            "Close", extras_overlay_, layout.close_x, layout.close_y, 1);
++        log_ << "RESULT: DYNARMIC_EXTRAS_GD_OVERLAY_READY placeholder="
++             << (extras_placeholder_button_ ? 1 : 0)
++             << " time-machine=" << (extras_time_button_ ? 1 : 0) << "\n";
++        log_.flush();
++        return true;
++    }
++
+     void RefreshDesktopGameplayState() {
+         const auto now = std::chrono::steady_clock::now();
+         if (gameplay_check_at_.time_since_epoch().count() != 0 &&
+-            now - gameplay_check_at_ < std::chrono::milliseconds(100)) {
++            now - gameplay_check_at_ < std::chrono::milliseconds(500)) {
+             return;
+         }
+         gameplay_check_at_ = now;
+@@ -2415,32 +2683,55 @@ public:
+         editor_active_cache_ = false;
+         active_play_layer_ = 0u;
+         active_editor_layer_ = 0u;
+-        if (!runtime_.game_manager_shared_state) {
+-            gl_.SetExtrasVisible(true);
+-            return;
+-        }
+-
+-        u32 manager = 0u;
+-        if (!RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+-                         "GameManager::sharedState gameplay detection",
+-                         100000000u,
+-                         std::chrono::milliseconds(5000)) ||
+-            !manager || !env_.IsMapped(manager, 0x600u)) {
+-            return;
++        active_editor_ui_ = 0u;
++        active_menu_layer_ = 0u;
++        active_scene_root_ = 0u;
++
++        bool scene_scanned = false;
++        if (runtime_.cc_director_shared && runtime_.ccnode_get_children &&
++            runtime_.ccarray_object_at_index) {
++            u32 scene = 0u;
++            if (ResolveRunningScene(scene) && scene) {
++                active_scene_root_ = scene;
++                unsigned visited = 0u;
++                scene_scanned = WalkSceneTree(scene, 0u, visited);
++                if (scene_scan_logs_ < 4u) {
++                    ++scene_scan_logs_;
++                    log_ << "RESULT: DYNARMIC_SCENE_TREE_SCAN nodes=" << visited
++                         << " menu=" << (active_menu_layer_ ? 1 : 0)
++                         << " play=" << (active_play_layer_ ? 1 : 0)
++                         << " editor=" << (active_editor_layer_ ? 1 : 0)
++                         << " editor-ui=" << (active_editor_ui_ ? 1 : 0) << "\n";
++                    log_.flush();
++                }
++            }
+         }
+ 
+-        for (u32 offset = 0x40u; offset + 4u <= 0x600u; offset += 4u) {
+-            const u32 candidate = env_.MemoryRead32(manager + offset);
+-            if (GuestObjectTypeContains(candidate, "LevelEditorLayer")) {
+-                editor_active_cache_ = true;
+-                active_editor_layer_ = candidate;
+-            }
+-            if (GuestObjectTypeContains(candidate, "PlayLayer")) {
+-                gameplay_active_cache_ = true;
+-                active_play_layer_ = candidate;
++        if ((!scene_scanned || (!active_play_layer_ && !active_editor_layer_)) &&
++            runtime_.game_manager_shared_state) {
++            u32 manager = 0u;
++            if (RunFunction(runtime_.game_manager_shared_state, {}, &manager,
++                            "GameManager::sharedState gameplay fallback", 0u,
++                            std::chrono::milliseconds(2000)) &&
++                manager && env_.IsMapped(manager, 0x600u)) {
++                for (u32 offset = 0x40u; offset + 4u <= 0x600u; offset += 4u) {
++                    const u32 candidate = env_.MemoryRead32(manager + offset);
++                    if (!active_editor_layer_ &&
++                        GuestObjectTypeContains(candidate, "LevelEditorLayer")) {
++                        editor_active_cache_ = true;
++                        active_editor_layer_ = candidate;
++                    }
++                    if (!active_play_layer_ && GuestObjectTypeContains(candidate, "PlayLayer")) {
++                        gameplay_active_cache_ = true;
++                        active_play_layer_ = candidate;
++                    }
++                }
+             }
+         }
+-        gl_.SetExtrasVisible(!gameplay_active_cache_ && !editor_active_cache_);
++        gameplay_active_cache_ = active_play_layer_ != 0u;
++        editor_active_cache_ = active_editor_layer_ != 0u;
++        gl_.SetExtrasVisible(active_menu_layer_ && !gameplay_active_cache_ && !editor_active_cache_);
++        (void)RefreshExtrasVisuals();
+         if (placeholder_no_music_) {
+             if (gameplay_active_cache_) placeholder_seen_gameplay_ = true;
+             else if (placeholder_seen_gameplay_) {
+@@ -2453,11 +2744,17 @@ public:
+     u32 FindActiveEditorUi() {
+         gameplay_check_at_ = {};
+         RefreshDesktopGameplayState();
+-        if (!editor_active_cache_ || !active_editor_layer_) return 0u;
+-        for (u32 offset = 0x40u; offset + 4u <= 0x3000u; offset += 4u) {
+-            if (!env_.IsMapped(active_editor_layer_ + offset, 4u)) continue;
+-            const u32 candidate = env_.MemoryRead32(active_editor_layer_ + offset);
+-            if (GuestObjectTypeContains(candidate, "EditorUI")) return candidate;
++        if (active_editor_ui_) return active_editor_ui_;
++        if (active_editor_layer_) {
++            unsigned visited = 0u;
++            (void)WalkSceneTree(active_editor_layer_, 0u, visited);
++            if (active_editor_ui_) return active_editor_ui_;
++        }
++        if (editor_hotkey_miss_logs_ < 8u) {
++            ++editor_hotkey_miss_logs_;
++            log_ << "RESULT: DYNARMIC_EDITOR_COMMAND_IGNORED reason=no-active-EditorUI"
++                 << " editor-layer=" << (active_editor_layer_ ? 1 : 0) << "\n";
++            log_.flush();
+         }
+         return 0u;
+     }
+@@ -2532,14 +2829,14 @@ public:
+         }
+         u32 scene = 0u, director = 0u;
+         if (!RunFunction(runtime_.play_layer_scene, {level}, &scene,
+-                         "PlayLayer::scene extras", 100000000u,
+-                         std::chrono::milliseconds(5000)) || !scene) return false;
++                         "PlayLayer::scene extras", 0u,
++                         std::chrono::milliseconds(15000)) || !scene) return false;
+         if (!RunFunction(runtime_.cc_director_shared, {}, &director,
+                          "CCDirector::sharedDirector extras", 100000000u,
+                          std::chrono::milliseconds(1000)) || !director) return false;
+         if (!RunFunction(runtime_.cc_director_replace_scene, {director, scene}, nullptr,
+-                         "CCDirector::replaceScene extras", 100000000u,
+-                         std::chrono::milliseconds(5000))) return false;
++                         "CCDirector::replaceScene extras", 0u,
++                         std::chrono::milliseconds(15000))) return false;
+         log_ << "RESULT: DYNARMIC_EXTRAS_PLAY label="
+              << (label ? label : "unknown");
+         if (level_id >= 0) log_ << " level_id=" << level_id;
+@@ -2564,32 +2861,17 @@ public:
+     }
+ 
+     bool PlayPlaceholderLevel() {
+-        /* Early Android LevelTools has no hidden numeric placeholder: ID 0 and
+-           out-of-range IDs deliberately alias level 1.  The real unconfigured
+-           GJGameLevel object is the safe internal placeholder. */
+-        if (!runtime_.gj_game_level_create) {
+-            log_ << "RESULT: DYNARMIC_EXTRAS_ACTION_UNAVAILABLE label=placeholder"
+-                    " reason=missing-GJGameLevel-create\n";
+-            log_.flush();
+-            return true;
+-        }
+-        u32 level = 0u;
+         placeholder_no_music_ = true;
+         placeholder_seen_gameplay_ = false;
+-        if (!RunFunction(runtime_.gj_game_level_create, {}, &level,
+-                         "GJGameLevel::create placeholder", 100000000u,
+-                         std::chrono::milliseconds(2000)) || !level) {
+-            placeholder_no_music_ = false;
+-            return false;
+-        }
+-        const bool ok = EnterLevelScene(level, "placeholder", -1);
+-        if (!ok) placeholder_no_music_ = false;
+-        /* In case this build starts music synchronously inside PlayLayer::scene. */
+         audio_stop_background();
++        const bool ok = PlayBuiltInLevel(10u, "placeholder");
++        if (!ok) placeholder_no_music_ = false;
+         return ok;
+     }
+ 
+     bool HandleExtrasAction(u32 action) {
++        if (action == GD_EXTRAS_ACTION_UI_CHANGED)
++            return RefreshExtrasVisuals();
+         if (action == GD_EXTRAS_ACTION_PLAY_PLACEHOLDER)
+             return PlayPlaceholderLevel();
+         if (action == GD_EXTRAS_ACTION_PLAY_TIME_MACHINE_BETA)
+@@ -6736,6 +7018,20 @@ private:
+     bool placeholder_seen_gameplay_ = false;
+     u32 active_play_layer_ = 0u;
+     u32 active_editor_layer_ = 0u;
++    u32 active_editor_ui_ = 0u;
++    u32 active_menu_layer_ = 0u;
++    u32 active_scene_root_ = 0u;
++    u32 extras_scene_root_ = 0u;
++    u32 extras_main_button_ = 0u;
++    u32 extras_overlay_ = 0u;
++    u32 extras_placeholder_button_ = 0u;
++    u32 extras_time_button_ = 0u;
++    u32 extras_close_button_ = 0u;
++    u32 extras_empty_button_ = 0u;
++    u64 scene_scan_logs_ = 0u;
++    u64 editor_hotkey_miss_logs_ = 0u;
++    int native_width_ = 1280;
++    int native_height_ = 720;
+     WinGlHost gl_;
+     double frame_interval_=1.0/60.0;
+     std::unordered_map<u32,u32> gl_string_cache_;
+@@ -7067,7 +7363,7 @@ private:
+             allocations += sample.allocation_calls;
+             frees += sample.free_calls;
+         }
+-        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes4 legacy ARM debug profile\n";
++        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes5 legacy ARM debug profile\n";
+         file << "frames=" << samples_.size() << '\n';
+         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
+         file << "slow_frames=" << slow_frame_count_ << '\n';
+diff --git a/src/backends/armv7/dynarmic_armv7.cpp b/src/backends/armv7/dynarmic_armv7.cpp
+index 3d12123c50a0054a7ab53f7a1e1e03b5d4a87d87..b590690962f1c967e8cae80da47da823d6274272 100644
+--- a/src/backends/armv7/dynarmic_armv7.cpp
++++ b/src/backends/armv7/dynarmic_armv7.cpp
+@@ -1212,6 +1212,16 @@ struct ElfRuntime {
+     u32 editor_move_edit_command = 0;
+     u32 editor_transform_object_call = 0;
+     u32 editor_transform_edit_command = 0;
++    u32 cc_director_shared = 0;
++    u32 ccnode_get_children = 0;
++    u32 ccnode_get_children_count = 0;
++    u32 ccarray_object_at_index = 0;
++    u32 button_sprite_create = 0;
++    u32 ccnode_add_child = 0;
++    u32 ccnode_add_child_z = 0;
++    u32 ccnode_set_position_ff = 0;
++    u32 ccnode_remove_from_parent_cleanup = 0;
++    u32 cclayer_color_create = 0;
+     std::vector<u32> constructors;
+     std::vector<ImportRecord> imports;
+     std::vector<ObjectRecord> objects;
+@@ -2872,6 +2882,17 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
+             else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d6CCNodeE") runtime.editor_transform_object_call = address;
+             else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d8CCObjectE") runtime.editor_transform_object_call = address;
+             else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand") runtime.editor_transform_edit_command = address;
++            else if (name == "_ZN7cocos2d10CCDirector14sharedDirectorEv") runtime.cc_director_shared = address;
++            else if (name == "_ZN7cocos2d6CCNode11getChildrenEv") runtime.ccnode_get_children = address;
++            else if (name == "_ZN7cocos2d6CCNode16getChildrenCountEv" ||
++                     name == "_ZNK7cocos2d6CCNode16getChildrenCountEv") runtime.ccnode_get_children_count = address;
++            else if (name == "_ZN7cocos2d7CCArray13objectAtIndexEj") runtime.ccarray_object_at_index = address;
++            else if (name == "_ZN12ButtonSprite6createEPKc") runtime.button_sprite_create = address;
++            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_") runtime.ccnode_add_child = address;
++            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_i") runtime.ccnode_add_child_z = address;
++            else if (name == "_ZN7cocos2d6CCNode11setPositionEff") runtime.ccnode_set_position_ff = address;
++            else if (name == "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb") runtime.ccnode_remove_from_parent_cleanup = address;
++            else if (name == "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE") runtime.cclayer_color_create = address;
+         }
+     }
+ 
+@@ -3323,6 +3344,18 @@ public:
+     void SetExtrasVisible(bool visible) {
+         gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
+     }
++    bool ExtrasEnabled() const { return extras_menu_.enabled != 0; }
++    bool ExtrasVisible() const { return extras_menu_.visible != 0; }
++    bool ExtrasOverlayOpen() const { return extras_menu_.overlay_open != 0; }
++    bool ExtrasEarlyFullVersion() const { return extras_menu_.early_full_version != 0; }
++    bool ExtrasTimeMachineAvailable() const {
++        return extras_menu_.time_machine_beta_available != 0;
++    }
++    GdExtrasLayout ExtrasLayout() const {
++        GdExtrasLayout layout{};
++        gd_extras_menu_get_layout(&extras_menu_, native_width_, native_height_, &layout);
++        return layout;
++    }
+ 
+     void SetTextInputActive(bool active) {
+         text_input_active_ = active;
+@@ -3500,19 +3533,36 @@ private:
+         }
+         case WM_ERASEBKGND:
+             return 1;
+-        case WM_LBUTTONDOWN:
++        case WM_LBUTTONDOWN: {
+             self->ClientPoint(lparam, x, y);
+             self->last_x_ = x; self->last_y_ = y;
+             SetFocus(window);
+             self->mouse_down_ = true;
+             SetCapture(window);
+-            self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
++            int consumed = 0;
++            const int action = gd_extras_menu_pointer_event(
++                &self->extras_menu_, GD_EXTRAS_POINTER_BEGIN, x, y,
++                self->native_width_, self->native_height_, &consumed);
++            if (action != GD_EXTRAS_ACTION_NONE)
++                self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                      static_cast<u32>(action)});
++            if (!consumed)
++                self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
+             return 0;
++        }
+         case WM_MOUSEMOVE:
+             if (self->mouse_down_) {
+                 self->ClientPoint(lparam, x, y);
+                 self->last_x_ = x; self->last_y_ = y;
+-                self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_MOVE, x, y,
++                    self->native_width_, self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
+             }
+             return 0;
+         case WM_LBUTTONUP:
+@@ -3521,13 +3571,31 @@ private:
+                 self->last_x_ = x; self->last_y_ = y;
+                 self->mouse_down_ = false;
+                 ReleaseCapture();
+-                self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_END, x, y,
++                    self->native_width_, self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
+             }
+             return 0;
+         case WM_CAPTURECHANGED:
+             if (self->mouse_down_) {
+                 self->mouse_down_ = false;
+-                self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
++                int consumed = 0;
++                const int action = gd_extras_menu_pointer_event(
++                    &self->extras_menu_, GD_EXTRAS_POINTER_END,
++                    self->last_x_, self->last_y_, self->native_width_,
++                    self->native_height_, &consumed);
++                if (action != GD_EXTRAS_ACTION_NONE)
++                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
++                                          static_cast<u32>(action)});
++                if (!consumed)
++                    self->Queue(HostEvent{HostEventType::TouchEnd,
++                                          self->last_x_, self->last_y_, 0});
+             }
+             return 0;
+         case WM_COMMAND: {
+@@ -3683,6 +3751,12 @@ public:
+     bool Active() const { return false; }
+     void SetTitle(const std::string&) {}
+     void SetExtrasVisible(bool) {}
++    bool ExtrasEnabled() const { return false; }
++    bool ExtrasVisible() const { return false; }
++    bool ExtrasOverlayOpen() const { return false; }
++    bool ExtrasEarlyFullVersion() const { return false; }
++    bool ExtrasTimeMachineAvailable() const { return false; }
++    GdExtrasLayout ExtrasLayout() const { return GdExtrasLayout{}; }
+     void SetTextInputActive(bool) {}
+     void RequestClose() {}
+ };
+@@ -4240,16 +4314,197 @@ public:
+     }
+ 
+ 
++    bool ResolveSceneRoot(u32& scene) {
++        scene = 0u;
++        if (!runtime_.cc_director_shared) return true;
++        u32 director = 0u;
++        if (!RunFunction(runtime_.cc_director_shared, {}, &director,
++                         "CCDirector::sharedDirector scene scan", 0u,
++                         std::chrono::milliseconds(1000)) || !director)
++            return false;
++        if (!env_.IsMapped(director, 0x600u)) return true;
++        for (u32 offset = 0u; offset + 4u <= 0x600u; offset += 4u) {
++            const u32 candidate = env_.MemoryRead32(director + offset);
++            if (GuestObjectTypeContains(candidate, "CCScene")) {
++                scene = candidate;
++                break;
++            }
++        }
++        return true;
++    }
++
++    bool WalkSceneTree(u32 node, unsigned depth, unsigned& visited) {
++        if (!node || depth > 12u || visited >= 4096u ||
++            !GuestObjectTypeContains(node, "")) return true;
++        ++visited;
++        const bool is_menu = GuestObjectTypeContains(node, "MenuLayer");
++        const bool is_play = GuestObjectTypeContains(node, "PlayLayer");
++        const bool is_editor = GuestObjectTypeContains(node, "LevelEditorLayer");
++        const bool is_editor_ui = GuestObjectTypeContains(node, "EditorUI");
++        if (!scene_menu_layer_ && is_menu) scene_menu_layer_ = node;
++        if (!scene_play_layer_ && is_play) scene_play_layer_ = node;
++        if (!scene_editor_layer_ && is_editor) scene_editor_layer_ = node;
++        if (!scene_editor_ui_ && is_editor_ui) scene_editor_ui_ = node;
++        if ((is_menu || is_play || is_editor_ui) && !is_editor) return true;
++        if (!runtime_.ccnode_get_children_count || !runtime_.ccnode_get_children ||
++            !runtime_.ccarray_object_at_index) return true;
++        u32 count = 0u;
++        if (!RunFunction(runtime_.ccnode_get_children_count, {node}, &count,
++                         "CCNode::getChildrenCount scene scan", 0u,
++                         std::chrono::milliseconds(500))) return false;
++        if (!count) return true;
++        count = std::min<u32>(count, 512u);
++        u32 children = 0u;
++        if (!RunFunction(runtime_.ccnode_get_children, {node}, &children,
++                         "CCNode::getChildren scene scan", 0u,
++                         std::chrono::milliseconds(500)) || !children) return true;
++        for (u32 index = 0u; index < count && visited < 4096u; ++index) {
++            u32 child = 0u;
++            if (!RunFunction(runtime_.ccarray_object_at_index, {children, index}, &child,
++                             "CCArray::objectAtIndex scene scan", 0u,
++                             std::chrono::milliseconds(500))) return false;
++            if (child && !WalkSceneTree(child, depth + 1u, visited)) return false;
++        }
++        return true;
++    }
++
++    bool RefreshSceneTreeState(bool force = false) {
++        const auto now = std::chrono::steady_clock::now();
++        if (!force && scene_scan_at_.time_since_epoch().count() != 0 &&
++            now - scene_scan_at_ < std::chrono::milliseconds(500))
++            return true;
++        scene_scan_at_ = now;
++        scene_menu_layer_ = 0u;
++        scene_play_layer_ = 0u;
++        scene_editor_layer_ = 0u;
++        scene_editor_ui_ = 0u;
++        scene_root_ = 0u;
++        if (!ResolveSceneRoot(scene_root_) || !scene_root_) return true;
++        unsigned visited = 0u;
++        const bool ok = WalkSceneTree(scene_root_, 0u, visited);
++        if (scene_scan_logs_ < 4u) {
++            ++scene_scan_logs_;
++            log_ << "RESULT: DYNARMIC_V22_SCENE_TREE_SCAN nodes=" << visited
++                 << " menu=" << (scene_menu_layer_ ? 1 : 0)
++                 << " play=" << (scene_play_layer_ ? 1 : 0)
++                 << " editor=" << (scene_editor_layer_ ? 1 : 0)
++                 << " editor-ui=" << (scene_editor_ui_ ? 1 : 0) << "\n";
++            log_.flush();
++        }
++        return ok;
++    }
++
++    bool AddExtrasChild(u32 parent, u32 child, int z) {
++        if (!parent || !child) return false;
++        if (runtime_.ccnode_add_child_z)
++            return RunFunction(runtime_.ccnode_add_child_z,
++                               {parent, child, static_cast<u32>(z)}, nullptr,
++                               "CCNode::addChild extras", 0u,
++                               std::chrono::milliseconds(1000));
++        if (runtime_.ccnode_add_child)
++            return RunFunction(runtime_.ccnode_add_child, {parent, child}, nullptr,
++                               "CCNode::addChild extras", 0u,
++                               std::chrono::milliseconds(1000));
++        return false;
++    }
++
++    u32 CreateExtrasButton(const char* text, u32 parent, float x, float y, int z) {
++        if (!runtime_.button_sprite_create || !runtime_.ccnode_set_position_ff || !parent)
++            return 0u;
++        const u32 label = AllocateString(text ? text : "Extras");
++        u32 button = 0u;
++        if (!label || !RunFunction(runtime_.button_sprite_create, {label}, &button,
++                                   "ButtonSprite::create extras", 0u,
++                                   std::chrono::milliseconds(1500)) || !button)
++            return 0u;
++        if (!RunFunction(runtime_.ccnode_set_position_ff,
++                         {button, FloatToWord(x), FloatToWord(y)}, nullptr,
++                         "CCNode::setPosition extras", 0u,
++                         std::chrono::milliseconds(1000)) ||
++            !AddExtrasChild(parent, button, z)) return 0u;
++        return button;
++    }
++
++    void RemoveExtrasNode(u32& node) {
++        if (!node) return;
++        if (runtime_.ccnode_remove_from_parent_cleanup && env_.IsMapped(node, 4u))
++            (void)RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
++                              {node, 1u}, nullptr,
++                              "CCNode::removeFromParentAndCleanup extras", 0u,
++                              std::chrono::milliseconds(1000));
++        node = 0u;
++    }
++
++    void ResetExtrasVisualPointers(u32 scene) {
++        extras_scene_root_ = scene;
++        extras_main_button_ = 0u;
++        extras_overlay_ = 0u;
++        extras_close_button_ = 0u;
++        extras_empty_button_ = 0u;
++    }
++
++    bool RefreshExtrasVisuals() {
++        if (!gl_.ExtrasEnabled()) return true;
++        if (scene_root_ != extras_scene_root_)
++            ResetExtrasVisualPointers(scene_root_);
++        if (!gl_.ExtrasVisible() || !scene_menu_layer_ || !scene_root_) {
++            RemoveExtrasNode(extras_overlay_);
++            return true;
++        }
++        const GdExtrasLayout layout = gl_.ExtrasLayout();
++        if (!extras_main_button_) {
++            extras_main_button_ = CreateExtrasButton(
++                "Extras", scene_menu_layer_, layout.main_x, layout.main_y, 10000);
++            if (extras_main_button_) {
++                log_ << "RESULT: DYNARMIC_V22_EXTRAS_GD_BUTTON_READY\n";
++                log_.flush();
++            }
++        }
++        if (!gl_.ExtrasOverlayOpen()) {
++            RemoveExtrasNode(extras_overlay_);
++            extras_close_button_ = extras_empty_button_ = 0u;
++            return true;
++        }
++        if (extras_overlay_) return true;
++        if (!runtime_.cclayer_color_create) return true;
++        const u32 color = Allocate(4u);
++        if (!color) return false;
++        const std::array<u8,4> rgba{0u,0u,0u,180u};
++        env_.WriteBytes(color, rgba.data(), rgba.size());
++        if (!RunFunction(runtime_.cclayer_color_create, {color}, &extras_overlay_,
++                         "CCLayerColor::create extras", 0u,
++                         std::chrono::milliseconds(1500)) || !extras_overlay_)
++            return false;
++        if (!AddExtrasChild(scene_root_, extras_overlay_, 20000)) {
++            extras_overlay_ = 0u;
++            return false;
++        }
++        extras_empty_button_ = CreateExtrasButton(
++            "No extras for this version", extras_overlay_,
++            layout.empty_x, layout.empty_y, 1);
++        extras_close_button_ = CreateExtrasButton(
++            "Close", extras_overlay_, layout.close_x, layout.close_y, 1);
++        log_ << "RESULT: DYNARMIC_V22_EXTRAS_GD_OVERLAY_READY\n";
++        log_.flush();
++        return true;
++    }
++
+     u32 FindActiveEditorUi() {
+         u32 playtest_editor = 0u;
+         if (IsV22EditorPlaytestActive(playtest_editor)) return 0u;
++        if (!RefreshSceneTreeState(true)) return 0u;
++        if (scene_editor_ui_) return scene_editor_ui_;
+         const u32 editor_layer = v22_editor_visual_layer_;
+-        if (!editor_layer || !LooksLikeGuestObject(runtime_, env_, editor_layer))
+-            return 0u;
+-        for (u32 offset = 0x40u; offset + 4u <= 0x3000u; offset += 4u) {
+-            if (!env_.IsMapped(editor_layer + offset, 4u)) continue;
+-            const u32 candidate = env_.MemoryRead32(editor_layer + offset);
+-            if (GuestObjectTypeContains(candidate, "EditorUI")) return candidate;
++        if (editor_layer && LooksLikeGuestObject(runtime_, env_, editor_layer)) {
++            unsigned visited = 0u;
++            (void)WalkSceneTree(editor_layer, 0u, visited);
++            if (scene_editor_ui_) return scene_editor_ui_;
++        }
++        if (editor_hotkey_miss_logs_ < 8u) {
++            ++editor_hotkey_miss_logs_;
++            log_ << "RESULT: DYNARMIC_EDITOR_COMMAND_IGNORED reason=no-active-EditorUI"
++                 << " editor-layer=" << (editor_layer ? 1 : 0) << "\n";
++            log_.flush();
+         }
+         return 0u;
+     }
+@@ -4270,10 +4525,6 @@ public:
+         const char* sender_name = movement
+             ? "EditorUI::moveObjectCall sender shortcut"
+             : "EditorUI::transformObjectCall sender shortcut";
+-
+-        /* 2.2 exports the EditCommand overloads directly. Movement and
+-           transform commands are deliberately kept separate: feeding editor
+-           keys through EditorUI::keyDown is unsafe on Android builds. */
+         if (direct) {
+             const bool ok = RunFunction(
+                 direct, {editor_ui, tag}, nullptr, direct_name, 0u,
+@@ -4286,7 +4537,6 @@ public:
+             }
+             return ok;
+         }
+-
+         if (!runtime_.ccnode_get_tag || !runtime_.ccnode_set_tag || !sender) {
+             log_ << "RESULT: DYNARMIC_EDITOR_CONTROLS_UNAVAILABLE reason=missing-"
+                  << (movement ? "move" : "transform") << "-symbol\n";
+@@ -4311,14 +4561,15 @@ public:
+     }
+ 
+     void RefreshExtrasMenuVisibility() {
+-        u32 layer = 0u;
+-        (void)ResolveV22ActiveGameLayer(layer);
+-        const bool editor = v22_editor_visual_layer_ &&
+-            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_);
+-        gl_.SetExtrasVisible(!layer && !editor);
++        if (!gl_.ExtrasEnabled()) return;
++        if (!RefreshSceneTreeState()) return;
++        gl_.SetExtrasVisible(scene_menu_layer_ && !scene_play_layer_ && !scene_editor_layer_);
++        (void)RefreshExtrasVisuals();
+     }
+ 
+     bool HandleExtrasAction(u32 action) {
++        if (action == GD_EXTRAS_ACTION_UI_CHANGED)
++            return RefreshExtrasVisuals();
+         log_ << "RESULT: DYNARMIC_EXTRAS_ACTION_UNAVAILABLE backend=armv7 action="
+              << action << "\n";
+         log_.flush();
+@@ -11978,6 +12229,19 @@ private:
+     u64 v22_level_settings_fallback_successes_=0;
+     u64 v22_editor_entries_=0;
+     u32 v22_editor_visual_layer_=0;
++    u32 scene_root_=0;
++    u32 scene_menu_layer_=0;
++    u32 scene_play_layer_=0;
++    u32 scene_editor_layer_=0;
++    u32 scene_editor_ui_=0;
++    u32 extras_scene_root_=0;
++    u32 extras_main_button_=0;
++    u32 extras_overlay_=0;
++    u32 extras_close_button_=0;
++    u32 extras_empty_button_=0;
++    u64 scene_scan_logs_=0;
++    u64 editor_hotkey_miss_logs_=0;
++    std::chrono::steady_clock::time_point scene_scan_at_{};
+     u32 v22_draw_grid_layer_=0;
+     u64 v22_editor_visibility_passes_=0;
+     u64 v22_editor_overlay_frames_=0;
+@@ -12402,7 +12666,7 @@ private:
+             allocations += sample.allocation_calls;
+             frees += sample.free_calls;
+         }
+-        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes4 debug-everything profile\n";
++        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes5 debug-everything profile\n";
+         file << "frames=" << samples_.size() << '\n';
+         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
+         file << "slow_frames=" << slow_frame_count_ << '\n';
+diff --git a/src/backends/x86/main.c b/src/backends/x86/main.c
+index d43e56aa3a424061b87f18d8e382e2970ba00fbd..72ea7197965cdd50431327e33096cc623aad309a 100644
+--- a/src/backends/x86/main.c
++++ b/src/backends/x86/main.c
+@@ -41,6 +41,17 @@ typedef void (__cdecl *EditorMoveObjectCallFunction)(void *self, void *sender);
+ typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
+ typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
+ typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
++typedef void *(__cdecl *CcDirectorSharedFunction)(void);
++typedef void *(__cdecl *CcNodeGetChildrenFunction)(void *self);
++typedef unsigned int (__cdecl *CcNodeGetChildrenCountFunction)(void *self);
++typedef void *(__cdecl *CcArrayObjectAtIndexFunction)(void *self, unsigned int index);
++typedef void *(__cdecl *ButtonSpriteCreateFunction)(const char *text);
++typedef void (__cdecl *CcNodeAddChildFunction)(void *self, void *child);
++typedef void (__cdecl *CcNodeAddChildZFunction)(void *self, void *child, int z);
++typedef void (__cdecl *CcNodeSetPositionFunction)(void *self, float x, float y);
++typedef void (__cdecl *CcNodeRemoveFunction)(void *self, int cleanup);
++typedef struct { unsigned char r, g, b, a; } GdCcColor4B;
++typedef void *(__cdecl *CcLayerColorCreateFunction)(const GdCcColor4B *color);
+ 
+ typedef struct {
+     HWND window;
+@@ -85,6 +96,27 @@ typedef struct {
+     EditorMoveEditCommandFunction editor_move_edit_command;
+     EditorTransformObjectCallFunction editor_transform_object_call;
+     EditorTransformEditCommandFunction editor_transform_edit_command;
++    CcDirectorSharedFunction cc_director_shared;
++    CcNodeGetChildrenFunction ccnode_get_children;
++    CcNodeGetChildrenCountFunction ccnode_get_children_count;
++    CcArrayObjectAtIndexFunction ccarray_object_at_index;
++    ButtonSpriteCreateFunction button_sprite_create;
++    CcNodeAddChildFunction ccnode_add_child;
++    CcNodeAddChildZFunction ccnode_add_child_z;
++    CcNodeSetPositionFunction ccnode_set_position;
++    CcNodeRemoveFunction ccnode_remove;
++    CcLayerColorCreateFunction cclayer_color_create;
++    void *active_editor_ui;
++    void *active_menu_layer;
++    void *active_scene_root;
++    void *extras_scene_root;
++    void *extras_main_button;
++    void *extras_overlay;
++    void *extras_placeholder_button;
++    void *extras_time_button;
++    void *extras_close_button;
++    void *extras_empty_button;
++    unsigned int editor_hotkey_miss_logs;
+     GdExtrasMenu extras_menu;
+     uint32_t practice_mode_offset;
+     LARGE_INTEGER frame_clock_frequency;
+@@ -644,32 +676,82 @@ static int object_type_contains(const void *object, const char *needle) {
+     return strstr(name, needle) != NULL;
+ }
+ 
++static void *find_running_scene(void) {
++    void *director;
++    size_t offset;
++    if (!g_host.cc_director_shared) return NULL;
++    director = g_host.cc_director_shared();
++    if (!director || !memory_range_is_readable(director, 0x500u)) return NULL;
++    for (offset = 0; offset + sizeof(void *) <= 0x500u; offset += sizeof(void *)) {
++        void *candidate = *(void **)((unsigned char *)director + offset);
++        if (object_type_contains(candidate, "CCScene")) return candidate;
++    }
++    return NULL;
++}
++
++static void walk_scene_tree(void *node, unsigned int depth, unsigned int *visited) {
++    unsigned int count, index;
++    void *children;
++    if (!node || !visited || depth > 12u || *visited >= 4096u ||
++        !object_type_contains(node, "")) return;
++    ++*visited;
++    {
++        const int is_menu = object_type_contains(node, "MenuLayer");
++        const int is_play = object_type_contains(node, "PlayLayer");
++        const int is_editor = object_type_contains(node, "LevelEditorLayer");
++        const int is_editor_ui = object_type_contains(node, "EditorUI");
++        if (!g_host.active_menu_layer && is_menu) g_host.active_menu_layer = node;
++        if (!g_host.active_play_layer && is_play) g_host.active_play_layer = node;
++        if (!g_host.active_editor_layer && is_editor) g_host.active_editor_layer = node;
++        if (!g_host.active_editor_ui && is_editor_ui) g_host.active_editor_ui = node;
++        if ((is_menu || is_play || is_editor_ui) && !is_editor) return;
++    }
++    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
++        !g_host.ccarray_object_at_index) return;
++    count = g_host.ccnode_get_children_count(node);
++    if (!count) return;
++    if (count > 512u) count = 512u;
++    children = g_host.ccnode_get_children(node);
++    if (!children) return;
++    for (index = 0; index < count && *visited < 4096u; ++index) {
++        void *child = g_host.ccarray_object_at_index(children, index);
++        if (child) walk_scene_tree(child, depth + 1u, visited);
++    }
++}
++
+ static int detect_gameplay_active(void) {
+     ULONGLONG now = GetTickCount64();
+     void *manager;
+     size_t offset;
+-    if (!g_host.game_manager_shared_state) return 0;
+-    if (now - g_host.gameplay_cache_time < 100u)
++    unsigned int visited = 0;
++    if (now - g_host.gameplay_cache_time < 500u)
+         return g_host.gameplay_cache_value;
+     g_host.gameplay_cache_time = now;
+     g_host.gameplay_cache_value = 0;
+     g_host.editor_cache_value = 0;
+     g_host.active_play_layer = NULL;
+     g_host.active_editor_layer = NULL;
+-    manager = g_host.game_manager_shared_state();
+-    if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
+-    for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
+-         offset += sizeof(void *)) {
+-        void *candidate = *(void **)((unsigned char *)manager + offset);
+-        if (object_type_contains(candidate, "LevelEditorLayer")) {
+-            g_host.editor_cache_value = 1;
+-            g_host.active_editor_layer = candidate;
+-        }
+-        if (object_type_contains(candidate, "PlayLayer")) {
+-            g_host.gameplay_cache_value = 1;
+-            g_host.active_play_layer = candidate;
++    g_host.active_editor_ui = NULL;
++    g_host.active_menu_layer = NULL;
++    g_host.active_scene_root = find_running_scene();
++    if (g_host.active_scene_root)
++        walk_scene_tree(g_host.active_scene_root, 0u, &visited);
++    if ((!g_host.active_play_layer && !g_host.active_editor_layer) &&
++        g_host.game_manager_shared_state) {
++        manager = g_host.game_manager_shared_state();
++        if (manager && memory_range_is_readable(manager, 0x600u)) {
++            for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
++                 offset += sizeof(void *)) {
++                void *candidate = *(void **)((unsigned char *)manager + offset);
++                if (!g_host.active_editor_layer && object_type_contains(candidate, "LevelEditorLayer"))
++                    g_host.active_editor_layer = candidate;
++                if (!g_host.active_play_layer && object_type_contains(candidate, "PlayLayer"))
++                    g_host.active_play_layer = candidate;
++            }
+         }
+     }
++    g_host.gameplay_cache_value = g_host.active_play_layer != NULL;
++    g_host.editor_cache_value = g_host.active_editor_layer != NULL;
+     return g_host.gameplay_cache_value;
+ }
+ 
+@@ -690,25 +772,104 @@ static void *find_active_ui_layer(void) {
+ }
+ 
+ static void *find_active_editor_ui(void) {
+-    size_t offset;
+-    unsigned char *editor_layer;
+-    /* detect_gameplay_active also refreshes the editor cache even when its
+-       return value is false (editing is not normal PlayLayer gameplay). */
++    unsigned int visited = 0;
+     g_host.gameplay_cache_time = 0;
+     (void)detect_gameplay_active();
+-    if (!g_host.editor_cache_value || !g_host.active_editor_layer) return NULL;
+-    editor_layer = (unsigned char *)g_host.active_editor_layer;
+-    for (offset = 0x40u; offset + sizeof(void *) <= 0x3000u;
+-         offset += sizeof(void *)) {
+-        void *candidate;
+-        if (!memory_range_is_readable(editor_layer + offset, sizeof(void *)))
+-            continue;
+-        candidate = *(void **)(editor_layer + offset);
+-        if (object_type_contains(candidate, "EditorUI")) return candidate;
+-    }
++    if (g_host.active_editor_ui) return g_host.active_editor_ui;
++    if (g_host.active_editor_layer) {
++        walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
++        if (g_host.active_editor_ui) return g_host.active_editor_ui;
++    }
++    if (g_host.editor_hotkey_miss_logs++ < 8u)
++        runtime_log("Editor controls: key ignored; no active EditorUI found (editor-layer=%s)",
++                    g_host.active_editor_layer ? "yes" : "no");
+     return NULL;
+ }
+ 
++static void remove_extras_node(void **node) {
++    if (!node || !*node) return;
++    if (g_host.ccnode_remove && memory_range_is_readable(*node, sizeof(void *)))
++        g_host.ccnode_remove(*node, 1);
++    *node = NULL;
++}
++
++static int add_extras_child(void *parent, void *child, int z) {
++    if (!parent || !child) return 0;
++    if (g_host.ccnode_add_child_z) { g_host.ccnode_add_child_z(parent, child, z); return 1; }
++    if (g_host.ccnode_add_child) { g_host.ccnode_add_child(parent, child); return 1; }
++    return 0;
++}
++
++static void *create_extras_button(const char *text, void *parent,
++                                  float x, float y, int z) {
++    void *button;
++    if (!g_host.button_sprite_create || !g_host.ccnode_set_position || !parent)
++        return NULL;
++    button = g_host.button_sprite_create(text);
++    if (!button) return NULL;
++    g_host.ccnode_set_position(button, x, y);
++    if (!add_extras_child(parent, button, z)) return NULL;
++    return button;
++}
++
++static void refresh_extras_visuals(void) {
++    GdExtrasLayout layout;
++    if (!g_host.extras_menu.enabled) return;
++    if (g_host.active_scene_root != g_host.extras_scene_root) {
++        g_host.extras_scene_root = g_host.active_scene_root;
++        g_host.extras_main_button = NULL;
++        g_host.extras_overlay = NULL;
++        g_host.extras_placeholder_button = NULL;
++        g_host.extras_time_button = NULL;
++        g_host.extras_close_button = NULL;
++        g_host.extras_empty_button = NULL;
++    }
++    if (!g_host.extras_menu.visible || !g_host.active_menu_layer ||
++        !g_host.active_scene_root) {
++        remove_extras_node(&g_host.extras_overlay);
++        return;
++    }
++    gd_extras_menu_get_layout(&g_host.extras_menu, g_host.native_width,
++                              g_host.native_height, &layout);
++    if (!g_host.extras_main_button) {
++        g_host.extras_main_button = create_extras_button(
++            "Extras", g_host.active_menu_layer, layout.main_x, layout.main_y, 10000);
++        if (g_host.extras_main_button)
++            runtime_log("RESULT: X86_EXTRAS_GD_BUTTON_READY");
++    }
++    if (!g_host.extras_menu.overlay_open) {
++        remove_extras_node(&g_host.extras_overlay);
++        g_host.extras_placeholder_button = g_host.extras_time_button = NULL;
++        g_host.extras_close_button = g_host.extras_empty_button = NULL;
++        return;
++    }
++    if (g_host.extras_overlay || !g_host.cclayer_color_create) return;
++    {
++        GdCcColor4B color = {0, 0, 0, 180};
++        g_host.extras_overlay = g_host.cclayer_color_create(&color);
++    }
++    if (!g_host.extras_overlay ||
++        !add_extras_child(g_host.active_scene_root, g_host.extras_overlay, 20000)) {
++        g_host.extras_overlay = NULL;
++        return;
++    }
++    if (g_host.extras_menu.early_full_version)
++        g_host.extras_placeholder_button = create_extras_button(
++            "Play Placeholder Level", g_host.extras_overlay,
++            layout.placeholder_x, layout.placeholder_y, 1);
++    if (g_host.extras_menu.time_machine_beta_available)
++        g_host.extras_time_button = create_extras_button(
++            "Play Time Machine Beta", g_host.extras_overlay,
++            layout.time_machine_x, layout.time_machine_y, 1);
++    if (!g_host.extras_menu.early_full_version)
++        g_host.extras_empty_button = create_extras_button(
++            "No extras for this version", g_host.extras_overlay,
++            layout.empty_x, layout.empty_y, 1);
++    g_host.extras_close_button = create_extras_button(
++        "Close", g_host.extras_overlay, layout.close_x, layout.close_y, 1);
++    runtime_log("RESULT: X86_EXTRAS_GD_OVERLAY_READY");
++}
++
+ static int send_editor_hotkey(int tag, int virtual_key) {
+     void *editor_ui;
+     int old_tag;
+@@ -978,28 +1139,60 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
+         if (wparam == UNICODE_NOCHAR) return TRUE;
+         send_text_character(wparam);
+         return 0;
+-    case WM_LBUTTONDOWN:
++    case WM_LBUTTONDOWN: {
++        int consumed = 0;
++        int action;
+         SetFocus(window);
+         g_host.mouse_down = 1;
+         SetCapture(window);
+-        send_touch_begin(x, y);
++        action = gd_extras_menu_pointer_event(&g_host.extras_menu,
++            GD_EXTRAS_POINTER_BEGIN, x, y, g_host.native_width,
++            g_host.native_height, &consumed);
++        if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
++        else if (action != GD_EXTRAS_ACTION_NONE)
++            runtime_log("Extras action %d is unavailable on x86", action);
++        if (!consumed) send_touch_begin(x, y);
+         return 0;
++    }
+     case WM_MOUSEMOVE:
+         if (g_host.mouse_down) {
+-            send_touch_move(x, y);
++            int consumed = 0;
++            int action = gd_extras_menu_pointer_event(&g_host.extras_menu,
++                GD_EXTRAS_POINTER_MOVE, x, y, g_host.native_width,
++                g_host.native_height, &consumed);
++            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
++            else if (action != GD_EXTRAS_ACTION_NONE)
++                runtime_log("Extras action %d is unavailable on x86", action);
++            if (!consumed) send_touch_move(x, y);
+         }
+         return 0;
+     case WM_LBUTTONUP:
+         if (g_host.mouse_down) {
++            int consumed = 0;
++            int action;
+             g_host.mouse_down = 0;
+             ReleaseCapture();
+-            send_touch_end(x, y);
++            action = gd_extras_menu_pointer_event(&g_host.extras_menu,
++                GD_EXTRAS_POINTER_END, x, y, g_host.native_width,
++                g_host.native_height, &consumed);
++            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
++            else if (action != GD_EXTRAS_ACTION_NONE)
++                runtime_log("Extras action %d is unavailable on x86", action);
++            if (!consumed) send_touch_end(x, y);
+         }
+         return 0;
+     case WM_CAPTURECHANGED:
+         if (g_host.mouse_down) {
++            int consumed = 0;
++            int action;
+             g_host.mouse_down = 0;
+-            send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
++            action = gd_extras_menu_pointer_event(&g_host.extras_menu,
++                GD_EXTRAS_POINTER_END, g_host.last_touch_x, g_host.last_touch_y,
++                g_host.native_width, g_host.native_height, &consumed);
++            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
++            else if (action != GD_EXTRAS_ACTION_NONE)
++                runtime_log("Extras action %d is unavailable on x86", action);
++            if (!consumed) send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+         }
+         return 0;
+     case WM_COMMAND: {
+@@ -1095,7 +1288,7 @@ static int create_opengl_window(int client_width, int client_height) {
+     gd_extras_menu_init(&g_host.extras_menu);
+     if (g_host.extras_menu.enabled) {
+         gd_extras_menu_attach(&g_host.extras_menu, g_host.window);
+-        runtime_log("Extras menu: enabled host main-menu button");
++        runtime_log("Extras menu: enabled in-game cocos2d UI");
+     }
+ 
+     g_host.device = GetDC(g_host.window);
+@@ -1196,7 +1389,9 @@ static int run_message_loop(void) {
+         if (g_host.extras_menu.enabled) {
+             (void)detect_gameplay_active();
+             gd_extras_menu_set_visible(&g_host.extras_menu,
+-                !g_host.gameplay_cache_value && !g_host.editor_cache_value);
++                g_host.active_menu_layer && !g_host.gameplay_cache_value &&
++                !g_host.editor_cache_value);
++            refresh_extras_visuals();
+         }
+         if (g_host.render && g_host.window_active) {
+             g_host.render(jni_shim_env(), NULL);
+@@ -1329,6 +1524,29 @@ int main(int argc, char **argv) {
+     g_host.editor_transform_edit_command =
+         (EditorTransformEditCommandFunction)elf_image_find_export(
+             &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
++    g_host.cc_director_shared = (CcDirectorSharedFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
++    g_host.ccnode_get_children = (CcNodeGetChildrenFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode11getChildrenEv");
++    g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode16getChildrenCountEv");
++    if (!g_host.ccnode_get_children_count)
++        g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(
++            &image, "_ZNK7cocos2d6CCNode16getChildrenCountEv");
++    g_host.ccarray_object_at_index = (CcArrayObjectAtIndexFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d7CCArray13objectAtIndexEj");
++    g_host.button_sprite_create = (ButtonSpriteCreateFunction)elf_image_find_export(
++        &image, "_ZN12ButtonSprite6createEPKc");
++    g_host.ccnode_add_child = (CcNodeAddChildFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode8addChildEPS0_");
++    g_host.ccnode_add_child_z = (CcNodeAddChildZFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode8addChildEPS0_i");
++    g_host.ccnode_set_position = (CcNodeSetPositionFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode11setPositionEff");
++    g_host.ccnode_remove = (CcNodeRemoveFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb");
++    g_host.cclayer_color_create = (CcLayerColorCreateFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE");
+     g_host.ui_on_check = (UiCheckpointFunction)elf_image_find_export(
+         &image, "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
+     g_host.ui_on_delete_check = (UiCheckpointFunction)elf_image_find_export(
+diff --git a/src/launcher/native_launcher.c b/src/launcher/native_launcher.c
+index 5b137e88b7eaf259bfd71a1e78338abe69f9f2c8..5f9bb10549c7f60a6995e76f2ba6824cf9e14e56 100644
+--- a/src/launcher/native_launcher.c
++++ b/src/launcher/native_launcher.c
+@@ -39,7 +39,7 @@
+ 
+ #include "zlib.h"
+ 
+-#define LAUNCHER_VERSION "0.9.6-gdpsfixes4"
++#define LAUNCHER_VERSION "0.9.6-gdpsfixes5"
+ #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
+ #define MAX_UTF8_TEXT 512
+ #define MAX_COMMAND_LINE 32768
+diff --git a/src/shared/build_info.h b/src/shared/build_info.h
+index df6a00f894c28538667b251c5c4f481b5990f4b3..1ca61190e0254b977d0deb9de820fbd38a1bf0ce 100644
+--- a/src/shared/build_info.h
++++ b/src/shared/build_info.h
+@@ -1,8 +1,8 @@
+ #ifndef GD_BUILD_INFO_H
+ #define GD_BUILD_INFO_H
+ 
+-#define GD_WRAPPER_VERSION "0.9.6-gdpsfixes4"
+-#define GD_WRAPPER_BRANCH "gdpsfixes4"
++#define GD_WRAPPER_VERSION "0.9.6-gdpsfixes5"
++#define GD_WRAPPER_BRANCH "gdpsfixes5"
+ #define GD_X86_BACKEND_NAME "x86-native/0.9.3-alpha3"
+ #define GD_ARM_LEGACY_BACKEND_NAME "arm-dynarmic/dynarmictest14-fix1"
+ #define GD_ARMV7_BACKEND_NAME "armv7-dynarmic/0.9.4-milestone1"
+diff --git a/src/shared/extras_menu_win.c b/src/shared/extras_menu_win.c
+index f26b0adb2b438f50c8731138337ffaeba68e71d5..ef370f2cef80048cd762f688cce95041629e7f9f 100644
+--- a/src/shared/extras_menu_win.c
++++ b/src/shared/extras_menu_win.c
+@@ -1,22 +1,16 @@
++#include <ctype.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <ctype.h>
++
+ #include "extras_menu_win.h"
+ #include "runtime_settings.h"
+ 
+-#ifdef _WIN32
+-#define WIN32_LEAN_AND_MEAN
+-#include <windows.h>
+-
+-#define GD_EXTRAS_BUTTON_ID 0x6E10
+-#define GD_EXTRAS_PLACEHOLDER_ID 0x6E11
+-#define GD_EXTRAS_TIMEMACHINE_ID 0x6E12
+-
+ static int eq_ci(const char *a, const char *b) {
+     if (!a || !b) return 0;
+     while (*a && *b) {
+         if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+-        ++a; ++b;
++        ++a;
++        ++b;
+     }
+     return *a == 0 && *b == 0;
+ }
+@@ -24,8 +18,10 @@ static int eq_ci(const char *a, const char *b) {
+ static int starts_ci(const char *text, const char *prefix) {
+     if (!text || !prefix) return 0;
+     while (*prefix) {
+-        if (!*text || tolower((unsigned char)*text) != tolower((unsigned char)*prefix)) return 0;
+-        ++text; ++prefix;
++        if (!*text || tolower((unsigned char)*text) !=
++                          tolower((unsigned char)*prefix)) return 0;
++        ++text;
++        ++prefix;
+     }
+     return 1;
+ }
+@@ -46,6 +42,11 @@ static int is_early_full_version(const char *version) {
+            starts_ci(version, "1.2") || starts_ci(version, "1.3");
+ }
+ 
++static int hit(float x, float y, float cx, float cy, float w, float h) {
++    return x >= cx - w * 0.5f && x <= cx + w * 0.5f &&
++           y >= cy - h * 0.5f && y <= cy + h * 0.5f;
++}
++
+ void gd_extras_menu_init(GdExtrasMenu *menu) {
+     const char *version;
+     if (!menu) return;
+@@ -58,77 +59,137 @@ void gd_extras_menu_init(GdExtrasMenu *menu) {
+ }
+ 
+ int gd_extras_menu_attach(GdExtrasMenu *menu, void *parent_window) {
+-    HWND parent = (HWND)parent_window;
+-    if (!menu || !parent || !menu->enabled) return 0;
+-    menu->parent = parent;
+-    menu->button = CreateWindowExA(
+-        0, "BUTTON", "Extras",
+-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+-        8, 8, 78, 26, parent, (HMENU)(INT_PTR)GD_EXTRAS_BUTTON_ID,
+-        GetModuleHandleA(NULL), NULL);
+-    return menu->button != NULL;
++    (void)parent_window;
++    return menu && menu->enabled;
+ }
+ 
+ void gd_extras_menu_set_visible(GdExtrasMenu *menu, int visible) {
+-    if (!menu || !menu->button) return;
+-    ShowWindow(menu->button, visible ? SW_SHOW : SW_HIDE);
+-}
+-
+-static int show_popup(GdExtrasMenu *menu) {
+-    HMENU popup;
+-    RECT rect;
+-    UINT result;
+-    if (!menu || !menu->button) return GD_EXTRAS_ACTION_NONE;
+-    popup = CreatePopupMenu();
+-    if (!popup) return GD_EXTRAS_ACTION_NONE;
+-    if (menu->early_full_version) {
+-        AppendMenuA(popup, MF_STRING, GD_EXTRAS_PLACEHOLDER_ID,
+-                    "Play Placeholder Level");
+-    }
+-    if (menu->time_machine_beta_available) {
+-        AppendMenuA(popup, MF_STRING, GD_EXTRAS_TIMEMACHINE_ID,
+-                    "Play Time Machine Beta");
+-    }
+-    if (!menu->early_full_version && !menu->time_machine_beta_available) {
+-        AppendMenuA(popup, MF_STRING | MF_GRAYED, 0, "No extras for this version yet");
++    if (!menu) return;
++    menu->visible = visible != 0;
++    if (!menu->visible) {
++        menu->overlay_open = 0;
++        menu->pointer_capture = 0;
+     }
+-    GetWindowRect(menu->button, &rect);
+-    result = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+-                            rect.left, rect.bottom, 0, menu->parent, NULL);
+-    DestroyMenu(popup);
+-    if (result == GD_EXTRAS_PLACEHOLDER_ID) return GD_EXTRAS_ACTION_PLAY_PLACEHOLDER;
+-    if (result == GD_EXTRAS_TIMEMACHINE_ID) return GD_EXTRAS_ACTION_PLAY_TIME_MACHINE_BETA;
+-    return GD_EXTRAS_ACTION_NONE;
+ }
+ 
+ int gd_extras_menu_handle_command(GdExtrasMenu *menu, unsigned long wparam) {
+-    if (!menu || !menu->enabled) return GD_EXTRAS_ACTION_NONE;
+-    if (LOWORD(wparam) != GD_EXTRAS_BUTTON_ID || HIWORD(wparam) != BN_CLICKED)
+-        return GD_EXTRAS_ACTION_NONE;
+-    return show_popup(menu);
++    (void)menu;
++    (void)wparam;
++    return GD_EXTRAS_ACTION_NONE;
+ }
+ 
+ void gd_extras_menu_destroy(GdExtrasMenu *menu) {
+     if (!menu) return;
+-    if (menu->button) DestroyWindow(menu->button);
+-    menu->button = NULL;
+-    menu->parent = NULL;
++    menu->visible = 0;
++    menu->overlay_open = 0;
++    menu->pointer_capture = 0;
+ }
+ 
+-#else
+-void gd_extras_menu_init(GdExtrasMenu *menu) {
+-    if (!menu) return;
+-    memset(menu, 0, sizeof(*menu));
+-    menu->enabled = gd_settings_extras_menu();
+-}
+-int gd_extras_menu_attach(GdExtrasMenu *menu, void *parent_window) {
+-    (void)menu; (void)parent_window; return 0;
++void gd_extras_menu_get_layout(const GdExtrasMenu *menu,
++                               int native_width, int native_height,
++                               GdExtrasLayout *layout) {
++    float logical_width = 568.8889f;
++    (void)menu;
++    if (!layout) return;
++    memset(layout, 0, sizeof(*layout));
++    if (native_width > 0 && native_height > 0)
++        logical_width = 320.0f * (float)native_width / (float)native_height;
++    if (logical_width < 420.0f) logical_width = 420.0f;
++    layout->logical_width = logical_width;
++    layout->logical_height = 320.0f;
++    layout->main_x = logical_width - 57.0f;
++    layout->main_y = 28.0f;
++    layout->placeholder_x = logical_width * 0.5f;
++    layout->placeholder_y = menu && menu->time_machine_beta_available
++                                ? 190.0f : 170.0f;
++    layout->time_machine_x = logical_width * 0.5f;
++    layout->time_machine_y = 140.0f;
++    layout->close_x = logical_width * 0.5f;
++    layout->close_y = menu && menu->early_full_version ? 82.0f : 112.0f;
++    layout->empty_x = logical_width * 0.5f;
++    layout->empty_y = 176.0f;
+ }
+-void gd_extras_menu_set_visible(GdExtrasMenu *menu, int visible) {
+-    (void)menu; (void)visible;
++
++int gd_extras_menu_pointer_event(GdExtrasMenu *menu, int phase,
++                                 float native_x, float native_y,
++                                 int native_width, int native_height,
++                                 int *consumed) {
++    enum { HIT_NONE = 0, HIT_MAIN = 1, HIT_PLACEHOLDER = 2,
++           HIT_TIME = 3, HIT_CLOSE = 4, HIT_BACKGROUND = 5 };
++    GdExtrasLayout layout;
++    float scale;
++    float x;
++    float y;
++    int candidate = HIT_NONE;
++    int action = GD_EXTRAS_ACTION_NONE;
++
++    if (consumed) *consumed = 0;
++    if (!menu || !menu->enabled || !menu->visible || native_height <= 0)
++        return GD_EXTRAS_ACTION_NONE;
++
++    gd_extras_menu_get_layout(menu, native_width, native_height, &layout);
++    scale = (float)native_height / 320.0f;
++    x = native_x / scale;
++    y = 320.0f - native_y / scale;
++
++    if (menu->overlay_open) {
++        if (menu->early_full_version &&
++            hit(x, y, layout.placeholder_x, layout.placeholder_y, 260.0f, 42.0f))
++            candidate = HIT_PLACEHOLDER;
++        else if (menu->time_machine_beta_available &&
++                 hit(x, y, layout.time_machine_x, layout.time_machine_y, 260.0f, 42.0f))
++            candidate = HIT_TIME;
++        else if (hit(x, y, layout.close_x, layout.close_y, 120.0f, 40.0f))
++            candidate = HIT_CLOSE;
++        else
++            candidate = HIT_BACKGROUND;
++    } else if (hit(x, y, layout.main_x, layout.main_y, 112.0f, 42.0f)) {
++        candidate = HIT_MAIN;
++    }
++
++    if (phase == GD_EXTRAS_POINTER_BEGIN) {
++        if (candidate != HIT_NONE) {
++            menu->pointer_capture = candidate;
++            if (consumed) *consumed = 1;
++        }
++        return GD_EXTRAS_ACTION_NONE;
++    }
++
++    if (phase == GD_EXTRAS_POINTER_MOVE) {
++        if (menu->pointer_capture != HIT_NONE && consumed) *consumed = 1;
++        return GD_EXTRAS_ACTION_NONE;
++    }
++
++    if (phase != GD_EXTRAS_POINTER_END || menu->pointer_capture == HIT_NONE)
++        return GD_EXTRAS_ACTION_NONE;
++
++    if (consumed) *consumed = 1;
++    if (candidate == menu->pointer_capture) {
++        switch (candidate) {
++        case HIT_MAIN:
++            menu->overlay_open = 1;
++            action = GD_EXTRAS_ACTION_UI_CHANGED;
++            break;
++        case HIT_PLACEHOLDER:
++            menu->overlay_open = 0;
++            action = GD_EXTRAS_ACTION_PLAY_PLACEHOLDER;
++            break;
++        case HIT_TIME:
++            menu->overlay_open = 0;
++            action = GD_EXTRAS_ACTION_PLAY_TIME_MACHINE_BETA;
++            break;
++        case HIT_CLOSE:
++            menu->overlay_open = 0;
++            action = GD_EXTRAS_ACTION_UI_CHANGED;
++            break;
++        default:
++            break;
++        }
++    }
++    menu->pointer_capture = HIT_NONE;
++    return action;
+ }
+-int gd_extras_menu_handle_command(GdExtrasMenu *menu, unsigned long wparam) {
+-    (void)menu; (void)wparam; return GD_EXTRAS_ACTION_NONE;
++
++int gd_extras_menu_pointer_captured(const GdExtrasMenu *menu) {
++    return menu && menu->pointer_capture != 0;
+ }
+-void gd_extras_menu_destroy(GdExtrasMenu *menu) { (void)menu; }
+-#endif
+diff --git a/src/shared/extras_menu_win.h b/src/shared/extras_menu_win.h
+index 21fec4bb3a497e47a2b3933e924fdbea0848d3c5..4e7ac2df947c9774b27827b6278979262521688f 100644
+--- a/src/shared/extras_menu_win.h
++++ b/src/shared/extras_menu_win.h
+@@ -1,10 +1,6 @@
+ #ifndef GD_EXTRAS_MENU_WIN_H
+ #define GD_EXTRAS_MENU_WIN_H
+ 
+-#ifdef _WIN32
+-#include <windows.h>
+-#endif
+-
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -12,25 +8,57 @@ extern "C" {
+ enum {
+     GD_EXTRAS_ACTION_NONE = 0,
+     GD_EXTRAS_ACTION_PLAY_PLACEHOLDER = 1,
+-    GD_EXTRAS_ACTION_PLAY_TIME_MACHINE_BETA = 2
++    GD_EXTRAS_ACTION_PLAY_TIME_MACHINE_BETA = 2,
++    GD_EXTRAS_ACTION_UI_CHANGED = 3
++};
++
++enum {
++    GD_EXTRAS_POINTER_BEGIN = 1,
++    GD_EXTRAS_POINTER_MOVE = 2,
++    GD_EXTRAS_POINTER_END = 3
+ };
+ 
++typedef struct GdExtrasLayout {
++    float logical_width;
++    float logical_height;
++    float main_x;
++    float main_y;
++    float placeholder_x;
++    float placeholder_y;
++    float time_machine_x;
++    float time_machine_y;
++    float close_x;
++    float close_y;
++    float empty_x;
++    float empty_y;
++} GdExtrasLayout;
++
+ typedef struct GdExtrasMenu {
+-#ifdef _WIN32
+-    HWND parent;
+-    HWND button;
+-#endif
+     int enabled;
+     int early_full_version;
+     int time_machine_beta_available;
++    int visible;
++    int overlay_open;
++    int pointer_capture;
+ } GdExtrasMenu;
+ 
+ void gd_extras_menu_init(GdExtrasMenu *menu);
++/* Kept as no-op compatibility shims for older backend call sites. The UI is
++   rendered inside cocos2d by the backend starting with gdpsfixes5. */
+ int gd_extras_menu_attach(GdExtrasMenu *menu, void *parent_window);
+ void gd_extras_menu_set_visible(GdExtrasMenu *menu, int visible);
+ int gd_extras_menu_handle_command(GdExtrasMenu *menu, unsigned long wparam);
+ void gd_extras_menu_destroy(GdExtrasMenu *menu);
+ 
++void gd_extras_menu_get_layout(const GdExtrasMenu *menu,
++                               int native_width, int native_height,
++                               GdExtrasLayout *layout);
++int gd_extras_menu_pointer_event(GdExtrasMenu *menu, int phase,
++                                 float native_x, float native_y,
++                                 int native_width, int native_height,
++                                 int *consumed);
++int gd_extras_menu_pointer_captured(const GdExtrasMenu *menu);
++
+ #ifdef __cplusplus
+ }
+ #endif
