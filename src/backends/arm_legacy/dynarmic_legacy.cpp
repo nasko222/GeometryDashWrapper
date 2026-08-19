@@ -3809,6 +3809,45 @@ private:
         }
         return nullptr;
     }
+    std::shared_ptr<const std::vector<u8>> LoadExtensionResourceFallback(
+        const std::string& guest_path, std::string* resolved_member = nullptr) {
+        std::string normalized = guest_path;
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        const std::string marker = "/extensions/";
+        std::size_t relative_start = std::string::npos;
+        if (normalized.starts_with("extensions/"))
+            relative_start = std::string("extensions/").size();
+        else {
+            const std::size_t marker_pos = normalized.find(marker);
+            if (marker_pos != std::string::npos)
+                relative_start = marker_pos + marker.size();
+        }
+        if (relative_start == std::string::npos) return {};
+
+        std::string relative = normalized.substr(relative_start);
+        while (!relative.empty() && relative.front() == '/') relative.erase(relative.begin());
+        if (relative.empty() || relative.find("..") != std::string::npos) return {};
+
+        std::vector<std::string> candidates;
+        candidates.push_back(relative);
+        const std::size_t slash = relative.find_last_of('/');
+        const std::size_t dot = relative.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash) &&
+            !relative.substr(0, dot).ends_with("-hd")) {
+            std::string hd = relative;
+            hd.insert(dot, "-hd");
+            candidates.push_back(std::move(hd));
+        }
+
+        for (const std::string& candidate : candidates) {
+            const auto bytes = apk_member_cache_.Load(candidate);
+            if (!bytes) continue;
+            if (resolved_member) *resolved_member = "assets/" + candidate;
+            return bytes;
+        }
+        return {};
+    }
+
     std::string TranslatePath(const std::string& input) const {
         if (input.empty()) return input;
         std::string normalized = input;
@@ -3851,6 +3890,20 @@ private:
             return handle;
         }
         std::FILE* stream = std::fopen(host_path.c_str(), mode.c_str());
+        if (!stream && read_only) {
+            std::string resolved_member;
+            const auto bytes = LoadExtensionResourceFallback(guest_path, &resolved_member);
+            if (bytes) {
+                const u32 handle = NewGuestFile(nullptr, false, guest_path, mode);
+                GuestFile* file = FindGuestFile(handle);
+                if (!file) return 0;
+                file->memory = bytes.get();
+                env_.MemoryWrite32(errno_address_, 0u);
+                log_ << "Dynarmic extension resource fallback: " << guest_path
+                     << " -> " << resolved_member << " bytes=" << bytes->size() << '\n';
+                return handle;
+            }
+        }
         if (!stream) {
             env_.MemoryWrite32(errno_address_, static_cast<u32>(errno));
             if (logged_file_failures_.insert(guest_path).second) log_ << "Dynarmic file open failed: " << guest_path << " mode=" << mode << '\n';
@@ -6625,7 +6678,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes1 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes2 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

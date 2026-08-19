@@ -1,49 +1,40 @@
-# Geometry Dash Wrapper 0.9.6-gdpsfixes1
+# Geometry Dash Wrapper 0.9.6-gdpsfixes2
 
-`gdpsfixes1` is an Android-only maintenance branch focused on GDPS reliability and
-legacy Geometry Dash compatibility. Non-Android experimental platform code and its launcher/build paths are not part of this branch.
+`gdpsfixes2` is an Android-only maintenance branch focused on GDPS reliability
+and legacy Geometry Dash compatibility. The abandoned experimental iOS backend
+remains removed.
+
+## New in GDPSFixes2: legacy color picker
+
+Geometry Dash 1.0 and 1.01 can request the cocos2d color-picker sheet through
+`/data/data/<package>/extensions/CCControlColourPickerSpriteSheet.plist` even
+though the packaged resource lives under APK `assets/`, commonly as the `-hd`
+variant. The old wrapper translated that request only into the writable save
+directory, returned fopen failure, and the game then crashed inside
+`CCSpriteBatchNode::updateBlendFunc`.
+
+The ARM file bridges now fall back from a missing read-only `extensions/...`
+request to the corresponding APK asset, trying both the exact basename and the
+`-hd` variant. The returned data uses the existing memory-backed FILE path, so
+normal cocos2d parsing can continue. Saves and write paths are untouched.
+
+## Carried fixes
+
+- Large ARM/GDPS level uploads are no longer chopped at 4095 formatted bytes.
+- MCI music seeks stop the alias before seeking for Wine/Proton compatibility.
+- Legacy ARM nonblocking sockets no longer synchronously stall on bad network.
 
 ## Included backends
 
-- x86 native Android wrapper for supported x86 Geometry Dash builds.
+- x86 native Android wrapper for supported x86 builds.
 - Dynarmic legacy ARM backend for Geometry Dash 1.0-1.4-era ARM APKs.
-- Dynarmic ARMv7 backend for later ARMv7 builds / the existing 2.2-beta path.
-
-## GDPSFixes1 changes
-
-### Large level uploads
-
-The ARM printf/sprintf compatibility bridge no longer truncates a formatted `%s`
-at 4095 bytes. `snprintf`'s required size is now honored and long values are
-reformatted into a dynamically sized buffer (bounded by the wrapper's existing
-16 MiB guest-format limit). This applies to both Dynarmic ARM backends.
-
-### Background music seeking
-
-The shared Windows MCI music backend now stops the MPEG alias before seeking.
-This targets Wine/Proton failures where retry/death music continued from the old
-position and StartPos seeks failed with MCI error 277. Because the audio bridge
-is shared, the behavior applies across wrapper backends.
-
-### Slow/unreachable GDPS connections
-
-The legacy ARM socket bridge now honors guest nonblocking mode. A pending
-nonblocking `connect()` returns Android/POSIX `EINPROGRESS` instead of blocking
-the render/input callback for up to 15 seconds; nonblocking `recv()` returns
-`EAGAIN` immediately. The ARMv7 path already used this model.
+- Dynarmic ARMv7 backend for later ARMv7 builds / existing 2.2-beta path.
 
 ## Still open
 
-- Geometry Dash 1.0.0's original background-color/BG-trigger crash needs a
-  binary-level comparison against Android 1.0.1 before a safe compatibility
-  patch is installed.
-- Editor WASD/Q shortcuts need a verified editor callback ABI for each supported
-  game family. The known unsafe `EditorUI::keyDown` route is deliberately not
-  used.
+- Editor WASD/Q shortcuts require a safe verified transform callback ABI.
 - Cursor hiding and pause-button removal are deliberately not included.
 
 ## Building
 
 Run `BUILD_ALL.cmd` on Windows. No APK or proprietary game executable is bundled.
-Drag a supported Android APK onto `RUN_AUTO_BOOMLINGS.cmd` or `RUN_AUTO_GDPS.cmd`
-after building.
