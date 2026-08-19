@@ -68,6 +68,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "build_info.h"
 }
@@ -1205,6 +1206,12 @@ struct ElfRuntime {
     u32 v22_game_manager_shared = 0;
     u32 v22_game_manager_editor_state_offset = 0;
     u32 v22_edit_level_pointer_offset = 0;
+    u32 ccnode_get_tag = 0;
+    u32 ccnode_set_tag = 0;
+    u32 editor_move_object_call = 0;
+    u32 editor_move_edit_command = 0;
+    u32 editor_transform_object_call = 0;
+    u32 editor_transform_edit_command = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -2856,6 +2863,15 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeDeleteBackward") runtime.native_delete_backward = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause") runtime.native_pause = address;
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
+            else if (name == "_ZN7cocos2d6CCNode6getTagEv" ||
+                     name == "_ZNK7cocos2d6CCNode6getTagEv") runtime.ccnode_get_tag = address;
+            else if (name == "_ZN7cocos2d6CCNode6setTagEi") runtime.ccnode_set_tag = address;
+            else if (name == "_ZN8EditorUI14moveObjectCallEPN7cocos2d6CCNodeE") runtime.editor_move_object_call = address;
+            else if (name == "_ZN8EditorUI14moveObjectCallEPN7cocos2d8CCObjectE") runtime.editor_move_object_call = address;
+            else if (name == "_ZN8EditorUI14moveObjectCallE11EditCommand") runtime.editor_move_edit_command = address;
+            else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d6CCNodeE") runtime.editor_transform_object_call = address;
+            else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d8CCObjectE") runtime.editor_transform_object_call = address;
+            else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand") runtime.editor_transform_edit_command = address;
         }
     }
 
@@ -3080,6 +3096,8 @@ enum class HostEventType {
     TextInput,
     DeleteBackward,
     PracticeCheckpoint,
+    EditorCommand,
+    ExtrasAction,
     PlatformButton,
     Pause,
     Resume
@@ -3164,6 +3182,11 @@ public:
         if (gd_apply_window_icon(window_) && log_) {
             *log_ << "Window icon applied from GD_WINDOW_ICON\n";
         }
+        gd_extras_menu_init(&extras_menu_);
+        if (extras_menu_.enabled) {
+            gd_extras_menu_attach(&extras_menu_, window_);
+            if (log_) *log_ << "RESULT: DYNARMIC_EXTRAS_MENU_READY\n";
+        }
         device_ = GetDC(window_);
         if (!device_) return Fail("GetDC failed");
 
@@ -3199,6 +3222,7 @@ public:
     }
 
     void Destroy() {
+        gd_extras_menu_destroy(&extras_menu_);
         DestroyGpuProfiler();
         if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
         if (device_ && window_) { ReleaseDC(window_, device_); device_ = nullptr; }
@@ -3296,6 +3320,9 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
+    void SetExtrasVisible(bool visible) {
+        gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
+    }
 
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
@@ -3503,7 +3530,30 @@ private:
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
             }
             return 0;
+        case WM_COMMAND: {
+            const int action = gd_extras_menu_handle_command(
+                &self->extras_menu_, static_cast<unsigned long>(wparam));
+            if (action != GD_EXTRAS_ACTION_NONE) {
+                self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
+                                      static_cast<u32>(action)});
+                return 0;
+            }
+            break;
+        }
         case WM_KEYDOWN:
+            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
+                gd_settings_editor_controls()) {
+                const bool large = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                u32 tag = 0u;
+                if (wparam == 'A') tag = large ? 5u : 1u;
+                else if (wparam == 'D') tag = large ? 6u : 2u;
+                else if (wparam == 'W') tag = large ? 7u : 3u;
+                else if (wparam == 'S') tag = large ? 8u : 4u;
+                else if (wparam == 'E') tag = 0x13u; /* clockwise */
+                else if (wparam == 'Q') tag = 0x14u; /* counter-clockwise */
+                if (tag) self->Queue(HostEvent{HostEventType::EditorCommand, 0.0f, 0.0f, tag});
+                if (tag && wparam != 'A' && wparam != 'D') return 0;
+            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -3600,6 +3650,7 @@ private:
     int native_height_ = 720;
     float last_x_ = 0.0f;
     float last_y_ = 0.0f;
+    GdExtrasMenu extras_menu_{};
     std::deque<HostEvent> events_;
     std::unordered_map<std::string, void*> functions_;
     bool gpu_profiler_ready_ = false;
@@ -3631,6 +3682,7 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
+    void SetExtrasVisible(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -4188,6 +4240,91 @@ public:
     }
 
 
+    u32 FindActiveEditorUi() {
+        u32 playtest_editor = 0u;
+        if (IsV22EditorPlaytestActive(playtest_editor)) return 0u;
+        const u32 editor_layer = v22_editor_visual_layer_;
+        if (!editor_layer || !LooksLikeGuestObject(runtime_, env_, editor_layer))
+            return 0u;
+        for (u32 offset = 0x40u; offset + 4u <= 0x3000u; offset += 4u) {
+            if (!env_.IsMapped(editor_layer + offset, 4u)) continue;
+            const u32 candidate = env_.MemoryRead32(editor_layer + offset);
+            if (GuestObjectTypeContains(candidate, "EditorUI")) return candidate;
+        }
+        return 0u;
+    }
+
+    bool SendEditorCommand(u32 tag) {
+        if (!gd_settings_editor_controls()) return true;
+        const u32 editor_ui = FindActiveEditorUi();
+        if (!editor_ui) return true;
+
+        const bool movement = tag >= 1u && tag <= 8u;
+        const u32 direct = movement ? runtime_.editor_move_edit_command
+                                    : runtime_.editor_transform_edit_command;
+        const u32 sender = movement ? runtime_.editor_move_object_call
+                                    : runtime_.editor_transform_object_call;
+        const char* direct_name = movement
+            ? "EditorUI::moveObjectCall(EditCommand) shortcut"
+            : "EditorUI::transformObjectCall(EditCommand) shortcut";
+        const char* sender_name = movement
+            ? "EditorUI::moveObjectCall sender shortcut"
+            : "EditorUI::transformObjectCall sender shortcut";
+
+        /* 2.2 exports the EditCommand overloads directly. Movement and
+           transform commands are deliberately kept separate: feeding editor
+           keys through EditorUI::keyDown is unsafe on Android builds. */
+        if (direct) {
+            const bool ok = RunFunction(
+                direct, {editor_ui, tag}, nullptr, direct_name, 0u,
+                std::chrono::milliseconds(2000));
+            if (ok) {
+                log_ << "RESULT: DYNARMIC_EDITOR_COMMAND tag=" << tag
+                     << " family=" << (movement ? "move" : "transform")
+                     << " path=direct-edit-command\n";
+                log_.flush();
+            }
+            return ok;
+        }
+
+        if (!runtime_.ccnode_get_tag || !runtime_.ccnode_set_tag || !sender) {
+            log_ << "RESULT: DYNARMIC_EDITOR_CONTROLS_UNAVAILABLE reason=missing-"
+                 << (movement ? "move" : "transform") << "-symbol\n";
+            log_.flush();
+            return true;
+        }
+        u32 old_tag = 0u;
+        if (!RunFunction(runtime_.ccnode_get_tag, {editor_ui}, &old_tag,
+                         "CCNode::getTag editor shortcut", 0u,
+                         std::chrono::milliseconds(1000))) return false;
+        if (!RunFunction(runtime_.ccnode_set_tag, {editor_ui, tag}, nullptr,
+                         "CCNode::setTag editor shortcut", 0u,
+                         std::chrono::milliseconds(1000))) return false;
+        const bool invoked = RunFunction(
+            sender, {editor_ui, editor_ui}, nullptr, sender_name, 0u,
+            std::chrono::milliseconds(2000));
+        const bool restored = RunFunction(
+            runtime_.ccnode_set_tag, {editor_ui, old_tag}, nullptr,
+            "CCNode::setTag restore editor shortcut", 0u,
+            std::chrono::milliseconds(1000));
+        return invoked && restored;
+    }
+
+    void RefreshExtrasMenuVisibility() {
+        u32 layer = 0u;
+        (void)ResolveV22ActiveGameLayer(layer);
+        const bool editor = v22_editor_visual_layer_ &&
+            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_);
+        gl_.SetExtrasVisible(!layer && !editor);
+    }
+
+    bool HandleExtrasAction(u32 action) {
+        log_ << "RESULT: DYNARMIC_EXTRAS_ACTION_UNAVAILABLE backend=armv7 action="
+             << action << "\n";
+        log_.flush();
+        return true;
+    }
+
     bool SendPracticeCheckpoint(bool place) {
         u32 layer = 0u;
         if (!ResolveV22ActiveGameLayer(layer)) return false;
@@ -4221,6 +4358,7 @@ public:
     }
 
     bool SendPlatformerButton(u32 button, bool pressed) {
+        if (gd_settings_editor_controls() && FindActiveEditorUi()) return true;
         u32 layer = 0u;
         if (!ResolveV22ActiveGameLayer(layer)) return false;
         if (!layer && !v22_editor_visual_layer_) return true;
@@ -6201,6 +6339,16 @@ private:
         std::string text;
         if (!env_.ReadCString(address, text, maximum)) return {};
         return text;
+    }
+    bool GuestObjectTypeContains(u32 object, const char* needle) const {
+        if (!object || !needle || !env_.IsMapped(object, 4u)) return false;
+        const u32 vtable = env_.MemoryRead32(object);
+        if (vtable < 4u || !env_.IsMapped(vtable - 4u, 4u)) return false;
+        const u32 type_info = env_.MemoryRead32(vtable - 4u);
+        if (!type_info || !env_.IsMapped(type_info + 4u, 4u)) return false;
+        const u32 name_address = env_.MemoryRead32(type_info + 4u);
+        const std::string name = ReadCString(name_address, 96u);
+        return !name.empty() && name.find(needle) != std::string::npos;
     }
     u32 ArgWord(unsigned index) {
         if (index < 4u) return cpu_.Regs()[index];
@@ -8194,16 +8342,11 @@ private:
         return {};
     }
 
-    std::optional<std::size_t> LocateExtensionResourceFallback(
-        const std::string& guest_path, int case_sensitivity,
-        std::string* resolved_member = nullptr) const {
+    bool ExtensionResourceExistsFallback(const std::string& guest_path) const {
         for (const std::string& candidate : ExtensionResourceCandidates(guest_path)) {
-            const auto index = apk_member_cache_.LocateIndex(candidate, case_sensitivity);
-            if (!index) continue;
-            if (resolved_member) *resolved_member = "assets/" + candidate;
-            return index;
+            if (apk_member_cache_.Exists(candidate)) return true;
         }
-        return std::nullopt;
+        return false;
     }
 
     std::size_t StageAndroidExtensionResources() {
@@ -10552,7 +10695,7 @@ private:
             zip_path != "game.apk" && !zip_path.ends_with("/game.apk")) return 0;
         const std::string member = ReadCString(member_address);
         if (apk_member_cache_.Exists(member)) return 1u;
-        return LocateExtensionResourceFallback(member, 1) ? 1u : 0u;
+        return ExtensionResourceExistsFallback(member) ? 1u : 0u;
     }
 
     enum class FmodObjectKind { System, Sound, Stream, Channel, Dsp };
@@ -12259,7 +12402,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes3 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes4 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12483,6 +12626,12 @@ extern "C" void runtime_log(const char* format, ...) {
 }
 
 int main(int argc,char** argv) {
+    if (!gd_settings_i_lost_the_game()) {
+#ifdef _WIN32
+        MessageBoxA(nullptr, "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch through a RUN_AUTO batch file.", "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
+#endif
+        return 69;
+    }
     std::string log_path = "gd-dynarmic-interactive.log";
     std::string profile_path = "gd-dynarmic-profile.csv";
     std::string profile_summary_path = "gd-dynarmic-profile-summary.txt";
@@ -13291,6 +13440,12 @@ int main(int argc,char** argv) {
                     if(!native_paused)
                         ok=executor.SendPracticeCheckpoint(event.value != 0u);
                     break;
+                case HostEventType::EditorCommand:
+                    if(!native_paused) ok=executor.SendEditorCommand(event.value);
+                    break;
+                case HostEventType::ExtrasAction:
+                    if(!native_paused) ok=executor.HandleExtrasAction(event.value);
+                    break;
                 case HostEventType::PlatformButton:
                     if(!native_paused)
                         ok=executor.SendPlatformerButton(
@@ -13346,6 +13501,7 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
+            executor.RefreshExtrasMenuVisibility();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

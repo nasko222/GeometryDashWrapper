@@ -39,7 +39,7 @@
 
 #include "zlib.h"
 
-#define LAUNCHER_VERSION "0.9.6-gdpsfixes3"
+#define LAUNCHER_VERSION "0.9.6-gdpsfixes4"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -738,6 +738,9 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t pulse[64];
     wchar_t isolated_saves[64];
     wchar_t network_mode[64];
+    wchar_t lost_game[64];
+    wchar_t editor_controls[64];
+    wchar_t extras_menu[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
     if (_wfopen_s(&file, path, L"wb, ccs=UTF-8") != 0 || !file) return 0;
@@ -773,6 +776,12 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     fwprintf(file, L"version_isolated_saves=%ls\n",
              GetSetting(L"VERSION_ISOLATED_SAVES", L"true", isolated_saves,
                         ARRAY_COUNT(isolated_saves)));
+    fwprintf(file, L"i_lost_the_game=%ls\n",
+             GetSetting(L"I_LOST_THE_GAME", L"false", lost_game, ARRAY_COUNT(lost_game)));
+    fwprintf(file, L"editor_controlls=%ls\n",
+             GetSetting(L"EDITOR_CONTROLLS", L"false", editor_controls, ARRAY_COUNT(editor_controls)));
+    fwprintf(file, L"extras_menu=%ls\n",
+             GetSetting(L"EXTRAS_MENU", L"false", extras_menu, ARRAY_COUNT(extras_menu)));
     fwprintf(file, L"x86_api_connect_mode=%ls\n",
              GetSetting(L"GD_X86_API_CONNECT_MODE",
                         IsX86Version211(context) ? L"real" : L"synthetic",
@@ -1081,6 +1090,12 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
 
 int wmain(int argc, wchar_t **argv) {
     LauncherContext context;
+    if (!GetBooleanSetting(L"I_LOST_THE_GAME", 0)) {
+        MessageBoxW(NULL,
+                    L"I_LOST_THE_GAME is false. You lost the game.\n\nLaunch this through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",
+                    L"Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
+        return 69;
+    }
     wchar_t launcher_error[1024];
     DWORD exit_code;
     launcher_error[0] = L'\0';
@@ -1089,6 +1104,13 @@ int wmain(int argc, wchar_t **argv) {
 
     SetEnvironmentVariableW(L"GD_SAVE_DIR", context.save_directory);
     SetEnvironmentVariableW(L"GD_GAME_TITLE", context.identity.window_title);
+    {
+        wchar_t package_wide[MAX_UTF8_TEXT];
+        if (Utf8ToWide(context.metadata.package_name, package_wide,
+                       ARRAY_COUNT(package_wide))) {
+            SetEnvironmentVariableW(L"GD_GAME_PACKAGE", package_wide);
+        }
+    }
     {
         wchar_t version_wide[MAX_UTF8_TEXT];
         if (Utf8ToWide(context.metadata.version_name, version_wide,

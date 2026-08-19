@@ -14,6 +14,7 @@
 #include "runtime.h"
 #include "build_info.h"
 #include "runtime_settings.h"
+#include "extras_menu_win.h"
 #include "window_icon_win.h"
 
 typedef int (*JniOnLoadFunction)(void *java_vm, void *reserved);
@@ -34,6 +35,12 @@ typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
 typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
+typedef int (__cdecl *CcNodeGetTagFunction)(void *self);
+typedef void (__cdecl *CcNodeSetTagFunction)(void *self, int tag);
+typedef void (__cdecl *EditorMoveObjectCallFunction)(void *self, void *sender);
+typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
+typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
+typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
 
 typedef struct {
     HWND window;
@@ -66,11 +73,19 @@ typedef struct {
     int gameplay_cache_value;
     int editor_cache_value;
     void *active_play_layer;
+    void *active_editor_layer;
     GameManagerSharedStateFunction game_manager_shared_state;
     UiCheckpointFunction ui_on_check;
     UiCheckpointFunction ui_on_delete_check;
     UiCheckpointNoSenderFunction ui_on_check_no_sender;
     UiCheckpointNoSenderFunction ui_on_delete_check_no_sender;
+    CcNodeGetTagFunction ccnode_get_tag;
+    CcNodeSetTagFunction ccnode_set_tag;
+    EditorMoveObjectCallFunction editor_move_object_call;
+    EditorMoveEditCommandFunction editor_move_edit_command;
+    EditorTransformObjectCallFunction editor_transform_object_call;
+    EditorTransformEditCommandFunction editor_transform_edit_command;
+    GdExtrasMenu extras_menu;
     uint32_t practice_mode_offset;
     LARGE_INTEGER frame_clock_frequency;
     LONGLONG next_frame_deadline;
@@ -640,13 +655,16 @@ static int detect_gameplay_active(void) {
     g_host.gameplay_cache_value = 0;
     g_host.editor_cache_value = 0;
     g_host.active_play_layer = NULL;
+    g_host.active_editor_layer = NULL;
     manager = g_host.game_manager_shared_state();
     if (!manager || !memory_range_is_readable(manager, 0x600u)) return 0;
     for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
          offset += sizeof(void *)) {
         void *candidate = *(void **)((unsigned char *)manager + offset);
-        if (object_type_contains(candidate, "LevelEditorLayer"))
+        if (object_type_contains(candidate, "LevelEditorLayer")) {
             g_host.editor_cache_value = 1;
+            g_host.active_editor_layer = candidate;
+        }
         if (object_type_contains(candidate, "PlayLayer")) {
             g_host.gameplay_cache_value = 1;
             g_host.active_play_layer = candidate;
@@ -669,6 +687,80 @@ static void *find_active_ui_layer(void) {
         if (object_type_contains(candidate, "UILayer")) return candidate;
     }
     return NULL;
+}
+
+static void *find_active_editor_ui(void) {
+    size_t offset;
+    unsigned char *editor_layer;
+    /* detect_gameplay_active also refreshes the editor cache even when its
+       return value is false (editing is not normal PlayLayer gameplay). */
+    g_host.gameplay_cache_time = 0;
+    (void)detect_gameplay_active();
+    if (!g_host.editor_cache_value || !g_host.active_editor_layer) return NULL;
+    editor_layer = (unsigned char *)g_host.active_editor_layer;
+    for (offset = 0x40u; offset + sizeof(void *) <= 0x3000u;
+         offset += sizeof(void *)) {
+        void *candidate;
+        if (!memory_range_is_readable(editor_layer + offset, sizeof(void *)))
+            continue;
+        candidate = *(void **)(editor_layer + offset);
+        if (object_type_contains(candidate, "EditorUI")) return candidate;
+    }
+    return NULL;
+}
+
+static int send_editor_hotkey(int tag, int virtual_key) {
+    void *editor_ui;
+    int old_tag;
+    const int movement = tag >= 1 && tag <= 8;
+    EditorTransformObjectCallFunction sender;
+    EditorTransformEditCommandFunction direct;
+
+    if (!gd_settings_editor_controls()) return 0;
+    editor_ui = find_active_editor_ui();
+    if (!editor_ui) return 0;
+
+    /* The move buttons and rotate/flip buttons use different EditorUI
+       callbacks in the real game. Keep those paths separate and never route
+       desktop editor shortcuts through EditorUI::keyDown. */
+    sender = movement
+        ? (EditorTransformObjectCallFunction)g_host.editor_move_object_call
+        : g_host.editor_transform_object_call;
+    direct = movement
+        ? (EditorTransformEditCommandFunction)g_host.editor_move_edit_command
+        : g_host.editor_transform_edit_command;
+
+    if (direct) {
+        direct(editor_ui, tag);
+        runtime_log("Editor controls: key=%c tag=%d family=%s via direct EditCommand",
+                    virtual_key, tag, movement ? "move" : "transform");
+        return 1;
+    }
+    if (!g_host.ccnode_get_tag || !g_host.ccnode_set_tag || !sender) {
+        runtime_log("Editor controls: active editor found but %s callback is unavailable",
+                    movement ? "move" : "transform");
+        return 1;
+    }
+    old_tag = g_host.ccnode_get_tag(editor_ui);
+    g_host.ccnode_set_tag(editor_ui, tag);
+    sender(editor_ui, editor_ui);
+    g_host.ccnode_set_tag(editor_ui, old_tag);
+    runtime_log("Editor controls: key=%c tag=%d family=%s via sender tag",
+                virtual_key, tag, movement ? "move" : "transform");
+    return 1;
+}
+
+static int editor_tag_for_key(WPARAM key) {
+    const int large = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    switch (key) {
+    case 'A': return large ? 5 : 1;
+    case 'D': return large ? 6 : 2;
+    case 'W': return large ? 7 : 3;
+    case 'S': return large ? 8 : 4;
+    case 'E': return 11; /* clockwise on the x86-era editor ABI */
+    case 'Q': return 12; /* counter-clockwise */
+    default: return 0;
+    }
 }
 
 static int send_practice_checkpoint_hotkey(int place) {
@@ -910,7 +1002,21 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
         }
         return 0;
+    case WM_COMMAND: {
+        int action = gd_extras_menu_handle_command(&g_host.extras_menu,
+                                                    (unsigned long)wparam);
+        if (action != GD_EXTRAS_ACTION_NONE) {
+            runtime_log("Extras action %d is not available on the x86 backend/version", action);
+            return 0;
+        }
+        break;
+    }
     case WM_KEYDOWN:
+        if (!(lparam & (1L << 30)) && !jni_shim_text_input_active()) {
+            const int editor_tag = editor_tag_for_key(wparam);
+            if (editor_tag && send_editor_hotkey(editor_tag, (int)wparam))
+                return 0;
+        }
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
@@ -986,6 +1092,11 @@ static int create_opengl_window(int client_width, int client_height) {
     if (gd_apply_window_icon(g_host.window)) {
         runtime_log("Window icon applied from GD_WINDOW_ICON");
     }
+    gd_extras_menu_init(&g_host.extras_menu);
+    if (g_host.extras_menu.enabled) {
+        gd_extras_menu_attach(&g_host.extras_menu, g_host.window);
+        runtime_log("Extras menu: enabled host main-menu button");
+    }
 
     g_host.device = GetDC(g_host.window);
     memset(&descriptor, 0, sizeof(descriptor));
@@ -1024,6 +1135,7 @@ static int create_opengl_window(int client_width, int client_height) {
 }
 
 static void destroy_opengl_window(void) {
+    gd_extras_menu_destroy(&g_host.extras_menu);
     if (g_host.context) {
         wglMakeCurrent(NULL, NULL);
         wglDeleteContext(g_host.context);
@@ -1081,6 +1193,11 @@ static int run_message_loop(void) {
             TranslateMessage(&message);
             DispatchMessageA(&message);
         }
+        if (g_host.extras_menu.enabled) {
+            (void)detect_gameplay_active();
+            gd_extras_menu_set_visible(&g_host.extras_menu,
+                !g_host.gameplay_cache_value && !g_host.editor_cache_value);
+        }
         if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
@@ -1105,6 +1222,12 @@ finished:
 }
 
 int main(int argc, char **argv) {
+    if (!gd_settings_i_lost_the_game()) {
+        MessageBoxA(NULL,
+                    "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch Geometry Dash Wrapper through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",
+                    "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
+        return 69;
+    }
     const char *library_path = NULL;
     const char *apk_path = "game.apk";
     int mode = 2; /* 0 = relocate, 1 = probe, 2 = graphical boot */
@@ -1179,6 +1302,33 @@ int main(int argc, char **argv) {
     g_host.game_manager_shared_state =
         (GameManagerSharedStateFunction)elf_image_find_export(
             &image, "_ZN11GameManager11sharedStateEv");
+    g_host.ccnode_get_tag = (CcNodeGetTagFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode6getTagEv");
+    if (!g_host.ccnode_get_tag)
+        g_host.ccnode_get_tag = (CcNodeGetTagFunction)elf_image_find_export(
+            &image, "_ZNK7cocos2d6CCNode6getTagEv");
+    g_host.ccnode_set_tag = (CcNodeSetTagFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode6setTagEi");
+    g_host.editor_move_object_call =
+        (EditorMoveObjectCallFunction)elf_image_find_export(
+            &image, "_ZN8EditorUI14moveObjectCallEPN7cocos2d6CCNodeE");
+    if (!g_host.editor_move_object_call)
+        g_host.editor_move_object_call =
+            (EditorMoveObjectCallFunction)elf_image_find_export(
+                &image, "_ZN8EditorUI14moveObjectCallEPN7cocos2d8CCObjectE");
+    g_host.editor_move_edit_command =
+        (EditorMoveEditCommandFunction)elf_image_find_export(
+            &image, "_ZN8EditorUI14moveObjectCallE11EditCommand");
+    g_host.editor_transform_object_call =
+        (EditorTransformObjectCallFunction)elf_image_find_export(
+            &image, "_ZN8EditorUI19transformObjectCallEPN7cocos2d6CCNodeE");
+    if (!g_host.editor_transform_object_call)
+        g_host.editor_transform_object_call =
+            (EditorTransformObjectCallFunction)elf_image_find_export(
+                &image, "_ZN8EditorUI19transformObjectCallEPN7cocos2d8CCObjectE");
+    g_host.editor_transform_edit_command =
+        (EditorTransformEditCommandFunction)elf_image_find_export(
+            &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
     g_host.ui_on_check = (UiCheckpointFunction)elf_image_find_export(
         &image, "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE");
     g_host.ui_on_delete_check = (UiCheckpointFunction)elf_image_find_export(
@@ -1194,6 +1344,14 @@ int main(int argc, char **argv) {
     g_host.practice_mode_offset = derive_practice_mode_offset(&image);
     runtime_log("PC gameplay detection: GameManager::sharedState=%s",
                 g_host.game_manager_shared_state ? "ready" : "unavailable");
+    runtime_log("Editor controls: toggle=%s move-direct=%s move-sender=%s transform-direct=%s transform-sender=%s getTag=%s setTag=%s",
+                gd_settings_editor_controls() ? "on" : "off",
+                g_host.editor_move_edit_command ? "ready" : "missing",
+                g_host.editor_move_object_call ? "ready" : "missing",
+                g_host.editor_transform_edit_command ? "ready" : "missing",
+                g_host.editor_transform_object_call ? "ready" : "missing",
+                g_host.ccnode_get_tag ? "ready" : "missing",
+                g_host.ccnode_set_tag ? "ready" : "missing");
     runtime_log("Practice Z/X callbacks: place=%s remove=%s guard_offset=0x%lx abi=%s",
                 (g_host.ui_on_check || g_host.ui_on_check_no_sender)
                     ? "ready" : "unavailable",

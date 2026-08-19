@@ -1,0 +1,83 @@
+Geometry Dash Wrapper 0.9.6-gdpsfixes4 verification
+===================================================
+Branch: gdpsfixes4
+Version: 0.9.6-gdpsfixes4
+
+Reported fixes3 build failure
+-----------------------------
+The supplied Windows build log failed in src/backends/armv7/dynarmic_armv7.cpp
+because ApkMemberCache::LocateIndex did not exist on that backend.
+
+GDPSFixes4 build repair
+-----------------------
+PASS: ARMv7 contains no LocateIndex reference.
+PASS: ARMv7 extension-resource existence fallback uses ApkMemberCache::Exists().
+PASS: portable runtime_settings.c compiles with clang -std=c11 -Wall -Wextra -Werror.
+PASS: portable extras_menu_win.c compiles with clang -std=c11 -Wall -Wextra -Werror.
+NOTE: full Windows/Dynarmic compile is not available in this container, so the
+      final Windows link still requires the user's normal BUILD_ALL.cmd test.
+
+Mandatory launch joke gate
+--------------------------
+PASS: I_LOST_THE_GAME defaults to false.
+PASS: native launcher refuses launch while false.
+PASS: x86 backend refuses launch while false.
+PASS: legacy ARM backend refuses launch while false.
+PASS: ARMv7 backend refuses launch while false.
+PASS: RUN_AUTO_GDPS.cmd sets I_LOST_THE_GAME=true.
+PASS: RUN_AUTO_BOOMLINGS.cmd sets I_LOST_THE_GAME=true.
+PASS: generated legacy/ARMv7 RUN.cmd and RUN_DEBUG.cmd set it true.
+
+Editor controls
+---------------
+PASS: EDITOR_CONTROLLS defaults to false and normal RUN batches set it true.
+PASS: all three runtime backends contain EditorUI move + transform callback resolution.
+PASS: no new shortcut path calls EditorUI::keyDown.
+PASS: W/A/S/D use move commands 3/1/4/2 respectively.
+PASS: Shift+W/A/S/D use move commands 7/5/8/6 respectively.
+PASS: legacy ARM uses E=11 clockwise, Q=12 counter-clockwise.
+PASS: x86-era editor path uses E=11 clockwise, Q=12 counter-clockwise.
+PASS: ARMv7 2.2 uses E=0x13 clockwise, Q=0x14 counter-clockwise.
+
+Real binary audit used for editor controls:
+- supplied GD 1.0 exports EditorUI::moveObjectCall(CCNode*) and
+  EditorUI::transformObjectCall(CCNode*), plus createMoveMenu().
+- its editor resources contain edit_cwBtn_001.png / edit_ccwBtn_001.png and
+  the audited createMoveMenu tag table uses 11/12 for those buttons.
+- supplied 2.2 beta exports moveObjectCall(EditCommand) and
+  transformObjectCall(EditCommand). Its createMoveMenu table associates
+  edit_cwBtn_001.png with command 0x13 and edit_ccwBtn_001.png with 0x14.
+
+Extras menu
+-----------
+PASS: EXTRAS_MENU defaults to false and normal RUN batches set it true.
+PASS: shared Win32 Extras button is compiled into x86, legacy ARM and ARMv7 builds.
+PASS: button is hidden while gameplay/editor activity is detected.
+PASS: version gating requires full Geometry Dash for early-level actions.
+PASS: versions beginning 1.0/1.1/1.2/1.3 expose Play Placeholder Level.
+PASS: exact version 1.02 additionally exposes Play Time Machine Beta.
+PASS: Time Machine Beta calls LevelTools::getLevel(8), then normal PlayLayer::scene.
+PASS: Placeholder does NOT use level ID 0.
+PASS: Placeholder creates a raw default GJGameLevel and enters it via PlayLayer::scene.
+PASS: placeholder run suppresses background music until the wrapper observes the run end.
+
+Real GD 1.0 binary audit used for Extras:
+- LevelTools::getLevel(int) is present.
+- GJGameLevel::create() is present.
+- PlayLayer::scene(GJGameLevel*) is present.
+- earlier disassembly confirmed LevelTools::getLevel(0) aliases official level 1,
+  so ID 0 is deliberately not used as the placeholder implementation.
+
+Carried GDPSFixes fixes
+-----------------------
+PASS: >4095-byte formatted-string/GDPS upload repair remains present.
+PASS: stop-before-seek music compatibility repair remains present.
+PASS: legacy nonblocking network compatibility repair remains present.
+PASS: GDPSFixes3 color-picker extension resource work remains present.
+PASS: abandoned iOS backend remains removed.
+
+Runtime status
+--------------
+NOT LIVE-TESTED in this container. In particular, the fixes3 color-picker fix
+still needs its first successful Windows build/test because the supplied fixes3
+build stopped at the ARMv7 compile error before the user could test it.

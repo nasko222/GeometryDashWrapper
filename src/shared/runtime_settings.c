@@ -138,6 +138,18 @@ int gd_settings_force_highest_graphics(void) {
     return gd_setting_bool("FORCE_HIGHEST_GRAPHICS", 1);
 }
 
+int gd_settings_i_lost_the_game(void) {
+    return gd_setting_bool("I_LOST_THE_GAME", 0);
+}
+
+int gd_settings_editor_controls(void) {
+    return gd_setting_bool("EDITOR_CONTROLLS", 0);
+}
+
+int gd_settings_extras_menu(void) {
+    return gd_setting_bool("EXTRAS_MENU", 0);
+}
+
 int gd_settings_v22_exact_editor_visibility(void) {
     return gd_setting_bool("V22_EXACT_EDITOR_VISIBILITY", 0);
 }

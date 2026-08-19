@@ -92,6 +92,7 @@ $Sources = @(
     (Join-Path $Root "src\shared\storage_win.c"),
     (Join-Path $Root "src\shared\net_compat_win.c"),
     (Join-Path $Root "src\shared\runtime_settings.c"),
+    (Join-Path $Root "src\shared\extras_menu_win.c"),
     (Join-Path $Root "src\shared\song_http_win.c"),
     (Join-Path $Root "src\shared\window_icon_win.c"),
     (Join-Path $Root "src\shared\embedded_effects_stub.c"),
