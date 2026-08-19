@@ -1288,10 +1288,20 @@ static GraphicsPatchCounts InstallHighestGraphicsHooks(
 }
 
 static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironment& env) {
-    struct Hook { const char* symbol; const char* import; u16 prologue; };
+    // RobTop's early cocos2d 2.0 builds use smaller register-save prologues than
+    // later 1.x builds for these two methods. Accept both known ABI-equivalent
+    // layouts so GD 1.0 reaches the host ZIP/resource compatibility path too.
+    struct Hook {
+        const char* symbol;
+        const char* import;
+        u16 primary_prologue;
+        u16 early_prologue;
+    };
     static constexpr Hook hooks[] = {
-        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm", "__dynarmic_ccfileutils_getFileDataFromZip", 0xB5F0u},
-        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_", "__dynarmic_ccfileutils_existFileDataFromZip", 0xB570u},
+        {"_ZN7cocos2d11CCFileUtils18getFileDataFromZipEPKcS2_Pm",
+         "__dynarmic_ccfileutils_getFileDataFromZip", 0xB5F0u, 0xB530u},
+        {"_ZN7cocos2d11CCFileUtils20existFileDataFromZipEPKcS2_",
+         "__dynarmic_ccfileutils_existFileDataFromZip", 0xB570u, 0xB500u},
     };
     std::size_t installed = 0;
     for (const Hook& hook : hooks) {
@@ -1300,13 +1310,16 @@ static std::size_t InstallCcFileUtilsZipHooks(ElfRuntime& runtime, ProbeEnvironm
         const u32 address = target->address & ~1u;
         if ((target->address & 1u) == 0u || target->size < 8u ||
             (address & 3u) != 0u || address < runtime.image_min ||
-            address > runtime.image_max - 8u ||
-            env.MemoryRead16(address) != hook.prologue) {
+            address > runtime.image_max - 8u) {
             continue;
         }
+        const u16 actual_prologue = env.MemoryRead16(address);
+        if (actual_prologue != hook.primary_prologue &&
+            actual_prologue != hook.early_prologue)
+            continue;
         const u32 destination = EnsureImport(runtime, env, hook.import);
         if (TryInstallThumbAbsoluteImportHookPreservingArguments(
-                env, runtime, *target, hook.prologue, destination))
+                env, runtime, *target, actual_prologue, destination))
             ++installed;
     }
     return installed;
@@ -2221,6 +2234,7 @@ public:
         writable_path_ = writable_path;
         apk_image_ = &apk_image;
         apk_member_cache_.Initialize(apk_image, writable_path, log_);
+        StageAndroidExtensionResources();
         // Text-entry UI lazily requests these assets the first time a level
         // name, description, or search field opens. Pull them into the native
         // member cache during startup so slower disks do not add another
@@ -3809,8 +3823,8 @@ private:
         }
         return nullptr;
     }
-    std::shared_ptr<const std::vector<u8>> LoadExtensionResourceFallback(
-        const std::string& guest_path, std::string* resolved_member = nullptr) {
+    std::vector<std::string> ExtensionResourceCandidates(
+        const std::string& guest_path) const {
         std::string normalized = guest_path;
         std::replace(normalized.begin(), normalized.end(), '\\', '/');
         const std::string marker = "/extensions/";
@@ -3830,22 +3844,122 @@ private:
 
         std::vector<std::string> candidates;
         candidates.push_back(relative);
-        const std::size_t slash = relative.find_last_of('/');
-        const std::size_t dot = relative.find_last_of('.');
-        if (dot != std::string::npos && (slash == std::string::npos || dot > slash) &&
-            !relative.substr(0, dot).ends_with("-hd")) {
-            std::string hd = relative;
-            hd.insert(dot, "-hd");
-            candidates.push_back(std::move(hd));
+        const std::size_t last_slash = relative.find_last_of('/');
+        if (last_slash != std::string::npos && last_slash + 1u < relative.size()) {
+            const std::string basename = relative.substr(last_slash + 1u);
+            if (basename != relative) candidates.push_back(basename);
         }
 
-        for (const std::string& candidate : candidates) {
+        const std::size_t original_count = candidates.size();
+        for (std::size_t i = 0; i < original_count; ++i) {
+            const std::string& candidate = candidates[i];
+            const std::size_t slash = candidate.find_last_of('/');
+            const std::size_t dot = candidate.find_last_of('.');
+            if (dot == std::string::npos || (slash != std::string::npos && dot <= slash) ||
+                candidate.substr(0, dot).ends_with("-hd"))
+                continue;
+            std::string hd = candidate;
+            hd.insert(dot, "-hd");
+            if (std::find(candidates.begin(), candidates.end(), hd) == candidates.end())
+                candidates.push_back(std::move(hd));
+        }
+        return candidates;
+    }
+
+    std::shared_ptr<const std::vector<u8>> LoadExtensionResourceFallback(
+        const std::string& guest_path, std::string* resolved_member = nullptr) {
+        for (const std::string& candidate : ExtensionResourceCandidates(guest_path)) {
             const auto bytes = apk_member_cache_.Load(candidate);
             if (!bytes) continue;
             if (resolved_member) *resolved_member = "assets/" + candidate;
             return bytes;
         }
         return {};
+    }
+
+    std::optional<std::size_t> LocateExtensionResourceFallback(
+        const std::string& guest_path, int case_sensitivity,
+        std::string* resolved_member = nullptr) const {
+        for (const std::string& candidate : ExtensionResourceCandidates(guest_path)) {
+            const auto index = apk_member_cache_.LocateIndex(candidate, case_sensitivity);
+            if (!index) continue;
+            if (resolved_member) *resolved_member = "assets/" + candidate;
+            return index;
+        }
+        return std::nullopt;
+    }
+
+    std::size_t StageAndroidExtensionResources() {
+        if (!apk_image_) return 0u;
+        static constexpr const char* kMembers[] = {
+            "assets/CCControlColourPickerSpriteSheet.plist",
+            "assets/CCControlColourPickerSpriteSheet.png",
+            "assets/CCControlColourPickerSpriteSheet-hd.plist",
+            "assets/CCControlColourPickerSpriteSheet-hd.png",
+        };
+
+        const std::filesystem::path extension_root =
+            std::filesystem::path(writable_path_) / "extensions";
+        std::error_code error;
+        std::filesystem::create_directories(extension_root, error);
+        if (error) {
+            log_ << "WARNING: could not create Android extension resource mirror: "
+                 << extension_root.string() << " error=" << error.message() << '\n';
+            return 0u;
+        }
+
+        std::size_t ready = 0u;
+        std::size_t available = 0u;
+        for (const char* member : kMembers) {
+            const auto bytes = apk_member_cache_.Load(member);
+            if (!bytes) continue;
+            ++available;
+            const std::filesystem::path destination =
+                extension_root / std::filesystem::path(member).filename();
+
+            bool already_ready = false;
+            error.clear();
+            if (std::filesystem::is_regular_file(destination, error) && !error) {
+                error.clear();
+                already_ready =
+                    std::filesystem::file_size(destination, error) == bytes->size() && !error;
+            }
+            if (!already_ready) {
+                const std::filesystem::path temporary =
+                    destination.string() + ".wrapper.tmp";
+                std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+                if (output) {
+                    if (!bytes->empty())
+                        output.write(reinterpret_cast<const char*>(bytes->data()),
+                                     static_cast<std::streamsize>(bytes->size()));
+                    output.close();
+                }
+                if (!output) {
+                    std::filesystem::remove(temporary, error);
+                    log_ << "WARNING: could not stage Android extension resource: "
+                         << member << '\n';
+                    continue;
+                }
+                error.clear();
+                std::filesystem::remove(destination, error);
+                error.clear();
+                std::filesystem::rename(temporary, destination, error);
+                if (error) {
+                    std::filesystem::remove(temporary, error);
+                    log_ << "WARNING: could not install Android extension resource: "
+                         << member << " error=" << error.message() << '\n';
+                    continue;
+                }
+            }
+            ++ready;
+            log_ << "[host] Android extension resource ready: " << member
+                 << " -> " << destination.string() << " bytes=" << bytes->size()
+                 << (already_ready ? " cached=yes" : " cached=no") << '\n';
+        }
+        log_ << "RESULT: DYNARMIC_ANDROID_EXTENSION_RESOURCE_MIRROR_READY ready="
+             << ready << " available=" << available
+             << " root=" << extension_root.string() << '\n';
+        return ready;
     }
 
     std::string TranslatePath(const std::string& input) const {
@@ -5510,7 +5624,16 @@ private:
         if (member.empty()) return 0;
         if (!zip_path.empty() && TranslatePath(zip_path) != apk_path_ &&
             zip_path != "game.apk" && !zip_path.ends_with("/game.apk")) return 0;
-        const auto bytes = apk_member_cache_.Load(member);
+        auto bytes = apk_member_cache_.Load(member);
+        if (!bytes) {
+            std::string resolved_member;
+            bytes = LoadExtensionResourceFallback(member, &resolved_member);
+            if (bytes) {
+                log_ << "[host] APK ZIP extension path fallback: " << member
+                     << " -> " << resolved_member
+                     << " bytes=" << bytes->size() << '\n';
+            }
+        }
         if (!bytes) return 0;
         const u32 allocation_size = static_cast<u32>(std::max<std::size_t>(bytes->size(), 1u));
         const u32 output = Allocate(allocation_size);
@@ -5526,7 +5649,9 @@ private:
         const std::string zip_path = ReadCString(zip_path_address);
         if (!zip_path.empty() && TranslatePath(zip_path) != apk_path_ &&
             zip_path != "game.apk" && !zip_path.ends_with("/game.apk")) return 0;
-        return apk_member_cache_.Exists(ReadCString(member_address)) ? 1u : 0u;
+        const std::string member = ReadCString(member_address);
+        if (apk_member_cache_.Exists(member)) return 1u;
+        return LocateExtensionResourceFallback(member, 1) ? 1u : 0u;
     }
 
     struct HostUnzState {
@@ -5641,7 +5766,17 @@ private:
             return finish(kUnzOk);
         }
         if (name == "__dynarmic_unzLocateFile") {
-            const auto index = apk_member_cache_.LocateIndex(ReadCString(r1), static_cast<int>(r2));
+            const std::string requested = ReadCString(r1);
+            auto index = apk_member_cache_.LocateIndex(requested, static_cast<int>(r2));
+            if (!index) {
+                std::string resolved_member;
+                index = LocateExtensionResourceFallback(
+                    requested, static_cast<int>(r2), &resolved_member);
+                if (index) {
+                    log_ << "[host] minizip extension path fallback: " << requested
+                         << " -> " << resolved_member << '\n';
+                }
+            }
             if (!index) return finish(kUnzEndOfList);
             state->current_index = *index; state->current_open = false; state->current_bytes.reset();
             return finish(kUnzOk);
@@ -6678,7 +6813,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes3 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -6920,6 +7055,8 @@ int main(int argc,char** argv) {
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         MinizipHookCounts minizip_hooks{};
         if (legacy_gd_100) {
+            emit("RESULT: DYNARMIC_LEGACY_GD100_CCFILEUTILS_COMPAT zip-hooks=" +
+                 std::to_string(zip_hooks) + " expected=2");
             emit("RESULT: DYNARMIC_LEGACY_GD100_MINIZIP_GUARD "
                  "host-acceleration=disabled guest-fallback=enabled");
         } else {

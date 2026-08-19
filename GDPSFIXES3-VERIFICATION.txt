@@ -1,0 +1,127 @@
+Geometry Dash Wrapper 0.9.6-gdpsfixes3 verification
+===================================================
+Branch: gdpsfixes3
+
+GDPSFixes2 runtime result supplied by user
+------------------------------------------
+GD 1.0:
+- the new plist fallback DID execute successfully:
+    .../extensions/CCControlColourPickerSpriteSheet.plist
+    -> assets/CCControlColourPickerSpriteSheet.plist bytes=4137
+- the game still immediately faulted at address 0x54 inside
+  cocos2d::CCSpriteBatchNode::updateBlendFunc.
+- startup reported DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=0.
+- exact 1.0 also intentionally keeps broad host minizip acceleration disabled.
+
+GD 1.01:
+- the same plist fallback executed successfully.
+- the same address-0x54 updateBlendFunc fault remained.
+- startup reported DYNARMIC_CCFILEUTILS_ZIP_HOOKS_READY count=2.
+
+Conclusion: the fixes2 absolute-fopen fallback repaired only the plist path. It
+did not repair the PNG texture route, and GD 1.0 had an additional hook-layout
+compatibility failure.
+
+Exact Geometry Dash 1.0 binary/APK audit
+----------------------------------------
+Input APK size: 17,856,216 bytes.
+lib/armeabi/libgame.so size: 5,551,628 bytes.
+
+PASS: game binary contains literal:
+  extensions/CCControlColourPickerSpriteSheet.plist
+PASS: game binary contains literal:
+  extensions/CCControlColourPickerSpriteSheet.png
+
+PASS: APK contains:
+  assets/CCControlColourPickerSpriteSheet.plist       4,137 bytes
+  assets/CCControlColourPickerSpriteSheet.png        38,149 bytes
+  assets/CCControlColourPickerSpriteSheet-hd.plist    4,145 bytes
+  assets/CCControlColourPickerSpriteSheet-hd.png     83,570 bytes
+
+Static call-chain audit:
+- CCControlColourPicker::init loads the plist, then creates a
+  CCSpriteBatchNode for the PNG.
+- CCSpriteBatchNode::initWithFile reaches CCTextureCache::addImage.
+- relative APK resources reach CCFileUtils::getFileDataFromZip.
+- a null texture subsequently reaches CCSpriteBatchNode::updateBlendFunc, which
+  matches the supplied crash location.
+
+Critical 1.0 hook-layout audit
+------------------------------
+PASS: CCFileUtils::getFileDataFromZip symbol:
+  Thumb address = 0x002ffaad
+  code address  = 0x002ffaac
+  size          = 408 bytes
+  first halfword= 0xB530
+PASS: CCFileUtils::existFileDataFromZip symbol:
+  Thumb address = 0x00300869
+  code address  = 0x00300868
+  size          = 122 bytes
+  first halfword= 0xB500
+
+The previous hook installer only accepted 0xB5F0 / 0xB570, explaining the
+runtime count=0 in GD 1.0.
+
+GDPSFixes3 implementation
+-------------------------
+PASS: getFileDataFromZip hook accepts both 0xB5F0 and verified early 0xB530.
+PASS: existFileDataFromZip hook accepts both 0xB570 and verified early 0xB500.
+PASS: both exact GD 1.0 functions satisfy hook alignment/size/prologue checks.
+PASS: 1.0 emits diagnostic marker:
+  DYNARMIC_LEGACY_GD100_CCFILEUTILS_COMPAT zip-hooks=<n> expected=2
+PASS: standard/HD picker plist and PNG are staged into writable/extensions.
+PASS: extension fallback supports absolute app-data, extensions/... and
+      assets/extensions/... request forms.
+PASS: fallback candidate order is exact basename then -hd form.
+PASS: traversal-like '..' candidates are rejected.
+PASS: getFileDataFromZip and existFileDataFromZip use the extension fallback.
+PASS: accelerated host minizip lookup also uses the extension fallback.
+PASS: normal save/write paths are not redirected to APK assets.
+PASS: same fallback logic remains in ARMv7 for consistency.
+
+Focused tests performed here
+----------------------------
+PASS: standalone C++20 extension-candidate test compiled with:
+  -Wall -Wextra -Werror
+PASS: candidate test covers plist, PNG and non-extension negative case.
+PASS: all four picker resources were mirrored from the exact 1.0 APK to a test
+      extensions directory byte-for-byte.
+PASS: exact 1.0 symbol/prologue audit matches the new accepted hook layouts.
+
+Carried gdpsfixes1 fixes
+------------------------
+PASS: >4095-byte ARM formatted-string / GDPS level-upload fix remains present.
+PASS: stop-before-seek MCI music compatibility change remains present.
+PASS: legacy ARM nonblocking connect/recv compatibility change remains present.
+PASS: iOS backend remains removed from the Android-focused branch.
+
+Branch/package checks
+---------------------
+PASS: VERSION.txt = 0.9.6-gdpsfixes3
+PASS: BRANCH.txt = gdpsfixes3
+PASS: shared build info / launcher identities use gdpsfixes3.
+PASS: Dynarmic builder revision = dynarmic-x64-builder90-0.9.6-gdpsfixes3.
+PASS: no iOS backend source directory exists.
+PASS: no APK, IPA, extracted SO, EXE or DLL payload is included in source tree.
+
+Runtime status
+--------------
+NOT LIVE-TESTED on Windows in this environment. The fixes2 failure was used to
+move the patch one layer deeper, and this version specifically fixes the 1.0
+ZIP-hook layout mismatch plus the PNG texture resource route. Real gameplay
+confirmation is still required.
+
+Priority runtime test / expected markers
+----------------------------------------
+1. Start GD 1.0 and confirm startup contains:
+     RESULT: DYNARMIC_LEGACY_GD100_CCFILEUTILS_COMPAT zip-hooks=2 expected=2
+2. Confirm startup contains:
+     RESULT: DYNARMIC_ANDROID_EXTENSION_RESOURCE_MIRROR_READY ready=4 available=4
+3. Open the background color picker and move its controls.
+4. Edit a BG-color trigger and open its picker.
+5. Repeat both tests in GD 1.01.
+6. There must be no immediate:
+     invalid guest memory at 0x54 ... CCSpriteBatchNode::updateBlendFunc
+7. If a new fault occurs, attach gd-arm-legacy.log; the ZIP-hook count and PNG
+   fallback marker will now distinguish a resource failure from a later picker
+   bug.
