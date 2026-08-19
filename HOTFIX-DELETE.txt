@@ -1,3 +1,0 @@
-Delete these obsolete PublicTest20 docs after applying the hotfix:
-PUBLICTEST20.md
-PUBLICTEST20-VERIFICATION.txt

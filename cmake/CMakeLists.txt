@@ -89,32 +89,3 @@ gd_add_dynarmic_backend(
     "${GD_ROOT}/src/backends/armv7"
 )
 
-
-# The PublicTest2 iOS bootstrap is intentionally isolated from the Android
-# shared runtime.  It only needs Dynarmic and zlib while it is still at the
-# Mach-O/UIApplicationMain bootstrap stage.  Pulling GD_SHARED_SOURCES here
-# introduces backend-owned symbols such as runtime_log that the iOS bootstrap
-# neither uses nor should have to implement.
-add_executable(
-    RobTopIOSArmV7
-    "${GD_ROOT}/src/backends/ios_armv7/dynarmic_ios_armv7.cpp"
-    ${GD_ZLIB_SOURCES}
-)
-target_include_directories(RobTopIOSArmV7 PRIVATE
-    "${GD_ROOT}/src/shared"
-    "${GD_ROOT}/src/backends/ios_armv7"
-    "${GD_ROOT}/third_party/zlib"
-)
-target_compile_definitions(RobTopIOSArmV7 PRIVATE
-    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS crc32=gd_z_crc32
-)
-target_compile_options(RobTopIOSArmV7 PRIVATE
-    $<$<COMPILE_LANGUAGE:C,CXX>:-O3>
-    $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
-    $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
-)
-target_link_libraries(RobTopIOSArmV7 PRIVATE dynarmic opengl32 user32 gdi32)
-set_target_properties(RobTopIOSArmV7 PROPERTIES
-    OUTPUT_NAME "RobTopIOSArmV7"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/unified-output"
-)

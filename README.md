@@ -1,40 +1,49 @@
-# Geometry Dash Wrapper 0.9.6 — PublicTest2
+# Geometry Dash Wrapper 0.9.6-gdpsfixes1
 
-PublicTest2 keeps the existing Android APK wrapper path and adds the first real
-32-bit iOS execution bootstrap.
+`gdpsfixes1` is an Android-only maintenance branch focused on GDPS reliability and
+legacy Geometry Dash compatibility. Non-Android experimental platform code and its launcher/build paths are not part of this branch.
 
-## APKs
+## Included backends
 
-Drag an APK onto `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd` exactly as
-before. The x86, legacy ARM and ARMv7 Android runtime paths are carried forward
-from PublicTest1/EnduranceTest12 apart from the displayed version string.
+- x86 native Android wrapper for supported x86 Geometry Dash builds.
+- Dynarmic legacy ARM backend for Geometry Dash 1.0-1.4-era ARM APKs.
+- Dynarmic ARMv7 backend for later ARMv7 builds / the existing 2.2-beta path.
 
-## IPAs — new in PublicTest2
+## GDPSFixes1 changes
 
-Drag a decrypted 32-bit ARM `.ipa` onto either launcher. The native launcher
-first prints the existing Info.plist/Mach-O analysis, then starts the separate
-`ios-armv7/RobTopIOSArmV7.exe` backend.
+### Large level uploads
 
-The iOS backend selects the ARMv7 slice, maps the Mach-O segments at their
-preferred addresses, processes dyld bind/weak/lazy-bind information, prepares a
-Darwin-style initial stack and executes the real `LC_UNIXTHREAD` ARM entry point
-with Dynarmic A32.
+The ARM printf/sprintf compatibility bridge no longer truncates a formatted `%s`
+at 4095 bytes. `snprintf`'s required size is now honored and long values are
+reformatted into a dynamically sized buffer (bounded by the wrapper's existing
+16 MiB guest-format limit). This applies to both Dynarmic ARM backends.
 
-This is a bootstrap milestone, not an iOS emulator yet. The minimal Objective-C
-compatibility layer is intentionally only large enough to test startup. On
-success the backend stops at `_UIApplicationMain` and logs:
+### Background music seeking
 
-`RESULT: IOS_BOOTSTRAP_REACHED_UIAPPLICATIONMAIN`
+The shared Windows MCI music backend now stops the MPEG alias before seeking.
+This targets Wine/Proton failures where retry/death music continued from the old
+position and StartPos seeks failed with MCI error 277. Because the audio bridge
+is shared, the behavior applies across wrapper backends.
 
-UIKit event handling, rendering, audio and actual gameplay are future work.
-PublicTest2 does not bypass App Store encryption and refuses encrypted binaries.
+### Slow/unreachable GDPS connections
 
-The bootstrap was designed against user-supplied decrypted copies of Geometry
-Dash 1.0 and Forlorn 1.9c. No IPA or extracted Apple executable is included in
-this source archive.
+The legacy ARM socket bridge now honors guest nonblocking mode. A pending
+nonblocking `connect()` returns Android/POSIX `EINPROGRESS` instead of blocking
+the render/input callback for up to 15 seconds; nonblocking `recv()` returns
+`EAGAIN` immediately. The ARMv7 path already used this model.
 
-### PublicTest34 iOS ARMv7 focus
-PublicTest34 continues the GD 2.11/SubZero first-frame bring-up with real libc parsing primitives and exact low-address fault diagnostics after the objectDefinitions.plist load. See `PUBLICTEST34.md`.
+## Still open
 
-### PublicTest35 iOS ARMv7 focus
-PublicTest35 targets the still-black but now genuinely executing GD 2.11/SubZero frame path: it implements `glMapBufferOES`/`glUnmapBufferOES` with guest-visible VBO shadow memory, restores a fixed-function-safe host presentation state, and probes the offscreen surface before the final blit. See `PUBLICTEST35.md`.
+- Geometry Dash 1.0.0's original background-color/BG-trigger crash needs a
+  binary-level comparison against Android 1.0.1 before a safe compatibility
+  patch is installed.
+- Editor WASD/Q shortcuts need a verified editor callback ABI for each supported
+  game family. The known unsafe `EditorUI::keyDown` route is deliberately not
+  used.
+- Cursor hiding and pause-button removal are deliberately not included.
+
+## Building
+
+Run `BUILD_ALL.cmd` on Windows. No APK or proprietary game executable is bundled.
+Drag a supported Android APK onto `RUN_AUTO_BOOMLINGS.cmd` or `RUN_AUTO_GDPS.cmd`
+after building.

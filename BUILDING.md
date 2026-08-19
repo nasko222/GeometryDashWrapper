@@ -1,16 +1,14 @@
-# Building PublicTest2
+# Building Geometry Dash Wrapper 0.9.6-gdpsfixes1
 
-Run `BUILD_ALL.cmd` on Windows. The scripts fetch or reuse the pinned CMake,
-Ninja, Zig and Dynarmic dependencies and build the native launcher plus four
-runtime backends:
+Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use the
+project's pinned Zig, CMake, Ninja, Dynarmic and Boost dependencies and produce:
 
-- x86 Android
-- legacy ARM Android
-- ARMv7 Android
-- ARMv7 iOS bootstrap
+- the native launcher;
+- x86-native backend files;
+- `arm-legacy/GeometryDashArmLegacy.exe`;
+- `armv7/GeometryDashArmV7.exe`.
 
-The iOS backend uses the same Dynarmic A32 core and bundled zlib source. No
-Python or Apple SDK/toolchain is required to build the wrapper.
+This branch is Android-only.
 
-No APK, IPA, extracted Android/iOS executable, built EXE/DLL, Python file or
-`.gitignore` is included in this source archive.
+No APK, extracted game `.so`, built executable, or proprietary game asset is
+included in the source archive.

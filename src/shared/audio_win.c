@@ -1153,24 +1153,41 @@ void audio_preload_background(const char *path) {
     (void)open_music(path);
 }
 
+static int seek_music_milliseconds(unsigned long milliseconds, int resume_after) {
+    char command[128];
+    if (!g_music_open) return 0;
+
+    /* Wine/Proton (and some native MCI drivers) reject seek while an MPEG alias
+       is actively playing. Always stop the transport before moving the position;
+       callers decide whether playback should resume afterwards. */
+    (void)mci_command("stop gd18_music", NULL, 0, 0);
+    (void)mci_command("set gd18_music time format milliseconds", NULL, 0, 0);
+    snprintf(command, sizeof(command), "seek gd18_music to %lu", milliseconds);
+    if (!mci_command(command, NULL, 0, 1)) return 0;
+
+    if (resume_after) {
+        snprintf(command, sizeof(command), "play gd18_music from %lu%s",
+                 milliseconds, g_music_loop ? " repeat" : "");
+        if (!mci_command(command, NULL, 0, 1)) return 0;
+        g_music_paused = 0;
+    }
+    runtime_log("Audio music seek: target_ms=%lu stop-before-seek=yes resume=%s",
+                milliseconds, resume_after ? "yes" : "no");
+    return 1;
+}
+
 void audio_play_background(const char *path, int loop) {
     char command[96];
     int replay_first_start;
     if (!open_music(path)) return;
     replay_first_start = !loop && g_legacy_first_play_replay &&
                          g_music_needs_first_play_replay;
-    mci_command("seek gd18_music to start", NULL, 0, 0);
+    g_music_loop = loop != 0;
+    if (!seek_music_milliseconds(0u, 0)) return;
     snprintf(command, sizeof(command), "play gd18_music%s",
              loop ? " repeat" : "");
     if (mci_command(command, NULL, 0, 1)) {
         if (replay_first_start) {
-            /*
-             * Legacy MCI is quieter only on the first play command issued to a
-             * freshly opened level alias.  The real attempt-2 path sends play
-             * again while that alias is already active.  Reproduce that state
-             * transition for attempt 1 without changing volume, muting, waiting
-             * or stopping the decoder.
-             */
             const int replay_ok =
                 mci_command("play gd18_music from 0", NULL, 0, 1);
             runtime_log(
@@ -1178,7 +1195,6 @@ void audio_play_background(const char *path, int loop) {
                 replay_ok ? "ok" : "failed");
             g_music_needs_first_play_replay = 0;
         }
-        g_music_loop = loop != 0;
         g_music_paused = 0;
         runtime_log("Audio music playing: %s (loop=%s)", file_name_part(path),
                     loop ? "yes" : "no");
@@ -1186,10 +1202,7 @@ void audio_play_background(const char *path, int loop) {
 }
 
 void audio_stop_background(void) {
-    if (g_music_open) {
-        mci_command("stop gd18_music", NULL, 0, 0);
-        mci_command("seek gd18_music to start", NULL, 0, 0);
-    }
+    if (g_music_open) (void)seek_music_milliseconds(0u, 0);
     g_music_paused = 0;
 }
 
@@ -1213,49 +1226,36 @@ void audio_resume_background(void) {
 }
 
 void audio_resume_background_from(float seconds) {
-    char command[128];
     unsigned long milliseconds;
     if (!g_music_open) return;
     if (seconds < 0.0f) seconds = 0.0f;
     milliseconds = (unsigned long)(seconds * 1000.0f + 0.5f);
-    mci_command("set gd18_music time format milliseconds", NULL, 0, 0);
-    snprintf(command, sizeof(command), "seek gd18_music to %lu", milliseconds);
-    if (!mci_command(command, NULL, 0, 1)) return;
-    snprintf(command, sizeof(command), "play gd18_music from %lu%s",
-             milliseconds, g_music_loop ? " repeat" : "");
-    if (mci_command(command, NULL, 0, 1)) {
-        g_music_paused = 0;
+    if (seek_music_milliseconds(milliseconds, 1))
         runtime_log("Audio music resumed from %lu ms", milliseconds);
-    }
 }
 
 void audio_rewind_background(void) {
-    int playing = audio_is_background_playing();
+    int playing;
+    int paused;
     if (!g_music_open) return;
-    mci_command("seek gd18_music to start", NULL, 0, 0);
-    if (playing) {
-        char command[96];
-        snprintf(command, sizeof(command), "play gd18_music%s",
-                 g_music_loop ? " repeat" : "");
-        (void)mci_command(command, NULL, 0, 1);
+    playing = audio_is_background_playing();
+    paused = g_music_paused;
+    if (seek_music_milliseconds(0u, playing)) {
+        if (!playing) g_music_paused = paused;
     }
 }
 
 void audio_set_background_time(float seconds) {
-    char command[128];
     int playing;
+    int paused;
     unsigned long milliseconds;
     if (!g_music_open) return;
     if (seconds < 0.0f) seconds = 0.0f;
     milliseconds = (unsigned long)(seconds * 1000.0f + 0.5f);
     playing = audio_is_background_playing();
-    mci_command("set gd18_music time format milliseconds", NULL, 0, 0);
-    snprintf(command, sizeof(command), "seek gd18_music to %lu", milliseconds);
-    if (!mci_command(command, NULL, 0, 1)) return;
-    if (playing) {
-        snprintf(command, sizeof(command), "play gd18_music from %lu%s",
-                 milliseconds, g_music_loop ? " repeat" : "");
-        (void)mci_command(command, NULL, 0, 1);
+    paused = g_music_paused;
+    if (seek_music_milliseconds(milliseconds, playing)) {
+        if (!playing) g_music_paused = paused;
     }
 }
 

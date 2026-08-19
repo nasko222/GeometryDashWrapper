@@ -3990,28 +3990,45 @@ private:
             token += length;
             token.push_back(specifier);
             char temporary[4096]{};
-            int length_written = 0;
+            auto append_formatted = [&](auto value) {
+                const int needed = std::snprintf(temporary, sizeof(temporary), token.c_str(), value);
+                if (needed < 0) return;
+                const std::size_t room = output.size() < maximum ? maximum - output.size() : 0u;
+                const std::size_t wanted = std::min<std::size_t>(static_cast<std::size_t>(needed), room);
+                if (!wanted) return;
+                if (static_cast<std::size_t>(needed) < sizeof(temporary)) {
+                    output.append(temporary, wanted);
+                    return;
+                }
+                // snprintf reports the complete required size even when its output buffer is
+                // too small. Re-render into a buffer large enough for the remaining guest
+                // output instead of silently chopping long HTTP/level strings at 4095 bytes.
+                std::vector<char> dynamic(wanted + 1u);
+                const int rendered = std::snprintf(dynamic.data(), dynamic.size(), token.c_str(), value);
+                if (rendered < 0) return;
+                output.append(dynamic.data(), std::min<std::size_t>(wanted, static_cast<std::size_t>(rendered)));
+            };
             switch (specifier) {
             case 's': {
                 const std::string value = ReadCString(cursor.Word());
-                length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), value.c_str());
+                append_formatted(value.c_str());
                 break;
             }
-            case 'c': length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<int>(cursor.Word())); break;
+            case 'c': append_formatted(static_cast<int>(cursor.Word())); break;
             case 'd': case 'i':
-                if (length == "ll" || length == "j") length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<long long>(static_cast<s64>(cursor.U64())));
-                else if (length == "l") length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<long>(static_cast<s32>(cursor.Word())));
-                else length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<int>(static_cast<s32>(cursor.Word())));
+                if (length == "ll" || length == "j") append_formatted(static_cast<long long>(static_cast<s64>(cursor.U64())));
+                else if (length == "l") append_formatted(static_cast<long>(static_cast<s32>(cursor.Word())));
+                else append_formatted(static_cast<int>(static_cast<s32>(cursor.Word())));
                 break;
             case 'u': case 'o': case 'x': case 'X':
-                if (length == "ll" || length == "j") length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<unsigned long long>(cursor.U64()));
-                else if (length == "l") length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<unsigned long>(cursor.Word()));
-                else length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), static_cast<unsigned>(cursor.Word()));
+                if (length == "ll" || length == "j") append_formatted(static_cast<unsigned long long>(cursor.U64()));
+                else if (length == "l") append_formatted(static_cast<unsigned long>(cursor.Word()));
+                else append_formatted(static_cast<unsigned>(cursor.Word()));
                 break;
-            case 'p': length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), reinterpret_cast<void*>(static_cast<std::uintptr_t>(cursor.Word()))); break;
+            case 'p': append_formatted(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cursor.Word()))); break;
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
                 const u64 bits = cursor.U64();
-                length_written = std::snprintf(temporary, sizeof(temporary), token.c_str(), WordsToDouble(static_cast<u32>(bits), static_cast<u32>(bits >> 32)));
+                append_formatted(WordsToDouble(static_cast<u32>(bits), static_cast<u32>(bits >> 32)));
                 break;
             }
             case 'n': {
@@ -4024,14 +4041,7 @@ private:
                 output.append(format.substr(token_start, i - token_start));
                 continue;
             }
-            if (length_written < 0) continue;
-            if (static_cast<std::size_t>(length_written) < sizeof(temporary)) output.append(temporary, static_cast<std::size_t>(length_written));
-            else {
-                std::vector<char> dynamic(static_cast<std::size_t>(length_written) + 1u);
-                // Re-formatting very large values is unnecessary for this game; preserve a bounded diagnostic instead.
-                output.append(temporary, std::strlen(temporary));
-            }
-            if (output.size() > maximum) { output.resize(maximum); break; }
+            if (output.size() >= maximum) { output.resize(maximum); break; }
         }
         return output;
     }
@@ -4663,10 +4673,25 @@ private:
             return 0u;
         }
 
-        // Bionic/libcurl uses nonblocking sockets. Windows reports
-        // WSAEWOULDBLOCK while POSIX connect reports EINPROGRESS. Test9
-        // translated it to EAGAIN, making libcurl reject a healthy connection.
-        // Complete the pending connect on the host, then return a connected socket.
+        // Honor POSIX nonblocking connect semantics. The old bridge waited here for
+        // up to 15 seconds, which froze the UI/input callback whenever a GDPS was
+        // slow or unreachable. libcurl expects EINPROGRESS and completes the socket
+        // through poll + getsockopt(SO_ERROR).
+        if ((initial_error == WSAEWOULDBLOCK || initial_error == WSAEINPROGRESS ||
+             initial_error == WSAEALREADY) && nonblocking_sockets_.count(guest_fd)) {
+            constexpr int kGuestEinprogress = 115;
+            SetGuestErrno(kGuestEinprogress);
+            if (network_log_count_++ < 192u) {
+                log_ << "[host] Socket connect fd=" << guest_fd << " target="
+                     << (address_text[0] ? address_text : "?") << ':' << port
+                     << " status=in-progress async=yes errno=" << kGuestEinprogress << '\n';
+                log_.flush();
+            }
+            return static_cast<u32>(-1);
+        }
+
+        // Preserve blocking-socket behavior for callers that intentionally did not
+        // request O_NONBLOCK/FIONBIO.
         if (initial_error == WSAEWOULDBLOCK || initial_error == WSAEINPROGRESS ||
             initial_error == WSAEALREADY) {
             fd_set writable{};
@@ -4957,11 +4982,17 @@ private:
         int code = ::recv(socket_value, data, host_length, HostMessageFlags(flags));
         int error = code == SOCKET_ERROR ? WSAGetLastError() : 0;
 
-        // Test11 connected and sent correctly, but the old ARM libcurl asks for
-        // recv immediately. On Windows that commonly returns WSAEWOULDBLOCK
-        // before the first response byte arrives. Its legacy poll/error path then
-        // turns the harmless race into CURLE_RECV_ERROR. Wait for readability and
-        // retry here so the guest sees actual data, EOF, or a real socket error.
+        // Nonblocking sockets must surface EAGAIN immediately so libcurl can poll
+        // without freezing the render/input thread. Keep the old bounded wait only
+        // for genuinely blocking guest sockets.
+        if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK &&
+            nonblocking_sockets_.count(guest_fd)) {
+            SetGuestErrno(11);
+            if (network_log_count_++ < 192u)
+                log_ << "[host] Socket recv would-block fd=" << guest_fd
+                     << " async=yes errno=11\n";
+            return static_cast<u32>(-1);
+        }
         if (code == SOCKET_ERROR && error == WSAEWOULDBLOCK) {
             fd_set readable{};
             fd_set exceptional{};
@@ -6594,7 +6625,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-publictest35 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
