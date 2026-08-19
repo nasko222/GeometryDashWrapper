@@ -104,6 +104,28 @@ static bool RangeFits(std::size_t total, std::size_t off, std::size_t size) {
 static u32 AlignUp(u32 value, u32 alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
+
+static std::string EscapeForLog(std::string_view value, std::size_t limit = 160u) {
+    std::ostringstream out;
+    const std::size_t shown = std::min(limit, value.size());
+    for (std::size_t i = 0; i < shown; ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        switch (c) {
+            case '\\': out << "\\\\"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            case '\0': out << "\\0"; break;
+            default:
+                if (c >= 0x20u && c < 0x7fu) out << static_cast<char>(c);
+                else out << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                         << static_cast<unsigned>(c) << std::dec << std::setfill(' ');
+                break;
+        }
+    }
+    if (value.size() > shown) out << "...<" << (value.size() - shown) << " more bytes>";
+    return out.str();
+}
 static float FloatFromBits(u32 bits) {
     float value = 0.0f;
     std::memcpy(&value, &bits, sizeof(value));
@@ -710,7 +732,9 @@ public:
     ProbeEnvironment() : page_regions_(kGuestPageCount, kUnmappedPage) {}
     u64 ticks_left = 0;
     bool invalid_access = false, interpreter_fallback = false, exception_seen = false, svc_pending = false;
-    u32 pending_svc = 0, fault_address = 0, fault_pc = 0, fault_lr = 0, fallback_pc = 0, exception_pc = 0;
+    u32 pending_svc = 0, fault_address = 0, fault_pc = 0, fault_lr = 0, fault_size = 0, fallback_pc = 0, exception_pc = 0;
+    enum class FaultAccess : u8 { None, Read, Write };
+    FaultAccess fault_access = FaultAccess::None;
     std::size_t fallback_count = 0;
     void Map(u32 base, std::size_t size, bool executable) {
         if (!size || size > std::numeric_limits<u32>::max()) throw std::runtime_error("invalid guest mapping");
@@ -763,12 +787,12 @@ public:
         MemoryRegion* r=FindMutable(address,size);
         return r ? static_cast<void*>(r->data.data()+(address-r->base)) : nullptr;
     }
-    void ResetStopState() { invalid_access=false; interpreter_fallback=false; exception_seen=false; svc_pending=false; pending_svc=0; fault_address=0; fault_pc=0; fault_lr=0; fallback_pc=0; fallback_count=0; exception_pc=0; }
+    void ResetStopState() { invalid_access=false; interpreter_fallback=false; exception_seen=false; svc_pending=false; pending_svc=0; fault_address=0; fault_pc=0; fault_lr=0; fault_size=0; fault_access=FaultAccess::None; fallback_pc=0; fallback_count=0; exception_pc=0; }
     u8 MemoryRead8(u32 a) override { auto* r=Find(a,1); if(!r)return ReadFault<u8>(a); return r->data[a-r->base]; }
     u16 MemoryRead16(u32 a) override { return ReadTyped<u16>(a); }
     u32 MemoryRead32(u32 a) override { return ReadTyped<u32>(a); }
     u64 MemoryRead64(u32 a) override { return ReadTyped<u64>(a); }
-    void MemoryWrite8(u32 a,u8 v) override { auto* r=FindMutable(a,1); if(!r){WriteFault(a);return;} r->data[a-r->base]=v; }
+    void MemoryWrite8(u32 a,u8 v) override { auto* r=FindMutable(a,1); if(!r){WriteFault(a,1u);return;} r->data[a-r->base]=v; }
     void MemoryWrite16(u32 a,u16 v) override { WriteTyped(a,v); }
     void MemoryWrite32(u32 a,u32 v) override { WriteTyped(a,v); }
     void MemoryWrite64(u32 a,u64 v) override { WriteTyped(a,v); }
@@ -789,11 +813,11 @@ private:
     MemoryRegion* FindContainingMutable(u32 a){ const auto i=page_regions_[a>>kShift];if(i<0)return nullptr;auto& r=regions_[static_cast<std::size_t>(i)];return u64(a)<u64(r.base)+r.data.size()&&a>=r.base?&r:nullptr; }
     const MemoryRegion* Find(u32 a,std::size_t s) const { const u64 e=u64(a)+s;if(e>0x100000000ull)return nullptr;const auto* r=FindContaining(a);return r&&e<=u64(r->base)+r->data.size()?r:nullptr; }
     MemoryRegion* FindMutable(u32 a,std::size_t s){ const u64 e=u64(a)+s;if(e>0x100000000ull)return nullptr;auto* r=FindContainingMutable(a);return r&&e<=u64(r->base)+r->data.size()?r:nullptr; }
-    template<class T>T ReadFault(u32 a){invalid_access=true;fault_address=a;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();return T{};}
-    void WriteFault(u32 a){invalid_access=true;fault_address=a;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();}
+    template<class T>T ReadFault(u32 a){invalid_access=true;fault_address=a;fault_size=static_cast<u32>(sizeof(T));fault_access=FaultAccess::Read;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();return T{};}
+    void WriteFault(u32 a,u32 size=1u){invalid_access=true;fault_address=a;fault_size=size;fault_access=FaultAccess::Write;if(cpu_){fault_pc=cpu_->Regs()[15];fault_lr=cpu_->Regs()[14];}RequestHalt();}
     template<class T>T ReadTyped(u32 a){const auto* r=Find(a,sizeof(T));if(!r)return ReadFault<T>(a);T v{};std::memcpy(&v,r->data.data()+(a-r->base),sizeof(v));return v;}
-    template<class T>void WriteTyped(u32 a,T v){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a);return;}std::memcpy(r->data.data()+(a-r->base),&v,sizeof(v));}
-    template<class T>bool CompareExchange(u32 a,T v,T e){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a);return false;}T c{};u8* p=r->data.data()+(a-r->base);std::memcpy(&c,p,sizeof(c));if(c!=e)return false;std::memcpy(p,&v,sizeof(v));return true;}
+    template<class T>void WriteTyped(u32 a,T v){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a,static_cast<u32>(sizeof(T)));return;}std::memcpy(r->data.data()+(a-r->base),&v,sizeof(v));}
+    template<class T>bool CompareExchange(u32 a,T v,T e){auto* r=FindMutable(a,sizeof(T));if(!r){WriteFault(a,static_cast<u32>(sizeof(T)));return false;}T c{};u8* p=r->data.data()+(a-r->base);std::memcpy(&c,p,sizeof(c));if(c!=e)return false;std::memcpy(p,&v,sizeof(v));return true;}
     std::vector<MemoryRegion> regions_; std::vector<std::int16_t> page_regions_; Dynarmic::A32::Jit* cpu_=nullptr;
 };
 
@@ -834,6 +858,7 @@ public:
 
     bool Initialize(Logger& log) {
 #ifdef _WIN32
+        logger_=&log;
         if(ready_)return true;
         instance_=GetModuleHandleW(nullptr);
         WNDCLASSW wc{};
@@ -939,10 +964,40 @@ public:
         // scene inside that portrait surface. A physical iPhone then rotates
         // the display itself; Windows does not, so rotate the final renderbuffer
         // counter-clockwise here instead of distorting every guest GL call.
+        //
+        // Before touching presentation state, sample the guest-owned offscreen
+        // surface for the first few presents. This tells us whether a black host
+        // window is caused by guest rendering or by the final host blit.
+        GLint previous_program=0;
+        GLint previous_active_texture=static_cast<GLint>(kGlTexture0);
+        glGetIntegerv(kGlCurrentProgram,&previous_program);
+        glGetIntegerv(kGlActiveTexture,&previous_active_texture);
+        if(logger_&&surface_probe_count_<10u){
+            std::vector<GLubyte> probe(std::size_t(kPortraitWidth)*kPortraitHeight*4u);
+            glReadPixels(0,0,kPortraitWidth,kPortraitHeight,GL_RGBA,GL_UNSIGNED_BYTE,probe.data());
+            std::size_t nonblack=0u;
+            unsigned max_rgb=0u;
+            for(std::size_t i=0;i<probe.size();i+=4u){
+                const unsigned m=std::max({unsigned(probe[i]),unsigned(probe[i+1u]),unsigned(probe[i+2u])});
+                if(m!=0u)++nonblack;
+                max_rgb=std::max(max_rgb,m);
+            }
+            (*logger_)<<"IOS HOSTGL SURFACE: present="<<(present_count_+1u)
+                      <<" nonblack-rgb="<<nonblack<<"/"<<(std::size_t(kPortraitWidth)*kPortraitHeight)
+                      <<" max-rgb="<<max_rgb<<" current-program="<<previous_program<<"\n";
+            ++surface_probe_count_;
+        }
+
         glPushAttrib(GL_ALL_ATTRIB_BITS);
         glPushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS);
         GLint previous_matrix_mode=GL_MODELVIEW;
         glGetIntegerv(GL_MATRIX_MODE,&previous_matrix_mode);
+
+        // cocos2d ES2 leaves its GLSL program and active texture unit bound.
+        // The wrapper's final rotate/pillarbox pass uses fixed-function glBegin,
+        // so explicitly switch back to program 0 / texture unit 0 for the blit.
+        if(glUseProgram_)glUseProgram_(0);
+        if(glActiveTexture_)glActiveTexture_(kGlTexture0);
 
         glBindFramebuffer_(kGlFramebuffer,0);
         RECT client{};
@@ -1000,6 +1055,11 @@ public:
         glPopClientAttrib();
         glPopAttrib();
 
+        // GLSL program / active texture are not reliably restored by the old
+        // attribute stack on compatibility drivers, so put the guest state back.
+        if(glActiveTexture_)glActiveTexture_(static_cast<GLenum>(previous_active_texture));
+        if(glUseProgram_)glUseProgram_(static_cast<GLuint>(previous_program));
+
         SwapBuffers(dc_);
         ++present_count_;
 
@@ -1036,6 +1096,35 @@ public:
     using PFNGLDELETERENDERBUFFERSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
     using PFNGLRENDERBUFFERSTORAGEPROC_ = void (APIENTRY*)(GLenum,GLenum,GLsizei,GLsizei);
     using PFNGLFRAMEBUFFERRENDERBUFFERPROC_ = void (APIENTRY*)(GLenum,GLenum,GLenum,GLuint);
+    using PFNGLCREATESHADERPROC_ = GLuint (APIENTRY*)(GLenum);
+    using PFNGLSHADERSOURCEPROC_ = void (APIENTRY*)(GLuint,GLsizei,const char* const*,const GLint*);
+    using PFNGLCOMPILESHADERPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLGETSHADERIVPROC_ = void (APIENTRY*)(GLuint,GLenum,GLint*);
+    using PFNGLGETSHADERINFOLOGPROC_ = void (APIENTRY*)(GLuint,GLsizei,GLsizei*,char*);
+    using PFNGLDELETESHADERPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLCREATEPROGRAMPROC_ = GLuint (APIENTRY*)();
+    using PFNGLATTACHSHADERPROC_ = void (APIENTRY*)(GLuint,GLuint);
+    using PFNGLDETACHSHADERPROC_ = void (APIENTRY*)(GLuint,GLuint);
+    using PFNGLBINDATTRIBLOCATIONPROC_ = void (APIENTRY*)(GLuint,GLuint,const char*);
+    using PFNGLLINKPROGRAMPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLGETPROGRAMIVPROC_ = void (APIENTRY*)(GLuint,GLenum,GLint*);
+    using PFNGLGETPROGRAMINFOLOGPROC_ = void (APIENTRY*)(GLuint,GLsizei,GLsizei*,char*);
+    using PFNGLDELETEPROGRAMPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLUSEPROGRAMPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLGETUNIFORMLOCATIONPROC_ = GLint (APIENTRY*)(GLuint,const char*);
+    using PFNGLGETATTRIBLOCATIONPROC_ = GLint (APIENTRY*)(GLuint,const char*);
+    using PFNGLUNIFORM1IPROC_ = void (APIENTRY*)(GLint,GLint);
+    using PFNGLUNIFORM1FPROC_ = void (APIENTRY*)(GLint,GLfloat);
+    using PFNGLUNIFORM2FPROC_ = void (APIENTRY*)(GLint,GLfloat,GLfloat);
+    using PFNGLUNIFORM3FPROC_ = void (APIENTRY*)(GLint,GLfloat,GLfloat,GLfloat);
+    using PFNGLUNIFORM4FPROC_ = void (APIENTRY*)(GLint,GLfloat,GLfloat,GLfloat,GLfloat);
+    using PFNGLUNIFORMMATRIX4FVPROC_ = void (APIENTRY*)(GLint,GLsizei,GLboolean,const GLfloat*);
+    using PFNGLENABLEVERTEXATTRIBARRAYPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLDISABLEVERTEXATTRIBARRAYPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLVERTEXATTRIBPOINTERPROC_ = void (APIENTRY*)(GLuint,GLint,GLenum,GLboolean,GLsizei,const void*);
+    using PFNGLGENVERTEXARRAYSPROC_ = void (APIENTRY*)(GLsizei,GLuint*);
+    using PFNGLBINDVERTEXARRAYPROC_ = void (APIENTRY*)(GLuint);
+    using PFNGLDELETEVERTEXARRAYSPROC_ = void (APIENTRY*)(GLsizei,const GLuint*);
 
     PFNGLACTIVETEXTUREPROC_ glActiveTexture_ = nullptr;
     PFNGLGENBUFFERSPROC_ glGenBuffers_ = nullptr;
@@ -1054,6 +1143,35 @@ public:
     PFNGLDELETERENDERBUFFERSPROC_ glDeleteRenderbuffers_ = nullptr;
     PFNGLRENDERBUFFERSTORAGEPROC_ glRenderbufferStorage_ = nullptr;
     PFNGLFRAMEBUFFERRENDERBUFFERPROC_ glFramebufferRenderbuffer_ = nullptr;
+    PFNGLCREATESHADERPROC_ glCreateShader_ = nullptr;
+    PFNGLSHADERSOURCEPROC_ glShaderSource_ = nullptr;
+    PFNGLCOMPILESHADERPROC_ glCompileShader_ = nullptr;
+    PFNGLGETSHADERIVPROC_ glGetShaderiv_ = nullptr;
+    PFNGLGETSHADERINFOLOGPROC_ glGetShaderInfoLog_ = nullptr;
+    PFNGLDELETESHADERPROC_ glDeleteShader_ = nullptr;
+    PFNGLCREATEPROGRAMPROC_ glCreateProgram_ = nullptr;
+    PFNGLATTACHSHADERPROC_ glAttachShader_ = nullptr;
+    PFNGLDETACHSHADERPROC_ glDetachShader_ = nullptr;
+    PFNGLBINDATTRIBLOCATIONPROC_ glBindAttribLocation_ = nullptr;
+    PFNGLLINKPROGRAMPROC_ glLinkProgram_ = nullptr;
+    PFNGLGETPROGRAMIVPROC_ glGetProgramiv_ = nullptr;
+    PFNGLGETPROGRAMINFOLOGPROC_ glGetProgramInfoLog_ = nullptr;
+    PFNGLDELETEPROGRAMPROC_ glDeleteProgram_ = nullptr;
+    PFNGLUSEPROGRAMPROC_ glUseProgram_ = nullptr;
+    PFNGLGETUNIFORMLOCATIONPROC_ glGetUniformLocation_ = nullptr;
+    PFNGLGETATTRIBLOCATIONPROC_ glGetAttribLocation_ = nullptr;
+    PFNGLUNIFORM1IPROC_ glUniform1i_ = nullptr;
+    PFNGLUNIFORM1FPROC_ glUniform1f_ = nullptr;
+    PFNGLUNIFORM2FPROC_ glUniform2f_ = nullptr;
+    PFNGLUNIFORM3FPROC_ glUniform3f_ = nullptr;
+    PFNGLUNIFORM4FPROC_ glUniform4f_ = nullptr;
+    PFNGLUNIFORMMATRIX4FVPROC_ glUniformMatrix4fv_ = nullptr;
+    PFNGLENABLEVERTEXATTRIBARRAYPROC_ glEnableVertexAttribArray_ = nullptr;
+    PFNGLDISABLEVERTEXATTRIBARRAYPROC_ glDisableVertexAttribArray_ = nullptr;
+    PFNGLVERTEXATTRIBPOINTERPROC_ glVertexAttribPointer_ = nullptr;
+    PFNGLGENVERTEXARRAYSPROC_ glGenVertexArrays_ = nullptr;
+    PFNGLBINDVERTEXARRAYPROC_ glBindVertexArray_ = nullptr;
+    PFNGLDELETEVERTEXARRAYSPROC_ glDeleteVertexArrays_ = nullptr;
 #endif
 
 private:
@@ -1082,6 +1200,35 @@ private:
         glDeleteRenderbuffers_=LoadGlProc<PFNGLDELETERENDERBUFFERSPROC_>("glDeleteRenderbuffers","glDeleteRenderbuffersEXT");
         glRenderbufferStorage_=LoadGlProc<PFNGLRENDERBUFFERSTORAGEPROC_>("glRenderbufferStorage","glRenderbufferStorageEXT");
         glFramebufferRenderbuffer_=LoadGlProc<PFNGLFRAMEBUFFERRENDERBUFFERPROC_>("glFramebufferRenderbuffer","glFramebufferRenderbufferEXT");
+        glCreateShader_=LoadGlProc<PFNGLCREATESHADERPROC_>("glCreateShader");
+        glShaderSource_=LoadGlProc<PFNGLSHADERSOURCEPROC_>("glShaderSource");
+        glCompileShader_=LoadGlProc<PFNGLCOMPILESHADERPROC_>("glCompileShader");
+        glGetShaderiv_=LoadGlProc<PFNGLGETSHADERIVPROC_>("glGetShaderiv");
+        glGetShaderInfoLog_=LoadGlProc<PFNGLGETSHADERINFOLOGPROC_>("glGetShaderInfoLog");
+        glDeleteShader_=LoadGlProc<PFNGLDELETESHADERPROC_>("glDeleteShader");
+        glCreateProgram_=LoadGlProc<PFNGLCREATEPROGRAMPROC_>("glCreateProgram");
+        glAttachShader_=LoadGlProc<PFNGLATTACHSHADERPROC_>("glAttachShader");
+        glDetachShader_=LoadGlProc<PFNGLDETACHSHADERPROC_>("glDetachShader");
+        glBindAttribLocation_=LoadGlProc<PFNGLBINDATTRIBLOCATIONPROC_>("glBindAttribLocation");
+        glLinkProgram_=LoadGlProc<PFNGLLINKPROGRAMPROC_>("glLinkProgram");
+        glGetProgramiv_=LoadGlProc<PFNGLGETPROGRAMIVPROC_>("glGetProgramiv");
+        glGetProgramInfoLog_=LoadGlProc<PFNGLGETPROGRAMINFOLOGPROC_>("glGetProgramInfoLog");
+        glDeleteProgram_=LoadGlProc<PFNGLDELETEPROGRAMPROC_>("glDeleteProgram");
+        glUseProgram_=LoadGlProc<PFNGLUSEPROGRAMPROC_>("glUseProgram");
+        glGetUniformLocation_=LoadGlProc<PFNGLGETUNIFORMLOCATIONPROC_>("glGetUniformLocation");
+        glGetAttribLocation_=LoadGlProc<PFNGLGETATTRIBLOCATIONPROC_>("glGetAttribLocation");
+        glUniform1i_=LoadGlProc<PFNGLUNIFORM1IPROC_>("glUniform1i");
+        glUniform1f_=LoadGlProc<PFNGLUNIFORM1FPROC_>("glUniform1f");
+        glUniform2f_=LoadGlProc<PFNGLUNIFORM2FPROC_>("glUniform2f");
+        glUniform3f_=LoadGlProc<PFNGLUNIFORM3FPROC_>("glUniform3f");
+        glUniform4f_=LoadGlProc<PFNGLUNIFORM4FPROC_>("glUniform4f");
+        glUniformMatrix4fv_=LoadGlProc<PFNGLUNIFORMMATRIX4FVPROC_>("glUniformMatrix4fv");
+        glEnableVertexAttribArray_=LoadGlProc<PFNGLENABLEVERTEXATTRIBARRAYPROC_>("glEnableVertexAttribArray");
+        glDisableVertexAttribArray_=LoadGlProc<PFNGLDISABLEVERTEXATTRIBARRAYPROC_>("glDisableVertexAttribArray");
+        glVertexAttribPointer_=LoadGlProc<PFNGLVERTEXATTRIBPOINTERPROC_>("glVertexAttribPointer");
+        glGenVertexArrays_=LoadGlProc<PFNGLGENVERTEXARRAYSPROC_>("glGenVertexArrays","glGenVertexArraysAPPLE");
+        glBindVertexArray_=LoadGlProc<PFNGLBINDVERTEXARRAYPROC_>("glBindVertexArray","glBindVertexArrayAPPLE");
+        glDeleteVertexArrays_=LoadGlProc<PFNGLDELETEVERTEXARRAYSPROC_>("glDeleteVertexArrays","glDeleteVertexArraysAPPLE");
     }
 
     bool CreatePortraitFramebuffer(Logger& log){
@@ -1201,6 +1348,9 @@ private:
     static constexpr GLenum kGlDepthAttachment=0x8d00u;
     static constexpr GLenum kGlDepthComponent24=0x81a6u;
     static constexpr GLenum kGlFramebufferComplete=0x8cd5u;
+    static constexpr GLenum kGlCurrentProgram=0x8b8du;
+    static constexpr GLenum kGlActiveTexture=0x84e0u;
+    static constexpr GLenum kGlTexture0=0x84c0u;
 
     HINSTANCE instance_=nullptr;
     HWND hwnd_=nullptr;
@@ -1209,6 +1359,8 @@ private:
     GLuint offscreen_texture_=0;
     GLuint offscreen_fbo_=0;
     GLuint offscreen_depth_=0;
+    Logger* logger_=nullptr;
+    u32 surface_probe_count_=0u;
 #endif
     bool ready_=false;
     bool closed_=false;
@@ -1350,7 +1502,7 @@ public:
                 <<" unknown-imports="<<unknown_import_count_
                 <<" objc-stubs="<<unimplemented_objc_count_
                 <<" category-methods="<<guest_category_method_count_<<"\n";
-            log_<<"Execution status: PublicTest29 bypasses unavailable Everyplay telemetry, implements Darwin errno/ARC helpers, and continues Geometry Dash startup toward the first cocos2d scene.\n";
+            log_<<"Execution status: PublicTest30 bypasses unavailable Everyplay telemetry, implements Darwin errno/ARC helpers, and continues Geometry Dash startup toward the first cocos2d scene.\n";
             return true;
         }
         if(delegate_launch_returned_){
@@ -1466,6 +1618,19 @@ private:
             <<" r4=0x"<<Hex(r[4])<<" r5=0x"<<Hex(r[5])<<" r6=0x"<<Hex(r[6])<<" r7=0x"<<Hex(r[7])
             <<" r8=0x"<<Hex(r[8])<<" r9=0x"<<Hex(r[9])<<" r10=0x"<<Hex(r[10])<<" r11=0x"<<Hex(r[11])<<" r12=0x"<<Hex(r[12])
             <<" sp=0x"<<Hex(r[13])<<" lr=0x"<<Hex(r[14])<<" pc=0x"<<Hex(r[15])<<"\n";
+        const char* access=env_.fault_access==ProbeEnvironment::FaultAccess::Read?"read":(env_.fault_access==ProbeEnvironment::FaultAccess::Write?"write":"unknown");
+        log_<<"IOS FAULT ACCESS: type="<<access<<" size="<<env_.fault_size<<" address=0x"<<Hex(env_.fault_address)<<"\n";
+        if(last_new44_ptr_)log_<<"IOS CXX LAST NEW44: ptr=0x"<<Hex(last_new44_ptr_)<<" caller=0x"<<Hex(last_new44_caller_)<<" sp=0x"<<Hex(last_new44_sp_)<<"\n";
+        const u32 sp=r[13];
+        if(sp&&env_.IsMapped(sp,0x1b4u)){
+            static constexpr std::array<u32,12> key_offsets{0x38u,0x40u,0x64u,0x68u,0x6cu,0x70u,0x74u,0xb8u,0xbcu,0xc0u,0x138u,0x140u};
+            log_<<"IOS FAULT STACK KEY:";
+            for(const u32 off:key_offsets)log_<<" +"<<std::hex<<off<<"=0x"<<Hex(env_.MemoryRead32(sp+off))<<std::dec;
+            log_<<"\n";
+            log_<<"IOS FAULT STACK WINDOW:";
+            for(u32 off=0x30u;off<=0x80u;off+=4u)log_<<" +"<<std::hex<<off<<"=0x"<<Hex(env_.MemoryRead32(sp+off))<<std::dec;
+            log_<<"\n";
+        }
         if(r[15]>=kImportBase&&r[15]<kImportBase+kImportSize){
             const u32 stub=kImportBase+((r[15]-kImportBase)/8u)*8u;
             const std::size_t index=(stub-kImportBase)/8u;
@@ -1577,6 +1742,10 @@ private:
         return {};
     }
     const DecodedPng* DecodeAsset(std::string relative){
+        // PT32: UIImage +imageWithData: creates decoded images that do not have an
+        // IPA path.  Consult the decoded-image cache before normalizing an asset
+        // name so those synthetic keys survive the CoreGraphics bridge.
+        if(auto cached=decoded_assets_.find(relative);cached!=decoded_assets_.end())return &cached->second;
         relative=ResolveAssetRelative(std::move(relative));
         if(relative.empty()||!ipa_)return nullptr;
         auto cached=decoded_assets_.find(relative);
@@ -1601,6 +1770,37 @@ private:
         const u32 image=NewExternalInstance("UIImage");
         fake_objects_[image].resource_value=rel;
         if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: UIImage "<<request<<" -> "<<rel<<"\n";
+        return image;
+    }
+    u32 NewDataFromGuestBytes(u32 source,u32 length){
+        const u32 data_obj=NewExternalInstance("NSData");
+        auto& bytes=fake_data_bytes_[data_obj];
+        if(source&&length&&env_.IsMapped(source,length)){
+            bytes.resize(length);
+            env_.ReadBytes(source,bytes.data(),bytes.size());
+        }
+        if(++nsdata_logs_<=24u)
+            log_<<"IOS FOUNDATION DATA: dataWithBytes source=0x"<<Hex(source)
+                <<" length="<<length<<" copied="<<bytes.size()<<" -> 0x"<<Hex(data_obj)<<"\n";
+        return data_obj;
+    }
+    u32 NewImageFromData(u32 data_obj){
+        auto it=fake_data_bytes_.find(data_obj);
+        if(it==fake_data_bytes_.end()||it->second.empty())return 0u;
+        DecodedPng decoded;
+        if(!DecodeIosPngRgba(it->second,decoded)){
+            if(++asset_failure_logs_<=8u)
+                log_<<"IOS ASSET: UIImage imageWithData decode failed bytes="<<it->second.size()<<"\n";
+            return 0u;
+        }
+        const u32 image=NewExternalInstance("UIImage");
+        const std::string key="__uiimage_data_"+Hex(image);
+        const u32 w=decoded.width,h=decoded.height;
+        decoded_assets_[key]=std::move(decoded);
+        fake_objects_[image].resource_value=key;
+        if(++asset_decode_logs_<=32u)
+            log_<<"IOS ASSET: UIImage imageWithData decoded "<<w<<"x"<<h
+                <<" RGBA bytes="<<it->second.size()<<" image=0x"<<Hex(image)<<"\n";
         return image;
     }
     struct VirtualFile {
@@ -1814,6 +2014,30 @@ private:
         if(symbol=="_CGAffineTransformIdentity")return EnsureFloatData(symbol,{1.0f,0.0f,0.0f,1.0f,0.0f,0.0f});
         if(symbol=="_CGPointZero"||symbol=="_CGSizeZero")return EnsureFloatData(symbol,{0.0f,0.0f});
         if(symbol=="_CGRectZero")return EnsureFloatData(symbol,{0.0f,0.0f,0.0f,0.0f});
+        if(symbol.starts_with("_ZTVN10__cxxabiv1")){
+            auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
+            // C++ ABI vtables are DATA symbols.  Older PT builds incorrectly
+            // bound them to executable SVC stubs, so a plain vtable load could
+            // jump into the import dispatcher.  Supply a small inert table with
+            // callable fallbacks in the virtual slots.
+            const u32 addr=Allocate(128u,4u,true);
+            const u32 fallback=EnsureImport("__cxxabi_typeinfo_virtual");
+            for(u32 off=8u;off<128u;off+=4u)env_.MemoryWrite32(addr+off,fallback);
+            data_symbols_[symbol]=addr;
+            return addr;
+        }
+        if(symbol.starts_with("_ZTI")){
+            auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
+            const u32 addr=Allocate(16u,4u,true);
+            env_.MemoryWrite32(addr,EnsureImport("__cxxabi_typeinfo_virtual"));
+            env_.MemoryWrite32(addr+4u,AllocateCString(symbol.substr(4u)));
+            data_symbols_[symbol]=addr;
+            return addr;
+        }
+        if(symbol.starts_with("_ZTS")){
+            auto it=data_symbols_.find(symbol);if(it!=data_symbols_.end())return it->second;
+            const u32 addr=AllocateCString(symbol.substr(4u));data_symbols_[symbol]=addr;return addr;
+        }
         static const std::set<std::string> known_data={"_NSDefaultRunLoopMode","_NSRunLoopCommonModes","_NSLocaleCountryCode","_NSLocaleLanguageCode","_NSLocalizedDescriptionKey","_UIApplicationDidBecomeActiveNotification","_UIApplicationDidFinishLaunchingNotification","_AVAudioSessionCategoryAmbient","_AVAudioSessionCategoryPlayback","_AVAudioSessionCategorySoloAmbient","_AVAudioSessionCategoryPlayAndRecord"};
         if(known_data.count(symbol)){ auto it=data_symbols_.find(symbol); if(it!=data_symbols_.end())return it->second; const u32 obj=NewFakeString(symbol.substr(1)); data_symbols_[symbol]=obj; return obj; }
         return EnsureImport(symbol);
@@ -2223,6 +2447,96 @@ private:
             if(host_window_.glActiveTexture_)host_window_.glActiveTexture_(static_cast<GLenum>(r[0]));
             r[0]=0u;return true;
         }
+        if(name=="glCreateShader"){
+            r[0]=host_window_.glCreateShader_?static_cast<u32>(host_window_.glCreateShader_(static_cast<GLenum>(r[0]))):0u;
+            if(++shader_bridge_logs_<=24u)log_<<"IOS HOSTGL ES2: glCreateShader -> "<<r[0]<<"\n";
+            return true;
+        }
+        if(name=="glShaderSource"){
+            if(host_window_.glShaderSource_){
+                const GLuint shader=static_cast<GLuint>(r[0]);const u32 count=r[1],strings=r[2],lengths=r[3];
+                std::vector<std::string> owned;std::vector<const char*> ptrs;std::vector<GLint> lens;
+                if(count&&count<128u&&strings&&env_.IsMapped(strings,count*4u)){
+                    owned.reserve(count);ptrs.reserve(count);lens.reserve(count);
+                    for(u32 i=0;i<count;++i){
+                        const u32 addr=env_.MemoryRead32(strings+i*4u);std::string src;
+                        GLint wanted=-1;
+                        if(lengths&&env_.IsMapped(lengths+i*4u,4u))wanted=static_cast<GLint>(env_.MemoryRead32(lengths+i*4u));
+                        if(addr){
+                            if(wanted>=0&&wanted<(1<<24)&&env_.IsMapped(addr,std::max<GLint>(wanted,1))){src.resize(static_cast<std::size_t>(wanted));if(wanted)env_.ReadBytes(addr,src.data(),static_cast<std::size_t>(wanted));}
+                            else env_.ReadCString(addr,src,1u<<20);
+                        }
+                        auto erase_token=[&](std::string_view token){std::size_t pos=0;while((pos=src.find(token,pos))!=std::string::npos)src.erase(pos,token.size());};
+                        erase_token("lowp ");erase_token("mediump ");erase_token("highp ");
+                        owned.push_back(std::move(src));
+                    }
+                    for(auto& src:owned){ptrs.push_back(src.c_str());lens.push_back(static_cast<GLint>(src.size()));}
+                    host_window_.glShaderSource_(shader,static_cast<GLsizei>(ptrs.size()),ptrs.data(),lens.data());
+                }
+            }
+            r[0]=0u;return true;
+        }
+        if(name=="glCompileShader"){
+            if(host_window_.glCompileShader_)host_window_.glCompileShader_(static_cast<GLuint>(r[0]));
+            if(host_window_.glGetShaderiv_){GLint ok=0;host_window_.glGetShaderiv_(static_cast<GLuint>(r[0]),0x8b81u,&ok);if(!ok&&host_window_.glGetShaderInfoLog_){char buf[2048]{};GLsizei n=0;host_window_.glGetShaderInfoLog_(static_cast<GLuint>(r[0]),2047,&n,buf);log_<<"IOS HOSTGL ES2: shader compile failed id="<<r[0]<<" log='"<<buf<<"'\n";}}
+            r[0]=0u;return true;
+        }
+        if(name=="glGetShaderiv"){
+            GLint value=0;if(host_window_.glGetShaderiv_)host_window_.glGetShaderiv_(static_cast<GLuint>(r[0]),static_cast<GLenum>(r[1]),&value);
+            if(r[2]&&env_.IsMapped(r[2],4u))env_.MemoryWrite32(r[2],static_cast<u32>(value));r[0]=0u;return true;
+        }
+        if(name=="glGetShaderInfoLog"){
+            const GLsizei maxlen=static_cast<GLsizei>(r[1]);std::vector<char> buf(std::max<GLsizei>(maxlen,1));GLsizei n=0;
+            if(host_window_.glGetShaderInfoLog_)host_window_.glGetShaderInfoLog_(static_cast<GLuint>(r[0]),maxlen,&n,buf.data());
+            if(r[2]&&env_.IsMapped(r[2],4u))env_.MemoryWrite32(r[2],static_cast<u32>(n));if(r[3]&&maxlen>0&&env_.IsMapped(r[3],static_cast<std::size_t>(maxlen)))env_.WriteBytes(r[3],buf.data(),static_cast<std::size_t>(maxlen));r[0]=0u;return true;
+        }
+        if(name=="glDeleteShader"){if(host_window_.glDeleteShader_)host_window_.glDeleteShader_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glCreateProgram"){
+            r[0]=host_window_.glCreateProgram_?static_cast<u32>(host_window_.glCreateProgram_()):0u;
+            if(++shader_bridge_logs_<=24u)log_<<"IOS HOSTGL ES2: glCreateProgram -> "<<r[0]<<"\n";
+            return true;
+        }
+        if(name=="glAttachShader"){if(host_window_.glAttachShader_)host_window_.glAttachShader_(static_cast<GLuint>(r[0]),static_cast<GLuint>(r[1]));r[0]=0u;return true;}
+        if(name=="glDetachShader"){if(host_window_.glDetachShader_)host_window_.glDetachShader_(static_cast<GLuint>(r[0]),static_cast<GLuint>(r[1]));r[0]=0u;return true;}
+        if(name=="glBindAttribLocation"){
+            std::string n;if(r[2])env_.ReadCString(r[2],n,1024u);if(host_window_.glBindAttribLocation_)host_window_.glBindAttribLocation_(static_cast<GLuint>(r[0]),static_cast<GLuint>(r[1]),n.c_str());r[0]=0u;return true;
+        }
+        if(name=="glLinkProgram"){
+            const GLuint program=static_cast<GLuint>(r[0]);if(host_window_.glLinkProgram_)host_window_.glLinkProgram_(program);
+            if(host_window_.glGetProgramiv_){GLint ok=0;host_window_.glGetProgramiv_(program,0x8b82u,&ok);if(!ok&&host_window_.glGetProgramInfoLog_){char buf[2048]{};GLsizei n=0;host_window_.glGetProgramInfoLog_(program,2047,&n,buf);log_<<"IOS HOSTGL ES2: program link failed id="<<program<<" log='"<<buf<<"'\n";}}
+            r[0]=0u;return true;
+        }
+        if(name=="glGetProgramiv"){
+            GLint value=0;if(host_window_.glGetProgramiv_)host_window_.glGetProgramiv_(static_cast<GLuint>(r[0]),static_cast<GLenum>(r[1]),&value);if(r[2]&&env_.IsMapped(r[2],4u))env_.MemoryWrite32(r[2],static_cast<u32>(value));r[0]=0u;return true;
+        }
+        if(name=="glGetProgramInfoLog"){
+            const GLsizei maxlen=static_cast<GLsizei>(r[1]);std::vector<char> buf(std::max<GLsizei>(maxlen,1));GLsizei n=0;if(host_window_.glGetProgramInfoLog_)host_window_.glGetProgramInfoLog_(static_cast<GLuint>(r[0]),maxlen,&n,buf.data());if(r[2]&&env_.IsMapped(r[2],4u))env_.MemoryWrite32(r[2],static_cast<u32>(n));if(r[3]&&maxlen>0&&env_.IsMapped(r[3],static_cast<std::size_t>(maxlen)))env_.WriteBytes(r[3],buf.data(),static_cast<std::size_t>(maxlen));r[0]=0u;return true;
+        }
+        if(name=="glDeleteProgram"){if(host_window_.glDeleteProgram_)host_window_.glDeleteProgram_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glUseProgram"){if(host_window_.glUseProgram_)host_window_.glUseProgram_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glGetUniformLocation"||name=="glGetAttribLocation"){
+            std::string n;if(r[1])env_.ReadCString(r[1],n,1024u);GLint loc=-1;if(name=="glGetUniformLocation"&&host_window_.glGetUniformLocation_)loc=host_window_.glGetUniformLocation_(static_cast<GLuint>(r[0]),n.c_str());if(name=="glGetAttribLocation"&&host_window_.glGetAttribLocation_)loc=host_window_.glGetAttribLocation_(static_cast<GLuint>(r[0]),n.c_str());r[0]=static_cast<u32>(loc);return true;
+        }
+        if(name=="glUniform1i"){if(host_window_.glUniform1i_)host_window_.glUniform1i_(static_cast<GLint>(r[0]),static_cast<GLint>(r[1]));r[0]=0u;return true;}
+        if(name=="glUniform1f"){if(host_window_.glUniform1f_)host_window_.glUniform1f_(static_cast<GLint>(r[0]),FloatFromBits(r[1]));r[0]=0u;return true;}
+        if(name=="glUniform2f"){if(host_window_.glUniform2f_)host_window_.glUniform2f_(static_cast<GLint>(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]));r[0]=0u;return true;}
+        if(name=="glUniform3f"){if(host_window_.glUniform3f_)host_window_.glUniform3f_(static_cast<GLint>(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]));r[0]=0u;return true;}
+        if(name=="glUniform4f"){if(host_window_.glUniform4f_)host_window_.glUniform4f_(static_cast<GLint>(r[0]),FloatFromBits(r[1]),FloatFromBits(r[2]),FloatFromBits(r[3]),FloatFromBits(StackArg(0)));r[0]=0u;return true;}
+        if(name=="glUniformMatrix4fv"){
+            const u32 addr=r[3];const auto* p=static_cast<const GLfloat*>(env_.HostPointer(addr,std::size_t(std::max<u32>(r[1],1u))*16u*sizeof(GLfloat)));if(host_window_.glUniformMatrix4fv_&&p)host_window_.glUniformMatrix4fv_(static_cast<GLint>(r[0]),static_cast<GLsizei>(r[1]),static_cast<GLboolean>(r[2]),p);r[0]=0u;return true;
+        }
+        if(name=="glEnableVertexAttribArray"){if(host_window_.glEnableVertexAttribArray_)host_window_.glEnableVertexAttribArray_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glDisableVertexAttribArray"){if(host_window_.glDisableVertexAttribArray_)host_window_.glDisableVertexAttribArray_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glVertexAttribPointer"){
+            const void* ptr=GuestGlPointer(StackArg(1),false);if(host_window_.glVertexAttribPointer_&&(ptr||bound_array_buffer_))host_window_.glVertexAttribPointer_(static_cast<GLuint>(r[0]),static_cast<GLint>(r[1]),static_cast<GLenum>(r[2]),static_cast<GLboolean>(r[3]),static_cast<GLsizei>(StackArg(0)),ptr);r[0]=0u;return true;
+        }
+        if(name=="glGenVertexArraysOES"){
+            const u32 count=r[0],ptr=r[1];if(host_window_.glGenVertexArrays_&&count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){std::vector<GLuint> ids(count);host_window_.glGenVertexArrays_(static_cast<GLsizei>(count),ids.data());env_.WriteBytes(ptr,ids.data(),count*4u);}else WriteGeneratedIds(count,ptr);r[0]=0u;return true;
+        }
+        if(name=="glBindVertexArrayOES"){if(host_window_.glBindVertexArray_)host_window_.glBindVertexArray_(static_cast<GLuint>(r[0]));r[0]=0u;return true;}
+        if(name=="glDeleteVertexArraysOES"){
+            const u32 count=r[0],ptr=r[1];if(host_window_.glDeleteVertexArrays_&&count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){std::vector<GLuint> ids(count);env_.ReadBytes(ptr,ids.data(),count*4u);host_window_.glDeleteVertexArrays_(static_cast<GLsizei>(count),ids.data());}r[0]=0u;return true;
+        }
         if(name=="glBindTexture"){glBindTexture(static_cast<GLenum>(r[0]),static_cast<GLuint>(r[1]));bound_texture_=r[1];r[0]=0u;return true;}
         if(name=="glGenTextures"){
             const u32 count=r[0],ptr=r[1];
@@ -2335,8 +2649,18 @@ private:
         }
         if(name=="glDeleteBuffers"){
             const u32 count=r[0],ptr=r[1];
-            if(host_window_.glDeleteBuffers_&&count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
-                std::vector<GLuint> ids(count);env_.ReadBytes(ptr,ids.data(),count*4u);host_window_.glDeleteBuffers_(static_cast<GLsizei>(count),ids.data());
+            if(count&&count<4096u&&ptr&&env_.IsMapped(ptr,count*4u)){
+                std::vector<GLuint> ids(count);env_.ReadBytes(ptr,ids.data(),count*4u);
+                if(host_window_.glDeleteBuffers_)host_window_.glDeleteBuffers_(static_cast<GLsizei>(count),ids.data());
+                for(const GLuint id:ids){
+                    auto it=gl_buffer_shadows_.find(static_cast<u32>(id));
+                    if(it!=gl_buffer_shadows_.end()){
+                        if(it->second.guest_addr)ReleaseHeapBlock(it->second.guest_addr);
+                        gl_buffer_shadows_.erase(it);
+                    }
+                    if(bound_array_buffer_==id)bound_array_buffer_=0u;
+                    if(bound_element_array_buffer_==id)bound_element_array_buffer_=0u;
+                }
             }
             r[0]=0u;return true;
         }
@@ -2347,11 +2671,72 @@ private:
             r[0]=0u;return true;
         }
         if(name=="glBufferData"){
-            if(host_window_.glBufferData_){
-                const std::size_t size=r[1];
-                const void* data=r[2]?env_.HostPointer(r[2],std::max<std::size_t>(size,1u)):nullptr;
-                if(!r[2]||data)host_window_.glBufferData_(static_cast<GLenum>(r[0]),static_cast<std::ptrdiff_t>(size),data,static_cast<GLenum>(r[3]));
+            const GLenum target=static_cast<GLenum>(r[0]);
+            const std::size_t size=r[1];
+            const u32 buffer_id=(target==0x8892u)?bound_array_buffer_:((target==0x8893u)?bound_element_array_buffer_:0u);
+            const void* data=r[2]?env_.HostPointer(r[2],std::max<std::size_t>(size,1u)):nullptr;
+            if(host_window_.glBufferData_&&(!r[2]||data))
+                host_window_.glBufferData_(target,static_cast<std::ptrdiff_t>(size),data,static_cast<GLenum>(r[3]));
+            if(buffer_id){
+                auto& shadow=gl_buffer_shadows_[buffer_id];
+                if(shadow.guest_addr&&shadow.size!=size){ReleaseHeapBlock(shadow.guest_addr);shadow.guest_addr=0u;}
+                shadow.size=static_cast<u32>(std::min<std::size_t>(size,0xffffffffu));
+                shadow.mapped=false;
+                if(shadow.guest_addr&&data&&shadow.size)env_.WriteBytes(shadow.guest_addr,data,shadow.size);
             }
+            r[0]=0u;return true;
+        }
+        if(name=="glMapBufferOES"){
+            const GLenum target=static_cast<GLenum>(r[0]);
+            const u32 buffer_id=(target==0x8892u)?bound_array_buffer_:((target==0x8893u)?bound_element_array_buffer_:0u);
+            u32 guest_ptr=0u;u32 size=0u;
+            if(buffer_id){
+                auto it=gl_buffer_shadows_.find(buffer_id);
+                if(it!=gl_buffer_shadows_.end()&&it->second.size){
+                    auto& shadow=it->second;
+                    size=shadow.size;
+                    if(!shadow.guest_addr)shadow.guest_addr=Allocate(shadow.size,16u,true);
+                    if(shadow.guest_addr){
+                        guest_ptr=shadow.guest_addr;shadow.mapped=true;
+                        // GL_WRITE_ONLY_OES does not promise old contents. Start
+                        // with deterministic bytes so guest writes cannot expose
+                        // stale heap contents if it updates only part of a VBO.
+                        if(r[1]==0x88b9u){
+                            if(void* p=env_.HostPointerMutable(guest_ptr,shadow.size))std::memset(p,0,shadow.size);
+                        }
+                    }
+                }
+            }
+            if(++gl_buffer_map_logs_<=24u)
+                log_<<"IOS HOSTGL VBO MAP: target=0x"<<Hex(target)<<" buffer="<<buffer_id
+                    <<" access=0x"<<Hex(r[1])<<" size="<<size<<" guest=0x"<<Hex(guest_ptr)<<"\n";
+            r[0]=guest_ptr;return true;
+        }
+        if(name=="glUnmapBufferOES"){
+            const GLenum target=static_cast<GLenum>(r[0]);
+            const u32 buffer_id=(target==0x8892u)?bound_array_buffer_:((target==0x8893u)?bound_element_array_buffer_:0u);
+            bool ok=false;u32 guest_ptr=0u,size=0u;
+            auto it=gl_buffer_shadows_.find(buffer_id);
+            if(buffer_id&&it!=gl_buffer_shadows_.end()){
+                auto& shadow=it->second;guest_ptr=shadow.guest_addr;size=shadow.size;
+                const void* p=(shadow.guest_addr&&shadow.size)?env_.HostPointer(shadow.guest_addr,shadow.size):nullptr;
+                if(p&&host_window_.glBufferSubData_){
+                    host_window_.glBufferSubData_(target,0,static_cast<std::ptrdiff_t>(shadow.size),p);
+                    ok=true;
+                }
+                shadow.mapped=false;
+            }
+            if(gl_buffer_map_logs_<=24u)
+                log_<<"IOS HOSTGL VBO UNMAP: target=0x"<<Hex(target)<<" buffer="<<buffer_id
+                    <<" size="<<size<<" guest=0x"<<Hex(guest_ptr)<<" uploaded="<<(ok?1:0)<<"\n";
+            r[0]=ok?1u:0u;return true;
+        }
+        if(name=="glGetBufferParameterivOES"){
+            const GLenum target=static_cast<GLenum>(r[0]);const u32 pname=r[1],out=r[2];
+            const u32 buffer_id=(target==0x8892u)?bound_array_buffer_:((target==0x8893u)?bound_element_array_buffer_:0u);
+            u32 value=0u;
+            if(pname==0x8764u){auto it=gl_buffer_shadows_.find(buffer_id);if(it!=gl_buffer_shadows_.end())value=it->second.size;} // GL_BUFFER_SIZE
+            if(out&&env_.IsMapped(out,4u))env_.MemoryWrite32(out,value);
             r[0]=0u;return true;
         }
         if(name=="glBufferSubData"){
@@ -2387,15 +2772,17 @@ private:
             r[0]=0u;return true;
         }
 
-        // iOS renderbuffer/FBO objects are collapsed onto the Win32 default
-        // framebuffer for the first visible-host test.
-        if(name=="glGenFramebuffersOES"||name=="glGenRenderbuffersOES"){WriteGeneratedIds(r[0],r[1]);r[0]=0u;return true;}
+        // Guest EAGL renderbuffer/FBO names are virtual. Keep rendering on the
+        // wrapper-owned portrait FBO and hand the guest stable non-zero names.
+        if(name=="glGenFramebuffersOES"||name=="glGenRenderbuffersOES"||name=="glGenFramebuffers"||name=="glGenRenderbuffers"){WriteGeneratedIds(r[0],r[1]);r[0]=0u;return true;}
         if(name=="glBindFramebufferOES"||name=="glBindRenderbufferOES"||name=="glFramebufferRenderbufferOES"||name=="glFramebufferTexture2DOES"||
            name=="glDeleteFramebuffersOES"||name=="glDeleteRenderbuffersOES"||name=="glRenderbufferStorageOES"||
+           name=="glBindFramebuffer"||name=="glBindRenderbuffer"||name=="glFramebufferRenderbuffer"||name=="glFramebufferTexture2D"||
+           name=="glDeleteFramebuffers"||name=="glDeleteRenderbuffers"||name=="glRenderbufferStorage"||
            name=="glRenderbufferStorageMultisampleAPPLE"||name=="glResolveMultisampleFramebufferAPPLE"||name=="glDiscardFramebufferEXT"){
             r[0]=0u;return true;
         }
-        if(name=="glCheckFramebufferStatusOES"){r[0]=0x8cd5u;return true;}
+        if(name=="glCheckFramebufferStatusOES"||name=="glCheckFramebufferStatus"){r[0]=0x8cd5u;return true;}
         if(name=="glGetRenderbufferParameterivOES"){
             const u32 pname=r[1],ptr=r[2];
             if(ptr&&env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,pname==0x8d43u?480u:320u);
@@ -2533,17 +2920,34 @@ private:
     }
 
     bool BeginDirectorAcquire(){
-        const GuestClass* cls=FindGuestClassByName("CCDirector");
-        if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_NO_CCDIRECTOR_CLASS\n";done_=true;return true;}
-        const GuestMethod* method=FindClassMethodRecursive(cls,"sharedDirector");
-        if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_SHARED_DIRECTOR\n";done_=true;return true;}
-        cpu_.Regs()[0]=cls->class_addr;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
-        EnterGuestMethod(*method);host_call_stage_=HostCallStage::AcquireDirector;
-        log_<<"IOS: UIApplicationMain continuing into cocos2d event loop: acquiring CCDirector\n";
-        return true;
+        if(const GuestClass* cls=FindGuestClassByName("CCDirector")){
+            if(const GuestMethod* method=FindClassMethodRecursive(cls,"sharedDirector")){
+                director_caller_mode_=false;
+                cpu_.Regs()[0]=cls->class_addr;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+                EnterGuestMethod(*method);host_call_stage_=HostCallStage::AcquireDirector;
+                log_<<"IOS: UIApplicationMain continuing into cocos2d event loop: acquiring CCDirector\n";
+                return true;
+            }
+        }
+        // cocos2d-x 2.x iOS does not expose the C++ CCDirector as an ObjC class.
+        // Its Objective-C display-link shim is CCDirectorCaller.  startMainLoop
+        // installs CADisplayLink(target:self, selector:doCaller:); doCaller: then
+        // calls the real C++ CCDirector::mainLoop virtual entry. Drive that shim
+        // directly from the Windows 60 Hz host loop.
+        if(const GuestClass* caller=FindGuestClassByName("CCDirectorCaller")){
+            if(const GuestMethod* method=FindClassMethodRecursive(caller,"sharedDirectorCaller")){
+                director_caller_mode_=true;
+                cpu_.Regs()[0]=caller->class_addr;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
+                EnterGuestMethod(*method);host_call_stage_=HostCallStage::AcquireDirector;
+                log_<<"IOS FRAME: CCDirector ObjC class absent; using CCDirectorCaller display-link shim\n";
+                return true;
+            }
+        }
+        log_<<"RESULT: IOS_FRAME_PUMP_NO_DIRECTOR_BRIDGE classes=CCDirector,CCDirectorCaller\n";done_=true;return true;
     }
 
     bool BeginRunningSceneQuery(){
+        if(director_caller_mode_)return BeginFrameProbe();
         const GuestClass* cls=FindGuestClassForInstance(director_instance_);
         if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
         const GuestMethod* method=FindInstanceMethodRecursive(cls,"runningScene");
@@ -2562,14 +2966,16 @@ private:
         if(BeginTouchDispatch())return true;
         const GuestClass* cls=FindGuestClassForInstance(director_instance_);
         if(!cls){log_<<"RESULT: IOS_FRAME_PUMP_BAD_DIRECTOR object=0x"<<Hex(director_instance_)<<"\n";done_=true;return true;}
-        const GuestMethod* method=FindInstanceMethodRecursive(cls,"drawScene");
-        if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_DRAWSCENE director-class="<<cls->name<<"\n";done_=true;return true;}
+        const char* selector=director_caller_mode_?"doCaller:":"drawScene";
+        const GuestMethod* method=FindInstanceMethodRecursive(cls,selector);
+        if(!method){log_<<"RESULT: IOS_FRAME_PUMP_NO_CALLBACK director-class="<<cls->name<<" selector="<<selector<<"\n";done_=true;return true;}
         virtual_time_usec_+=kSyntheticFrameUsec;
         cpu_.Regs()[0]=director_instance_;cpu_.Regs()[1]=method->selector_addr;cpu_.Regs()[2]=0u;cpu_.Regs()[3]=0u;cpu_.Regs()[14]=kControlBase;
         frame_present_start_=host_window_.PresentCount();
         EnterGuestMethod(*method);host_call_stage_=HostCallStage::Frame;frame_pump_active_=true;
         if(frame_count_<3u||frame_count_%120u==0u)
-            log_<<"IOS: frame pump begin frame="<<(frame_count_+1u)<<" director="<<cls->name<<" drawScene=0x"<<Hex(method->imp)<<"\n";
+            log_<<"IOS: frame pump begin frame="<<(frame_count_+1u)<<" bridge="<<(director_caller_mode_?"CCDirectorCaller":"CCDirector")
+                <<" class="<<cls->name<<" selector="<<selector<<" imp=0x"<<Hex(method->imp)<<"\n";
         return true;
     }
 
@@ -2650,6 +3056,185 @@ private:
     u32 LibcxxStringData(u32 object){
         if(!object||!env_.IsMapped(object,12u))return 0u;
         return (env_.MemoryRead8(object)&1u)?env_.MemoryRead32(object+8u):(object+1u);
+    }
+
+    std::string FormatGuestPrintf(std::string_view format,u32 first_slot,u32 va_list_ptr=0u){
+        // ARMv7 variadic arguments occupy 32-bit core-register/stack slots.
+        // first_slot is the absolute AAPCS word slot: r0=0 ... r3=3, stack[0]=4.
+        u32 slot=first_slot;
+        u32 va_cursor=va_list_ptr;
+        auto fetch32=[&]() -> u32 {
+            u32 value=0u;
+            if(va_cursor){
+                if(env_.IsMapped(va_cursor,4u))value=env_.MemoryRead32(va_cursor);
+                va_cursor+=4u;
+                return value;
+            }
+            if(slot<4u)value=cpu_.Regs()[slot];
+            else value=StackArg(slot-4u);
+            ++slot;
+            return value;
+        };
+        auto align64=[&](){
+            if(va_cursor){va_cursor=AlignUp(va_cursor,8u);return;}
+            if(slot&1u)++slot;
+        };
+        auto fetch64=[&]() -> u64 {
+            align64();
+            const u32 lo=fetch32(),hi=fetch32();
+            return u64(lo)|(u64(hi)<<32u);
+        };
+        std::ostringstream out;
+        for(std::size_t i=0;i<format.size();){
+            if(format[i]!='%'){out<<format[i++];continue;}
+            ++i;
+            if(i<format.size()&&format[i]=='%'){out<<'%';++i;continue;}
+            bool left=false,plus=false,space=false,alt=false,zero=false;
+            for(;i<format.size();++i){
+                if(format[i]=='-')left=true;
+                else if(format[i]=='+')plus=true;
+                else if(format[i]==' ')space=true;
+                else if(format[i]=='#')alt=true;
+                else if(format[i]=='0')zero=true;
+                else break;
+            }
+            int width=-1,precision=-1;
+            if(i<format.size()&&format[i]=='*'){width=static_cast<int>(fetch32());++i;}
+            else if(i<format.size()&&std::isdigit(static_cast<unsigned char>(format[i]))){
+                width=0;while(i<format.size()&&std::isdigit(static_cast<unsigned char>(format[i])))width=width*10+(format[i++]-'0');
+            }
+            if(i<format.size()&&format[i]=='.'){
+                ++i;
+                if(i<format.size()&&format[i]=='*'){precision=static_cast<int>(fetch32());++i;}
+                else {precision=0;while(i<format.size()&&std::isdigit(static_cast<unsigned char>(format[i])))precision=precision*10+(format[i++]-'0');}
+            }
+            enum class Len{None,HH,H,L,LL,Z,T,J};
+            Len len=Len::None;
+            if(i+1<format.size()&&format.substr(i,2)=="hh"){len=Len::HH;i+=2;}
+            else if(i<format.size()&&format[i]=='h'){len=Len::H;++i;}
+            else if(i+1<format.size()&&format.substr(i,2)=="ll"){len=Len::LL;i+=2;}
+            else if(i<format.size()&&format[i]=='l'){len=Len::L;++i;}
+            else if(i<format.size()&&format[i]=='z'){len=Len::Z;++i;}
+            else if(i<format.size()&&format[i]=='t'){len=Len::T;++i;}
+            else if(i<format.size()&&format[i]=='j'){len=Len::J;++i;}
+            if(i>=format.size())break;
+            const char conv=format[i++];
+            std::ostringstream field;
+            if(left)field<<std::left;
+            if(plus)field<<std::showpos;
+            if(alt)field<<std::showbase;
+            if(zero&&!left)field<<std::setfill('0');
+            if(width>=0)field<<std::setw(width);
+            if(precision>=0)field<<std::setprecision(precision);
+            switch(conv){
+                case 's':{
+                    const u32 ptr=fetch32();std::string v;
+                    if(ptr)env_.ReadCString(ptr,v,1u<<20);
+                    if(precision>=0&&static_cast<std::size_t>(precision)<v.size())v.resize(static_cast<std::size_t>(precision));
+                    field<<v;break;
+                }
+                case '@':{
+                    field<<DescribeString(fetch32());break;
+                }
+                case 'c':field<<static_cast<char>(fetch32()&0xffu);break;
+                case 'p':field<<"0x"<<std::hex<<fetch32()<<std::dec;break;
+                case 'd':case 'i':{
+                    if(len==Len::LL||len==Len::J)field<<static_cast<s64>(fetch64());
+                    else field<<static_cast<s32>(fetch32());
+                    break;
+                }
+                case 'u':case 'o':case 'x':case 'X':{
+                    const bool wide=len==Len::LL||len==Len::J;
+                    const u64 v=wide?fetch64():fetch32();
+                    if(conv=='o')field<<std::oct;
+                    else if(conv=='x'||conv=='X'){field<<std::hex;if(conv=='X')field<<std::uppercase;}
+                    field<<v<<std::dec;break;
+                }
+                case 'f':case 'F':case 'e':case 'E':case 'g':case 'G':{
+                    const u64 bits=fetch64();double v=0.0;std::memcpy(&v,&bits,sizeof(v));
+                    if(conv=='f'||conv=='F')field<<std::fixed;
+                    else if(conv=='e'||conv=='E')field<<std::scientific;
+                    if(conv=='E'||conv=='F'||conv=='G')field<<std::uppercase;
+                    field<<v;break;
+                }
+                case 'n':{
+                    const u32 ptr=fetch32();if(ptr&&env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,static_cast<u32>(out.str().size()));break;
+                }
+                default: field<<'%'<<conv; break;
+            }
+            out<<field.str();
+        }
+        return out.str();
+    }
+    u32 WriteGuestFormatted(u32 dest,u32 capacity,const std::string& value){
+        const u32 required=static_cast<u32>(std::min<std::size_t>(value.size(),0x7fffffffu));
+        if(dest&&capacity){
+            const u32 copied=std::min<u32>(required,capacity-1u);
+            if(env_.IsMapped(dest,capacity)){
+                if(copied)env_.WriteBytes(dest,value.data(),copied);
+                env_.MemoryWrite8(dest+copied,0u);
+            }
+        }
+        return required;
+    }
+
+
+    int ScanGuestString(std::string_view input,std::string_view format,u32 first_slot){
+        u32 slot=first_slot;
+        auto fetch_ptr=[&]()->u32{u32 v=slot<4u?cpu_.Regs()[slot]:StackArg(slot-4u);++slot;return v;};
+        std::size_t ip=0,fp=0;int assigned=0;
+        auto skip_input_ws=[&](){while(ip<input.size()&&std::isspace(static_cast<unsigned char>(input[ip])))++ip;};
+        auto store_integer=[&](u32 ptr,long long value,int bytes,bool is_unsigned){
+            if(!ptr)return;
+            if(bytes==1&&env_.IsMapped(ptr,1u))env_.MemoryWrite8(ptr,static_cast<u8>(value));
+            else if(bytes==2&&env_.IsMapped(ptr,2u))env_.MemoryWrite16(ptr,static_cast<u16>(value));
+            else if(bytes==8&&env_.IsMapped(ptr,8u))env_.MemoryWrite64(ptr,static_cast<u64>(value));
+            else if(env_.IsMapped(ptr,4u))env_.MemoryWrite32(ptr,is_unsigned?static_cast<u32>(static_cast<unsigned long long>(value)):static_cast<u32>(static_cast<s32>(value)));
+        };
+        while(fp<format.size()){
+            if(std::isspace(static_cast<unsigned char>(format[fp]))){while(fp<format.size()&&std::isspace(static_cast<unsigned char>(format[fp])))++fp;skip_input_ws();continue;}
+            if(format[fp]!='%'){if(ip>=input.size()||input[ip]!=format[fp])break;++ip;++fp;continue;}
+            ++fp;if(fp<format.size()&&format[fp]=='%'){if(ip>=input.size()||input[ip]!='%')break;++ip;++fp;continue;}
+            bool suppress=false;if(fp<format.size()&&format[fp]=='*'){suppress=true;++fp;}
+            int width=0;while(fp<format.size()&&std::isdigit(static_cast<unsigned char>(format[fp])))width=width*10+(format[fp++]-'0');
+            enum class Len{None,HH,H,L,LL};Len len=Len::None;
+            if(fp+1<format.size()&&format.substr(fp,2)=="hh"){len=Len::HH;fp+=2;}
+            else if(fp<format.size()&&format[fp]=='h'){len=Len::H;++fp;}
+            else if(fp+1<format.size()&&format.substr(fp,2)=="ll"){len=Len::LL;fp+=2;}
+            else if(fp<format.size()&&format[fp]=='l'){len=Len::L;++fp;}
+            if(fp>=format.size())break;const char conv=format[fp++];
+            if(conv!='c'&&conv!='['&&conv!='n')skip_input_ws();
+            const std::size_t begin=ip;
+            if(conv=='d'||conv=='i'||conv=='u'||conv=='x'||conv=='X'||conv=='o'){
+                const int base=conv=='x'||conv=='X'?16:(conv=='o'?8:(conv=='i'?0:10));
+                std::size_t maxn=width?std::min<std::size_t>(width,input.size()-ip):input.size()-ip;
+                std::string temp(input.substr(ip,maxn));char* end=nullptr;
+                if(conv=='u'||conv=='x'||conv=='X'||conv=='o'){
+                    unsigned long long v=std::strtoull(temp.c_str(),&end,base);if(end==temp.c_str())break;ip+=static_cast<std::size_t>(end-temp.c_str());
+                    if(!suppress){const u32 ptr=fetch_ptr();const int bytes=len==Len::HH?1:(len==Len::H?2:(len==Len::LL?8:4));store_integer(ptr,static_cast<long long>(v),bytes,true);++assigned;}
+                }else{
+                    long long v=std::strtoll(temp.c_str(),&end,base);if(end==temp.c_str())break;ip+=static_cast<std::size_t>(end-temp.c_str());
+                    if(!suppress){const u32 ptr=fetch_ptr();const int bytes=len==Len::HH?1:(len==Len::H?2:(len==Len::LL?8:4));store_integer(ptr,v,bytes,false);++assigned;}
+                }
+            }else if(conv=='f'||conv=='F'||conv=='e'||conv=='E'||conv=='g'||conv=='G'){
+                std::size_t maxn=width?std::min<std::size_t>(width,input.size()-ip):input.size()-ip;std::string temp(input.substr(ip,maxn));char* end=nullptr;double v=std::strtod(temp.c_str(),&end);if(end==temp.c_str())break;ip+=static_cast<std::size_t>(end-temp.c_str());
+                if(!suppress){const u32 ptr=fetch_ptr();if(len==Len::L){if(ptr&&env_.IsMapped(ptr,8u))env_.WriteBytes(ptr,&v,8u);}else{const float f=static_cast<float>(v);if(ptr&&env_.IsMapped(ptr,4u))env_.WriteBytes(ptr,&f,4u);}++assigned;}
+            }else if(conv=='s'){
+                std::size_t n=0;while(ip+n<input.size()&&!std::isspace(static_cast<unsigned char>(input[ip+n]))&&(!width||n<static_cast<std::size_t>(width)))++n;if(!n)break;
+                if(!suppress){const u32 ptr=fetch_ptr();if(ptr&&env_.IsMapped(ptr,n+1u)){env_.WriteBytes(ptr,input.data()+ip,n);env_.MemoryWrite8(ptr+static_cast<u32>(n),0u);}++assigned;}ip+=n;
+            }else if(conv=='c'){
+                const std::size_t n=width?static_cast<std::size_t>(width):1u;if(ip+n>input.size())break;
+                if(!suppress){const u32 ptr=fetch_ptr();if(ptr&&env_.IsMapped(ptr,n))env_.WriteBytes(ptr,input.data()+ip,n);++assigned;}ip+=n;
+            }else if(conv=='n'){
+                if(!suppress){const u32 ptr=fetch_ptr();const int bytes=len==Len::HH?1:(len==Len::H?2:(len==Len::LL?8:4));store_integer(ptr,static_cast<long long>(ip),bytes,false);}
+            }else if(conv=='['){
+                bool negate=false;if(fp<format.size()&&format[fp]=='^'){negate=true;++fp;}std::array<bool,256> set{};if(fp<format.size()&&format[fp]==']'){set[static_cast<unsigned char>(']')]=true;++fp;}while(fp<format.size()&&format[fp]!=']')set[static_cast<unsigned char>(format[fp++])]=true;if(fp<format.size()&&format[fp]==']')++fp;
+                std::size_t n=0;while(ip+n<input.size()&&(!width||n<static_cast<std::size_t>(width))){const bool in=set[static_cast<unsigned char>(input[ip+n])];if((!negate&&!in)||(negate&&in))break;++n;}if(!n)break;
+                if(!suppress){const u32 ptr=fetch_ptr();if(ptr&&env_.IsMapped(ptr,n+1u)){env_.WriteBytes(ptr,input.data()+ip,n);env_.MemoryWrite8(ptr+static_cast<u32>(n),0u);}++assigned;}ip+=n;
+            }else break;
+            if(ip==begin&&conv!='n')break;
+        }
+        return assigned;
     }
 
     float FakeFontSize(u32 font)const{
@@ -2836,7 +3421,7 @@ private:
         // Geometry Dash 1.81-2.11 bundles the now-defunct Everyplay SDK.
         // PublicTest28 only bypassed Everyplay itself, but the game immediately
         // entered EveryplayAudioManager / EveryplaySoundEngine / notification
-        // helpers and crashed before cocos2d could present frame 1.  PublicTest29
+        // helpers and crashed before cocos2d could present frame 1.  PublicTest30
         // quarantines the whole Everyplay class family: do not execute any guest
         // Everyplay IMP.  Singleton/constructor-style calls receive a stable
         // inert object; capability queries report unavailable; everything else
@@ -3061,6 +3646,14 @@ private:
             if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithString:"){
                 cpu_.Regs()[0]=NewFakeString(DescribeString(cpu_.Regs()[2]));return true;
             }
+            if(fo.is_class&&fo.class_name=="NSString"&&selector=="stringWithFormat:"){
+                const std::string fmt=DescribeString(cpu_.Regs()[2]);
+                const std::string value=FormatGuestPrintf(fmt,3u);
+                cpu_.Regs()[0]=NewFakeString(value);
+                if(++format_string_logs_<=24u)log_<<"IOS FOUNDATION FORMAT: '"<<EscapeForLog(fmt)
+                    <<"' -> '"<<EscapeForLog(value)<<"'\n";
+                return true;
+            }
             if(fo.is_class&&fo.class_name=="UIFont"&&(selector=="systemFontOfSize:"||selector=="boldSystemFontOfSize:")){
                 cpu_.Regs()[0]=NewFakeFont(FloatFromBits(cpu_.Regs()[2]),selector=="boldSystemFontOfSize:");return true;
             }
@@ -3074,9 +3667,17 @@ private:
                     ?std::string("file://")+value:value;
                 cpu_.Regs()[0]=obj;
                 if(++url_object_logs_<=24u)
-                    log_<<"IOS URL: "<<selector<<" '"<<fake_objects_[obj].string_value
+                    log_<<"IOS URL: "<<selector<<" '"<<EscapeForLog(fake_objects_[obj].string_value)
                         <<"' -> 0x"<<Hex(obj)<<"\n";
                 return true;
+            }
+            if(fo.is_class&&fo.class_name=="NSData"&&
+               (selector=="dataWithBytes:length:"||selector=="dataWithBytesNoCopy:length:"||
+                selector=="dataWithBytesNoCopy:length:freeWhenDone:")){
+                cpu_.Regs()[0]=NewDataFromGuestBytes(cpu_.Regs()[2],cpu_.Regs()[3]);return true;
+            }
+            if(fo.is_class&&fo.class_name=="UIImage"&&selector=="imageWithData:"){
+                cpu_.Regs()[0]=NewImageFromData(cpu_.Regs()[2]);return true;
             }
             if(fo.is_class&&fo.class_name=="UIImage"&&(selector=="imageNamed:"||selector=="imageWithContentsOfFile:")){
                 cpu_.Regs()[0]=NewImageForAsset(DescribeString(cpu_.Regs()[2]));return true;
@@ -3130,8 +3731,18 @@ private:
                 }
                 const std::string rel=ResolveAssetRelative(candidate);
                 cpu_.Regs()[0]=rel.empty()?0u:NewFakeString("ipa://"+rel);
-                if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: NSBundle "<<candidate<<" -> "<<rel<<"\n";
+                if(!rel.empty()&&++asset_resolve_logs_<=16u)log_<<"IOS ASSET: NSBundle "<<EscapeForLog(candidate)<<" -> "<<EscapeForLog(rel)<<"\n";
                 return true;
+            }
+            if(!fo.is_class&&fo.class_name=="NSData"){
+                auto dit=fake_data_bytes_.find(receiver);
+                if(selector=="length"){cpu_.Regs()[0]=dit==fake_data_bytes_.end()?0u:static_cast<u32>(dit->second.size());return true;}
+                if(selector=="bytes"){
+                    if(dit==fake_data_bytes_.end()||dit->second.empty()){cpu_.Regs()[0]=0u;return true;}
+                    u32& guest_copy=fake_objects_[receiver].aux0;
+                    if(!guest_copy){guest_copy=Allocate(static_cast<u32>(dit->second.size()),8u);env_.WriteBytes(guest_copy,dit->second.data(),dit->second.size());}
+                    cpu_.Regs()[0]=guest_copy;return true;
+                }
             }
             if(!fo.is_class&&fo.class_name=="UIImage"&&selector=="initWithContentsOfFile:"){
                 fake_objects_[receiver].resource_value=ResolveAssetRelative(DescribeString(cpu_.Regs()[2]));
@@ -3562,7 +4173,8 @@ private:
         if(host_call_stage_==HostCallStage::AcquireDirector){
             director_instance_=cpu_.Regs()[0];host_call_stage_=HostCallStage::None;
             const GuestClass* cls=FindGuestClassForInstance(director_instance_);
-            log_<<"IOS: CCDirector acquired object=0x"<<Hex(director_instance_)<<" class="<<(cls?cls->name:"unknown")<<"\n";
+            log_<<"IOS FRAME: acquired object=0x"<<Hex(director_instance_)<<" class="<<(cls?cls->name:"unknown")
+                <<" bridge="<<(director_caller_mode_?"CCDirectorCaller":"CCDirector")<<"\n";
             return BeginRunningSceneQuery();
         }
         if(host_call_stage_==HostCallStage::QueryRunningScene){
@@ -3580,6 +4192,7 @@ private:
             if(observed_scene_)running_scene_=observed_scene_;
             if(host_window_.Ready()){
                 if(host_window_.PresentCount()==frame_present_start_)host_window_.Present();
+                if(frame_count_<=8u)log_<<"IOS HOSTGL PRESENT: completed-frame="<<frame_count_<<" presents="<<host_window_.PresentCount()<<"\n";
                 host_window_.Pace60();
             }
             if(kFrameProbeCount!=0u&&frame_count_>=kFrameProbeCount){
@@ -3646,6 +4259,48 @@ private:
            name=="_objc_autoreleaseReturnValue"||name=="_objc_retainAutoreleaseReturnValue")return true;
         if(name=="_objc_release"){cpu_.Regs()[0]=0u;return true;}
 
+        // Core compiler/runtime helpers.  These are not optional SDK APIs:
+        // cocos2d and the C++ standard library use them in ordinary control flow.
+        if(name=="__udivsi3"){
+            const u32 divisor=cpu_.Regs()[1];
+            cpu_.Regs()[0]=divisor?cpu_.Regs()[0]/divisor:0u;
+            return true;
+        }
+        if(name=="__umodsi3"){
+            const u32 divisor=cpu_.Regs()[1];
+            cpu_.Regs()[0]=divisor?cpu_.Regs()[0]%divisor:0u;
+            return true;
+        }
+        if(name=="__divsi3"){
+            const s32 lhs=static_cast<s32>(cpu_.Regs()[0]),rhs=static_cast<s32>(cpu_.Regs()[1]);
+            cpu_.Regs()[0]=rhs?static_cast<u32>(lhs/rhs):0u;
+            return true;
+        }
+        if(name=="__modsi3"){
+            const s32 lhs=static_cast<s32>(cpu_.Regs()[0]),rhs=static_cast<s32>(cpu_.Regs()[1]);
+            cpu_.Regs()[0]=rhs?static_cast<u32>(lhs%rhs):0u;
+            return true;
+        }
+        if(name=="__cxxabi_typeinfo_virtual"){
+            // Inert fallback for imported C++ ABI type_info vtables.  The
+            // bootstrap does not throw across this boundary; preserve object
+            // identity for pointer-returning calls and otherwise succeed.
+            return true;
+        }
+        if(name=="__dynamic_cast"){
+            // Full Itanium RTTI traversal is unnecessary for the startup casts
+            // observed in GD: they are casts of already-live cocos2d objects to
+            // their concrete type.  Returning the source object preserves the
+            // object identity instead of manufacturing a null pointer.
+            const u32 source=cpu_.Regs()[0];
+            cpu_.Regs()[0]=source;
+            if(++dynamic_cast_logs_<=48u)
+                log_<<"IOS CXX RTTI: __dynamic_cast source=0x"<<Hex(source)
+                    <<" src-type=0x"<<Hex(cpu_.Regs()[1])<<" dst-type=0x"<<Hex(cpu_.Regs()[2])
+                    <<" -> 0x"<<Hex(source)<<"\n";
+            return true;
+        }
+
         // libdispatch once.  Geometry Dash uses this pervasively for singleton
         // creation.  PublicTest26 skipped every block, leaving managers nil.
         if(name=="dispatch_once"){
@@ -3700,6 +4355,20 @@ private:
         }
         if(name=="_ZNSs5eraseEmm"){
             const u32 self=cpu_.Regs()[0];std::string v;ReadGnuString(self,v);const u32 pos=cpu_.Regs()[1],n=cpu_.Regs()[2];if(pos<v.size())v.erase(pos,std::min<std::size_t>(n,v.size()-pos));WriteGnuString(self,v);cpu_.Regs()[0]=self;return true;
+        }
+        if(name=="_ZNSs9_M_mutateEmmm"){
+            const u32 self=cpu_.Regs()[0],pos=cpu_.Regs()[1],erase_count=cpu_.Regs()[2],insert_count=cpu_.Regs()[3];
+            std::string v;ReadGnuString(self,v);
+            const std::size_t p=std::min<std::size_t>(pos,v.size());
+            const std::size_t erase_n=std::min<std::size_t>(erase_count,v.size()-p);
+            if(insert_count>(1u<<20)){cpu_.Regs()[0]=self;return true;}
+            v.replace(p,erase_n,static_cast<std::size_t>(insert_count),'\0');
+            WriteGnuString(self,v);
+            cpu_.Regs()[0]=self;
+            if(++cpp_mutate_logs_<=32u)
+                log_<<"IOS CXXSTR: libstdc++ _M_mutate pos="<<pos<<" erase="<<erase_count
+                    <<" insert="<<insert_count<<" new-len="<<v.size()<<"\n";
+            return true;
         }
         if(name=="_ZNSs7reserveEm"||name=="_ZNSs12_M_leak_hardEv"){return true;}
         if(name=="_ZNSs4_Rep10_M_destroyERKSaIcE"){
@@ -4113,6 +4782,66 @@ private:
         if(name=="CFRelease"){cpu_.Regs()[0]=0u;return true;}
         if(name=="dispatch_queue_create"){cpu_.Regs()[0]=NewExternalInstance("OS_dispatch_queue");return true;}
 
+        if(name=="NSSearchPathForDirectoriesInDomains"){
+            const u32 directory=cpu_.Regs()[0];
+            std::string path="/var/mobile/Applications/GeometryDash";
+            if(directory==9u)path+="/Documents";          // NSDocumentDirectory
+            else if(directory==5u)path+="/Library";      // NSLibraryDirectory
+            else if(directory==13u)path+="/Library/Caches";
+            else path+="/Documents";
+            const u32 array=NewExternalInstance("NSArray");
+            fake_collections_[array].push_back(NewFakeString(path));
+            cpu_.Regs()[0]=array;
+            if(++search_path_logs_<=16u)
+                log_<<"IOS FOUNDATION PATH: NSSearchPath directory="<<directory
+                    <<" -> '"<<path<<"'\n";
+            return true;
+        }
+        if(name=="atoi"||name=="atol"){
+            std::string text;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],text,1u<<20);char* end=nullptr;const long v=std::strtol(text.c_str(),&end,10);cpu_.Regs()[0]=static_cast<u32>(static_cast<s32>(v));
+            if(++libc_parse_logs_<=32u)log_<<"IOS LIBC PARSE: "<<name<<" '"<<EscapeForLog(text)<<"' -> "<<static_cast<s32>(cpu_.Regs()[0])<<"\n";return true;
+        }
+        if(name=="strtol"||name=="strtoul"){
+            std::string text;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],text,1u<<20);const int base=static_cast<int>(cpu_.Regs()[2]);char* end=nullptr;u32 result=0u;std::size_t consumed=0u;
+            if(name=="strtoul"){const unsigned long v=std::strtoul(text.c_str(),&end,base);result=static_cast<u32>(v);}else{const long v=std::strtol(text.c_str(),&end,base);result=static_cast<u32>(static_cast<s32>(v));}if(end)consumed=static_cast<std::size_t>(end-text.c_str());
+            const u32 endptr=cpu_.Regs()[1];if(endptr&&env_.IsMapped(endptr,4u))env_.MemoryWrite32(endptr,cpu_.Regs()[0]+static_cast<u32>(consumed));cpu_.Regs()[0]=result;return true;
+        }
+        if(name=="strtok"){
+            const u32 input_ptr=cpu_.Regs()[0];std::string delims;if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],delims,1024u);if(input_ptr)strtok_cursor_=input_ptr;
+            auto is_delim=[&](u8 c){return delims.find(static_cast<char>(c))!=std::string::npos;};u32 cur=strtok_cursor_;if(!cur){cpu_.Regs()[0]=0u;return true;}
+            while(env_.IsMapped(cur,1u)&&env_.MemoryRead8(cur)&&is_delim(env_.MemoryRead8(cur)))++cur;if(!env_.IsMapped(cur,1u)||!env_.MemoryRead8(cur)){strtok_cursor_=0u;cpu_.Regs()[0]=0u;return true;}
+            const u32 token=cur;while(env_.IsMapped(cur,1u)&&env_.MemoryRead8(cur)&&!is_delim(env_.MemoryRead8(cur)))++cur;if(env_.IsMapped(cur,1u)&&env_.MemoryRead8(cur)){env_.MemoryWrite8(cur,0u);strtok_cursor_=cur+1u;}else strtok_cursor_=0u;cpu_.Regs()[0]=token;
+            if(++libc_parse_logs_<=32u){std::string tok;env_.ReadCString(token,tok,4096u);log_<<"IOS LIBC PARSE: strtok -> '"<<EscapeForLog(tok)<<"'\n";}return true;
+        }
+        if(name=="sscanf"){
+            std::string input,fmt;if(cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],input,1u<<20);if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],fmt,4096u);const int n=ScanGuestString(input,fmt,2u);cpu_.Regs()[0]=static_cast<u32>(n);
+            if(++libc_parse_logs_<=32u)log_<<"IOS LIBC PARSE: sscanf fmt='"<<EscapeForLog(fmt)<<"' input='"<<EscapeForLog(input.substr(0,160u))<<"' assigned="<<n<<"\n";return true;
+        }
+        if(name=="sprintf"){
+            std::string fmt;if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],fmt,1u<<20);
+            const std::string value=FormatGuestPrintf(fmt,2u);
+            cpu_.Regs()[0]=WriteGuestFormatted(cpu_.Regs()[0],static_cast<u32>(value.size()+1u),value);
+            if(++printf_format_logs_<=24u)log_<<"IOS LIBC FORMAT: sprintf fmt='"<<EscapeForLog(fmt)
+                <<"' result='"<<EscapeForLog(value)<<"'\n";
+            return true;
+        }
+        if(name=="snprintf"){
+            const u32 dest=cpu_.Regs()[0],capacity=cpu_.Regs()[1];
+            std::string fmt;if(cpu_.Regs()[2])env_.ReadCString(cpu_.Regs()[2],fmt,1u<<20);
+            const std::string value=FormatGuestPrintf(fmt,3u);
+            cpu_.Regs()[0]=WriteGuestFormatted(dest,capacity,value);
+            return true;
+        }
+        if(name=="vsnprintf"){
+            const u32 dest=cpu_.Regs()[0],capacity=cpu_.Regs()[1],va_list_ptr=cpu_.Regs()[3];
+            std::string fmt;if(cpu_.Regs()[2])env_.ReadCString(cpu_.Regs()[2],fmt,1u<<20);
+            const std::string value=FormatGuestPrintf(fmt,4u,va_list_ptr);
+            cpu_.Regs()[0]=WriteGuestFormatted(dest,capacity,value);
+            if(++printf_format_logs_<=24u)log_<<"IOS LIBC FORMAT: vsnprintf fmt='"<<EscapeForLog(fmt)
+                <<"' result='"<<EscapeForLog(value)<<"'\n";
+            return true;
+        }
+
         // Read-only stdio backed directly by files inside Payload/<app>.app/.
         // cocos2d's CCZ/PVR loaders use the C FILE API even when NSBundle has
         // already resolved the resource path, so returning null from fopen was
@@ -4129,7 +4858,7 @@ private:
             cpu_.Regs()[0]=OpenVirtualAsset(path,false);
             if(!cpu_.Regs()[0]){
                 SetGuestErrno(2u); // ENOENT, matching a normal non-jailbroken iOS filesystem probe.
-                if(++file_failure_logs_<=16u)log_<<"IOS FILE: fopen miss path="<<path<<" mode="<<mode<<" errno=2\n";
+                if(++file_failure_logs_<=16u)log_<<"IOS FILE: fopen miss path='"<<EscapeForLog(path)<<"' mode='"<<EscapeForLog(mode)<<"' errno=2\n";
             }
             return true;
         }
@@ -4286,10 +5015,15 @@ private:
         // makes the first constructor that allocates an STL/FMOD object write
         // through address zero before UIApplicationMain can ever be reached.
         if(name=="_Znwm"||name=="_Znam"||name=="_ZnwmRKSt9nothrow_t"){
-            const u32 size=cpu_.Regs()[0];
+            const u32 size=cpu_.Regs()[0],caller=cpu_.Regs()[14];
             cpu_.Regs()[0]=Allocate(size?size:1u,8u,true);
             if(++cpp_runtime_logs_<=32u)
                 log_<<"IOS CXX: "<<name<<" size="<<size<<" -> 0x"<<Hex(cpu_.Regs()[0])<<"\n";
+            if(frame_pump_active_&&size==0x2cu){
+                last_new44_ptr_=cpu_.Regs()[0];last_new44_caller_=caller;last_new44_sp_=cpu_.Regs()[13];
+                if(++ccstring_alloc_logs_<=48u)
+                    log_<<"IOS CXX TRACE: new(0x2c) caller=0x"<<Hex(caller)<<" -> 0x"<<Hex(cpu_.Regs()[0])<<" sp=0x"<<Hex(cpu_.Regs()[13])<<"\n";
+            }
             return true;
         }
         if(name=="_ZdlPv"||name=="_ZdaPv"||name=="_ZdlPvRKSt9nothrow_t"){
@@ -4325,22 +5059,62 @@ private:
         if(name=="__cxa_begin_catch"){return true;}
         if(name=="__cxa_end_catch"){cpu_.Regs()[0]=0u;return true;}
         if(name=="dlsym"){
+            // iOS middleware (Everyplay/FMOD/CocosDenshion) resolves a surprising
+            // amount of system audio/GL functionality dynamically.  Returning
+            // NULL here is not equivalent to an unavailable optional feature:
+            // several released GD builds cache the result and later BLX through
+            // it without a null check.  Bind non-empty names to the same SVC
+            // import trampoline used by normal Mach-O symbols so indirect calls
+            // remain inside the compatibility layer.
             std::string symbol;
             if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],symbol,512u);
-            if(symbol=="alcMacOSXMixerOutputRate"){
-                cpu_.Regs()[0]=EnsureImport("alcMacOSXMixerOutputRate");
-                if(++dynamic_symbol_logs_<=16u)
+            if(!symbol.empty()){
+                cpu_.Regs()[0]=EnsureImport(symbol);
+                if(++dynamic_symbol_logs_<=64u)
                     log_<<"IOS DYNSYM: dlsym '"<<symbol<<"' -> synthetic stub 0x"<<Hex(cpu_.Regs()[0])<<"\n";
             }else{
                 cpu_.Regs()[0]=0u;
-                if(++dynamic_symbol_logs_<=16u)
-                    log_<<"IOS DYNSYM: dlsym '"<<symbol<<"' -> null\n";
+                if(++dynamic_symbol_logs_<=64u)
+                    log_<<"IOS DYNSYM: dlsym <empty> -> null\n";
             }
+            return true;
+        }
+        if(name=="alcGetProcAddress"||name=="alGetProcAddress"){
+            // OpenAL's extension resolver is itself commonly obtained via
+            // dlsym().  Return another synthetic import trampoline for the
+            // requested extension instead of handing guest code a null pointer.
+            std::string symbol;
+            if(cpu_.Regs()[1])env_.ReadCString(cpu_.Regs()[1],symbol,512u);
+            if(symbol.empty()&&cpu_.Regs()[0])env_.ReadCString(cpu_.Regs()[0],symbol,512u);
+            cpu_.Regs()[0]=symbol.empty()?0u:EnsureImport(symbol);
+            if(++dynamic_symbol_logs_<=64u)
+                log_<<"IOS DYNSYM: "<<name<<" '"<<symbol<<"' -> 0x"<<Hex(cpu_.Regs()[0])<<"\n";
             return true;
         }
         if(name=="alcMacOSXMixerOutputRate"){
             // Obsolete Apple OpenAL extension used only to tune the mixer rate.
             // Treat as a successful no-op; desktop OpenAL/host audio owns timing.
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="AudioOutputUnitStart"||name=="AudioOutputUnitStop"||
+           name=="AudioSessionInitialize"||name=="AUGraphStart"||name=="AUGraphStop"||
+           name=="AudioQueueDispose"||name=="AudioQueueStart"||name=="AudioQueueStop"||
+           name=="AudioQueuePause"||name=="AudioQueueEnqueueBuffer"||
+           name=="AudioQueueEnqueueBufferWithParameters"||name=="AudioQueueSetParameter"||
+           name=="AudioQueueSetOfflineRenderFormat"){
+            // These dynamically resolved audio entry points return OSStatus.
+            // Audio is not wired to the iOS device stack yet, but a successful
+            // inert implementation is substantially more faithful than a null
+            // function pointer and lets cocos2d continue initialisation.
+            cpu_.Regs()[0]=0u;
+            return true;
+        }
+        if(name=="AudioQueueNewOutput"){
+            // AudioQueueNewOutput(..., AudioQueueRef *outAQ).  The out pointer is
+            // the seventh AAPCS argument (stack slot 2 after r0-r3).
+            const u32 out_queue=StackArg(2);
+            if(out_queue&&env_.IsMapped(out_queue,4u))env_.MemoryWrite32(out_queue,Allocate(16u));
             cpu_.Regs()[0]=0u;
             return true;
         }
@@ -4386,10 +5160,11 @@ private:
     }
 
     enum class HostCallStage { None, Constructors, Delegate, AcquireDirector, QueryRunningScene, Touch, Frame };
+    struct GlBufferShadow { u32 guest_addr=0u; u32 size=0u; bool mapped=false; };
 
     MachImage image_; Logger& log_; const std::vector<u8>* ipa_=nullptr; std::string app_root_; ProbeEnvironment env_; Dynarmic::ExclusiveMonitor monitor_; Dynarmic::A32::Jit cpu_;
     std::vector<ZipEntry> asset_entries_; std::vector<std::string> asset_relative_; std::unordered_map<std::string,std::size_t> asset_lookup_; std::unordered_map<std::string,DecodedPng> decoded_assets_;
-    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_set<u32> dispatch_once_done_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
+    std::vector<Import> imports_; std::unordered_map<std::string,std::size_t> import_by_name_; std::unordered_set<u32> dispatch_once_done_; std::unordered_map<u32,FakeObject> fake_objects_; std::unordered_map<std::string,u32> fake_named_; std::unordered_map<std::string,u32> data_symbols_; std::unordered_map<std::string,u32> associated_fake_; std::unordered_map<u32,std::vector<u32>> fake_collections_; std::unordered_map<u32,std::unordered_map<std::string,u32>> fake_dictionaries_; std::unordered_map<u32,std::vector<u32>> fake_dictionary_keys_; std::unordered_map<u32,double> fake_numbers_; std::unordered_map<u32,u32> fake_method_signature_args_; std::unordered_map<u32,FakeInvocation> fake_invocations_; std::unordered_map<std::string,u32> plist_roots_; std::unordered_map<u32,VirtualFile> virtual_files_; std::unordered_map<u32,std::vector<u8>> fake_data_bytes_; std::unordered_map<u32,u32> heap_allocation_sizes_; std::unordered_map<u32,u32> heap_allocation_spans_; std::vector<HeapFreeBlock> heap_free_blocks_; std::vector<GuestClass> classes_; std::vector<GuestCallFrame> guest_call_frames_;
     u32 heap_cursor_=kHeapBase+0x1000u,heap_peak_cursor_=kHeapBase+0x1000u,object_cursor_=kObjectBase+0x1000u,initial_sp_=0;
     u32 argv_ptr_=0,envp_ptr_=0,apple_ptr_=0,constructor_sp_=0;
     std::size_t constructor_index_=0;
@@ -4397,17 +5172,19 @@ private:
     u32 director_instance_=0,running_scene_=0,observed_scene_=0,frame_count_=0,rng_state_=1u;
     u32 active_play_layer_=0;
     u32 eagl_view_instance_=0,window_instance_=0,main_thread_instance_=0,fast_enum_mutation_addr_=0;
-    u32 errno_addr_=0,autorelease_pool_token_=0;
+    u32 errno_addr_=0,autorelease_pool_token_=0,strtok_cursor_=0;
+    u32 last_new44_ptr_=0u,last_new44_caller_=0u,last_new44_sp_=0u;
     u32 touch_object_=0,touch_set_=0,touch_event_=0,touch_phase_=0;
     float touch_x_=0.0f,touch_y_=0.0f,previous_touch_x_=0.0f,previous_touch_y_=0.0f;
     u32 bound_texture_=0,bound_array_buffer_=0,bound_element_array_buffer_=0;
+    std::unordered_map<u32,GlBufferShadow> gl_buffer_shadows_;
     u64 virtual_time_usec_=1350000000000000ull;
-    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
+    u64 frame_present_start_=0,placeholder_texture_uploads_=0,real_asset_draws_=0,asset_resolve_logs_=0,asset_decode_logs_=0,asset_failure_logs_=0,nsdata_logs_=0,file_open_logs_=0,file_failure_logs_=0,zlib_logs_=0,plist_load_logs_=0,plist_failure_logs_=0,texture_upload_logs_=0,rect_hit_logs_=0,assertion_stub_logs_=0,claimed_touch_logs_=0,path_string_logs_=0,perform2_logs_=0,cg_draw_logs_=0,invocation_logs_=0,realloc_logs_=0,plist_init_logs_=0,text_bridge_logs_=0,text_context_logs_=0,capability_override_logs_=0,url_object_logs_=0,url_plist_fail_logs_=0,level_url_fallbacks_=0;
     u64 heap_reuse_count_=0,unknown_import_count_=0,unimplemented_objc_count_=0,guest_dispatch_logs_=0,testflight_bypass_count_=0,stret_stub_logs_=0,graphics_stub_logs_=0,guest_category_method_count_=0,scene_trace_count_=0,touch_log_count_=0,touch_dispatch_count_=0;
     u64 playlayer_track_logs_=0,guest_call_abi_repairs_=0,string_range_logs_=0,geometry_bridge_logs_=0,cpp_runtime_logs_=0,cpp_string_logs_=0,dispatch_once_logs_=0;
-    u64 everyplay_bypass_count_=0,everyplay_capability_logs_=0,errno_logs_=0,dynamic_symbol_logs_=0;
+    u64 everyplay_bypass_count_=0,everyplay_capability_logs_=0,errno_logs_=0,dynamic_symbol_logs_=0,dynamic_cast_logs_=0,cpp_mutate_logs_=0,format_string_logs_=0,search_path_logs_=0,printf_format_logs_=0,shader_bridge_logs_=0,libc_parse_logs_=0,ccstring_alloc_logs_=0,gl_buffer_map_logs_=0;
     u32 host_stage_no_svc_chunks_=0u;
-    bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false;
+    bool done_=false,reached_ui_application_main_=false,delegate_launch_started_=false,delegate_launch_active_=false,delegate_launch_returned_=false,delegate_launch_deferred_=false,frame_pump_active_=false,frame_probe_completed_=false,touch_dispatch_active_=false,director_caller_mode_=false;
     bool host_window_attempted_=false,host_window_closed_=false;
     HostCallStage host_call_stage_=HostCallStage::None;
     HostOpenGLWindow host_window_;

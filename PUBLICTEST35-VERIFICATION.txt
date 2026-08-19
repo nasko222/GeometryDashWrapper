@@ -1,0 +1,53 @@
+Geometry Dash Wrapper 0.9.6-publictest35 verification
+=====================================================
+
+Target
+------
+PublicTest35 is based on the exact PublicTest34 source tree and targets the
+black-but-running GD 2.11/SubZero frame path seen in the 2026-08-18 PT34 logs.
+
+Observed PT34 evidence
+----------------------
+- GD 2.11 completed/presented eight host frames before its later low-address
+  objectDefinitions crash.
+- Frame 1 called glMapBufferOES(GL_ARRAY_BUFFER, GL_WRITE_ONLY_OES) and
+  glUnmapBufferOES while PT34 still routed both calls to the generic zero stub.
+- The relevant VBO was created immediately beforehand with glBufferData size
+  0xE40 (3648 bytes).
+- The later low-address failure is a 4-byte WRITE to address 0x18; it is
+  separate from the black-frame problem.
+
+PublicTest35 source checks
+--------------------------
+- glMapBufferOES returns guest-visible shadow memory sized from the bound VBO.
+- glUnmapBufferOES uploads the guest-written shadow with host glBufferSubData.
+- glGetBufferParameterivOES(GL_BUFFER_SIZE) reports the tracked size.
+- shadow allocations are released on buffer resize/delete.
+- HostOpenGLWindow::Present temporarily switches to GLSL program 0 and texture
+  unit 0 for the fixed-function presentation quad, then restores guest state.
+- The first ten source presents read back the offscreen framebuffer and log
+  non-black RGB pixel counts before the final host blit.
+- Fault reports retain PT34 read/write/stack diagnostics and additionally log
+  the most recent frame-time 44-byte C++ allocation.
+
+Static compile command
+----------------------
+g++ -std=c++20 -fsyntax-only \
+  -I/mnt/data/dyn_stub \
+  -Ithird_party/zlib \
+  -Isrc/shared \
+  src/backends/ios_armv7/dynarmic_ios_armv7.cpp
+
+Result: PASS
+
+Environment limitation
+----------------------
+The available Linux environment cannot compile the _WIN32 OpenGL/WGL branch
+against Windows headers. The cross-platform translation unit syntax check
+passes; the Windows-only VBO/presentation code requires the user's normal
+Windows build for runtime validation.
+
+Payload check
+-------------
+The source package must contain no .ipa, .apk, game executable, DLL or shared
+library payloads.

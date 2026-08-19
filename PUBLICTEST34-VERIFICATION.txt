@@ -1,0 +1,44 @@
+Geometry Dash Wrapper 0.9.6-publictest34 verification
+====================================================
+
+Base: 0.9.6-publictest33
+Target: 0.9.6-publictest34
+
+Purpose
+-------
+PublicTest34 addresses the remaining GD 2.11/SubZero first-frame parser path seen after PT33 successfully entered CCDirectorCaller frames. PT33 logs show real frames, PNG decode/texture upload, and then a shared low-address 0x18 fault after objectDefinitions.plist. They also show atoi returning through the generic zero stub and sscanf/strtok lacking dedicated guest implementations.
+
+Implemented
+-----------
+- atoi / atol guest parsing.
+- strtol / strtoul with guest endptr support.
+- stateful guest-memory strtok.
+- guest-safe sscanf subset supporting integer, unsigned/hex/octal, float, string, char, scanset and %n conversions with ARMv7 vararg slots.
+- invalid-memory access type (read/write) and access-size logging.
+- fault stack key/window dump.
+- targeted 0x2c C++ allocation trace during frame execution.
+- early completed-frame/present counters.
+
+Static checks
+-------------
+C++20 syntax check:
+  g++ -std=c++20 -fsyntax-only \
+    -I/mnt/data/dyn_stub \
+    -Ithird_party/zlib \
+    -Isrc/shared \
+    src/backends/ios_armv7/dynarmic_ios_armv7.cpp
+Result: PASS (SYNTAX_OK)
+
+Patch verification
+------------------
+- PT33 -> PT34 patch: git apply --check PASS.
+- Applying the patch to a clean PT33 tree reproduces the PT34 source tree byte-for-byte: PASS.
+- Reproduced file count: 173 files.
+
+Payload check
+-------------
+No IPA, APK, extracted Mach-O, EXE, DLL or SO game/runtime payload files are included in the PT34 full-source or hotfix source trees.
+
+Runtime status
+--------------
+Not Windows-runtime-tested in this environment. The next Windows logs should show IOS LIBC PARSE markers. If the shared address=0x18 fault remains, IOS FAULT ACCESS and IOS FAULT STACK KEY should distinguish the two candidate faulting accesses without guesswork.

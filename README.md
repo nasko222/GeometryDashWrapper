@@ -32,3 +32,9 @@ PublicTest2 does not bypass App Store encryption and refuses encrypted binaries.
 The bootstrap was designed against user-supplied decrypted copies of Geometry
 Dash 1.0 and Forlorn 1.9c. No IPA or extracted Apple executable is included in
 this source archive.
+
+### PublicTest34 iOS ARMv7 focus
+PublicTest34 continues the GD 2.11/SubZero first-frame bring-up with real libc parsing primitives and exact low-address fault diagnostics after the objectDefinitions.plist load. See `PUBLICTEST34.md`.
+
+### PublicTest35 iOS ARMv7 focus
+PublicTest35 targets the still-black but now genuinely executing GD 2.11/SubZero frame path: it implements `glMapBufferOES`/`glUnmapBufferOES` with guest-visible VBO shadow memory, restores a fixed-function-safe host presentation state, and probes the offscreen surface before the final blit. See `PUBLICTEST35.md`.

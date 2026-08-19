@@ -1,0 +1,29 @@
+Geometry Dash Wrapper 0.9.6-publictest30 verification
+=====================================================
+
+Targeted PT29 finding
+---------------------
+PT29 did execute the Everyplay Objective-C quarantine, but GD 1.90, 1.91,
+2.11 and SubZero still faulted after a direct BLX through a function pointer.
+GD 1.81 likewise faulted during OpenAL extension setup. The PT29 startup logs
+show multiple dlsym requests returning NULL immediately before these paths.
+
+PublicTest30 changes
+--------------------
+- dlsym(non-empty-name) -> executable synthetic import trampoline.
+- alcGetProcAddress/alGetProcAddress -> nested synthetic extension trampoline.
+- inert/success bootstrap handling for dynamically resolved AudioUnit,
+  AudioSession, AUGraph and AudioQueue entry points.
+- AudioQueueNewOutput writes a stable guest queue handle to its out parameter.
+- PT29 Everyplay quarantine remains enabled.
+
+Static verification
+-------------------
+C++20 syntax-only compile of src/backends/ios_armv7/dynarmic_ios_armv7.cpp: PASS
+Known dlsym names from PT29 logs now covered by the generic synthetic-stub path: PASS
+No IPA/APK/game executable payloads are included in the source tree: PASS
+
+Scope note
+----------
+Geometry Dash 1.0 has a different imported C++ RTTI/vtable-data binding failure
+and is not claimed fixed by PublicTest30.
