@@ -76,6 +76,84 @@ static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
 
+static int g_display_native_width = 1280;
+static int g_display_native_height = 720;
+static int g_display_client_width = 1280;
+static int g_display_client_height = 720;
+static int g_have_guest_viewport;
+static int g_have_guest_scissor;
+static int g_guest_viewport[4] = {0, 0, 1280, 720};
+static int g_guest_scissor[4] = {0, 0, 1280, 720};
+
+static void scale_display_rect(int x, int y, int width, int height,
+                               int *scaled_x, int *scaled_y,
+                               int *scaled_width, int *scaled_height) {
+    double sx;
+    double sy;
+    double scale;
+    double content_width;
+    double content_height;
+    double offset_x;
+    double offset_y;
+    if (g_display_native_width <= 0 || g_display_native_height <= 0 ||
+        g_display_client_width <= 0 || g_display_client_height <= 0) {
+        if (scaled_x) *scaled_x = x;
+        if (scaled_y) *scaled_y = y;
+        if (scaled_width) *scaled_width = width;
+        if (scaled_height) *scaled_height = height;
+        return;
+    }
+    sx = (double)g_display_client_width / (double)g_display_native_width;
+    sy = (double)g_display_client_height / (double)g_display_native_height;
+    scale = sx < sy ? sx : sy;
+    if (scale < 0.0001) scale = 0.0001;
+    content_width = (double)g_display_native_width * scale;
+    content_height = (double)g_display_native_height * scale;
+    offset_x = ((double)g_display_client_width - content_width) * 0.5;
+    offset_y = ((double)g_display_client_height - content_height) * 0.5;
+    if (scaled_x) *scaled_x = (int)floor(offset_x + (double)x * scale + 0.5);
+    if (scaled_y) *scaled_y = (int)floor(offset_y + (double)y * scale + 0.5);
+    if (scaled_width) {
+        int value = (int)floor((double)width * scale + 0.5);
+        *scaled_width = value > 0 ? value : 0;
+    }
+    if (scaled_height) {
+        int value = (int)floor((double)height * scale + 0.5);
+        *scaled_height = value > 0 ? value : 0;
+    }
+}
+
+static void apply_saved_display_rects(void) {
+    typedef void (APIENTRY *RectFunction)(int, int, int, int);
+    RectFunction viewport;
+    RectFunction scissor;
+    int x, y, width, height;
+    if (!g_opengl) return;
+    viewport = (RectFunction)GetProcAddress(g_opengl, "glViewport");
+    scissor = (RectFunction)GetProcAddress(g_opengl, "glScissor");
+    if (viewport && g_have_guest_viewport) {
+        scale_display_rect(g_guest_viewport[0], g_guest_viewport[1],
+                           g_guest_viewport[2], g_guest_viewport[3],
+                           &x, &y, &width, &height);
+        viewport(x, y, width, height);
+    }
+    if (scissor && g_have_guest_scissor) {
+        scale_display_rect(g_guest_scissor[0], g_guest_scissor[1],
+                           g_guest_scissor[2], g_guest_scissor[3],
+                           &x, &y, &width, &height);
+        scissor(x, y, width, height);
+    }
+}
+
+void runtime_set_display_size(int native_width, int native_height,
+                              int client_width, int client_height) {
+    if (native_width > 0) g_display_native_width = native_width;
+    if (native_height > 0) g_display_native_height = native_height;
+    if (client_width > 0) g_display_client_width = client_width;
+    if (client_height > 0) g_display_client_height = client_height;
+    apply_saved_display_rects();
+}
+
 /* OpenSSL in the Android game reads /dev/urandom before starting HTTPS.
  * Keep this descriptor odd so it cannot collide with a Winsock HANDLE, which
  * is aligned, and below the Android getdtablesize() result. */
@@ -3467,6 +3545,49 @@ static void shim_glClearDepthf(float depth) {
     }
 }
 
+static void shim_glViewport(int x, int y, int width, int height) {
+    typedef void (APIENTRY *Function)(int, int, int, int);
+    Function function = (Function)GetProcAddress(g_opengl, "glViewport");
+    int scaled_x, scaled_y, scaled_width, scaled_height;
+    g_guest_viewport[0] = x;
+    g_guest_viewport[1] = y;
+    g_guest_viewport[2] = width;
+    g_guest_viewport[3] = height;
+    g_have_guest_viewport = 1;
+    scale_display_rect(x, y, width, height,
+                       &scaled_x, &scaled_y, &scaled_width, &scaled_height);
+    if (function) function(scaled_x, scaled_y, scaled_width, scaled_height);
+}
+
+static void shim_glScissor(int x, int y, int width, int height) {
+    typedef void (APIENTRY *Function)(int, int, int, int);
+    Function function = (Function)GetProcAddress(g_opengl, "glScissor");
+    int scaled_x, scaled_y, scaled_width, scaled_height;
+    g_guest_scissor[0] = x;
+    g_guest_scissor[1] = y;
+    g_guest_scissor[2] = width;
+    g_guest_scissor[3] = height;
+    g_have_guest_scissor = 1;
+    scale_display_rect(x, y, width, height,
+                       &scaled_x, &scaled_y, &scaled_width, &scaled_height);
+    if (function) function(scaled_x, scaled_y, scaled_width, scaled_height);
+}
+
+static void shim_glGetIntegerv(unsigned int pname, int *values) {
+    typedef void (APIENTRY *Function)(unsigned int, int *);
+    Function function = (Function)GetProcAddress(g_opengl, "glGetIntegerv");
+    if (!values) return;
+    if (pname == 0x0BA2u && g_have_guest_viewport) {
+        memcpy(values, g_guest_viewport, sizeof(g_guest_viewport));
+        return;
+    }
+    if (pname == 0x0C10u && g_have_guest_scissor) {
+        memcpy(values, g_guest_scissor, sizeof(g_guest_scissor));
+        return;
+    }
+    if (function) function(pname, values);
+}
+
 static int token_boundary(char value) {
     return !(value == '_' || (value >= '0' && value <= '9') ||
              (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z'));
@@ -3731,6 +3852,9 @@ static void *custom_function(const char *name) {
     CUSTOM("sqrtf", shim_sqrtf);
     CUSTOM("tanf", shim_tanf);
     CUSTOM("glClearDepthf", shim_glClearDepthf);
+    CUSTOM("glViewport", shim_glViewport);
+    CUSTOM("glScissor", shim_glScissor);
+    CUSTOM("glGetIntegerv", shim_glGetIntegerv);
     CUSTOM("glShaderSource", shim_glShaderSource);
     CUSTOM("pthread_attr_init", shim_pthread_attr_init);
     CUSTOM("pthread_cond_destroy", shim_pthread_cond_destroy);

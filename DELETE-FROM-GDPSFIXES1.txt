@@ -1,3 +1,0 @@
-Delete these obsolete GDPSFixes1 documentation files after applying the hotfix:
-GDPSFIXES1.md
-GDPSFIXES1-VERIFICATION.txt

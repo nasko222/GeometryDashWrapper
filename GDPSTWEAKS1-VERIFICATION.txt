@@ -1,0 +1,22 @@
+Geometry Dash Wrapper 0.9.6-gdpstweaks1 verification
+=====================================================
+
+Source-level checks
+-------------------
+PASS: BRANCH.txt is gdpstweaks1.
+PASS: VERSION.txt is 0.9.6-gdpstweaks1.
+PASS: launcher does not contain the gdpsfixes6 armv7-legacy libgame routing flag.
+PASS: legacy ARM does not contain DYNARMIC_LEGACY_V7_PACKAGE or DYNARMIC_LEGACY_HYBRID_READY.
+PASS: legacy ARM does not contain the auxiliary hybrid ELF mapper.
+PASS: ordinary legacy ARM and the independent ARMv7/2.2 backend remain present.
+PASS: Shift selects editor move tags 1-4 (small movement) on x86, legacy ARM, and ARMv7.
+PASS: no Shift selects editor move tags 5-8 (large movement) on all three Windows backends.
+PASS: F11 and Alt+Enter fullscreen toggles are implemented on all three Windows backends.
+PASS: resize scaling preserves the native aspect ratio and remaps pointer coordinates.
+PASS: viewport/scissor scaling is implemented on x86, legacy ARM, and ARMv7.
+PASS: Extras remains forced disabled.
+
+Runtime note
+------------
+Windows execution is not available in this environment. Build and runtime-test fullscreen,
+resize, editor movement, and the normal supported APK matrix on Windows.

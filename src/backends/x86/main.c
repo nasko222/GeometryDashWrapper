@@ -79,6 +79,10 @@ typedef struct {
     int native_paused;
     int window_active;
     int closing;
+    int fullscreen;
+    LONG_PTR windowed_style;
+    LONG_PTR windowed_ex_style;
+    WINDOWPLACEMENT windowed_placement;
     int vsync_enabled;
     ULONGLONG gameplay_cache_time;
     int gameplay_cache_value;
@@ -912,12 +916,12 @@ static int send_editor_hotkey(int tag, int virtual_key) {
 }
 
 static int editor_tag_for_key(WPARAM key) {
-    const int large = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const int small = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     switch (key) {
-    case 'A': return large ? 5 : 1;
-    case 'D': return large ? 6 : 2;
-    case 'W': return large ? 7 : 3;
-    case 'S': return large ? 8 : 4;
+    case 'A': return small ? 1 : 5;
+    case 'D': return small ? 2 : 6;
+    case 'W': return small ? 3 : 7;
+    case 'S': return small ? 4 : 8;
     case 'E': return 11; /* clockwise on the x86-era editor ABI */
     case 'Q': return 12; /* counter-clockwise */
     default: return 0;
@@ -1019,15 +1023,89 @@ static void resume_native_game(const char *reason) {
     g_host.native_paused = 0;
 }
 
+static void update_display_size(HWND window) {
+    RECT area;
+    if (!window || !GetClientRect(window, &area) ||
+        area.right <= area.left || area.bottom <= area.top) {
+        return;
+    }
+    runtime_set_display_size(
+        g_host.native_width, g_host.native_height,
+        area.right - area.left, area.bottom - area.top);
+}
+
 static void client_to_native(HWND window, float *x, float *y) {
     RECT area;
+    float client_width;
+    float client_height;
+    float sx;
+    float sy;
+    float scale;
+    float content_width;
+    float content_height;
+    float offset_x;
+    float offset_y;
     if (!x || !y || !GetClientRect(window, &area) || area.right <= area.left ||
         area.bottom <= area.top || g_host.native_width <= 0 ||
         g_host.native_height <= 0) {
         return;
     }
-    *x = *x * (float)g_host.native_width / (float)(area.right - area.left);
-    *y = *y * (float)g_host.native_height / (float)(area.bottom - area.top);
+    client_width = (float)(area.right - area.left);
+    client_height = (float)(area.bottom - area.top);
+    sx = client_width / (float)g_host.native_width;
+    sy = client_height / (float)g_host.native_height;
+    scale = sx < sy ? sx : sy;
+    if (scale < 0.0001f) scale = 0.0001f;
+    content_width = (float)g_host.native_width * scale;
+    content_height = (float)g_host.native_height * scale;
+    offset_x = (client_width - content_width) * 0.5f;
+    offset_y = (client_height - content_height) * 0.5f;
+    *x = (*x - offset_x) / scale;
+    *y = (*y - offset_y) / scale;
+    if (*x < 0.0f) *x = 0.0f;
+    if (*y < 0.0f) *y = 0.0f;
+    if (*x > (float)g_host.native_width) *x = (float)g_host.native_width;
+    if (*y > (float)g_host.native_height) *y = (float)g_host.native_height;
+}
+
+static void toggle_fullscreen(HWND window) {
+    MONITORINFO monitor_info;
+    HMONITOR monitor;
+    if (!window) return;
+    if (!g_host.fullscreen) {
+        g_host.windowed_style = GetWindowLongPtrA(window, GWL_STYLE);
+        g_host.windowed_ex_style = GetWindowLongPtrA(window, GWL_EXSTYLE);
+        memset(&g_host.windowed_placement, 0, sizeof(g_host.windowed_placement));
+        g_host.windowed_placement.length = sizeof(g_host.windowed_placement);
+        GetWindowPlacement(window, &g_host.windowed_placement);
+        memset(&monitor_info, 0, sizeof(monitor_info));
+        monitor_info.cbSize = sizeof(monitor_info);
+        monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        if (!GetMonitorInfoA(monitor, &monitor_info)) return;
+        SetWindowLongPtrA(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowLongPtrA(
+            window, GWL_EXSTYLE,
+            g_host.windowed_ex_style & ~(LONG_PTR)WS_EX_WINDOWEDGE);
+        SetWindowPos(
+            window, HWND_TOP,
+            monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+            monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+            monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        g_host.fullscreen = 1;
+    } else {
+        SetWindowLongPtrA(window, GWL_STYLE, g_host.windowed_style);
+        SetWindowLongPtrA(window, GWL_EXSTYLE, g_host.windowed_ex_style);
+        SetWindowPlacement(window, &g_host.windowed_placement);
+        SetWindowPos(
+            window, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_host.fullscreen = 0;
+    }
+    update_display_size(window);
+    runtime_log("Window mode: %s toggle=F11/Alt+Enter",
+                g_host.fullscreen ? "fullscreen" : "windowed");
 }
 
 static void send_touch_begin(float x, float y) {
@@ -1098,6 +1176,13 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         g_host.last_touch_x = x;
         g_host.last_touch_y = y;
     }
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        !(lparam & (1L << 30)) &&
+        (wparam == VK_F11 ||
+         (wparam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000)))) {
+        toggle_fullscreen(window);
+        return 0;
+    }
     switch (message) {
     case WM_CLOSE:
         g_host.closing = 1;
@@ -1126,6 +1211,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_SIZE:
+        update_display_size(window);
+        return 0;
     case WM_CHAR:
         if (wparam == '\b') {
             if (g_host.native_ready && g_host.delete_backward) {
@@ -1313,6 +1401,7 @@ static int create_opengl_window(int client_width, int client_height) {
                     (unsigned long)GetLastError());
         return 0;
     }
+    update_display_size(g_host.window);
     swap_interval = (SwapIntervalFunction)wglGetProcAddress("wglSwapIntervalEXT");
     if (swap_interval) {
         g_host.vsync_enabled = swap_interval(1) != FALSE;

@@ -1,3 +1,0 @@
-Obsolete branch-specific files removed in gdpsfixes3:
-GDPSFIXES2.md
-GDPSFIXES2-VERIFICATION.txt

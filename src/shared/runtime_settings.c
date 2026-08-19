@@ -147,7 +147,7 @@ int gd_settings_editor_controls(void) {
 }
 
 int gd_settings_extras_menu(void) {
-    /* Extras is temporarily removed from gdpsfixes7. */
+    /* Extras remains temporarily removed in gdpstweaks1. */
     return 0;
 }
 

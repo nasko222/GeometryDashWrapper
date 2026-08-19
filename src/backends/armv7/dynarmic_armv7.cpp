@@ -3277,11 +3277,62 @@ public:
         return {width, height};
     }
 
+    void ScaleGuestRect(GLint x, GLint y, GLsizei width, GLsizei height,
+                        GLint& scaled_x, GLint& scaled_y,
+                        GLsizei& scaled_width, GLsizei& scaled_height) const {
+        const auto [client_width, client_height] = ClientSize();
+        const double sx = native_width_ > 0
+            ? static_cast<double>(client_width) / static_cast<double>(native_width_)
+            : 1.0;
+        const double sy = native_height_ > 0
+            ? static_cast<double>(client_height) / static_cast<double>(native_height_)
+            : 1.0;
+        const double scale = std::max(0.0001, std::min(sx, sy));
+        const double content_width = static_cast<double>(native_width_) * scale;
+        const double content_height = static_cast<double>(native_height_) * scale;
+        const double offset_x = (static_cast<double>(client_width) - content_width) * 0.5;
+        const double offset_y = (static_cast<double>(client_height) - content_height) * 0.5;
+        scaled_x = static_cast<GLint>(std::lround(offset_x + static_cast<double>(x) * scale));
+        scaled_y = static_cast<GLint>(std::lround(offset_y + static_cast<double>(y) * scale));
+        scaled_width = static_cast<GLsizei>(std::max<long>(
+            0, std::lround(static_cast<double>(width) * scale)));
+        scaled_height = static_cast<GLsizei>(std::max<long>(
+            0, std::lround(static_cast<double>(height) * scale)));
+    }
+
+    void RememberGuestViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+        guest_viewport_ = {x, y, width, height};
+        have_guest_viewport_ = true;
+    }
+
+    void RememberGuestScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+        guest_scissor_ = {x, y, width, height};
+        have_guest_scissor_ = true;
+    }
+
+    bool ReadGuestClipRect(GLenum pname, std::array<GLint, 4>& values) const {
+        if (pname == 0x0BA2u && have_guest_viewport_) {
+            values = guest_viewport_;
+            return true;
+        }
+        if (pname == 0x0C10u && have_guest_scissor_) {
+            values = guest_scissor_;
+            return true;
+        }
+        return false;
+    }
+
     // Deliberately leave GL clip state under guest control.  EnduranceTest4's
     // host scissor/viewport sanitizer did not remove the right-side void and
     // risked invalidating editor-owned render state.
     void ResetFrameClipState(bool) {}
-    void Swap() { if (device_) SwapBuffers(device_); }
+    void Swap() {
+        if (resize_pending_) {
+            ReapplyGuestRects();
+            resize_pending_ = false;
+        }
+        if (device_) SwapBuffers(device_);
+    }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
         if (!gpu_profiler_ready_ || active_gpu_query_ >= 0) return;
@@ -3447,9 +3498,17 @@ private:
         }
         const float client_width = static_cast<float>(area.right - area.left);
         const float client_height = static_cast<float>(area.bottom - area.top);
-        x = std::clamp(static_cast<float>(raw_x) * static_cast<float>(native_width_) / client_width,
+        const float scale = std::max(
+            0.0001f,
+            std::min(client_width / static_cast<float>(native_width_),
+                     client_height / static_cast<float>(native_height_)));
+        const float content_width = static_cast<float>(native_width_) * scale;
+        const float content_height = static_cast<float>(native_height_) * scale;
+        const float offset_x = (client_width - content_width) * 0.5f;
+        const float offset_y = (client_height - content_height) * 0.5f;
+        x = std::clamp((static_cast<float>(raw_x) - offset_x) / scale,
                        0.0f, static_cast<float>(native_width_));
-        y = std::clamp(static_cast<float>(raw_y) * static_cast<float>(native_height_) / client_height,
+        y = std::clamp((static_cast<float>(raw_y) - offset_y) / scale,
                        0.0f, static_cast<float>(native_height_));
     }
 
@@ -3461,6 +3520,14 @@ private:
             SetWindowLongPtrA(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
         if (!self) return DefWindowProcA(window, message, wparam, lparam);
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            !(lparam & (1L << 30)) &&
+            (wparam == VK_F11 ||
+             (wparam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000)))) {
+            self->ToggleFullscreen();
+            return 0;
+        }
 
         float x = 0.0f, y = 0.0f;
         switch (message) {
@@ -3500,6 +3567,9 @@ private:
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_SIZE:
+            self->resize_pending_ = true;
+            return 0;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
@@ -3543,12 +3613,12 @@ private:
         case WM_KEYDOWN:
             if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
                 gd_settings_editor_controls()) {
-                const bool large = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool small = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 u32 tag = 0u;
-                if (wparam == 'A') tag = large ? 5u : 1u;
-                else if (wparam == 'D') tag = large ? 6u : 2u;
-                else if (wparam == 'W') tag = large ? 7u : 3u;
-                else if (wparam == 'S') tag = large ? 8u : 4u;
+                if (wparam == 'A') tag = small ? 1u : 5u;
+                else if (wparam == 'D') tag = small ? 2u : 6u;
+                else if (wparam == 'W') tag = small ? 3u : 7u;
+                else if (wparam == 'S') tag = small ? 4u : 8u;
                 else if (wparam == 'E') tag = 0x13u; /* clockwise */
                 else if (wparam == 'Q') tag = 0x14u; /* counter-clockwise */
                 if (tag) self->Queue(HostEvent{HostEventType::EditorCommand, 0.0f, 0.0f, tag});
@@ -3628,6 +3698,71 @@ private:
         return DefWindowProcA(window, message, wparam, lparam);
     }
 
+    void ToggleFullscreen() {
+        if (!window_) return;
+        if (!fullscreen_) {
+            windowed_style_ = GetWindowLongPtrA(window_, GWL_STYLE);
+            windowed_ex_style_ = GetWindowLongPtrA(window_, GWL_EXSTYLE);
+            windowed_placement_.length = sizeof(windowed_placement_);
+            GetWindowPlacement(window_, &windowed_placement_);
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+            if (!GetMonitorInfoA(monitor, &monitor_info)) return;
+            SetWindowLongPtrA(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtrA(window_, GWL_EXSTYLE,
+                              windowed_ex_style_ & ~static_cast<LONG_PTR>(WS_EX_WINDOWEDGE));
+            SetWindowPos(window_, HWND_TOP,
+                         monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+                         monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                         monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            fullscreen_ = true;
+        } else {
+            SetWindowLongPtrA(window_, GWL_STYLE, windowed_style_);
+            SetWindowLongPtrA(window_, GWL_EXSTYLE, windowed_ex_style_);
+            SetWindowPlacement(window_, &windowed_placement_);
+            SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            fullscreen_ = false;
+        }
+        resize_pending_ = true;
+        if (log_) {
+            *log_ << "Window mode: " << (fullscreen_ ? "fullscreen" : "windowed")
+                  << " toggle=F11/Alt+Enter\n";
+            log_->flush();
+        }
+    }
+
+    void ReapplyGuestRects() {
+        if (!context_) return;
+        if (have_guest_viewport_) {
+            auto* function = reinterpret_cast<void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei)>(
+                Resolve("glViewport"));
+            if (function) {
+                GLint x = 0, y = 0;
+                GLsizei width = 0, height = 0;
+                ScaleGuestRect(guest_viewport_[0], guest_viewport_[1],
+                               guest_viewport_[2], guest_viewport_[3],
+                               x, y, width, height);
+                function(x, y, width, height);
+            }
+        }
+        if (have_guest_scissor_) {
+            auto* function = reinterpret_cast<void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei)>(
+                Resolve("glScissor"));
+            if (function) {
+                GLint x = 0, y = 0;
+                GLsizei width = 0, height = 0;
+                ScaleGuestRect(guest_scissor_[0], guest_scissor_[1],
+                               guest_scissor_[2], guest_scissor_[3],
+                               x, y, width, height);
+                function(x, y, width, height);
+            }
+        }
+    }
+
     bool Fail(const char* message) {
         if (log_) { *log_ << "OpenGL host error: " << message << '\n'; log_->flush(); }
         return false;
@@ -3646,6 +3781,15 @@ private:
     bool platform_left_down_ = false;
     bool platform_right_down_ = false;
     bool text_input_active_ = false;
+    bool fullscreen_ = false;
+    bool resize_pending_ = true;
+    bool have_guest_viewport_ = false;
+    bool have_guest_scissor_ = false;
+    LONG_PTR windowed_style_ = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    LONG_PTR windowed_ex_style_ = 0;
+    WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
+    std::array<GLint, 4> guest_viewport_{0, 0, 1280, 720};
+    std::array<GLint, 4> guest_scissor_{0, 0, 1280, 720};
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -9188,8 +9332,14 @@ private:
         } else if (name == "glGetIntegerv") {
             using Fn = void (APIENTRY*)(GLenum, GLint*);
             std::array<GLint, 16> values{};
-            reinterpret_cast<Fn>(function)(static_cast<GLenum>(arguments[0]), values.data());
-            const std::size_t count = arguments[0] == 0x0BA2u || arguments[0] == 0x0C10u ? 4u : 1u;
+            std::array<GLint, 4> guest_clip{};
+            const GLenum pname = static_cast<GLenum>(arguments[0]);
+            const bool guest_clip_query = gl_.ReadGuestClipRect(pname, guest_clip);
+            if (guest_clip_query)
+                std::copy(guest_clip.begin(), guest_clip.end(), values.begin());
+            else
+                reinterpret_cast<Fn>(function)(pname, values.data());
+            const std::size_t count = pname == 0x0BA2u || pname == 0x0C10u ? 4u : 1u;
             env_.WriteBytes(static_cast<u32>(arguments[1]), values.data(), count * sizeof(GLint));
         } else if (name == "glGetFloatv") {
             using Fn = void (APIENTRY*)(GLenum, GLfloat*);
@@ -9246,11 +9396,24 @@ private:
             reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), static_cast<GLboolean>(arguments[2]), values);
         } else if (name == "glScissor" || name == "glViewport") {
             using Fn = void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei);
+            const GLint guest_x = static_cast<GLint>(arguments[0]);
+            const GLint guest_y = static_cast<GLint>(arguments[1]);
+            const GLsizei guest_width = static_cast<GLsizei>(arguments[2]);
+            const GLsizei guest_height = static_cast<GLsizei>(arguments[3]);
+            GLint scaled_x = 0;
+            GLint scaled_y = 0;
+            GLsizei scaled_width = 0;
+            GLsizei scaled_height = 0;
+            gl_.ScaleGuestRect(guest_x, guest_y, guest_width, guest_height,
+                               scaled_x, scaled_y, scaled_width, scaled_height);
             reinterpret_cast<Fn>(function)(
-                static_cast<GLint>(arguments[0]),
-                static_cast<GLint>(arguments[1]),
-                static_cast<GLsizei>(arguments[2]),
-                static_cast<GLsizei>(arguments[3]));
+                scaled_x, scaled_y, scaled_width, scaled_height);
+            if (name == "glViewport")
+                gl_.RememberGuestViewport(
+                    guest_x, guest_y, guest_width, guest_height);
+            else
+                gl_.RememberGuestScissor(
+                    guest_x, guest_y, guest_width, guest_height);
         } else if (name == "glBindBuffer") {
             if (arguments[0] == GL_ARRAY_BUFFER) gl_array_buffer_binding_ = static_cast<u32>(arguments[1]);
             if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER) gl_element_buffer_binding_ = static_cast<u32>(arguments[1]);
@@ -12432,7 +12595,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes7 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

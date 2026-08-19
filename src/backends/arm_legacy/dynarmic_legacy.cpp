@@ -52,7 +52,6 @@
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
-#include "dynarmic/interface/exclusive_monitor.h"
 
 extern "C" {
 #include "zlib.h"
@@ -91,13 +90,6 @@ private:
 };
 
 namespace {
-
-template <typename ArchVersion>
-constexpr ArchVersion DynarmicArmv7ArchVersion() {
-    if constexpr (requires { ArchVersion::v7A; }) return ArchVersion::v7A;
-    else if constexpr (requires { ArchVersion::v7; }) return ArchVersion::v7;
-    else { static_assert(!sizeof(ArchVersion), "Dynarmic has no recognized ARMv7 architecture enum"); }
-}
 
 constexpr u32 kGameBase = 0x10000000u;
 constexpr u32 kSmokeBase = 0x0F000000u;
@@ -318,53 +310,6 @@ static std::vector<u8> ExtractZipMember(const std::vector<u8>& zip, std::string_
         pos = next;
     }
     throw std::runtime_error("APK member not found: " + std::string(requested_name));
-}
-
-
-static std::vector<std::string> ListZipMembers(const std::vector<u8>& zip,
-                                                std::string_view prefix,
-                                                std::string_view suffix) {
-    constexpr u32 kEocdSignature = 0x06054B50u;
-    constexpr u32 kCentralSignature = 0x02014B50u;
-    const std::size_t search_start = zip.size() > (0xFFFFu + 22u)
-        ? zip.size() - (0xFFFFu + 22u) : 0;
-    std::optional<std::size_t> eocd;
-    if (zip.size() >= 22) {
-        for (std::size_t pos = zip.size() - 22;; --pos) {
-            if (ReadLe32(zip, pos) == kEocdSignature) { eocd = pos; break; }
-            if (pos == search_start) break;
-        }
-    }
-    if (!eocd) return {};
-    const u16 entry_count = ReadLe16(zip, *eocd + 10);
-    const u32 central_size = ReadLe32(zip, *eocd + 12);
-    const u32 central_offset = ReadLe32(zip, *eocd + 16);
-    if (static_cast<u64>(central_offset) + central_size > zip.size()) return {};
-    std::vector<std::string> result;
-    std::size_t pos = central_offset;
-    for (u16 index = 0; index < entry_count; ++index) {
-        if (pos + 46 > zip.size() || ReadLe32(zip, pos) != kCentralSignature) break;
-        const u16 name_length = ReadLe16(zip, pos + 28);
-        const u16 extra_length = ReadLe16(zip, pos + 30);
-        const u16 comment_length = ReadLe16(zip, pos + 32);
-        const std::size_t next = pos + 46ull + name_length + extra_length + comment_length;
-        if (next > zip.size()) break;
-        const std::string_view name(reinterpret_cast<const char*>(zip.data()+pos+46), name_length);
-        if (name.starts_with(prefix) && name.ends_with(suffix)) result.emplace_back(name);
-        pos = next;
-    }
-    return result;
-}
-
-static bool BytesContainAscii(const std::vector<u8>& bytes, std::string_view needle) {
-    if (needle.empty() || bytes.size() < needle.size()) return false;
-    return std::search(bytes.begin(), bytes.end(), needle.begin(), needle.end()) != bytes.end();
-}
-
-static std::optional<std::vector<u8>> TryExtractZipMember(const std::vector<u8>& zip,
-                                                           std::string_view name) {
-    try { return ExtractZipMember(zip, name); }
-    catch (const std::exception&) { return std::nullopt; }
 }
 
 struct ZipEntryRecord {
@@ -838,22 +783,6 @@ public:
         WriteTyped(vaddr, value);
     }
 
-    bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override {
-        return CompareExchangeTyped(vaddr, value, expected);
-    }
-
-    bool MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) override {
-        return CompareExchangeTyped(vaddr, value, expected);
-    }
-
-    bool MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) override {
-        return CompareExchangeTyped(vaddr, value, expected);
-    }
-
-    bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
-        return CompareExchangeTyped(vaddr, value, expected);
-    }
-
     void InterpreterFallback(u32 pc, std::size_t count) override {
         interpreter_fallback = true;
         fallback_pc = pc;
@@ -987,21 +916,6 @@ private:
         }
         std::memcpy(region->data.data() + (address - region->base), &value,
                     sizeof(value));
-    }
-
-    template <typename T>
-    bool CompareExchangeTyped(u32 address, T value, T expected) {
-        MemoryRegion* region = FindMutable(address, sizeof(T));
-        if (!region) {
-            WriteFault(address);
-            return false;
-        }
-        T current{};
-        u8* const bytes = region->data.data() + (address - region->base);
-        std::memcpy(&current, bytes, sizeof(current));
-        if (current != expected) return false;
-        std::memcpy(bytes, &value, sizeof(value));
-        return true;
     }
 
     std::vector<MemoryRegion> regions_;
@@ -1744,195 +1658,6 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
     return runtime;
 }
 
-static ElfRuntime MapAndRelocateAuxiliaryElf(
-    const std::vector<u8>& elf, ProbeEnvironment& env,
-    ElfRuntime& primary, u32 load_base) {
-    const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
-    if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 ||
-        header.ident[4] != 1 || header.ident[5] != 1 ||
-        header.type != kEtDyn || header.machine != kEmArm)
-        throw std::runtime_error("auxiliary module is not ARM ELF32 ET_DYN");
-    if (header.phentsize != sizeof(Elf32Phdr) ||
-        header.shentsize != sizeof(Elf32Shdr) ||
-        static_cast<u64>(header.phoff) +
-                static_cast<u64>(header.phnum) * sizeof(Elf32Phdr) > elf.size() ||
-        static_cast<u64>(header.shoff) +
-                static_cast<u64>(header.shnum) * sizeof(Elf32Shdr) > elf.size())
-        throw std::runtime_error("auxiliary ELF tables are invalid");
-
-    ElfRuntime companion{};
-    companion.entry = load_base + header.entry;
-    u32 min_vaddr = std::numeric_limits<u32>::max();
-    u32 max_vaddr = 0u;
-    u32 executable_min = std::numeric_limits<u32>::max();
-    u32 executable_max = 0u;
-    std::vector<Elf32Phdr> phdrs;
-    for (u16 i = 0; i < header.phnum; ++i) {
-        const Elf32Phdr ph = ReadPod<Elf32Phdr>(
-            elf, header.phoff + static_cast<std::size_t>(i) * sizeof(Elf32Phdr));
-        phdrs.push_back(ph);
-        if (ph.type != kPtLoad || ph.memsz == 0u) continue;
-        if (static_cast<u64>(ph.offset) + ph.filesz > elf.size() ||
-            ph.filesz > ph.memsz)
-            throw std::runtime_error("invalid auxiliary PT_LOAD segment");
-        ++companion.load_segments;
-        if (ph.flags & 1u) {
-            ++companion.executable_segments;
-            executable_min = std::min(executable_min, load_base + ph.vaddr);
-            executable_max = std::max(
-                executable_max, load_base + ph.vaddr + ph.memsz);
-        }
-        min_vaddr = std::min(min_vaddr, AlignDown(ph.vaddr, kPageSize));
-        max_vaddr = std::max(max_vaddr,
-                             AlignUp(ph.vaddr + ph.memsz, kPageSize));
-    }
-    if (!companion.load_segments || max_vaddr <= min_vaddr ||
-        !companion.executable_segments ||
-        executable_max <= executable_min)
-        throw std::runtime_error("auxiliary ELF has no loadable image");
-    companion.image_min = load_base + min_vaddr;
-    companion.image_max = load_base + max_vaddr;
-    if (companion.image_max >= kObjectBase)
-        throw std::runtime_error("auxiliary ELF overlaps wrapper memory regions");
-    env.Map(companion.image_min,
-            static_cast<std::size_t>(companion.image_max - companion.image_min),
-            true);
-    for (const Elf32Phdr& ph : phdrs) {
-        if (ph.type == kPtLoad && ph.filesz)
-            env.CopyIn(load_base + ph.vaddr, elf.data() + ph.offset, ph.filesz);
-    }
-
-    std::vector<Elf32Shdr> sections;
-    sections.reserve(header.shnum);
-    for (u16 i = 0; i < header.shnum; ++i)
-        sections.push_back(ReadPod<Elf32Shdr>(
-            elf, header.shoff + static_cast<std::size_t>(i) * sizeof(Elf32Shdr)));
-    if (header.shstrndx >= sections.size())
-        throw std::runtime_error("invalid auxiliary section-name table");
-    const Elf32Shdr& shstr = sections[header.shstrndx];
-
-    for (const Elf32Shdr& section : sections) {
-        if (section.type != kShtDynsym) continue;
-        if (section.entsize != sizeof(Elf32Sym) || section.link >= sections.size())
-            throw std::runtime_error("invalid auxiliary .dynsym metadata");
-        const Elf32Shdr& strings = sections[section.link];
-        companion.dynsym_count = section.size / sizeof(Elf32Sym);
-        for (std::size_t i = 0; i < companion.dynsym_count; ++i) {
-            const Elf32Sym symbol = ReadPod<Elf32Sym>(
-                elf, section.offset + i * sizeof(Elf32Sym));
-            if (symbol.shndx == kShnUndef && symbol.name) {
-                ++companion.undefined_symbols;
-                continue;
-            }
-            if (symbol.shndx == kShnUndef || !symbol.value) continue;
-            const std::string name = StringFromTable(elf, strings, symbol.name);
-            if (!name.empty())
-                companion.symbols.push_back(
-                    SymbolRecord{name, load_base + symbol.value, symbol.size});
-        }
-    }
-    std::sort(companion.symbols.begin(), companion.symbols.end(),
-              [](const SymbolRecord& lhs, const SymbolRecord& rhs) {
-                  if (lhs.address != rhs.address) return lhs.address < rhs.address;
-                  return lhs.size > rhs.size;
-              });
-
-    auto resolve_primary = [&](const std::string& name) -> u32 {
-        if (const SymbolRecord* symbol = FindSymbol(primary, name))
-            return symbol->address;
-        return 0u;
-    };
-
-    for (const Elf32Shdr& section : sections) {
-        if (section.type == kShtRela)
-            throw std::runtime_error("auxiliary ELF uses unsupported RELA");
-        if (section.type != kShtRel) continue;
-        if (section.entsize != sizeof(Elf32Rel) || section.link >= sections.size())
-            throw std::runtime_error("invalid auxiliary REL metadata");
-        const Elf32Shdr& symbols_section = sections[section.link];
-        if (symbols_section.entsize != sizeof(Elf32Sym) ||
-            symbols_section.link >= sections.size())
-            throw std::runtime_error("invalid auxiliary relocation symbols");
-        const Elf32Shdr& strings = sections[symbols_section.link];
-        const std::size_t symbol_count =
-            symbols_section.size / sizeof(Elf32Sym);
-        const std::size_t count = section.size / sizeof(Elf32Rel);
-        companion.relocation_count += count;
-        for (std::size_t rel_index = 0; rel_index < count; ++rel_index) {
-            const Elf32Rel rel = ReadPod<Elf32Rel>(
-                elf, section.offset + rel_index * sizeof(Elf32Rel));
-            const u32 symbol_index = rel.info >> 8u;
-            const u32 type = rel.info & 0xFFu;
-            const u32 where = load_base + rel.offset;
-            const u32 addend = env.MemoryRead32(where);
-            u32 value = 0u;
-            std::string name;
-            if (symbol_index) {
-                if (symbol_index >= symbol_count)
-                    throw std::runtime_error(
-                        "companion relocation symbol index is outside table");
-                const Elf32Sym symbol = ReadPod<Elf32Sym>(
-                    elf, symbols_section.offset +
-                             static_cast<std::size_t>(symbol_index) *
-                                 sizeof(Elf32Sym));
-                name = StringFromTable(elf, strings, symbol.name);
-                if (symbol.shndx != kShnUndef) {
-                    value = load_base + symbol.value;
-                } else if ((value = resolve_primary(name)) != 0u) {
-                    // Resolve Cocos/game code and imported data against the
-                    // already relocated primary libcocos2dcpp.so image.
-                } else if (IsImportedObjectName(name, symbol.info & 0x0Fu)) {
-                    value = EnsureObject(primary, env, name);
-                } else {
-                    value = EnsureImport(primary, env, name);
-                }
-            }
-            switch (type) {
-            case kRArmNone: break;
-            case kRArmAbs32: env.MemoryWrite32(where, value + addend); break;
-            case kRArmGlobDat:
-            case kRArmJumpSlot: env.MemoryWrite32(where, value); break;
-            case kRArmRelative:
-                env.MemoryWrite32(where, load_base + addend);
-                ++companion.relative_relocations;
-                break;
-            default: {
-                std::ostringstream error;
-                error << "unsupported auxiliary ARM relocation " << type
-                      << " at 0x" << std::hex << rel.offset << " (" << name
-                      << ")";
-                throw std::runtime_error(error.str());
-            }
-            }
-            if (type == kRArmAbs32 || type == kRArmGlobDat ||
-                type == kRArmJumpSlot)
-                ++companion.imported_relocations;
-        }
-    }
-
-    for (const Elf32Shdr& section : sections) {
-        const std::string name = SectionName(elf, shstr, section.name);
-        if (section.type != kShtInitArray && name != ".init_array") continue;
-        if (section.size % 4u)
-            throw std::runtime_error("invalid auxiliary .init_array size");
-        const std::size_t count = section.size / 4u;
-        companion.constructors.reserve(count);
-        for (std::size_t i = 0; i < count; ++i)
-            companion.constructors.push_back(env.MemoryRead32(
-                load_base + section.addr + static_cast<u32>(i * 4u)));
-        break;
-    }
-
-    primary.symbols.insert(primary.symbols.end(), companion.symbols.begin(),
-                           companion.symbols.end());
-    std::sort(primary.symbols.begin(), primary.symbols.end(),
-              [](const SymbolRecord& lhs, const SymbolRecord& rhs) {
-                  if (lhs.address != rhs.address) return lhs.address < rhs.address;
-                  return lhs.size > rhs.size;
-              });
-    return companion;
-}
-
 static u64 JoinU64(u32 low, u32 high) { return static_cast<u64>(low) | (static_cast<u64>(high) << 32); }
 static double WordsToDouble(u32 low, u32 high) {
     const u64 bits = JoinU64(low, high);
@@ -2211,7 +1936,70 @@ public:
         return result;
     }
 
-    void Swap() { if (device_) SwapBuffers(device_); }
+    std::pair<int, int> ClientSize() const {
+        RECT area{};
+        int width = native_width_;
+        int height = native_height_;
+        if (window_ && GetClientRect(window_, &area) &&
+            area.right > area.left && area.bottom > area.top) {
+            width = area.right - area.left;
+            height = area.bottom - area.top;
+        }
+        return {width, height};
+    }
+
+    void ScaleGuestRect(GLint x, GLint y, GLsizei width, GLsizei height,
+                        GLint& scaled_x, GLint& scaled_y,
+                        GLsizei& scaled_width, GLsizei& scaled_height) const {
+        const auto [client_width, client_height] = ClientSize();
+        const double sx = native_width_ > 0
+            ? static_cast<double>(client_width) / static_cast<double>(native_width_)
+            : 1.0;
+        const double sy = native_height_ > 0
+            ? static_cast<double>(client_height) / static_cast<double>(native_height_)
+            : 1.0;
+        const double scale = std::max(0.0001, std::min(sx, sy));
+        const double content_width = static_cast<double>(native_width_) * scale;
+        const double content_height = static_cast<double>(native_height_) * scale;
+        const double offset_x = (static_cast<double>(client_width) - content_width) * 0.5;
+        const double offset_y = (static_cast<double>(client_height) - content_height) * 0.5;
+        scaled_x = static_cast<GLint>(std::lround(offset_x + static_cast<double>(x) * scale));
+        scaled_y = static_cast<GLint>(std::lround(offset_y + static_cast<double>(y) * scale));
+        scaled_width = static_cast<GLsizei>(std::max<long>(
+            0, std::lround(static_cast<double>(width) * scale)));
+        scaled_height = static_cast<GLsizei>(std::max<long>(
+            0, std::lround(static_cast<double>(height) * scale)));
+    }
+
+    void RememberGuestViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+        guest_viewport_ = {x, y, width, height};
+        have_guest_viewport_ = true;
+    }
+
+    void RememberGuestScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+        guest_scissor_ = {x, y, width, height};
+        have_guest_scissor_ = true;
+    }
+
+    bool ReadGuestClipRect(GLenum pname, std::array<GLint, 4>& values) const {
+        if (pname == 0x0BA2u && have_guest_viewport_) {
+            values = guest_viewport_;
+            return true;
+        }
+        if (pname == 0x0C10u && have_guest_scissor_) {
+            values = guest_scissor_;
+            return true;
+        }
+        return false;
+    }
+
+    void Swap() {
+        if (resize_pending_) {
+            ReapplyGuestRects();
+            resize_pending_ = false;
+        }
+        if (device_) SwapBuffers(device_);
+    }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
         if (!gpu_profiler_ready_ || active_gpu_query_ >= 0) return;
@@ -2380,9 +2168,17 @@ private:
         }
         const float client_width = static_cast<float>(area.right - area.left);
         const float client_height = static_cast<float>(area.bottom - area.top);
-        x = std::clamp(static_cast<float>(raw_x) * static_cast<float>(native_width_) / client_width,
+        const float scale = std::max(
+            0.0001f,
+            std::min(client_width / static_cast<float>(native_width_),
+                     client_height / static_cast<float>(native_height_)));
+        const float content_width = static_cast<float>(native_width_) * scale;
+        const float content_height = static_cast<float>(native_height_) * scale;
+        const float offset_x = (client_width - content_width) * 0.5f;
+        const float offset_y = (client_height - content_height) * 0.5f;
+        x = std::clamp((static_cast<float>(raw_x) - offset_x) / scale,
                        0.0f, static_cast<float>(native_width_));
-        y = std::clamp(static_cast<float>(raw_y) * static_cast<float>(native_height_) / client_height,
+        y = std::clamp((static_cast<float>(raw_y) - offset_y) / scale,
                        0.0f, static_cast<float>(native_height_));
     }
 
@@ -2394,6 +2190,14 @@ private:
             SetWindowLongPtrA(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
         if (!self) return DefWindowProcA(window, message, wparam, lparam);
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            !(lparam & (1L << 30)) &&
+            (wparam == VK_F11 ||
+             (wparam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000)))) {
+            self->ToggleFullscreen();
+            return 0;
+        }
 
         float x = 0.0f, y = 0.0f;
         switch (message) {
@@ -2418,6 +2222,9 @@ private:
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_SIZE:
+            self->resize_pending_ = true;
+            return 0;
         case WM_LBUTTONDOWN: {
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
@@ -2496,12 +2303,12 @@ private:
         case WM_KEYDOWN:
             if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
                 gd_settings_editor_controls()) {
-                const bool large = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool small = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 u32 tag = 0u;
-                if (wparam == 'A') tag = large ? 5u : 1u;
-                else if (wparam == 'D') tag = large ? 6u : 2u;
-                else if (wparam == 'W') tag = large ? 7u : 3u;
-                else if (wparam == 'S') tag = large ? 8u : 4u;
+                if (wparam == 'A') tag = small ? 1u : 5u;
+                else if (wparam == 'D') tag = small ? 2u : 6u;
+                else if (wparam == 'W') tag = small ? 3u : 7u;
+                else if (wparam == 'S') tag = small ? 4u : 8u;
                 else if (wparam == 'E') tag = 11u; /* clockwise */
                 else if (wparam == 'Q') tag = 12u; /* counter-clockwise */
                 if (tag) {
@@ -2554,6 +2361,71 @@ private:
         return DefWindowProcA(window, message, wparam, lparam);
     }
 
+    void ToggleFullscreen() {
+        if (!window_) return;
+        if (!fullscreen_) {
+            windowed_style_ = GetWindowLongPtrA(window_, GWL_STYLE);
+            windowed_ex_style_ = GetWindowLongPtrA(window_, GWL_EXSTYLE);
+            windowed_placement_.length = sizeof(windowed_placement_);
+            GetWindowPlacement(window_, &windowed_placement_);
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+            if (!GetMonitorInfoA(monitor, &monitor_info)) return;
+            SetWindowLongPtrA(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtrA(window_, GWL_EXSTYLE,
+                              windowed_ex_style_ & ~static_cast<LONG_PTR>(WS_EX_WINDOWEDGE));
+            SetWindowPos(window_, HWND_TOP,
+                         monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+                         monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                         monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            fullscreen_ = true;
+        } else {
+            SetWindowLongPtrA(window_, GWL_STYLE, windowed_style_);
+            SetWindowLongPtrA(window_, GWL_EXSTYLE, windowed_ex_style_);
+            SetWindowPlacement(window_, &windowed_placement_);
+            SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            fullscreen_ = false;
+        }
+        resize_pending_ = true;
+        if (log_) {
+            *log_ << "Window mode: " << (fullscreen_ ? "fullscreen" : "windowed")
+                  << " toggle=F11/Alt+Enter\n";
+            log_->flush();
+        }
+    }
+
+    void ReapplyGuestRects() {
+        if (!context_) return;
+        if (have_guest_viewport_) {
+            auto* function = reinterpret_cast<void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei)>(
+                Resolve("glViewport"));
+            if (function) {
+                GLint x = 0, y = 0;
+                GLsizei width = 0, height = 0;
+                ScaleGuestRect(guest_viewport_[0], guest_viewport_[1],
+                               guest_viewport_[2], guest_viewport_[3],
+                               x, y, width, height);
+                function(x, y, width, height);
+            }
+        }
+        if (have_guest_scissor_) {
+            auto* function = reinterpret_cast<void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei)>(
+                Resolve("glScissor"));
+            if (function) {
+                GLint x = 0, y = 0;
+                GLsizei width = 0, height = 0;
+                ScaleGuestRect(guest_scissor_[0], guest_scissor_[1],
+                               guest_scissor_[2], guest_scissor_[3],
+                               x, y, width, height);
+                function(x, y, width, height);
+            }
+        }
+    }
+
     bool Fail(const char* message) {
         if (log_) { *log_ << "OpenGL host error: " << message << '\n'; log_->flush(); }
         return false;
@@ -2570,6 +2442,15 @@ private:
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
     bool text_input_active_ = false;
+    bool fullscreen_ = false;
+    bool resize_pending_ = true;
+    bool have_guest_viewport_ = false;
+    bool have_guest_scissor_ = false;
+    LONG_PTR windowed_style_ = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    LONG_PTR windowed_ex_style_ = 0;
+    WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
+    std::array<GLint, 4> guest_viewport_{0, 0, 1280, 720};
+    std::array<GLint, 4> guest_scissor_{0, 0, 1280, 720};
     int native_width_ = 1280;
     int native_height_ = 720;
     float last_x_ = 0.0f;
@@ -2619,11 +2500,8 @@ public:
 
 class GuestExecutor {
 public:
-    GuestExecutor(ProbeEnvironment& env, ElfRuntime& runtime, std::ostream& log,
-                  bool armv7_compat = false)
-        : env_(env), runtime_(runtime), log_(log),
-          armv7_compat_(armv7_compat), global_monitor_(1),
-          cpu_(MakeConfig(env, armv7_compat, global_monitor_)) {
+    GuestExecutor(ProbeEnvironment& env, ElfRuntime& runtime, std::ostream& log)
+        : env_(env), runtime_(runtime), log_(log), cpu_(MakeConfig(env)) {
         env_.AttachCpu(&cpu_);
         InitializeControlTraps();
         heap_cursor_ = kHeapBase + 0x1000u;
@@ -3535,15 +3413,10 @@ public:
     }
 
 private:
-    static Dynarmic::A32::UserConfig MakeConfig(ProbeEnvironment& env, bool armv7_compat,
-                                                Dynarmic::ExclusiveMonitor& monitor) {
+    static Dynarmic::A32::UserConfig MakeConfig(ProbeEnvironment& env) {
         Dynarmic::A32::UserConfig config;
         config.callbacks = &env;
-        config.arch_version = armv7_compat
-            ? DynarmicArmv7ArchVersion<Dynarmic::A32::ArchVersion>()
-            : Dynarmic::A32::ArchVersion::v5TE;
-        config.global_monitor = &monitor;
-        config.processor_id = 0;
+        config.arch_version = Dynarmic::A32::ArchVersion::v5TE;
         config.check_halt_on_memory_access = true;
         return config;
     }
@@ -5418,8 +5291,14 @@ private:
         } else if (name == "glGetIntegerv") {
             using Fn = void (APIENTRY*)(GLenum, GLint*);
             std::array<GLint, 16> values{};
-            reinterpret_cast<Fn>(function)(static_cast<GLenum>(arguments[0]), values.data());
-            const std::size_t count = arguments[0] == 0x0BA2u || arguments[0] == 0x0C10u ? 4u : 1u;
+            std::array<GLint, 4> guest_clip{};
+            const GLenum pname = static_cast<GLenum>(arguments[0]);
+            const bool guest_clip_query = gl_.ReadGuestClipRect(pname, guest_clip);
+            if (guest_clip_query)
+                std::copy(guest_clip.begin(), guest_clip.end(), values.begin());
+            else
+                reinterpret_cast<Fn>(function)(pname, values.data());
+            const std::size_t count = pname == 0x0BA2u || pname == 0x0C10u ? 4u : 1u;
             env_.WriteBytes(static_cast<u32>(arguments[1]), values.data(), count * sizeof(GLint));
         } else if (name == "glGetFloatv") {
             using Fn = void (APIENTRY*)(GLenum, GLfloat*);
@@ -5463,6 +5342,26 @@ private:
             const std::size_t bytes = static_cast<std::size_t>(arguments[1]) * 16u * sizeof(GLfloat);
             const GLfloat* values = static_cast<const GLfloat*>(env_.HostPointer(static_cast<u32>(arguments[3]), bytes));
             reinterpret_cast<Fn>(function)(static_cast<GLint>(arguments[0]), static_cast<GLsizei>(arguments[1]), static_cast<GLboolean>(arguments[2]), values);
+        } else if (name == "glScissor" || name == "glViewport") {
+            using Fn = void (APIENTRY*)(GLint, GLint, GLsizei, GLsizei);
+            const GLint guest_x = static_cast<GLint>(arguments[0]);
+            const GLint guest_y = static_cast<GLint>(arguments[1]);
+            const GLsizei guest_width = static_cast<GLsizei>(arguments[2]);
+            const GLsizei guest_height = static_cast<GLsizei>(arguments[3]);
+            GLint scaled_x = 0;
+            GLint scaled_y = 0;
+            GLsizei scaled_width = 0;
+            GLsizei scaled_height = 0;
+            gl_.ScaleGuestRect(guest_x, guest_y, guest_width, guest_height,
+                               scaled_x, scaled_y, scaled_width, scaled_height);
+            reinterpret_cast<Fn>(function)(
+                scaled_x, scaled_y, scaled_width, scaled_height);
+            if (name == "glViewport")
+                gl_.RememberGuestViewport(
+                    guest_x, guest_y, guest_width, guest_height);
+            else
+                gl_.RememberGuestScissor(
+                    guest_x, guest_y, guest_width, guest_height);
         } else if (name == "glBindBuffer") {
             if (arguments[0] == GL_ARRAY_BUFFER) gl_array_buffer_binding_ = static_cast<u32>(arguments[1]);
             if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER) gl_element_buffer_binding_ = static_cast<u32>(arguments[1]);
@@ -7070,50 +6969,14 @@ private:
         else if (name == "__fpclassifyd") result = static_cast<u32>(std::fpclassify(WordsToDouble(r0,r1)));
         else if (name == "qsort") { if (!GuestQsort(r0,r1,r2,r3)) return false; result=0; }
         else if (name == "bsearch") result = GuestBsearch(r0,r1,r2,r3,ArgWord(4));
-        else if (name == "__aeabi_memcpy" || name == "__aeabi_memcpy4" ||
-                 name == "__aeabi_memcpy8") {
-            result = CopyGuest(r0, r1, r2) ? r0 : 0u;
-        } else if (name == "__aeabi_memmove" || name == "__aeabi_memmove4" ||
-                   name == "__aeabi_memmove8") {
-            std::vector<u8> temporary(r2);
-            if (r2 && !env_.ReadBytes(r1, temporary.data(), temporary.size())) result = 0u;
-            else { if (r2) env_.WriteBytes(r0, temporary.data(), temporary.size()); result = r0; }
-        } else if (name == "__aeabi_memset" || name == "__aeabi_memset4") {
-            std::vector<u8> bytes(r1, static_cast<u8>(r2));
-            if (r1) env_.WriteBytes(r0, bytes.data(), bytes.size());
-            result = r0;
-        } else if (name == "__aeabi_memclr" || name == "__aeabi_memclr4" ||
-                   name == "__aeabi_memclr8") {
-            std::vector<u8> bytes(r1, 0u);
-            if (r1) env_.WriteBytes(r0, bytes.data(), bytes.size());
-            result = r0;
-        }
         else if (name == "__android_log_print") {
             FormatCursor cursor{*this,3u,0u};
             const std::string text=FormatGuestString(r2,cursor);
             last_android_log_ = text.size() <= 160u ? text : text.substr(0, 160u);
             log_ << "android log: " << text << '\n';
             result=static_cast<u32>(text.size());
-        } else if (name == "__android_log_vprint") {
-            result = 0u;
         } else if (name == "__gnu_Unwind_Find_exidx") { if(r1)env_.MemoryWrite32(r1,0); result=0; }
-        else if (name == "dlopen") {
-            result = armv7_compat_ ? 0x7f000001u : 0u;
-        } else if (name == "dlsym") {
-            result = 0u;
-            if (armv7_compat_ && r1) {
-                const std::string symbol_name = ReadCString(r1);
-                if (const SymbolRecord* symbol = FindSymbol(runtime_, symbol_name))
-                    result = symbol->address;
-                else {
-                    for (const auto& item : runtime_.imports)
-                        if (item.name == symbol_name) { result = item.address; break; }
-                }
-                if (import.calls <= 32u)
-                    log_ << "Dynarmic hybrid dlsym: " << symbol_name << " -> 0x"
-                         << std::hex << result << std::dec << '\n';
-            }
-        } else if (name == "dlclose" || name == "dlerror") result=0;
+        else if (name == "dlopen" || name == "dlsym" || name == "dlclose" || name == "dlerror") result=0;
         else if (name == "mmap") result=AllocateAligned(r1, kPageSize);
         else if (name == "munmap") { Free(r0); result=0; }
         else if (name == "socket") {
@@ -7245,8 +7108,6 @@ private:
     ProbeEnvironment& env_;
     ElfRuntime& runtime_;
     std::ostream& log_;
-    bool armv7_compat_ = false;
-    Dynarmic::ExclusiveMonitor global_monitor_;
     Dynarmic::A32::Jit cpu_;
     u32 heap_cursor_=0;
     std::map<u32,u32> allocations_;
@@ -7684,7 +7545,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes7 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7914,37 +7775,10 @@ int main(int argc,char** argv) {
         emit("Input APK: "+absolute_apk.string());
         const std::vector<u8> apk=ReadFile(absolute_apk.string());
         emit("APK bytes: "+std::to_string(apk.size()));
-        bool armv7_legacy_package = false;
-        std::vector<u8> libgame;
-        std::string libgame_member = "lib/armeabi/libgame.so";
-        if (auto member = TryExtractZipMember(apk, libgame_member)) {
-            libgame = std::move(*member);
-        } else {
-            libgame_member = "lib/armeabi-v7a/libgame.so";
-            auto v7_member = TryExtractZipMember(apk, libgame_member);
-            if (!v7_member)
-                throw std::runtime_error("APK has no legacy libgame.so in armeabi or armeabi-v7a");
-            libgame = std::move(*v7_member);
-            armv7_legacy_package = true;
-        }
-        std::vector<std::pair<std::string,std::vector<u8>>> auxiliary_modules;
-        if (armv7_legacy_package) {
-            for (const std::string& name : ListZipMembers(apk, "lib/armeabi-v7a/", ".so")) {
-                if (name == libgame_member) continue;
-                auto candidate = TryExtractZipMember(apk, name);
-                if (!candidate || candidate->size() < 52u ||
-                    std::memcmp(candidate->data(), "\x7f" "ELF", 4) != 0) continue;
-                if (!BytesContainAscii(*candidate, "libgame.so")) continue;
-                auxiliary_modules.emplace_back(name, std::move(*candidate));
-            }
-        }
-        const bool hybrid_armv7 = armv7_legacy_package;
-        emit("Extracted " + libgame_member + ": " +
+        const std::vector<u8> libgame=
+            ExtractZipMember(apk,"lib/armeabi/libgame.so");
+        emit("Extracted lib/armeabi/libgame.so: "+
              std::to_string(libgame.size())+" bytes");
-        if (armv7_legacy_package)
-            emit("RESULT: DYNARMIC_LEGACY_V7_PACKAGE detected=1 companions=" +
-                 std::to_string(auxiliary_modules.size()) +
-                 " guest-arch=v7");
         const u32 libgame_crc = static_cast<u32>(crc32(
             0, reinterpret_cast<const Bytef*>(libgame.data()),
             static_cast<uInt>(libgame.size())));
@@ -8038,24 +7872,7 @@ int main(int argc,char** argv) {
              ((runtime.ui_on_check && runtime.ui_on_delete_check &&
                 runtime.play_layer_get_practice_mode)
                   ? "ready-practice-guarded" : "disabled-unproven"));
-        std::vector<std::pair<std::string, ElfRuntime>> mapped_auxiliary;
-        if (!auxiliary_modules.empty()) {
-            u32 next_base = 0x18000000u;
-            for (auto& module : auxiliary_modules) {
-                ElfRuntime auxiliary = MapAndRelocateAuxiliaryElf(
-                    module.second, env, runtime, next_base);
-                emit("RESULT: DYNARMIC_AUXILIARY_MODULE_MAPPED name=" + module.first +
-                     " image=0x" + [&]{ std::ostringstream o; o << std::hex
-                         << auxiliary.image_min << "-0x" << auxiliary.image_max; return o.str(); }() +
-                     " constructors=" + std::to_string(auxiliary.constructors.size()) +
-                     " symbols=" + std::to_string(auxiliary.symbols.size()));
-                next_base = AlignUp(auxiliary.image_max + 0x00100000u, kPageSize);
-                mapped_auxiliary.emplace_back(module.first, std::move(auxiliary));
-            }
-            emit("RESULT: DYNARMIC_LEGACY_HYBRID_READY companions=" +
-                 std::to_string(mapped_auxiliary.size()) + " guest=v7");
-        }
-        GuestExecutor executor(env,runtime,log_file,hybrid_armv7);
+        GuestExecutor executor(env,runtime,log_file);
         executor.ConfigureHost(absolute_apk.string(),writable.string(),apk);
         emit("RESULT: DYNARMIC_APK_MEMORY_CACHE_READY bytes="+
              std::to_string(apk.size()));
@@ -8101,37 +7918,6 @@ int main(int argc,char** argv) {
             throw std::runtime_error(
                 "JNI_OnLoad returned unexpected version");
         emit("RESULT: DYNARMIC_JNI_ONLOAD_OK result=0x00010004");
-        if (!mapped_auxiliary.empty()) {
-            for (auto& module : mapped_auxiliary) {
-                ElfRuntime& auxiliary = module.second;
-                emit("Running " + std::to_string(auxiliary.constructors.size()) +
-                     " auxiliary constructors for " + module.first);
-                for (std::size_t index = 0; index < auxiliary.constructors.size(); ++index) {
-                    const u32 entry = auxiliary.constructors[index];
-                    if (!entry || entry == std::numeric_limits<u32>::max()) continue;
-                    u32 ignored = 0;
-                    if (!executor.RunFunction(entry, {}, &ignored,
-                            "auxiliary constructor " + module.first + " #" +
-                            std::to_string(index + 1u), 0u,
-                            std::chrono::milliseconds(15000)))
-                        throw std::runtime_error(executor.LastError());
-                }
-                if (const SymbolRecord* jni = FindSymbol(auxiliary, "JNI_OnLoad")) {
-                    u32 aux_result = 0;
-                    if (!executor.RunFunction(jni->address, {kVmObject, 0u}, &aux_result,
-                            "auxiliary JNI_OnLoad " + module.first, 0u,
-                            std::chrono::milliseconds(15000)))
-                        throw std::runtime_error(executor.LastError());
-                    std::ostringstream line;
-                    line << "RESULT: DYNARMIC_AUXILIARY_JNI_ONLOAD_OK name=" << module.first
-                         << " result=0x" << std::hex << aux_result << std::dec;
-                    emit(line.str());
-                } else {
-                    emit("RESULT: DYNARMIC_AUXILIARY_NO_JNI_ONLOAD name=" + module.first);
-                }
-                emit("RESULT: DYNARMIC_AUXILIARY_CONSTRUCTORS_OK name=" + module.first);
-            }
-        }
         if(probe_only){
             emit("RESULT: DYNARMIC_BRINGUP14_PROBE_ONLY_OK");
             return 0;

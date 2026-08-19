@@ -1,4 +1,4 @@
-# Source contents — 0.9.6-gdpsfixes7
+# Source contents — 0.9.6-gdpstweaks1
 
 Included:
 
@@ -8,6 +8,7 @@ Included:
 - `I_LOST_THE_GAME` and `EDITOR_CONTROLLS` runtime toggles.
 - Extras code remains in shared history/source but is hard-disabled for this build.
 - ARMv7 editor keyboard bridge with gameplay/playtest input priority.
+- Resizable/fullscreen Windows host code with aspect-ratio-preserving viewport/input scaling.
 - GDPS large-upload, music, nonblocking-network, and color-picker fixes.
 - Windows build/launcher scripts and vendored third-party source/licenses.
 
