@@ -1212,16 +1212,6 @@ struct ElfRuntime {
     u32 editor_move_edit_command = 0;
     u32 editor_transform_object_call = 0;
     u32 editor_transform_edit_command = 0;
-    u32 cc_director_shared = 0;
-    u32 ccnode_get_children = 0;
-    u32 ccnode_get_children_count = 0;
-    u32 ccarray_object_at_index = 0;
-    u32 button_sprite_create = 0;
-    u32 ccnode_add_child = 0;
-    u32 ccnode_add_child_z = 0;
-    u32 ccnode_set_position_ff = 0;
-    u32 ccnode_remove_from_parent_cleanup = 0;
-    u32 cclayer_color_create = 0;
     std::vector<u32> constructors;
     std::vector<ImportRecord> imports;
     std::vector<ObjectRecord> objects;
@@ -2882,17 +2872,6 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d6CCNodeE") runtime.editor_transform_object_call = address;
             else if (name == "_ZN8EditorUI19transformObjectCallEPN7cocos2d8CCObjectE") runtime.editor_transform_object_call = address;
             else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand") runtime.editor_transform_edit_command = address;
-            else if (name == "_ZN7cocos2d10CCDirector14sharedDirectorEv") runtime.cc_director_shared = address;
-            else if (name == "_ZN7cocos2d6CCNode11getChildrenEv") runtime.ccnode_get_children = address;
-            else if (name == "_ZN7cocos2d6CCNode16getChildrenCountEv" ||
-                     name == "_ZNK7cocos2d6CCNode16getChildrenCountEv") runtime.ccnode_get_children_count = address;
-            else if (name == "_ZN7cocos2d7CCArray13objectAtIndexEj") runtime.ccarray_object_at_index = address;
-            else if (name == "_ZN12ButtonSprite6createEPKc") runtime.button_sprite_create = address;
-            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_") runtime.ccnode_add_child = address;
-            else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_i") runtime.ccnode_add_child_z = address;
-            else if (name == "_ZN7cocos2d6CCNode11setPositionEff") runtime.ccnode_set_position_ff = address;
-            else if (name == "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb") runtime.ccnode_remove_from_parent_cleanup = address;
-            else if (name == "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE") runtime.cclayer_color_create = address;
         }
     }
 
@@ -3344,18 +3323,6 @@ public:
     void SetExtrasVisible(bool visible) {
         gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
     }
-    bool ExtrasEnabled() const { return extras_menu_.enabled != 0; }
-    bool ExtrasVisible() const { return extras_menu_.visible != 0; }
-    bool ExtrasOverlayOpen() const { return extras_menu_.overlay_open != 0; }
-    bool ExtrasEarlyFullVersion() const { return extras_menu_.early_full_version != 0; }
-    bool ExtrasTimeMachineAvailable() const {
-        return extras_menu_.time_machine_beta_available != 0;
-    }
-    GdExtrasLayout ExtrasLayout() const {
-        GdExtrasLayout layout{};
-        gd_extras_menu_get_layout(&extras_menu_, native_width_, native_height_, &layout);
-        return layout;
-    }
 
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
@@ -3533,36 +3500,19 @@ private:
         }
         case WM_ERASEBKGND:
             return 1;
-        case WM_LBUTTONDOWN: {
+        case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
             SetFocus(window);
             self->mouse_down_ = true;
             SetCapture(window);
-            int consumed = 0;
-            const int action = gd_extras_menu_pointer_event(
-                &self->extras_menu_, GD_EXTRAS_POINTER_BEGIN, x, y,
-                self->native_width_, self->native_height_, &consumed);
-            if (action != GD_EXTRAS_ACTION_NONE)
-                self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
-                                      static_cast<u32>(action)});
-            if (!consumed)
-                self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
+            self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
             return 0;
-        }
         case WM_MOUSEMOVE:
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
-                int consumed = 0;
-                const int action = gd_extras_menu_pointer_event(
-                    &self->extras_menu_, GD_EXTRAS_POINTER_MOVE, x, y,
-                    self->native_width_, self->native_height_, &consumed);
-                if (action != GD_EXTRAS_ACTION_NONE)
-                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
-                                          static_cast<u32>(action)});
-                if (!consumed)
-                    self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
+                self->Queue(HostEvent{HostEventType::TouchMove, x, y, 0});
             }
             return 0;
         case WM_LBUTTONUP:
@@ -3571,31 +3521,13 @@ private:
                 self->last_x_ = x; self->last_y_ = y;
                 self->mouse_down_ = false;
                 ReleaseCapture();
-                int consumed = 0;
-                const int action = gd_extras_menu_pointer_event(
-                    &self->extras_menu_, GD_EXTRAS_POINTER_END, x, y,
-                    self->native_width_, self->native_height_, &consumed);
-                if (action != GD_EXTRAS_ACTION_NONE)
-                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
-                                          static_cast<u32>(action)});
-                if (!consumed)
-                    self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
+                self->Queue(HostEvent{HostEventType::TouchEnd, x, y, 0});
             }
             return 0;
         case WM_CAPTURECHANGED:
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
-                int consumed = 0;
-                const int action = gd_extras_menu_pointer_event(
-                    &self->extras_menu_, GD_EXTRAS_POINTER_END,
-                    self->last_x_, self->last_y_, self->native_width_,
-                    self->native_height_, &consumed);
-                if (action != GD_EXTRAS_ACTION_NONE)
-                    self->Queue(HostEvent{HostEventType::ExtrasAction, 0.0f, 0.0f,
-                                          static_cast<u32>(action)});
-                if (!consumed)
-                    self->Queue(HostEvent{HostEventType::TouchEnd,
-                                          self->last_x_, self->last_y_, 0});
+                self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
             }
             return 0;
         case WM_COMMAND: {
@@ -3751,12 +3683,6 @@ public:
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
     void SetExtrasVisible(bool) {}
-    bool ExtrasEnabled() const { return false; }
-    bool ExtrasVisible() const { return false; }
-    bool ExtrasOverlayOpen() const { return false; }
-    bool ExtrasEarlyFullVersion() const { return false; }
-    bool ExtrasTimeMachineAvailable() const { return false; }
-    GdExtrasLayout ExtrasLayout() const { return GdExtrasLayout{}; }
     void SetTextInputActive(bool) {}
     void RequestClose() {}
 };
@@ -4314,197 +4240,16 @@ public:
     }
 
 
-    bool ResolveSceneRoot(u32& scene) {
-        scene = 0u;
-        if (!runtime_.cc_director_shared) return true;
-        u32 director = 0u;
-        if (!RunFunction(runtime_.cc_director_shared, {}, &director,
-                         "CCDirector::sharedDirector scene scan", 0u,
-                         std::chrono::milliseconds(1000)) || !director)
-            return false;
-        if (!env_.IsMapped(director, 0x600u)) return true;
-        for (u32 offset = 0u; offset + 4u <= 0x600u; offset += 4u) {
-            const u32 candidate = env_.MemoryRead32(director + offset);
-            if (GuestObjectTypeContains(candidate, "CCScene")) {
-                scene = candidate;
-                break;
-            }
-        }
-        return true;
-    }
-
-    bool WalkSceneTree(u32 node, unsigned depth, unsigned& visited) {
-        if (!node || depth > 12u || visited >= 4096u ||
-            !GuestObjectTypeContains(node, "")) return true;
-        ++visited;
-        const bool is_menu = GuestObjectTypeContains(node, "MenuLayer");
-        const bool is_play = GuestObjectTypeContains(node, "PlayLayer");
-        const bool is_editor = GuestObjectTypeContains(node, "LevelEditorLayer");
-        const bool is_editor_ui = GuestObjectTypeContains(node, "EditorUI");
-        if (!scene_menu_layer_ && is_menu) scene_menu_layer_ = node;
-        if (!scene_play_layer_ && is_play) scene_play_layer_ = node;
-        if (!scene_editor_layer_ && is_editor) scene_editor_layer_ = node;
-        if (!scene_editor_ui_ && is_editor_ui) scene_editor_ui_ = node;
-        if ((is_menu || is_play || is_editor_ui) && !is_editor) return true;
-        if (!runtime_.ccnode_get_children_count || !runtime_.ccnode_get_children ||
-            !runtime_.ccarray_object_at_index) return true;
-        u32 count = 0u;
-        if (!RunFunction(runtime_.ccnode_get_children_count, {node}, &count,
-                         "CCNode::getChildrenCount scene scan", 0u,
-                         std::chrono::milliseconds(500))) return false;
-        if (!count) return true;
-        count = std::min<u32>(count, 512u);
-        u32 children = 0u;
-        if (!RunFunction(runtime_.ccnode_get_children, {node}, &children,
-                         "CCNode::getChildren scene scan", 0u,
-                         std::chrono::milliseconds(500)) || !children) return true;
-        for (u32 index = 0u; index < count && visited < 4096u; ++index) {
-            u32 child = 0u;
-            if (!RunFunction(runtime_.ccarray_object_at_index, {children, index}, &child,
-                             "CCArray::objectAtIndex scene scan", 0u,
-                             std::chrono::milliseconds(500))) return false;
-            if (child && !WalkSceneTree(child, depth + 1u, visited)) return false;
-        }
-        return true;
-    }
-
-    bool RefreshSceneTreeState(bool force = false) {
-        const auto now = std::chrono::steady_clock::now();
-        if (!force && scene_scan_at_.time_since_epoch().count() != 0 &&
-            now - scene_scan_at_ < std::chrono::milliseconds(500))
-            return true;
-        scene_scan_at_ = now;
-        scene_menu_layer_ = 0u;
-        scene_play_layer_ = 0u;
-        scene_editor_layer_ = 0u;
-        scene_editor_ui_ = 0u;
-        scene_root_ = 0u;
-        if (!ResolveSceneRoot(scene_root_) || !scene_root_) return true;
-        unsigned visited = 0u;
-        const bool ok = WalkSceneTree(scene_root_, 0u, visited);
-        if (scene_scan_logs_ < 4u) {
-            ++scene_scan_logs_;
-            log_ << "RESULT: DYNARMIC_V22_SCENE_TREE_SCAN nodes=" << visited
-                 << " menu=" << (scene_menu_layer_ ? 1 : 0)
-                 << " play=" << (scene_play_layer_ ? 1 : 0)
-                 << " editor=" << (scene_editor_layer_ ? 1 : 0)
-                 << " editor-ui=" << (scene_editor_ui_ ? 1 : 0) << "\n";
-            log_.flush();
-        }
-        return ok;
-    }
-
-    bool AddExtrasChild(u32 parent, u32 child, int z) {
-        if (!parent || !child) return false;
-        if (runtime_.ccnode_add_child_z)
-            return RunFunction(runtime_.ccnode_add_child_z,
-                               {parent, child, static_cast<u32>(z)}, nullptr,
-                               "CCNode::addChild extras", 0u,
-                               std::chrono::milliseconds(1000));
-        if (runtime_.ccnode_add_child)
-            return RunFunction(runtime_.ccnode_add_child, {parent, child}, nullptr,
-                               "CCNode::addChild extras", 0u,
-                               std::chrono::milliseconds(1000));
-        return false;
-    }
-
-    u32 CreateExtrasButton(const char* text, u32 parent, float x, float y, int z) {
-        if (!runtime_.button_sprite_create || !runtime_.ccnode_set_position_ff || !parent)
-            return 0u;
-        const u32 label = AllocateString(text ? text : "Extras");
-        u32 button = 0u;
-        if (!label || !RunFunction(runtime_.button_sprite_create, {label}, &button,
-                                   "ButtonSprite::create extras", 0u,
-                                   std::chrono::milliseconds(1500)) || !button)
-            return 0u;
-        if (!RunFunction(runtime_.ccnode_set_position_ff,
-                         {button, FloatToWord(x), FloatToWord(y)}, nullptr,
-                         "CCNode::setPosition extras", 0u,
-                         std::chrono::milliseconds(1000)) ||
-            !AddExtrasChild(parent, button, z)) return 0u;
-        return button;
-    }
-
-    void RemoveExtrasNode(u32& node) {
-        if (!node) return;
-        if (runtime_.ccnode_remove_from_parent_cleanup && env_.IsMapped(node, 4u))
-            (void)RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                              {node, 1u}, nullptr,
-                              "CCNode::removeFromParentAndCleanup extras", 0u,
-                              std::chrono::milliseconds(1000));
-        node = 0u;
-    }
-
-    void ResetExtrasVisualPointers(u32 scene) {
-        extras_scene_root_ = scene;
-        extras_main_button_ = 0u;
-        extras_overlay_ = 0u;
-        extras_close_button_ = 0u;
-        extras_empty_button_ = 0u;
-    }
-
-    bool RefreshExtrasVisuals() {
-        if (!gl_.ExtrasEnabled()) return true;
-        if (scene_root_ != extras_scene_root_)
-            ResetExtrasVisualPointers(scene_root_);
-        if (!gl_.ExtrasVisible() || !scene_menu_layer_ || !scene_root_) {
-            RemoveExtrasNode(extras_overlay_);
-            return true;
-        }
-        const GdExtrasLayout layout = gl_.ExtrasLayout();
-        if (!extras_main_button_) {
-            extras_main_button_ = CreateExtrasButton(
-                "Extras", scene_menu_layer_, layout.main_x, layout.main_y, 10000);
-            if (extras_main_button_) {
-                log_ << "RESULT: DYNARMIC_V22_EXTRAS_GD_BUTTON_READY\n";
-                log_.flush();
-            }
-        }
-        if (!gl_.ExtrasOverlayOpen()) {
-            RemoveExtrasNode(extras_overlay_);
-            extras_close_button_ = extras_empty_button_ = 0u;
-            return true;
-        }
-        if (extras_overlay_) return true;
-        if (!runtime_.cclayer_color_create) return true;
-        const u32 color = Allocate(4u);
-        if (!color) return false;
-        const std::array<u8,4> rgba{0u,0u,0u,180u};
-        env_.WriteBytes(color, rgba.data(), rgba.size());
-        if (!RunFunction(runtime_.cclayer_color_create, {color}, &extras_overlay_,
-                         "CCLayerColor::create extras", 0u,
-                         std::chrono::milliseconds(1500)) || !extras_overlay_)
-            return false;
-        if (!AddExtrasChild(scene_root_, extras_overlay_, 20000)) {
-            extras_overlay_ = 0u;
-            return false;
-        }
-        extras_empty_button_ = CreateExtrasButton(
-            "No extras for this version", extras_overlay_,
-            layout.empty_x, layout.empty_y, 1);
-        extras_close_button_ = CreateExtrasButton(
-            "Close", extras_overlay_, layout.close_x, layout.close_y, 1);
-        log_ << "RESULT: DYNARMIC_V22_EXTRAS_GD_OVERLAY_READY\n";
-        log_.flush();
-        return true;
-    }
-
     u32 FindActiveEditorUi() {
         u32 playtest_editor = 0u;
         if (IsV22EditorPlaytestActive(playtest_editor)) return 0u;
-        if (!RefreshSceneTreeState(true)) return 0u;
-        if (scene_editor_ui_) return scene_editor_ui_;
         const u32 editor_layer = v22_editor_visual_layer_;
-        if (editor_layer && LooksLikeGuestObject(runtime_, env_, editor_layer)) {
-            unsigned visited = 0u;
-            (void)WalkSceneTree(editor_layer, 0u, visited);
-            if (scene_editor_ui_) return scene_editor_ui_;
-        }
-        if (editor_hotkey_miss_logs_ < 8u) {
-            ++editor_hotkey_miss_logs_;
-            log_ << "RESULT: DYNARMIC_EDITOR_COMMAND_IGNORED reason=no-active-EditorUI"
-                 << " editor-layer=" << (editor_layer ? 1 : 0) << "\n";
-            log_.flush();
+        if (!editor_layer || !LooksLikeGuestObject(runtime_, env_, editor_layer))
+            return 0u;
+        for (u32 offset = 0x40u; offset + 4u <= 0x3000u; offset += 4u) {
+            if (!env_.IsMapped(editor_layer + offset, 4u)) continue;
+            const u32 candidate = env_.MemoryRead32(editor_layer + offset);
+            if (GuestObjectTypeContains(candidate, "EditorUI")) return candidate;
         }
         return 0u;
     }
@@ -4525,6 +4270,10 @@ public:
         const char* sender_name = movement
             ? "EditorUI::moveObjectCall sender shortcut"
             : "EditorUI::transformObjectCall sender shortcut";
+
+        /* 2.2 exports the EditCommand overloads directly. Movement and
+           transform commands are deliberately kept separate: feeding editor
+           keys through EditorUI::keyDown is unsafe on Android builds. */
         if (direct) {
             const bool ok = RunFunction(
                 direct, {editor_ui, tag}, nullptr, direct_name, 0u,
@@ -4537,6 +4286,7 @@ public:
             }
             return ok;
         }
+
         if (!runtime_.ccnode_get_tag || !runtime_.ccnode_set_tag || !sender) {
             log_ << "RESULT: DYNARMIC_EDITOR_CONTROLS_UNAVAILABLE reason=missing-"
                  << (movement ? "move" : "transform") << "-symbol\n";
@@ -4561,15 +4311,14 @@ public:
     }
 
     void RefreshExtrasMenuVisibility() {
-        if (!gl_.ExtrasEnabled()) return;
-        if (!RefreshSceneTreeState()) return;
-        gl_.SetExtrasVisible(scene_menu_layer_ && !scene_play_layer_ && !scene_editor_layer_);
-        (void)RefreshExtrasVisuals();
+        u32 layer = 0u;
+        (void)ResolveV22ActiveGameLayer(layer);
+        const bool editor = v22_editor_visual_layer_ &&
+            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_);
+        gl_.SetExtrasVisible(!layer && !editor);
     }
 
     bool HandleExtrasAction(u32 action) {
-        if (action == GD_EXTRAS_ACTION_UI_CHANGED)
-            return RefreshExtrasVisuals();
         log_ << "RESULT: DYNARMIC_EXTRAS_ACTION_UNAVAILABLE backend=armv7 action="
              << action << "\n";
         log_.flush();
@@ -4609,20 +4358,24 @@ public:
     }
 
     bool SendPlatformerButton(u32 button, bool pressed) {
-        if (gd_settings_editor_controls() && FindActiveEditorUi()) return true;
+        // Gameplay/playtest input must win over desktop editor hotkeys.
+        u32 editor = 0u;
+        const bool editor_playtest = IsV22EditorPlaytestActive(editor);
+
         u32 layer = 0u;
         if (!ResolveV22ActiveGameLayer(layer)) return false;
-        if (!layer && !v22_editor_visual_layer_) return true;
+        if (!editor_playtest && !layer &&
+            gd_settings_editor_controls() && FindActiveEditorUi())
+            return true;
+        if (!layer && !editor_playtest && !v22_editor_visual_layer_) return true;
+
         const char* name =
             button == 1u ? "jump" : button == 2u ? "left" : "right";
 
         // GameManager's active-layer field is stale while the editor is
-        // playtesting. Bringup15 sent A/D through EditorUI::keyDown, but that
-        // desktop-only path dereferences an uninitialised beta field and
-        // crashes at EditorUI::keyDown+0x45. LevelEditorLayer is itself a
-        // GJBaseGameLayer, so queue the same player command directly.
-        u32 editor = 0u;
-        if (IsV22EditorPlaytestActive(editor)) {
+        // playtesting. LevelEditorLayer is itself a GJBaseGameLayer, so queue
+        // the same player command directly without touching EditorUI.
+        if (editor_playtest) {
             if (!runtime_.v22_gjbase_queue_button) return true;
             LogHostDispatch(
                 "editorPlatformerQueueButton",
@@ -4672,19 +4425,34 @@ public:
 
     bool PrepareV22MousePlatformerTouch() {
         v22_mouse_platformer_touch_ui_ = 0u;
+        v22_mouse_platformer_playtest_fallback_ = false;
         if (!runtime_.v22_ui_layer_offset) return true;
+
         u32 layer = 0u;
-        if (!ResolveV22ActiveGameLayer(layer)) return false;
+        u32 editor = 0u;
+        const bool editor_playtest = IsV22EditorPlaytestActive(editor);
+        if (editor_playtest) {
+            // GameManager's PlayLayer pointer is stale during editor playtest.
+            // LevelEditorLayer shares the GJBaseGameLayer UI slot.
+            layer = editor;
+        } else if (!ResolveV22ActiveGameLayer(layer)) {
+            return false;
+        }
+
         if (!layer ||
-            !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u))
+            !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u)) {
+            v22_mouse_platformer_playtest_fallback_ = editor_playtest;
             return true;
+        }
         const u32 ui_layer = env_.MemoryRead32(
             layer + runtime_.v22_ui_layer_offset);
         if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
             !env_.IsMapped(ui_layer + 518u, 1u) ||
             !env_.IsMapped(ui_layer + 476u, 4u) ||
-            env_.MemoryRead8(ui_layer + 518u) == 0u)
+            env_.MemoryRead8(ui_layer + 518u) == 0u) {
+            v22_mouse_platformer_playtest_fallback_ = editor_playtest;
             return true;
+        }
 
         // UILayer stores the touch identifier claimed by its native
         // platformer left/right control at +476. Windows sends one pointer
@@ -4700,14 +4468,24 @@ public:
         if (!pressed) {
             if (!v22_mouse_platformer_jump_down_) {
                 v22_mouse_platformer_touch_ui_ = 0u;
+                v22_mouse_platformer_playtest_fallback_ = false;
                 return true;
             }
             v22_mouse_platformer_jump_down_ = false;
             v22_mouse_platformer_touch_ui_ = 0u;
+            v22_mouse_platformer_playtest_fallback_ = false;
             return SendPlatformerButton(1u, false);
         }
         if (v22_mouse_platformer_jump_down_)
             return true;
+
+        if (v22_mouse_platformer_playtest_fallback_) {
+            v22_mouse_platformer_jump_down_ = true;
+            log_ << "[host] V22 editor-playtest mouse jump fallback pressed\n";
+            log_.flush();
+            return SendPlatformerButton(1u, true);
+        }
+
         const u32 ui_layer = v22_mouse_platformer_touch_ui_;
         if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
             !env_.IsMapped(ui_layer + 518u, 1u) ||
@@ -12229,19 +12007,6 @@ private:
     u64 v22_level_settings_fallback_successes_=0;
     u64 v22_editor_entries_=0;
     u32 v22_editor_visual_layer_=0;
-    u32 scene_root_=0;
-    u32 scene_menu_layer_=0;
-    u32 scene_play_layer_=0;
-    u32 scene_editor_layer_=0;
-    u32 scene_editor_ui_=0;
-    u32 extras_scene_root_=0;
-    u32 extras_main_button_=0;
-    u32 extras_overlay_=0;
-    u32 extras_close_button_=0;
-    u32 extras_empty_button_=0;
-    u64 scene_scan_logs_=0;
-    u64 editor_hotkey_miss_logs_=0;
-    std::chrono::steady_clock::time_point scene_scan_at_{};
     u32 v22_draw_grid_layer_=0;
     u64 v22_editor_visibility_passes_=0;
     u64 v22_editor_overlay_frames_=0;
@@ -12256,6 +12021,7 @@ private:
     u32 v22_editor_hide_variable_address_=0;
     u32 v22_platformer_ui_logged_=0;
     bool v22_mouse_platformer_jump_down_=false;
+    bool v22_mouse_platformer_playtest_fallback_ = false;
     u32 v22_mouse_platformer_touch_ui_=0;
     u64 v22_companion_hooks_installed_=0;
     u64 v22_companion_hooks_skipped_=0;
@@ -12666,7 +12432,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes6 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpsfixes7 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

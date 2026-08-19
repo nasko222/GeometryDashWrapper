@@ -51,7 +51,7 @@ void gd_extras_menu_init(GdExtrasMenu *menu) {
     const char *version;
     if (!menu) return;
     memset(menu, 0, sizeof(*menu));
-    menu->enabled = gd_settings_extras_menu();
+    menu->enabled = 0;
     version = getenv("GD_GAME_VERSION");
     menu->early_full_version = is_early_full_version(version);
     menu->time_machine_beta_available =

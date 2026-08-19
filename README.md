@@ -1,6 +1,6 @@
-# Geometry Dash Wrapper 0.9.6-gdpsfixes6
+# Geometry Dash Wrapper 0.9.6-gdpsfixes7
 
-`gdpsfixes6` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
+`gdpsfixes7` keeps the Android-only GDPSFixes line. The iOS backend remains removed.
 
 ## Confirmed carried fix
 
@@ -22,30 +22,13 @@ backends default it to false and refuse direct execution when it is not true.
 - `Q` — rotate counter-clockwise.
 - `E` — rotate clockwise.
 
-GDPSFixes5 replaces the failed raw-pointer search for `EditorUI` with cocos2d
-scene/child traversal. It deliberately never routes these keys through the
-unsafe Android `EditorUI::keyDown` desktop path.
+Editor shortcuts remain available while editing, but gameplay/playtest input now
+takes priority so platformer WASD/Space is not consumed by editor controls.
 
-## In-game Extras menu
+## Extras
 
-`EXTRAS_MENU=true` now renders the Extras interface inside cocos2d. There is no
-Win32 BUTTON and no `TrackPopupMenu`. The visible controls are real game
-`ButtonSprite` nodes, with an in-game `CCLayerColor` overlay. Host hit testing is
-used only to activate the injected controls without inventing a guest callback.
-
-For full Geometry Dash 1.0x through 1.3x:
-
-- **Play Placeholder Level** uses the real early level table slot **ID 10** and
-  suppresses background music for that run.
-
-For full Geometry Dash **1.02** only:
-
-- **Play Time Machine Beta** uses built-in level **ID 8**. Scene creation now
-  has no artificial 100,000,000 guest-tick cap; a real wall-clock watchdog is
-  kept so an actual infinite loop can still be stopped.
-
-Later wrapper backends still receive the in-game Extras button/overlay, with a
-`No extras for this version` entry until version-specific extras are added.
+Extras is temporarily removed/disabled in this build. Old `EXTRAS_MENU=true`
+environment settings are ignored, and no Extras button or overlay is created.
 
 ## Other carried GDPS fixes
 

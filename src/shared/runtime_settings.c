@@ -147,7 +147,8 @@ int gd_settings_editor_controls(void) {
 }
 
 int gd_settings_extras_menu(void) {
-    return gd_setting_bool("EXTRAS_MENU", 0);
+    /* Extras is temporarily removed from gdpsfixes7. */
+    return 0;
 }
 
 int gd_settings_v22_exact_editor_visibility(void) {

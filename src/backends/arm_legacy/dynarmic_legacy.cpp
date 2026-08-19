@@ -52,6 +52,7 @@
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 extern "C" {
 #include "zlib.h"
@@ -837,6 +838,22 @@ public:
         WriteTyped(vaddr, value);
     }
 
+    bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
+    bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
+        return CompareExchangeTyped(vaddr, value, expected);
+    }
+
     void InterpreterFallback(u32 pc, std::size_t count) override {
         interpreter_fallback = true;
         fallback_pc = pc;
@@ -970,6 +987,21 @@ private:
         }
         std::memcpy(region->data.data() + (address - region->base), &value,
                     sizeof(value));
+    }
+
+    template <typename T>
+    bool CompareExchangeTyped(u32 address, T value, T expected) {
+        MemoryRegion* region = FindMutable(address, sizeof(T));
+        if (!region) {
+            WriteFault(address);
+            return false;
+        }
+        T current{};
+        u8* const bytes = region->data.data() + (address - region->base);
+        std::memcpy(&current, bytes, sizeof(current));
+        if (current != expected) return false;
+        std::memcpy(bytes, &value, sizeof(value));
+        return true;
     }
 
     std::vector<MemoryRegion> regions_;
@@ -7652,7 +7684,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes6 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpsfixes7 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
