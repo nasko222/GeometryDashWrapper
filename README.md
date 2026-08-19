@@ -1,6 +1,6 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks1
+# Geometry Dash Wrapper 0.9.6-gdpstweaks2
 
-`gdpstweaks1` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
+`gdpstweaks2` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
 
 ## Confirmed carried fix
 

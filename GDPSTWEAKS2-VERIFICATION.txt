@@ -1,0 +1,11 @@
+Geometry Dash Wrapper 0.9.6-gdpstweaks2 verification
+====================================================
+
+PASS: branch/version metadata updated to gdpstweaks2.
+PASS: workaround is restricted to legacy ARM.
+PASS: workaround is restricted to GD_GAME_VERSION 1.0* and 1.1*.
+PASS: normal ESC/nativeKeyDown path remains the fallback when EndLevelLayer is absent.
+PASS: Geometry Dash 1.2+ is unaffected.
+PASS: real Geometry Dash 1.0 libgame.so exports EndLevelLayer::onMenu().
+PASS: scene traversal is only performed on ESC in affected versions; there is no per-frame cost.
+PASS: source package contains no APK, .so, .exe or .dll game/runtime payloads.

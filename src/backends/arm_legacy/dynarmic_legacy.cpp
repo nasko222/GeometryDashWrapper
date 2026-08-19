@@ -1015,6 +1015,7 @@ struct ElfRuntime {
     u32 ccnode_get_children = 0;
     u32 ccnode_get_children_count = 0;
     u32 ccarray_object_at_index = 0;
+    u32 end_level_on_menu = 0;
     u32 button_sprite_create = 0;
     u32 ccnode_add_child = 0;
     u32 ccnode_add_child_z = 0;
@@ -1562,6 +1563,8 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccnode_get_children_count = address;
             else if (name == "_ZN7cocos2d7CCArray13objectAtIndexEj")
                 runtime.ccarray_object_at_index = address;
+            else if (name == "_ZN13EndLevelLayer6onMenuEv")
+                runtime.end_level_on_menu = address;
             else if (name == "_ZN12ButtonSprite6createEPKc")
                 runtime.button_sprite_create = address;
             else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_")
@@ -2669,6 +2672,73 @@ public:
                 break;
             }
         }
+        return true;
+    }
+
+    bool FindSceneNodeByType(u32 node, const char* type_name, u32& match,
+                             unsigned depth, unsigned& visited) {
+        if (match || !node || !type_name || depth > 12u || visited >= 4096u ||
+            !GuestObjectTypeContains(node, ""))
+            return true;
+        ++visited;
+        if (GuestObjectTypeContains(node, type_name)) {
+            match = node;
+            return true;
+        }
+        if (!runtime_.ccnode_get_children_count || !runtime_.ccnode_get_children ||
+            !runtime_.ccarray_object_at_index)
+            return true;
+        u32 count = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children_count, {node}, &count,
+                         "CCNode::getChildrenCount ESC workaround", 0u,
+                         std::chrono::milliseconds(500)))
+            return false;
+        if (!count) return true;
+        count = std::min<u32>(count, 512u);
+        u32 children = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children, {node}, &children,
+                         "CCNode::getChildren ESC workaround", 0u,
+                         std::chrono::milliseconds(500)) || !children)
+            return true;
+        for (u32 index = 0u; index < count && visited < 4096u && !match; ++index) {
+            u32 child = 0u;
+            if (!RunFunction(runtime_.ccarray_object_at_index, {children, index}, &child,
+                             "CCArray::objectAtIndex ESC workaround", 0u,
+                             std::chrono::milliseconds(500)))
+                return false;
+            if (child && !FindSceneNodeByType(child, type_name, match,
+                                              depth + 1u, visited))
+                return false;
+        }
+        return true;
+    }
+
+    bool TryHandleEarlyEndLevelEscape(bool& handled) {
+        handled = false;
+        const char* version = std::getenv("GD_GAME_VERSION");
+        if (!version || !runtime_.end_level_on_menu) return true;
+        const bool affected_version =
+            std::strncmp(version, "1.0", 3u) == 0 ||
+            std::strncmp(version, "1.1", 3u) == 0;
+        if (!affected_version) return true;
+
+        u32 scene = 0u;
+        if (!ResolveRunningScene(scene)) return false;
+        if (!scene) return true;
+        u32 end_layer = 0u;
+        unsigned visited = 0u;
+        if (!FindSceneNodeByType(scene, "EndLevelLayer", end_layer, 0u, visited))
+            return false;
+        if (!end_layer) return true;
+
+        LogHostDispatch("earlyEndLevelEscapeFix", runtime_.end_level_on_menu,
+                        std::string("version=") + version +
+                        " action=EndLevelLayer::onMenu");
+        if (!RunFunction(runtime_.end_level_on_menu, {end_layer}, nullptr,
+                         "EndLevelLayer::onMenu ESC workaround", 0u,
+                         std::chrono::milliseconds(10000)))
+            return false;
+        handled = true;
         return true;
     }
 
@@ -7545,7 +7615,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks1 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks2 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7991,9 +8061,14 @@ int main(int argc,char** argv) {
                             "nativeTouchesEnd");
                     break;
                 case HostEventType::KeyDown:
-                    if(!native_paused)
-                        ok=executor.SendKey(
-                            runtime.native_key_down,event.value);
+                    if(!native_paused){
+                        bool handled=false;
+                        if(event.value==4u)
+                            ok=executor.TryHandleEarlyEndLevelEscape(handled);
+                        if(ok && !handled)
+                            ok=executor.SendKey(
+                                runtime.native_key_down,event.value);
+                    }
                     break;
                 case HostEventType::TextInput:
                     if(!native_paused)
