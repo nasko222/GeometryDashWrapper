@@ -5389,6 +5389,17 @@ private:
             reinterpret_cast<Fn>(function)(static_cast<GLuint>(arguments[0]), capacity, &length, text.data());
             if (arguments[2]) env_.MemoryWrite32(static_cast<u32>(arguments[2]), static_cast<u32>(length));
             if (arguments[3] && capacity > 0) env_.WriteBytes(static_cast<u32>(arguments[3]), text.data(), text.size());
+        } else if (name == "glTexParameteri") {
+            using Fn = void (APIENTRY*)(GLenum, GLenum, GLint);
+            const GLenum target = static_cast<GLenum>(arguments[0]);
+            const GLenum pname = static_cast<GLenum>(arguments[1]);
+            GLint param = static_cast<GLint>(arguments[2]);
+            // Smooth only texture magnification. Old GD builds may request
+            // GL_NEAREST, which becomes visibly blocky when the host window
+            // magnifies the 1280x720 presentation in fullscreen/resized modes.
+            if (pname == 0x2800u && param == 0x2600)
+                param = 0x2601;
+            reinterpret_cast<Fn>(function)(target, pname, param);
         } else if (name == "glUniform1f") {
             reinterpret_cast<void (APIENTRY*)(GLint,GLfloat)>(function)(static_cast<GLint>(arguments[0]), WordToFloat(static_cast<u32>(arguments[1])));
         } else if (name == "glUniform2f") {
@@ -7615,7 +7626,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks3 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

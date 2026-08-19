@@ -1,6 +1,6 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks2
+# Geometry Dash Wrapper 0.9.6-gdpstweaks3
 
-`gdpstweaks2` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
+`gdpstweaks3` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
 
 ## Confirmed carried fix
 
@@ -50,3 +50,7 @@ environment settings are ignored, and no Extras button or overlay is created.
 
 Run `BUILD_ALL.cmd` on Windows. The source archive contains no APK, extracted
 proprietary game library, game executable, or iOS backend.
+
+## gdpstweaks3 image quality
+
+Fullscreen/resized presentation forces linear texture magnification when an old build requests nearest-neighbour filtering, avoiding the blocky/cubed enlarged look while leaving minification and mipmaps unchanged.

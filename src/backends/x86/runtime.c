@@ -3545,6 +3545,22 @@ static void shim_glClearDepthf(float depth) {
     }
 }
 
+/*
+ * Old Geometry Dash builds can request nearest-neighbour magnification for
+ * sprite/font textures.  That is mostly invisible at the wrapper's native
+ * 1280x720 presentation, but becomes aggressively blocky when a resizable or
+ * fullscreen window magnifies the scene.  Preserve every other texture
+ * parameter (including minification/mipmaps) and smooth only magnification.
+ */
+static void shim_glTexParameteri(unsigned int target, unsigned int pname, int param) {
+    typedef void (APIENTRY *Function)(unsigned int, unsigned int, int);
+    Function function = (Function)GetProcAddress(g_opengl, "glTexParameteri");
+    if (pname == 0x2800u && param == 0x2600) { /* GL_TEXTURE_MAG_FILTER / GL_NEAREST */
+        param = 0x2601; /* GL_LINEAR */
+    }
+    if (function) function(target, pname, param);
+}
+
 static void shim_glViewport(int x, int y, int width, int height) {
     typedef void (APIENTRY *Function)(int, int, int, int);
     Function function = (Function)GetProcAddress(g_opengl, "glViewport");
@@ -3852,6 +3868,7 @@ static void *custom_function(const char *name) {
     CUSTOM("sqrtf", shim_sqrtf);
     CUSTOM("tanf", shim_tanf);
     CUSTOM("glClearDepthf", shim_glClearDepthf);
+    CUSTOM("glTexParameteri", shim_glTexParameteri);
     CUSTOM("glViewport", shim_glViewport);
     CUSTOM("glScissor", shim_glScissor);
     CUSTOM("glGetIntegerv", shim_glGetIntegerv);
