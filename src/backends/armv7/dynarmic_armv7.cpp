@@ -61,6 +61,7 @@
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+#include "win_dpi.h"
 
 extern "C" {
 #include "zlib.h"
@@ -3152,6 +3153,8 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
+        remove_pause_button_option_ = gd_settings_remove_pause_button() != 0;
+        hide_cursor_option_ = gd_settings_hide_cursor_when_playing() != 0;
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnified ARMv7Window";
         WNDCLASSEXA wc{};
@@ -3371,12 +3374,24 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
+    void SetGameplayActive(bool active, bool editor_active = false) {
+        gameplay_active_ = active;
+        editor_active_ = editor_active;
+        if (!active || editor_active) {
+            cursor_force_visible_ = false;
+            cursor_pause_click_seen_ = false;
+        }
+        UpdateCursorVisibility();
+    }
     void SetExtrasVisible(bool visible) {
         gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
     }
 
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
+        if (active) cursor_force_visible_ = true;
+        else if (gameplay_active_ && !editor_active_) cursor_force_visible_ = false;
+        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::PlatformButton,
@@ -3393,6 +3408,47 @@ public:
                             0.0f, 0.0f, 3u, false});
         }
     }
+    bool PauseButtonHit(float x, float y) const {
+        return remove_pause_button_option_ && gameplay_active_ && !editor_active_ &&
+               native_width_ > 0 && native_height_ > 0 &&
+               x >= static_cast<float>(native_width_) * 0.86f &&
+               y <= static_cast<float>(native_height_) * 0.22f;
+    }
+    void UpdateCursorVisibility() {
+        const bool hidden = hide_cursor_option_ && gameplay_active_ &&
+            !editor_active_ && active_ && !text_input_active_ &&
+            !cursor_force_visible_;
+        if (cursor_hidden_ == hidden) return;
+        cursor_hidden_ = hidden;
+        if (window_) SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
+    }
+    void ForceCursorVisible() {
+        cursor_force_visible_ = true;
+        cursor_pause_click_seen_ = false;
+        UpdateCursorVisibility();
+    }
+    void ConfirmKeyboardGameplayInput() {
+        if (gameplay_active_ && !editor_active_) {
+            cursor_force_visible_ = false;
+            cursor_pause_click_seen_ = false;
+            UpdateCursorVisibility();
+        }
+    }
+    void ConfirmMouseGameplayInput() {
+        if (!gameplay_active_ || editor_active_) return;
+        if (cursor_force_visible_) {
+            /* First click after Escape is normally Resume; keep the cursor for
+               that click. A following gameplay click hides it again. */
+            if (!cursor_pause_click_seen_) {
+                cursor_pause_click_seen_ = true;
+                return;
+            }
+            cursor_force_visible_ = false;
+            cursor_pause_click_seen_ = false;
+        }
+        UpdateCursorVisibility();
+    }
+
     void RequestClose() {
         closed_ = true;
         events_.clear();
@@ -3561,6 +3617,8 @@ private:
                     self->Queue(HostEvent{HostEventType::PlatformButton,
                                           0.0f, 0.0f, 1u, false});
                 }
+                if (!becoming_active) self->ForceCursorVisible();
+                else self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
@@ -3570,10 +3628,22 @@ private:
         case WM_SIZE:
             self->resize_pending_ = true;
             return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
             SetFocus(window);
+            if (self->PauseButtonHit(x, y)) {
+                self->pause_touch_blocked_ = true;
+                return 0;
+            }
+            self->pause_touch_blocked_ = false;
+            self->ConfirmMouseGameplayInput();
             self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
@@ -3586,6 +3656,10 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
+            if (self->pause_touch_blocked_) {
+                self->pause_touch_blocked_ = false;
+                return 0;
+            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -3595,6 +3669,7 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
+            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -3625,6 +3700,7 @@ private:
                 if (tag && wparam != 'A' && wparam != 'D') return 0;
             }
             if (wparam == VK_ESCAPE) {
+                self->ForceCursorVisible();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
             }
@@ -3638,6 +3714,7 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'A' || wparam == VK_LEFT) &&
                 !self->platform_left_down_) {
+                self->ConfirmKeyboardGameplayInput();
                 self->platform_left_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 2u, true});
@@ -3646,6 +3723,7 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'D' || wparam == VK_RIGHT) &&
                 !self->platform_right_down_) {
+                self->ConfirmKeyboardGameplayInput();
                 self->platform_right_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 3u, true});
@@ -3653,6 +3731,7 @@ private:
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
+                self->ConfirmKeyboardGameplayInput();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 1u, true});
@@ -3781,6 +3860,14 @@ private:
     bool platform_left_down_ = false;
     bool platform_right_down_ = false;
     bool text_input_active_ = false;
+    bool remove_pause_button_option_ = false;
+    bool pause_touch_blocked_ = false;
+    bool hide_cursor_option_ = false;
+    bool gameplay_active_ = false;
+    bool editor_active_ = false;
+    bool cursor_hidden_ = false;
+    bool cursor_force_visible_ = false;
+    bool cursor_pause_click_seen_ = false;
     bool fullscreen_ = false;
     bool resize_pending_ = true;
     bool have_guest_viewport_ = false;
@@ -3826,6 +3913,7 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
+    void SetGameplayActive(bool, bool = false) {}
     void SetExtrasVisible(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
@@ -4457,9 +4545,40 @@ public:
     void RefreshExtrasMenuVisibility() {
         u32 layer = 0u;
         (void)ResolveV22ActiveGameLayer(layer);
-        const bool editor = v22_editor_visual_layer_ &&
-            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_);
+        u32 editor_layer = 0u;
+        const bool editor_playtest = IsV22EditorPlaytestActive(editor_layer);
+        const bool editor = (v22_editor_visual_layer_ &&
+            LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_)) ||
+            editor_playtest;
+        const bool gameplay = layer != 0u && !editor;
+        if (gameplay) HideV22PauseButtonVisual(layer);
+        else v22_pause_hidden_item_ = 0u;
+        gl_.SetGameplayActive(gameplay, editor);
         gl_.SetExtrasVisible(!layer && !editor);
+    }
+
+    void HideV22PauseButtonVisual(u32 layer) {
+        if (!gd_settings_remove_pause_button() || !layer ||
+            !runtime_.v22_ui_layer_offset ||
+            !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u)) return;
+        const u32 ui_layer = env_.MemoryRead32(layer + runtime_.v22_ui_layer_offset);
+        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
+            !env_.IsMapped(ui_layer + 0x1C0u, 4u)) return;
+        const u32 pause_item = env_.MemoryRead32(ui_layer + 0x1C0u);
+        if (!LooksLikeGuestObject(runtime_, env_, pause_item)) return;
+        if (v22_pause_hidden_item_ == pause_item) return;
+        const SymbolRecord* set_visible = FindSymbol(
+            runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
+        if (!set_visible) return;
+        if (RunFunction(set_visible->address, {pause_item, 0u}, nullptr,
+                        "V22 hide top-right pause control", 0u,
+                        std::chrono::milliseconds(1000))) {
+            v22_pause_hidden_item_ = pause_item;
+            log_ << "RESULT: DYNARMIC_V22_PAUSE_BUTTON_HIDDEN ui=0x"
+                 << std::hex << ui_layer << " item=0x" << pause_item
+                 << std::dec << " escape-pause=preserved\n";
+            log_.flush();
+        }
     }
 
     bool HandleExtrasAction(u32 action) {
@@ -9364,12 +9483,7 @@ private:
             using Fn = void (APIENTRY*)(GLenum, GLenum, GLint);
             const GLenum target = static_cast<GLenum>(arguments[0]);
             const GLenum pname = static_cast<GLenum>(arguments[1]);
-            GLint param = static_cast<GLint>(arguments[2]);
-            // Smooth only texture magnification. Old GD builds may request
-            // GL_NEAREST, which becomes visibly blocky when the host window
-            // magnifies the 1280x720 presentation in fullscreen/resized modes.
-            if (pname == 0x2800u && param == 0x2600)
-                param = 0x2601;
+            const GLint param = static_cast<GLint>(arguments[2]);
             reinterpret_cast<Fn>(function)(target, pname, param);
         } else if (name == "glUniform1f") {
             reinterpret_cast<void (APIENTRY*)(GLint,GLfloat)>(function)(static_cast<GLint>(arguments[0]), WordToFloat(static_cast<u32>(arguments[1])));
@@ -12197,6 +12311,7 @@ private:
     bool v22_mouse_platformer_jump_down_=false;
     bool v22_mouse_platformer_playtest_fallback_ = false;
     u32 v22_mouse_platformer_touch_ui_=0;
+    u32 v22_pause_hidden_item_=0;
     u64 v22_companion_hooks_installed_=0;
     u64 v22_companion_hooks_skipped_=0;
     u64 v22_null_ccstring_float_recoveries_=0;
@@ -12606,7 +12721,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks3 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks4 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12830,6 +12945,7 @@ extern "C" void runtime_log(const char* format, ...) {
 }
 
 int main(int argc,char** argv) {
+    (void)gd_enable_application_dpi_awareness();
     if (!gd_settings_i_lost_the_game()) {
 #ifdef _WIN32
         MessageBoxA(nullptr, "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch through a RUN_AUTO batch file.", "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
@@ -13226,8 +13342,10 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
-             " desktop-pause-button=native"+
-             " mouse-cursor=native-visible"+
+             " remove-pause-button="+
+             (gd_settings_remove_pause_button() ? "true" : "false")+
+             " hide-cursor-when-playing="+
+             (gd_settings_hide_cursor_when_playing() ? "true" : "false")+
              " practice-zx="+
              ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
                 runtime.v22_practice_mode_offset)

@@ -38,8 +38,9 @@
 #include <wctype.h>
 
 #include "zlib.h"
+#include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.6-gdpstweaks3"
+#define LAUNCHER_VERSION "0.9.6-gdpstweaks4"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -740,6 +741,8 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t network_mode[64];
     wchar_t lost_game[64];
     wchar_t editor_controls[64];
+    wchar_t remove_pause[64];
+    wchar_t hide_cursor[64];
     wchar_t extras_menu[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
@@ -780,6 +783,10 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"I_LOST_THE_GAME", L"false", lost_game, ARRAY_COUNT(lost_game)));
     fwprintf(file, L"editor_controlls=%ls\n",
              GetSetting(L"EDITOR_CONTROLLS", L"false", editor_controls, ARRAY_COUNT(editor_controls)));
+    fwprintf(file, L"remove_pause_button=%ls\n",
+             GetSetting(L"REMOVE_PAUSE_BUTTON", L"false", remove_pause, ARRAY_COUNT(remove_pause)));
+    fwprintf(file, L"hide_cursor_when_playing=%ls\n",
+             GetSetting(L"HIDE_CURSOR_WHEN_PLAYING", L"false", hide_cursor, ARRAY_COUNT(hide_cursor)));
     fwprintf(file, L"extras_menu=%ls\n",
              GetSetting(L"EXTRAS_MENU", L"false", extras_menu, ARRAY_COUNT(extras_menu)));
     fwprintf(file, L"x86_api_connect_mode=%ls\n",
@@ -1089,6 +1096,7 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
 }
 
 int wmain(int argc, wchar_t **argv) {
+    (void)gd_enable_application_dpi_awareness();
     LauncherContext context;
     if (!GetBooleanSetting(L"I_LOST_THE_GAME", 0)) {
         MessageBoxW(NULL,

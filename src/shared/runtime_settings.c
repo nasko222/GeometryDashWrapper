@@ -146,8 +146,16 @@ int gd_settings_editor_controls(void) {
     return gd_setting_bool("EDITOR_CONTROLLS", 0);
 }
 
+int gd_settings_remove_pause_button(void) {
+    return gd_setting_bool("REMOVE_PAUSE_BUTTON", 0);
+}
+
+int gd_settings_hide_cursor_when_playing(void) {
+    return gd_setting_bool("HIDE_CURSOR_WHEN_PLAYING", 0);
+}
+
 int gd_settings_extras_menu(void) {
-    /* Extras remains temporarily removed in gdpstweaks3. */
+    /* Extras remains temporarily removed in gdpstweaks4. */
     return 0;
 }
 

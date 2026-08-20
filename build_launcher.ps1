@@ -90,6 +90,7 @@ $Arguments = @(
     "-D_CRT_SECURE_NO_WARNINGS",
     "-municode",
     "-I$Root\third_party\zlib",
+    "-I$Root\src\shared",
     "-o", (Join-Path $Output "GeometryDashLauncher.exe")
 ) + $Sources + @(
     "-lkernel32",

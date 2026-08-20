@@ -16,6 +16,7 @@
 #include "runtime_settings.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
+#include "win_dpi.h"
 
 typedef int (*JniOnLoadFunction)(void *java_vm, void *reserved);
 typedef void (*NativeSetApkPathFunction)(void *environment, void *object,
@@ -33,6 +34,7 @@ typedef void (*NativeInsertTextFunction)(void *environment, void *object,
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
+typedef void (__cdecl *CCNodeSetVisibleFunction)(void *node, int visible);
 typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
 typedef int (__cdecl *CcNodeGetTagFunction)(void *self);
@@ -84,11 +86,22 @@ typedef struct {
     LONG_PTR windowed_ex_style;
     WINDOWPLACEMENT windowed_placement;
     int vsync_enabled;
+    int remove_pause_button_option;
+    int pause_touch_blocked;
+    int hide_cursor_option;
+    int cursor_hidden;
+    int cursor_force_visible;
+    int cursor_pause_click_seen;
+    int pause_overlay_seen;
     ULONGLONG gameplay_cache_time;
     int gameplay_cache_value;
     int editor_cache_value;
     void *active_play_layer;
     void *active_editor_layer;
+    void *active_pause_layer;
+    void *pause_hidden_for_play_layer;
+    size_t pause_button_offset;
+    CCNodeSetVisibleFunction node_set_visible;
     GameManagerSharedStateFunction game_manager_shared_state;
     UiCheckpointFunction ui_on_check;
     UiCheckpointFunction ui_on_delete_check;
@@ -513,6 +526,39 @@ static unsigned patch_x86_world_creator_buttons(const ElfImage *image) {
     return 0;
 }
 
+/* Derive the UILayer member that receives the pause CCMenuItemSpriteExtra. */
+static size_t discover_x86_pause_button_offset(const ElfImage *image) {
+    unsigned char *initializer = (unsigned char *)elf_image_find_export(
+        image, "_ZN7UILayer4initEv");
+    unsigned char *create_item = (unsigned char *)elf_image_find_export(
+        image,
+        "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_"
+        "PNS0_8CCObjectEMS3_FvS4_E");
+    size_t offset;
+    if (!initializer || !create_item) return 0u;
+    for (offset = 0u; offset + 5u < 1024u; ++offset) {
+        int32_t displacement;
+        unsigned char *call_target;
+        size_t after;
+        if (initializer[offset] != 0xE8u) continue;
+        memcpy(&displacement, initializer + offset + 1u, sizeof(displacement));
+        call_target = initializer + offset + 5u + displacement;
+        if (call_target != create_item) continue;
+        for (after = offset + 5u;
+             after + 6u <= offset + 40u && after + 6u <= 1024u; ++after) {
+            uint32_t field;
+            const unsigned char modrm = initializer[after + 1u];
+            if (initializer[after] != 0x89u ||
+                (modrm & 0xF8u) != 0x80u || (modrm & 0x07u) == 0x04u)
+                continue;
+            memcpy(&field, initializer + after + 2u, sizeof(field));
+            if (field >= 0x80u && field <= 0x800u) return field;
+        }
+        break;
+    }
+    return 0u;
+}
+
 static void install_configurable_x86_hacks(const ElfImage *image) {
     static const char *const icon_checks[] = {
         "_ZN11GameManager14isIconUnlockedEi",
@@ -555,6 +601,11 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     unsigned texture_quality_patches = 0;
     unsigned world_creator_patches = 0;
     size_t index;
+    g_host.remove_pause_button_option = gd_settings_remove_pause_button();
+    g_host.hide_cursor_option = gd_settings_hide_cursor_when_playing();
+    g_host.pause_button_offset = discover_x86_pause_button_offset(image);
+    g_host.node_set_visible = (CCNodeSetVisibleFunction)elf_image_find_export(
+        image, "_ZN7cocos2d6CCNode10setVisibleEb");
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
@@ -589,7 +640,11 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
             }
         }
     }
-    runtime_log("PC desktop controls: native pause button and mouse cursor unchanged");
+    runtime_log("PC desktop tweaks: remove-pause=%s pause-field=0x%lx setVisible=%s hide-cursor=%s",
+                g_host.remove_pause_button_option ? "true" : "false",
+                (unsigned long)g_host.pause_button_offset,
+                g_host.node_set_visible ? "ready" : "missing",
+                g_host.hide_cursor_option ? "true" : "false");
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
                 "highest-graphics=%s hd=%u low-memory=%u texture-quality=%u "
@@ -704,7 +759,10 @@ static void walk_scene_tree(void *node, unsigned int depth, unsigned int *visite
         const int is_play = object_type_contains(node, "PlayLayer");
         const int is_editor = object_type_contains(node, "LevelEditorLayer");
         const int is_editor_ui = object_type_contains(node, "EditorUI");
+        const int is_pause = object_type_contains(node, "PauseLayer") &&
+                             !object_type_contains(node, "EditorPauseLayer");
         if (!g_host.active_menu_layer && is_menu) g_host.active_menu_layer = node;
+        if (!g_host.active_pause_layer && is_pause) g_host.active_pause_layer = node;
         if (!g_host.active_play_layer && is_play) g_host.active_play_layer = node;
         if (!g_host.active_editor_layer && is_editor) g_host.active_editor_layer = node;
         if (!g_host.active_editor_ui && is_editor_ui) g_host.active_editor_ui = node;
@@ -735,6 +793,7 @@ static int detect_gameplay_active(void) {
     g_host.editor_cache_value = 0;
     g_host.active_play_layer = NULL;
     g_host.active_editor_layer = NULL;
+    g_host.active_pause_layer = NULL;
     g_host.active_editor_ui = NULL;
     g_host.active_menu_layer = NULL;
     g_host.active_scene_root = find_running_scene();
@@ -773,6 +832,66 @@ static void *find_active_ui_layer(void) {
         if (object_type_contains(candidate, "UILayer")) return candidate;
     }
     return NULL;
+}
+
+static void set_cursor_hidden(int hidden) {
+    hidden = hidden != 0;
+    if (g_host.cursor_hidden == hidden) return;
+    g_host.cursor_hidden = hidden;
+    if (g_host.window)
+        SetCursor(hidden ? NULL : LoadCursorA(NULL, IDC_ARROW));
+}
+
+static void hide_pause_button_visual(void) {
+    void *ui_layer;
+    void *pause_item;
+    unsigned char *field;
+    if (!g_host.remove_pause_button_option || !detect_gameplay_active() ||
+        g_host.editor_cache_value || !g_host.active_play_layer ||
+        g_host.pause_hidden_for_play_layer == g_host.active_play_layer ||
+        !g_host.pause_button_offset || !g_host.node_set_visible)
+        return;
+    ui_layer = find_active_ui_layer();
+    if (!ui_layer) return;
+    field = (unsigned char *)ui_layer + g_host.pause_button_offset;
+    if (!memory_range_is_readable(field, sizeof(void *))) return;
+    pause_item = *(void **)field;
+    if (!object_type_contains(pause_item, "CCMenuItem")) return;
+    g_host.node_set_visible(pause_item, 0);
+    g_host.pause_hidden_for_play_layer = g_host.active_play_layer;
+    runtime_log("PC gameplay: pause button hidden at UILayer+0x%lx; Escape preserved",
+                (unsigned long)g_host.pause_button_offset);
+}
+
+static int point_is_pause_button(float x, float y) {
+    return g_host.remove_pause_button_option && detect_gameplay_active() &&
+           !g_host.editor_cache_value && g_host.native_width > 0 &&
+           g_host.native_height > 0 &&
+           x >= (float)g_host.native_width * 0.86f &&
+           y <= (float)g_host.native_height * 0.22f;
+}
+
+static void refresh_cursor_and_pause_features(void) {
+    const int gameplay = detect_gameplay_active();
+    if (!gameplay || g_host.editor_cache_value) {
+        g_host.cursor_force_visible = 0;
+        g_host.cursor_pause_click_seen = 0;
+        g_host.pause_overlay_seen = 0;
+        g_host.pause_hidden_for_play_layer = NULL;
+    } else if (g_host.active_pause_layer) {
+        g_host.pause_overlay_seen = 1;
+        g_host.cursor_pause_click_seen = 0;
+        g_host.cursor_force_visible = 1;
+    } else if (g_host.pause_overlay_seen) {
+        g_host.pause_overlay_seen = 0;
+        g_host.cursor_pause_click_seen = 0;
+        g_host.cursor_force_visible = 0;
+    }
+    if (gameplay && !g_host.editor_cache_value) hide_pause_button_visual();
+    set_cursor_hidden(g_host.hide_cursor_option && gameplay &&
+                      !g_host.editor_cache_value && g_host.window_active &&
+                      !jni_shim_text_input_active() &&
+                      !g_host.cursor_force_visible);
 }
 
 static void *find_active_editor_ui(void) {
@@ -1206,14 +1325,22 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (wparam) {
             resume_native_game("window activated");
         } else {
+            set_cursor_hidden(0);
             pause_native_game("window deactivated");
         }
+        refresh_cursor_and_pause_features();
         return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
         update_display_size(window);
         return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lparam) == HTCLIENT && g_host.cursor_hidden) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
     case WM_CHAR:
         if (wparam == '\b') {
             if (g_host.native_ready && g_host.delete_backward) {
@@ -1231,6 +1358,21 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         int consumed = 0;
         int action;
         SetFocus(window);
+        if (point_is_pause_button(x, y)) {
+            g_host.pause_touch_blocked = 1;
+            return 0;
+        }
+        g_host.pause_touch_blocked = 0;
+        if (detect_gameplay_active() && !g_host.editor_cache_value &&
+            !g_host.active_pause_layer) {
+            if (g_host.cursor_force_visible && !g_host.cursor_pause_click_seen) {
+                g_host.cursor_pause_click_seen = 1;
+            } else {
+                g_host.cursor_force_visible = 0;
+                g_host.cursor_pause_click_seen = 0;
+                refresh_cursor_and_pause_features();
+            }
+        }
         g_host.mouse_down = 1;
         SetCapture(window);
         action = gd_extras_menu_pointer_event(&g_host.extras_menu,
@@ -1255,6 +1397,10 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_LBUTTONUP:
+        if (g_host.pause_touch_blocked) {
+            g_host.pause_touch_blocked = 0;
+            return 0;
+        }
         if (g_host.mouse_down) {
             int consumed = 0;
             int action;
@@ -1270,6 +1416,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_CAPTURECHANGED:
+        g_host.pause_touch_blocked = 0;
         if (g_host.mouse_down) {
             int consumed = 0;
             int action;
@@ -1299,6 +1446,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
                 return 0;
         }
         if (wparam == VK_ESCAPE && g_host.native_ready && g_host.key_down) {
+            g_host.cursor_force_visible = 1;
+            g_host.cursor_pause_click_seen = 0;
+            set_cursor_hidden(0);
             g_host.key_down(jni_shim_env(), NULL, 4); /* Android KEYCODE_BACK */
             return 0;
         }
@@ -1309,6 +1459,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
             !jni_shim_text_input_active()) {
+            g_host.cursor_force_visible = 0;
+            g_host.cursor_pause_click_seen = 0;
+            refresh_cursor_and_pause_features();
             g_host.keyboard_down = 1;
             send_touch_begin((float)g_host.native_width * 0.5f,
                              (float)g_host.native_height * 0.5f);
@@ -1485,6 +1638,7 @@ static int run_message_loop(void) {
         if (g_host.render && g_host.window_active) {
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
+            refresh_cursor_and_pause_features();
             /*
              * The game explicitly requests its animation interval through JNI.
              * Vsync alone follows the monitor (for example 144 Hz), while an
@@ -1506,6 +1660,7 @@ finished:
 }
 
 int main(int argc, char **argv) {
+    (void)gd_enable_application_dpi_awareness();
     if (!gd_settings_i_lost_the_game()) {
         MessageBoxA(NULL,
                     "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch Geometry Dash Wrapper through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",

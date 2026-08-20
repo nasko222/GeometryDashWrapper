@@ -1,6 +1,20 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks3
+# Geometry Dash Wrapper 0.9.6-gdpstweaks4
 
-`gdpstweaks3` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
+`gdpstweaks4` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
+
+## gdpstweaks4 desktop defaults
+
+Windows DPI scaling is now application-managed automatically on all wrapper processes. The gdpstweaks3 forced linear texture-filter workaround has been removed.
+
+Optional gameplay UI controls (both disabled by default):
+
+```bat
+set "REMOVE_PAUSE_BUTTON=false"
+set "HIDE_CURSOR_WHEN_PLAYING=false"
+```
+
+Set either to `true` in the launch CMD to enable it. Escape pause remains available when the pause button is removed.
+
 
 ## Confirmed carried fix
 
@@ -51,6 +65,6 @@ environment settings are ignored, and no Extras button or overlay is created.
 Run `BUILD_ALL.cmd` on Windows. The source archive contains no APK, extracted
 proprietary game library, game executable, or iOS backend.
 
-## gdpstweaks3 image quality
+## gdpstweaks3 image-quality workaround (removed)
 
-Fullscreen/resized presentation forces linear texture magnification when an old build requests nearest-neighbour filtering, avoiding the blocky/cubed enlarged look while leaving minification and mipmaps unchanged.
+The forced linear magnification workaround from tweaks3 is no longer active. The game now owns texture filtering again; tweaks4 fixes the real problem by making Windows treat every wrapper as DPI-aware/application-scaled.
