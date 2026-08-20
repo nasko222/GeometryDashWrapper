@@ -155,7 +155,7 @@ int gd_settings_hide_cursor_when_playing(void) {
 }
 
 int gd_settings_extras_menu(void) {
-    /* Extras remains temporarily removed in gdpstweaks8. */
+    /* Extras remains temporarily removed in gdpstweaks9. */
     return 0;
 }
 

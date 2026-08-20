@@ -35,6 +35,9 @@ typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
 typedef void (__cdecl *CCNodeSetVisibleFunction)(void *node, int visible);
+typedef void *(__cdecl *PauseMenuItemCreateFunction)(
+    void *normal_sprite, void *selected_sprite, void *target,
+    uintptr_t selector_function, uintptr_t selector_adjustment);
 typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
 typedef int (__cdecl *CcNodeGetTagFunction)(void *self);
@@ -141,6 +144,21 @@ typedef struct {
 } GameHost;
 
 static GameHost g_host;
+static PauseMenuItemCreateFunction g_original_pause_menu_item_create;
+
+static void * __cdecl create_hidden_pause_menu_item(
+    void *normal_sprite, void *selected_sprite, void *target,
+    uintptr_t selector_function, uintptr_t selector_adjustment) {
+    void *item = NULL;
+    if (g_original_pause_menu_item_create) {
+        item = g_original_pause_menu_item_create(
+            normal_sprite, selected_sprite, target,
+            selector_function, selector_adjustment);
+    }
+    if (item && g_host.remove_pause_button_option && g_host.node_set_visible)
+        g_host.node_set_visible(item, 0);
+    return item;
+}
 
 typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
     void *self, const char *filename, const char *mode,
@@ -526,8 +544,12 @@ static unsigned patch_x86_world_creator_buttons(const ElfImage *image) {
     return 0;
 }
 
-/* Derive the UILayer member that receives the pause CCMenuItemSpriteExtra. */
-static size_t discover_x86_pause_button_offset(const ElfImage *image) {
+/* Derive the UILayer member that receives the pause CCMenuItemSpriteExtra.
+   The matching create call is also returned so REMOVE_PAUSE_BUTTON can suppress
+   the item before the first frame rather than waiting for gameplay polling. */
+static size_t discover_x86_pause_button_offset(const ElfImage *image,
+                                                unsigned char **create_callsite,
+                                                void **create_function) {
     unsigned char *initializer = (unsigned char *)elf_image_find_export(
         image, "_ZN7UILayer4initEv");
     unsigned char *create_item = (unsigned char *)elf_image_find_export(
@@ -535,6 +557,8 @@ static size_t discover_x86_pause_button_offset(const ElfImage *image) {
         "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_"
         "PNS0_8CCObjectEMS3_FvS4_E");
     size_t offset;
+    if (create_callsite) *create_callsite = NULL;
+    if (create_function) *create_function = create_item;
     if (!initializer || !create_item) return 0u;
     for (offset = 0u; offset + 5u < 1024u; ++offset) {
         int32_t displacement;
@@ -552,11 +576,47 @@ static size_t discover_x86_pause_button_offset(const ElfImage *image) {
                 (modrm & 0xF8u) != 0x80u || (modrm & 0x07u) == 0x04u)
                 continue;
             memcpy(&field, initializer + after + 2u, sizeof(field));
-            if (field >= 0x80u && field <= 0x800u) return field;
+            if (field >= 0x80u && field <= 0x800u) {
+                if (create_callsite) *create_callsite = initializer + offset;
+                return field;
+            }
         }
         break;
     }
     return 0u;
+}
+
+static int install_x86_pause_creation_suppression(const ElfImage *image) {
+#if defined(__i386__)
+    unsigned char *callsite = NULL;
+    void *create_function = NULL;
+    int32_t displacement;
+    DWORD old_protection;
+    DWORD ignored_protection;
+    size_t field;
+    if (!g_host.remove_pause_button_option || !g_host.node_set_visible)
+        return 0;
+    field = discover_x86_pause_button_offset(
+        image, &callsite, &create_function);
+    if (!field || !callsite || !create_function || callsite[0] != 0xE8u)
+        return 0;
+    g_original_pause_menu_item_create =
+        (PauseMenuItemCreateFunction)create_function;
+    displacement = (int32_t)((uintptr_t)create_hidden_pause_menu_item -
+                             ((uintptr_t)callsite + 5u));
+    if (!VirtualProtect(callsite + 1u, 4u, PAGE_EXECUTE_READWRITE,
+                        &old_protection))
+        return 0;
+    memcpy(callsite + 1u, &displacement, sizeof(displacement));
+    FlushInstructionCache(GetCurrentProcess(), callsite, 5u);
+    VirtualProtect(callsite + 1u, 4u, old_protection, &ignored_protection);
+    runtime_log("PC pause creation suppression: installed field=0x%lx",
+                (unsigned long)field);
+    return 1;
+#else
+    (void)image;
+    return 0;
+#endif
 }
 
 static void install_configurable_x86_hacks(const ElfImage *image) {
@@ -603,9 +663,14 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     size_t index;
     g_host.remove_pause_button_option = gd_settings_remove_pause_button();
     g_host.hide_cursor_option = gd_settings_hide_cursor_when_playing();
-    g_host.pause_button_offset = discover_x86_pause_button_offset(image);
+    g_host.pause_button_offset = discover_x86_pause_button_offset(
+        image, NULL, NULL);
     g_host.node_set_visible = (CCNodeSetVisibleFunction)elf_image_find_export(
         image, "_ZN7cocos2d6CCNode10setVisibleEb");
+    if (g_host.remove_pause_button_option &&
+        !install_x86_pause_creation_suppression(image)) {
+        runtime_log("PC pause creation suppression: unavailable; runtime hide fallback active");
+    }
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
@@ -781,16 +846,8 @@ static void walk_scene_tree(void *node, unsigned int depth, unsigned int *visite
     }
 }
 
-static int detect_gameplay_active(void) {
-    ULONGLONG now = GetTickCount64();
-    void *manager;
-    size_t offset;
+static void refresh_scene_tree_state(void) {
     unsigned int visited = 0;
-    if (now - g_host.gameplay_cache_time < 500u)
-        return g_host.gameplay_cache_value;
-    g_host.gameplay_cache_time = now;
-    g_host.gameplay_cache_value = 0;
-    g_host.editor_cache_value = 0;
     g_host.active_play_layer = NULL;
     g_host.active_editor_layer = NULL;
     g_host.active_pause_layer = NULL;
@@ -799,17 +856,44 @@ static int detect_gameplay_active(void) {
     g_host.active_scene_root = find_running_scene();
     if (g_host.active_scene_root)
         walk_scene_tree(g_host.active_scene_root, 0u, &visited);
-    if ((!g_host.active_play_layer && !g_host.active_editor_layer) &&
-        g_host.game_manager_shared_state) {
+    g_host.gameplay_cache_value = g_host.active_play_layer != NULL;
+    g_host.editor_cache_value = g_host.active_editor_layer != NULL;
+    g_host.gameplay_cache_time = GetTickCount64();
+}
+
+/*
+ * Pause/cursor features used to call the full recursive Cocos scene walk from
+ * the render loop every 500 ms. On old x86 builds (notably 1.5/1.6) that made
+ * level-page swipes visibly freeze at the same cadence. The recurrent path now
+ * looks only through GameManager's small state block. Full scene traversal is
+ * reserved for editor-hotkey/Extras discovery and pause-menu inspection.
+ */
+static int detect_gameplay_active(void) {
+    ULONGLONG now = GetTickCount64();
+    void *manager;
+    size_t offset;
+    if (now - g_host.gameplay_cache_time < 250u)
+        return g_host.gameplay_cache_value;
+    g_host.gameplay_cache_time = now;
+    g_host.gameplay_cache_value = 0;
+    g_host.editor_cache_value = 0;
+    g_host.active_play_layer = NULL;
+    g_host.active_editor_layer = NULL;
+    if (g_host.game_manager_shared_state) {
         manager = g_host.game_manager_shared_state();
         if (manager && memory_range_is_readable(manager, 0x600u)) {
             for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
                  offset += sizeof(void *)) {
                 void *candidate = *(void **)((unsigned char *)manager + offset);
-                if (!g_host.active_editor_layer && object_type_contains(candidate, "LevelEditorLayer"))
+                if (!candidate) continue;
+                if (!g_host.active_editor_layer &&
+                    object_type_contains(candidate, "LevelEditorLayer"))
                     g_host.active_editor_layer = candidate;
-                if (!g_host.active_play_layer && object_type_contains(candidate, "PlayLayer"))
+                if (!g_host.active_play_layer &&
+                    object_type_contains(candidate, "PlayLayer"))
                     g_host.active_play_layer = candidate;
+                if (g_host.active_play_layer && g_host.active_editor_layer)
+                    break;
             }
         }
     }
@@ -873,7 +957,11 @@ static int point_is_pause_button(float x, float y) {
 }
 
 static void refresh_cursor_and_pause_features(void) {
-    const int gameplay = detect_gameplay_active();
+    int gameplay = detect_gameplay_active();
+    if (gameplay && g_host.cursor_force_visible) {
+        refresh_scene_tree_state();
+        gameplay = g_host.gameplay_cache_value;
+    }
     if (!gameplay || g_host.editor_cache_value) {
         g_host.cursor_force_visible = 0;
         g_host.cursor_pause_click_seen = 0;
@@ -897,8 +985,7 @@ static void refresh_cursor_and_pause_features(void) {
 
 static void *find_active_editor_ui(void) {
     unsigned int visited = 0;
-    g_host.gameplay_cache_time = 0;
-    (void)detect_gameplay_active();
+    refresh_scene_tree_state();
     if (g_host.active_editor_ui) return g_host.active_editor_ui;
     if (g_host.active_editor_layer) {
         walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
@@ -1634,7 +1721,7 @@ static int run_message_loop(void) {
             DispatchMessageA(&message);
         }
         if (g_host.extras_menu.enabled) {
-            (void)detect_gameplay_active();
+            refresh_scene_tree_state();
             gd_extras_menu_set_visible(&g_host.extras_menu,
                 g_host.active_menu_layer && !g_host.gameplay_cache_value &&
                 !g_host.editor_cache_value);

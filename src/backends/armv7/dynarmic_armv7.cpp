@@ -1450,28 +1450,38 @@ static void WriteV22ThumbImportThunk(ProbeEnvironment& env, u32 address,
     env.MemoryWrite32(address + 4u, destination);
 }
 
-static void WriteV22ThumbCreateHiddenPauseThunk(
-    ProbeEnvironment& env, u32 address, u32 original_create,
-    u32 set_visible) {
-    if ((address & 3u) != 0u)
-        throw std::runtime_error("V22 pause-create thunk address is not aligned");
-    // Preserve the original CCMenuItemSpriteExtra::create ABI exactly. Once
-    // it returns, hide that same node before UILayer::init can add/render it.
-    // r4 survives the setVisible call and carries the original return value.
-    env.MemoryWrite16(address + 0u, 0xB510u); // push {r4,lr}
-    env.MemoryWrite16(address + 2u, 0xF8DFu); // ldr.w r12,[pc,#20]
-    env.MemoryWrite16(address + 4u, 0xC014u);
-    env.MemoryWrite16(address + 6u, 0x47E0u); // blx r12
-    env.MemoryWrite16(address + 8u, 0x4604u); // mov r4,r0
-    env.MemoryWrite16(address + 10u, 0x2100u); // movs r1,#0
-    env.MemoryWrite16(address + 12u, 0xF8DFu); // ldr.w r12,[pc,#12]
-    env.MemoryWrite16(address + 14u, 0xC00Cu);
-    env.MemoryWrite16(address + 16u, 0x47E0u); // blx r12
-    env.MemoryWrite16(address + 18u, 0x4620u); // mov r0,r4
-    env.MemoryWrite16(address + 20u, 0xBD10u); // pop {r4,pc}
-    env.MemoryWrite16(address + 22u, 0xBF00u); // alignment nop
-    env.MemoryWrite32(address + 24u, original_create);
-    env.MemoryWrite32(address + 28u, set_visible);
+static void WriteV22ThumbInitThenHidePauseThunk(
+    ProbeEnvironment& env, u32 address, u32 original_init,
+    u32 set_visible, u32 pause_field) {
+    if ((address & 3u) != 0u || pause_field > 0x0FFFu)
+        throw std::runtime_error("V22 pause post-init thunk parameters invalid");
+    /*
+     * UILayer::create calls UILayer::init before the layer can ever be drawn.
+     * Run the complete original init first, then hide the exact pause member.
+     * This survives builds that re-enable the item later inside init and is
+     * earlier/more deterministic than gameplay scene detection.
+     */
+    env.MemoryWrite16(address + 0x00u, 0xB530u); // push {r4,r5,lr}
+    env.MemoryWrite16(address + 0x02u, 0x4604u); // mov r4,r0 (UILayer*)
+    env.MemoryWrite16(address + 0x04u, 0xF8DFu); // ldr.w r12,[pc,#28]
+    env.MemoryWrite16(address + 0x06u, 0xC01Cu);
+    env.MemoryWrite16(address + 0x08u, 0x47E0u); // blx r12 (original init)
+    env.MemoryWrite16(address + 0x0Au, 0x4605u); // mov r5,r0 (bool result)
+    env.MemoryWrite16(address + 0x0Cu, 0x2D00u); // cmp r5,#0
+    env.MemoryWrite16(address + 0x0Eu, 0xD007u); // beq done
+    env.MemoryWrite16(address + 0x10u, 0xF8D4u); // ldr.w r0,[r4,#field]
+    env.MemoryWrite16(address + 0x12u,
+                      static_cast<u16>(pause_field & 0x0FFFu));
+    env.MemoryWrite16(address + 0x14u, 0x2800u); // cmp r0,#0
+    env.MemoryWrite16(address + 0x16u, 0xD003u); // beq done
+    env.MemoryWrite16(address + 0x18u, 0x2100u); // movs r1,#0
+    env.MemoryWrite16(address + 0x1Au, 0xF8DFu); // ldr.w r12,[pc,#12]
+    env.MemoryWrite16(address + 0x1Cu, 0xC00Cu);
+    env.MemoryWrite16(address + 0x1Eu, 0x47E0u); // blx r12 (setVisible)
+    env.MemoryWrite16(address + 0x20u, 0x4628u); // mov r0,r5
+    env.MemoryWrite16(address + 0x22u, 0xBD30u); // pop {r4,r5,pc}
+    env.MemoryWrite32(address + 0x24u, original_init);
+    env.MemoryWrite32(address + 0x28u, set_visible);
 }
 
 static void WriteV22ThumbCallThenImportThunk(
@@ -1924,27 +1934,43 @@ static std::size_t InstallV22PauseCreationSuppression(
     ElfRuntime& runtime, ProbeEnvironment& env) {
     if (!gd_settings_remove_pause_button()) return 0u;
     const SymbolRecord* ui_init = FindSymbol(runtime, "_ZN7UILayer4initEv");
-    const SymbolRecord* create = FindSymbol(
-        runtime,
-        "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_"
-        "PNS0_8CCObjectEMS3_FvS4_E");
+    const SymbolRecord* ui_vtable = FindSymbol(runtime, "_ZTV7UILayer");
     const SymbolRecord* set_visible = FindSymbol(
         runtime, "_ZN7cocos2d6CCNode10setVisibleEb");
-    if (!ui_init || !create || !set_visible) return 0u;
-    const std::vector<u32> calls = FindThumbBlCallSitesInRange(
-        env, ui_init->address, ui_init->size, create->address);
-    if (calls.empty()) return 0u;
+    if (!ui_init || !ui_vtable || !set_visible) return 0u;
 
-    // In the supplied 2019, 2022 and 2023 ARMv7 betas the first
-    // CCMenuItemSpriteExtra::create in UILayer::init is the top-right pause
-    // item (stored at +0x1B0, +0x1BC and +0x1C0 respectively). Hook that one
-    // creation site rather than hiding the item after a rendered frame.
+    u32 pause_field = 0u;
+    switch (runtime.v22_wrapper_editor_profile) {
+    case V22EditorRestoreProfile::Early2019: pause_field = 0x1B0u; break;
+    case V22EditorRestoreProfile::Late2022: pause_field = 0x1BCu; break;
+    case V22EditorRestoreProfile::Late2023: pause_field = 0x1C0u; break;
+    default: return 0u;
+    }
+
     EnsureV22ThunkPage(env);
     const u32 thunk = kV22ThunkBase + 0x100u;
-    WriteV22ThumbCreateHiddenPauseThunk(
-        env, thunk, create->address, set_visible->address);
-    WriteThumbBl(env, calls.front(), thunk);
-    return 1u;
+    WriteV22ThumbInitThenHidePauseThunk(
+        env, thunk, ui_init->address, set_visible->address, pause_field);
+
+    /*
+     * UILayer::create invokes init virtually (BLX through _ZTV7UILayer), so
+     * patch the exact vtable slot rather than looking for a direct BL that does
+     * not exist in these betas. The thunk runs the untouched original init and
+     * hides the stored pause item before create() can return the layer.
+     */
+    const u32 start = ui_vtable->address & ~1u;
+    const u32 bytes = ui_vtable->size ? std::min<u32>(ui_vtable->size, 0x300u)
+                                      : 0x300u;
+    std::size_t patched = 0u;
+    for (u32 offset = 0u; offset + 4u <= bytes; offset += 4u) {
+        if (!env.IsMapped(start + offset, 4u)) break;
+        const u32 value = env.MemoryRead32(start + offset);
+        if ((value & ~1u) != (ui_init->address & ~1u)) continue;
+        env.MemoryWrite32(start + offset, thunk | 1u);
+        ++patched;
+        break;
+    }
+    return patched;
 }
 
 static std::pair<std::size_t, std::size_t>
@@ -8533,6 +8559,65 @@ private:
             InitV22StdVector(editor, field(0x2B9Cu), count, 4u, resized);
     }
 
+    bool PrepareV22StockEditorSpriteAliases() {
+        u32 cache = 0u;
+        u32 ignored = 0u;
+        if (!CallV22Primary(
+                "_ZN7cocos2d18CCSpriteFrameCache22sharedSpriteFrameCacheEv",
+                {}, cache, "V22 editor sprite-frame cache") || !cache)
+            return false;
+
+        // The reduced Lite/SubZero APKs keep most editor art but omit several
+        // full-game-only frame entries. Ensure the stock sheet containing our
+        // fallback frame is loaded before installing aliases.
+        const u32 sheet_name = AllocateString("GJ_GameSheet03.plist");
+        if (!sheet_name) return false;
+        CallV22Primary(
+            "_ZN7cocos2d18CCSpriteFrameCache23addSpriteFramesWithFileEPKc",
+            {cache, sheet_name}, ignored,
+            "V22 editor ensure GJ_GameSheet03", false, 1500000000u);
+
+        const u32 fallback_name = AllocateString("GJ_arrow_02_001.png");
+        if (!fallback_name) return false;
+        u32 fallback_frame = 0u;
+        if (!CallV22Primary(
+                "_ZN7cocos2d18CCSpriteFrameCache17spriteFrameByNameEPKc",
+                {cache, fallback_name}, fallback_frame,
+                "V22 editor fallback sprite frame") || !fallback_frame)
+            return Fail("V22 editor fallback sprite frame is unavailable");
+
+        static constexpr std::array<const char*, 2> kMissingStockFrames = {
+            // Standalone PNG in the reduced APK, but EditorUI asks for it as
+            // a frame-cache entry.
+            "GJ_button_04.png",
+            // Present in the 2023 editor-mod donor PixelSheet, absent from all
+            // three supplied stock 2.2 beta APKs.
+            "pixelb_03_01_001.png",
+        };
+        u32 aliases = 0u;
+        for (const char* alias : kMissingStockFrames) {
+            const u32 guest_alias = AllocateString(alias);
+            if (!guest_alias) return false;
+            u32 existing = 0u;
+            if (!CallV22Primary(
+                    "_ZN7cocos2d18CCSpriteFrameCache17spriteFrameByNameEPKc",
+                    {cache, guest_alias}, existing,
+                    "V22 editor probe sprite alias", false))
+                return false;
+            if (existing) continue;
+            if (!CallV22Primary(
+                    "_ZN7cocos2d18CCSpriteFrameCache14addSpriteFrameEPNS_13CCSpriteFrameEPKc",
+                    {cache, fallback_frame, guest_alias}, ignored,
+                    "V22 editor install sprite alias", true))
+                return false;
+            ++aliases;
+        }
+        log_ << "RESULT: DYNARMIC_V22_EDITOR_SPRITE_ALIASES_READY aliases="
+             << aliases << " fallback=GJ_arrow_02_001.png\n";
+        log_.flush();
+        return true;
+    }
+
     bool FindV22EditorLevelSetup(u32 level, const V22EditorLayout& layout,
                                  u32& string_object,
                                  std::string& encoded) {
@@ -8941,39 +9026,8 @@ private:
                 return false;
         }
 
-        if (runtime_.v22_wrapper_editor_profile ==
-            V22EditorRestoreProfile::Early2019) {
-            // Lite 2.21 contains the complete editor atlases, but its normal
-            // menu path never loads them. EditorUI::create otherwise receives
-            // a null CCSpriteFrame and crashes in CCSpriteFrame::getTexture.
-            u32 frame_cache = 0u;
-            if (!CallV22Primary(
-                    "_ZN7cocos2d18CCSpriteFrameCache22sharedSpriteFrameCacheEv",
-                    {}, frame_cache, "V22 early editor sprite-frame cache") ||
-                !frame_cache)
-                return false;
-            static constexpr std::array<const char*, 5> kEditorSheets = {
-                "GJ_GameSheet.plist",
-                "GJ_GameSheet02.plist",
-                "GJ_GameSheet03.plist",
-                "GJ_GameSheet04.plist",
-                "GJ_GameSheetGlow.plist",
-            };
-            for (const char* sheet : kEditorSheets) {
-                const u32 guest_name = AllocateString(sheet);
-                if (!guest_name)
-                    return Fail("V22 early editor sprite-sheet name allocation failed");
-                if (!CallV22Primary(
-                        "_ZN7cocos2d18CCSpriteFrameCache23addSpriteFramesWithFileEPKc",
-                        {frame_cache, guest_name}, ignored,
-                        std::string("V22 early editor load ") + sheet, true,
-                        1500000000u))
-                    return false;
-            }
-            log_ << "RESULT: DYNARMIC_V22_EARLY_EDITOR_SPRITES_READY sheets="
-                 << kEditorSheets.size() << '\n';
-            log_.flush();
-        }
+        if (!PrepareV22StockEditorSpriteAliases())
+            return false;
 
         u32 editor_ui = 0u;
         if (!CallV22Primary("_ZN8EditorUI6createEP16LevelEditorLayer",
@@ -9126,7 +9180,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks8 restores only that missing initialization in the host;
+        // gdpstweaks9 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13714,7 +13768,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks8 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks9 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -14269,7 +14323,7 @@ int main(int argc,char** argv) {
         else if (pause_creation_suppression)
             emit("RESULT: DYNARMIC_V22_PAUSE_CREATION_SUPPRESSION_READY "
                  "count=" + std::to_string(pause_creation_suppression) +
-                 " stage=UILayer-init-before-render escape-pause=preserved");
+                 " stage=UILayer-create-post-init-before-render escape-pause=preserved");
         // Preserve the proven late-beta visibility repair when the 2023
         // companion exists, but stock-editor restoration itself never depends
         // on that library. 2019 already has a real updateVisibility function.
