@@ -1,0 +1,23 @@
+Geometry Dash Wrapper 0.9.6-gdpstweaks5 verification
+
+STATIC/SOURCE STATUS
+- ARMv7 C++20 syntax check with lightweight Dynarmic interfaces: PASS
+- 2019 stock profile primary bytes: 9,144,004
+- 2019 primary LevelEditorLayer::init size: 4 bytes
+- 2019 primary updateVisibility size: 2656 bytes (native implementation retained)
+- 2019 required stock-editor symbols: PASS
+- 2022 stock profile primary bytes: 9,541,500
+- 2022 primary LevelEditorLayer::init(bool) size: 4 bytes
+- 2022 primary updateVisibility size: 2 bytes; host bridge enabled
+- 2022 required stock-editor symbols: PASS
+- 2023 stock profile primary bytes: 9,578,364
+- 2023 primary LevelEditorLayer::init(bool) size: 4 bytes
+- 2023 primary updateVisibility size: 2 bytes; host bridge enabled
+- 2023 required stock-editor symbols: PASS
+- recognized stock profiles no longer require companion editor init: PASS
+- unknown stock layouts fail closed: PASS
+- donor APK/SO/game binaries in source tree: NONE
+
+IMPORTANT
+These are static/source checks. Windows runtime confirmation is still required.
+Test editor entry, object rendering, playtest, save+exit, reopen, and normal gameplay for each stock profile.

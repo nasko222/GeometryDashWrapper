@@ -1129,7 +1129,26 @@ static constexpr V22CompanionFeatureSpec kV22CompanionFeatures[] = {
     {"DevDebug", "_ZN13DevDebugHooks10ApplyHooksEv", false},
 };
 
+enum class V22EditorRestoreProfile : u32 {
+    None = 0,
+    Early2019,
+    Late2022,
+    Late2023,
+};
+
+static const char* V22EditorRestoreProfileName(V22EditorRestoreProfile profile) {
+    switch (profile) {
+    case V22EditorRestoreProfile::Early2019: return "stock-2019-9144004";
+    case V22EditorRestoreProfile::Late2022: return "stock-2022-9541500";
+    case V22EditorRestoreProfile::Late2023: return "stock-2023-9578364";
+    case V22EditorRestoreProfile::None: break;
+    }
+    return "none";
+}
+
 struct ElfRuntime {
+    std::size_t primary_file_bytes = 0;
+    V22EditorRestoreProfile v22_wrapper_editor_profile = V22EditorRestoreProfile::None;
     u32 image_min = 0;
     u32 image_max = 0;
     u32 entry = 0;
@@ -2458,6 +2477,37 @@ static bool HasV22PrimaryEditorInitializer(const ElfRuntime& runtime,
     return env.IsMapped(initializer->address & ~1u, initializer->size);
 }
 
+static V22EditorRestoreProfile DetectV22EditorRestoreProfile(
+    const ElfRuntime& runtime, ProbeEnvironment& env) {
+    const SymbolRecord* init_late = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer4initEP11GJGameLevelb");
+    const SymbolRecord* init_early = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer4initEP11GJGameLevel");
+    const SymbolRecord* create_late = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer6createEP11GJGameLevelb");
+    const SymbolRecord* create_early = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer6createEP11GJGameLevel");
+    const SymbolRecord* setup = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer11setupLayersEv");
+    const SymbolRecord* editor_ui = FindSymbol(
+        runtime, "_ZN8EditorUI6createEP16LevelEditorLayer");
+    const SymbolRecord* grid = FindSymbol(
+        runtime, "_ZN13DrawGridLayer6createEPN7cocos2d6CCNodeEP16LevelEditorLayer");
+    if (!setup || !editor_ui || !grid) return V22EditorRestoreProfile::None;
+
+    auto stub = [&env](const SymbolRecord* symbol) {
+        return symbol && symbol->size <= 4u &&
+               env.IsMapped(symbol->address & ~1u, std::max<u32>(symbol->size, 2u));
+    };
+    if (runtime.primary_file_bytes == 9144004u && create_early && stub(init_early))
+        return V22EditorRestoreProfile::Early2019;
+    if (runtime.primary_file_bytes == 9541500u && create_late && stub(init_late))
+        return V22EditorRestoreProfile::Late2022;
+    if (runtime.primary_file_bytes == 9578364u && create_late && stub(init_late))
+        return V22EditorRestoreProfile::Late2023;
+    return V22EditorRestoreProfile::None;
+}
+
 static bool HasCompatibleV22CompanionEditorInitializer(
     const ElfRuntime& runtime, ProbeEnvironment& env,
     bool late_beta_layout) {
@@ -2793,6 +2843,70 @@ static V22VisualHookCounts InstallV22SafeVisualHooks(
         exact_companion_editor};
 }
 
+static std::pair<std::size_t, std::size_t>
+InstallV22StockEditorVisibilityBridge(ElfRuntime& runtime,
+                                      ProbeEnvironment& env) {
+    const SymbolRecord* editor_visibility = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer16updateVisibilityEf");
+    if (!editor_visibility || editor_visibility->size > 4u)
+        return {};
+    const SymbolRecord* add_main_sprite = FindSymbol(
+        runtime, "_ZN10GameObject21addMainSpriteToParentEb");
+    const SymbolRecord* has_secondary_color = FindSymbol(
+        runtime, "_ZN10GameObject17hasSecondaryColorEv");
+    const SymbolRecord* add_color_sprite = FindSymbol(
+        runtime, "_ZN10GameObject22addColorSpriteToParentEb");
+    const SymbolRecord* activate_object = FindSymbol(
+        runtime, "_ZN10GameObject14activateObjectEv");
+    const SymbolRecord* deactivate_object = FindSymbol(
+        runtime, "_ZN10GameObject16deactivateObjectEb");
+    const SymbolRecord* game_object_opacity = FindSymbol(
+        runtime, "_ZN10GameObject10setOpacityEh");
+    const SymbolRecord* game_manager_shared = FindSymbol(
+        runtime, "_ZN11GameManager11sharedStateEv");
+    const SymbolRecord* get_game_variable = FindSymbol(
+        runtime, "_ZN11GameManager15getGameVariableEPKc");
+    const SymbolRecord* pre_update_visibility = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer19preUpdateVisibilityEf");
+    const SymbolRecord* update_object_colors = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer18updateObjectColorsEPN7cocos2d7CCArrayE");
+    const SymbolRecord* add_object = FindSymbol(
+        runtime, "_ZN7cocos2d7CCArray9addObjectEPNS_8CCObjectE");
+    const SymbolRecord* remove_all_objects = FindSymbol(
+        runtime, "_ZN7cocos2d7CCArray16removeAllObjectsEv");
+    const SymbolRecord* process_area_visual_actions = FindSymbol(
+        runtime, "_ZN15GJBaseGameLayer24processAreaVisualActionsEv");
+    const SymbolRecord* sort_batchnode_children = FindSymbol(
+        runtime, "_ZN16LevelEditorLayer21sortBatchnodeChildrenEf");
+    if (!add_main_sprite || !has_secondary_color || !add_color_sprite ||
+        !activate_object || !deactivate_object || !game_object_opacity ||
+        !game_manager_shared || !get_game_variable || !pre_update_visibility ||
+        !update_object_colors || !add_object || !remove_all_objects ||
+        !process_area_visual_actions || !sort_batchnode_children)
+        return {};
+
+    runtime.v22_game_object_add_main_sprite = add_main_sprite->address;
+    runtime.v22_game_object_has_secondary_color = has_secondary_color->address;
+    runtime.v22_game_object_add_color_sprite = add_color_sprite->address;
+    runtime.v22_game_object_activate = activate_object->address;
+    runtime.v22_game_object_deactivate = deactivate_object->address;
+    runtime.v22_game_object_set_opacity = game_object_opacity->address;
+    runtime.v22_game_manager_shared = game_manager_shared->address;
+    runtime.v22_game_manager_get_game_variable = get_game_variable->address;
+    runtime.v22_gjbase_pre_update_visibility = pre_update_visibility->address;
+    runtime.v22_level_editor_update_object_colors = update_object_colors->address;
+    runtime.v22_ccarray_add_object = add_object->address;
+    runtime.v22_ccarray_remove_all_objects = remove_all_objects->address;
+    runtime.v22_gjbase_process_area_visual_actions = process_area_visual_actions->address;
+    runtime.v22_level_editor_sort_batchnode_children = sort_batchnode_children->address;
+
+    const u32 editor_host = EnsureImport(
+        runtime, env, "__dynarmic_v22_editor_visibility");
+    return RedirectV22FunctionReferences(
+        runtime, env, *editor_visibility, editor_host,
+        kV22ThunkBase + 0x40u);
+}
+
 static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment& env) {
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(elf, 0);
     if (std::memcmp(header.ident, "\x7F" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1) {
@@ -2806,6 +2920,7 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
     }
 
     ElfRuntime runtime{};
+    runtime.primary_file_bytes = elf.size();
     runtime.entry = kGameBase + header.entry;
     u32 min_vaddr = std::numeric_limits<u32>::max();
     u32 max_vaddr = 0;
@@ -7419,9 +7534,11 @@ private:
                 "V22 editor pre-update visibility", 250000000u))
             return false;
 
-        constexpr u32 kSectionArrayOffset = 0x348u;
-        constexpr u32 kColorArrayOffset = 0x2C04u;
-        constexpr u32 kCameraNodeOffset = 0x48Cu;
+        const bool late2022 = runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Late2022;
+        const u32 kSectionArrayOffset = late2022 ? 0x344u : 0x348u;
+        const u32 kColorArrayOffset = late2022 ? 0x2BD0u : 0x2C04u;
+        const u32 kCameraNodeOffset = late2022 ? 0x470u : 0x48Cu;
         constexpr u32 kNodeScaleOffset = 0x38u;
         constexpr u32 kNodePositionOffset = 0x44u;
         constexpr u32 kNodeVisibleOffset = 0xEAu;
@@ -7538,9 +7655,10 @@ private:
             }
         }
 
+        const u32 selected_color_group_offset = late2022 ? 0x2C1Cu : 0x2C50u;
         const u32 selected_color_group =
-            env_.IsMapped(editor_layer + 0x2C50u, 4u)
-                ? env_.MemoryRead32(editor_layer + 0x2C50u)
+            env_.IsMapped(editor_layer + selected_color_group_offset, 4u)
+                ? env_.MemoryRead32(editor_layer + selected_color_group_offset)
                 : 0u;
         std::unordered_set<u32> visible_now;
         visible_now.reserve(v22_editor_visualized_objects_.size() + 64u);
@@ -8088,6 +8206,696 @@ private:
         return true;
     }
 
+    struct V22EditorLayout {
+        const char* name = "none";
+        u32 level_field = 0u;
+        u32 level_settings_field = 0u;
+        u32 object_layer_field = 0u;
+        u32 draw_grid_field = 0u;
+        u32 editor_ui_field = 0u;
+        u32 obb_field = 0u;
+        u32 point_buffer_field = 0u;
+        u32 arrow_field = 0u;
+        u32 setup_cache_field = 0u;
+        u32 manager_layer_field = 0u;
+        u32 manager_flag_field = 0u;
+        u32 level_setup_hint = 0u;
+        u32 vector_capacity = 0u;
+        bool vectors_are_resized = false;
+        bool late_background_api = false;
+        std::vector<u32> array_fields;
+        std::vector<u32> dictionary_fields;
+    };
+
+    static V22EditorLayout V22EditorLayoutFor(
+        V22EditorRestoreProfile profile) {
+        V22EditorLayout layout{};
+        switch (profile) {
+        case V22EditorRestoreProfile::Early2019:
+            layout.name = "early2019-9144004";
+            layout.level_field = 0x4ECu;
+            layout.level_settings_field = 0x28Cu;
+            layout.object_layer_field = 0x14Cu;
+            layout.draw_grid_field = 0x4E8u;
+            layout.editor_ui_field = 0x4C4u;
+            layout.obb_field = 0x4A0u;
+            layout.point_buffer_field = 0x50Cu;
+            layout.arrow_field = 0x4A4u;
+            layout.setup_cache_field = 0x508u;
+            layout.manager_layer_field = 0x15Cu;
+            layout.manager_flag_field = 0x1AAu;
+            layout.vector_capacity = 0x44Du;
+            layout.vectors_are_resized = true;
+            layout.late_background_api = false;
+            // These fields are mapped from the last full pre-stub editor
+            // initializer by destructor order and matching class methods.
+            layout.array_fields = {
+                0x418u, 0x41Cu, 0x428u, 0x5D0u, 0x42Cu,
+                0x430u, 0x434u, 0x440u, 0x448u, 0x47Cu,
+                0x44Cu, 0x458u, 0x43Cu, 0x4CCu, 0x4D0u};
+            layout.dictionary_fields = {
+                0x420u, 0x474u, 0x484u, 0x488u,
+                0x438u, 0x454u, 0x4FCu};
+            break;
+        case V22EditorRestoreProfile::Late2022:
+            layout.name = "late2022-9541500";
+            layout.level_field = 0x138u;
+            layout.level_settings_field = 0x338u;
+            layout.object_layer_field = 0x470u;
+            layout.draw_grid_field = 0x2C54u;
+            layout.editor_ui_field = 0x2C3Cu;
+            layout.obb_field = 0x2C24u;
+            layout.point_buffer_field = 0x2C64u;
+            layout.arrow_field = 0x2C2Cu;
+            layout.setup_cache_field = 0x2C60u;
+            layout.manager_layer_field = 0x16Cu;
+            layout.manager_flag_field = 0x1BAu;
+            layout.level_setup_hint = 0x118u;
+            layout.vector_capacity = 0x270Fu;
+            layout.vectors_are_resized = true;
+            layout.late_background_api = true;
+            layout.array_fields = {
+                0x2BCCu, 0x2BC4u, 0x2BBCu, 0x2BB8u,
+                0x2BB0u, 0x2BB4u, 0x2BD4u, 0x2BACu,
+                0x350u, 0x34Cu, 0x348u, 0x2C08u, 0x2C1Cu,
+                0x2BC8u, 0x2BC0u, 0x2C00u, 0x344u, 0x340u,
+                0x2C40u, 0x2C44u, 0x2D18u, 0x2BD0u};
+            layout.dictionary_fields = {0x450u, 0x43Cu, 0x2C80u};
+            break;
+        case V22EditorRestoreProfile::Late2023:
+            layout.name = "late2023-9578364";
+            layout.level_field = 0x13Cu;
+            layout.level_settings_field = 0x33Cu;
+            layout.object_layer_field = 0x48Cu;
+            layout.draw_grid_field = 0x2C88u;
+            layout.editor_ui_field = 0x2C70u;
+            layout.obb_field = 0x2C58u;
+            layout.point_buffer_field = 0x2C98u;
+            layout.arrow_field = 0x2C60u;
+            layout.setup_cache_field = 0x2C94u;
+            layout.manager_layer_field = 0x16Cu;
+            layout.manager_flag_field = 0x1BAu;
+            layout.level_setup_hint = 0x11Cu;
+            layout.vector_capacity = 0x270Fu;
+            layout.vectors_are_resized = true;
+            layout.late_background_api = true;
+            layout.array_fields = {
+                0x2C00u, 0x2BF8u, 0x2BF0u, 0x2BECu,
+                0x2BE4u, 0x2BE8u, 0x2C08u, 0x2BE0u,
+                0x354u, 0x350u, 0x34Cu, 0x2C3Cu, 0x2C50u,
+                0x2BFCu, 0x2BF4u, 0x2C34u, 0x348u, 0x344u,
+                0x2C74u, 0x2C78u, 0x2D50u, 0x2C04u};
+            layout.dictionary_fields = {0x46Cu, 0x43Cu, 0x2CB4u};
+            break;
+        default:
+            break;
+        }
+        return layout;
+    }
+
+    u32 V22PrimarySymbolAddress(const char* name) const {
+        if (!name || !*name) return 0u;
+        for (const SymbolRecord& symbol : runtime_.symbols) {
+            if (symbol.name == name &&
+                symbol.address >= runtime_.image_min &&
+                symbol.address < runtime_.image_max)
+                return symbol.address;
+        }
+        return 0u;
+    }
+
+    bool CallV22Primary(const char* name, const std::vector<u32>& args,
+                        u32& result, std::string_view label,
+                        bool required = true,
+                        u64 ticks = 500000000u) {
+        const u32 address = V22PrimarySymbolAddress(name);
+        if (!address) {
+            if (!required) return true;
+            return Fail(std::string("V22 editor restore missing symbol ") + name);
+        }
+        return RunNestedPreservingState(address, args, result,
+                                        std::string(label), ticks);
+    }
+
+    bool RetainV22Object(u32 object, std::string_view label) {
+        if (!object) return false;
+        u32 ignored = 0u;
+        return CallV22Primary("_ZN7cocos2d8CCObject6retainEv", {object},
+                              ignored, label);
+    }
+
+    bool CreateRetainedV22Field(u32 editor, u32 field,
+                                const char* create_symbol,
+                                std::string_view label,
+                                u32 create_argument = 0u,
+                                bool has_argument = false) {
+        if (!field || !env_.IsMapped(editor + field, 4u))
+            return Fail("V22 editor restore field is outside LevelEditorLayer");
+        const u32 existing = env_.MemoryRead32(editor + field);
+        if (LooksLikeGuestObject(runtime_, env_, existing)) return true;
+        u32 object = 0u;
+        const std::vector<u32> args = has_argument
+            ? std::vector<u32>{create_argument} : std::vector<u32>{};
+        if (!CallV22Primary(create_symbol, args, object, label) || !object)
+            return Fail(std::string(label) + " returned null");
+        env_.MemoryWrite32(editor + field, object);
+        return RetainV22Object(object, std::string(label) + " retain");
+    }
+
+    bool InitV22StdVector(u32 editor, u32 field, u32 count,
+                          u32 element_size, bool resized) {
+        if (!field || !count || !element_size ||
+            !env_.IsMapped(editor + field, 12u))
+            return false;
+        if (env_.MemoryRead32(editor + field)) return true;
+        const u64 byte_count64 = static_cast<u64>(count) * element_size;
+        if (byte_count64 > std::numeric_limits<u32>::max()) return false;
+        const u32 byte_count = static_cast<u32>(byte_count64);
+        const u32 memory = AllocateAligned(byte_count, 16u);
+        if (!memory) return false;
+        if (void* host = env_.HostPointer(memory, byte_count))
+            std::memset(host, 0, byte_count);
+        else
+            return false;
+        env_.MemoryWrite32(editor + field, memory);
+        env_.MemoryWrite32(editor + field + 4u,
+                           resized ? memory + byte_count : memory);
+        env_.MemoryWrite32(editor + field + 8u, memory + byte_count);
+        return true;
+    }
+
+    bool InitV22BoolVector(u32 editor, u32 field, u32 count, bool resized) {
+        if (!field || !count || !env_.IsMapped(editor + field, 20u))
+            return false;
+        if (env_.MemoryRead32(editor + field)) return true;
+        const u32 words = (count + 31u) / 32u;
+        const u32 bytes = words * 4u;
+        const u32 memory = AllocateAligned(bytes, 16u);
+        if (!memory) return false;
+        if (void* host = env_.HostPointer(memory, bytes))
+            std::memset(host, 0, bytes);
+        else
+            return false;
+        env_.MemoryWrite32(editor + field, memory);
+        env_.MemoryWrite32(editor + field + 4u, 0u);
+        if (resized) {
+            env_.MemoryWrite32(editor + field + 8u,
+                               memory + (count / 32u) * 4u);
+            env_.MemoryWrite32(editor + field + 12u, count % 32u);
+        } else {
+            env_.MemoryWrite32(editor + field + 8u, memory);
+            env_.MemoryWrite32(editor + field + 12u, 0u);
+        }
+        env_.MemoryWrite32(editor + field + 16u, memory + bytes);
+        return true;
+    }
+
+    bool InitV22EditorVectors(u32 editor, const V22EditorLayout& layout) {
+        const u32 count = layout.vector_capacity;
+        if (!count) return false;
+        const bool resized = layout.vectors_are_resized;
+        if (runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Early2019) {
+            // The early beta retained the older 1101-entry editor tables.
+            return
+                InitV22StdVector(editor, 0x510u, count, 4u, resized) &&
+                InitV22StdVector(editor, 0x51Cu, count, 4u, resized) &&
+                InitV22StdVector(editor, 0x528u, count, 4u, resized) &&
+                InitV22StdVector(editor, 0x538u, count, 4u, resized) &&
+                InitV22BoolVector(editor, 0x548u, count, resized) &&
+                InitV22BoolVector(editor, 0x55Cu, count, resized) &&
+                InitV22BoolVector(editor, 0x570u, count, resized) &&
+                InitV22BoolVector(editor, 0x584u, count, resized) &&
+                InitV22BoolVector(editor, 0x598u, count, resized) &&
+                InitV22StdVector(editor, 0x5ACu, count, 1u, resized) &&
+                InitV22StdVector(editor, 0x5B8u, count, 4u, resized);
+        }
+        const u32 delta = runtime_.v22_wrapper_editor_profile ==
+                                  V22EditorRestoreProfile::Late2022
+                              ? 0x34u : 0u;
+        const auto field = [delta](u32 late23) { return late23 - delta; };
+        return
+            InitV22StdVector(editor, field(0x2CDCu), count, 1u, resized) &&
+            InitV22StdVector(editor, field(0x2D2Cu), count, 1u, resized) &&
+            InitV22BoolVector(editor, field(0x2D18u), count, resized) &&
+            InitV22StdVector(editor, field(0x2D38u), count, 4u, resized) &&
+            InitV22BoolVector(editor, field(0x2CC8u), count, resized) &&
+            InitV22StdVector(editor, field(0x2C9Cu), count, 4u, resized) &&
+            InitV22BoolVector(editor, field(0x2CF0u), count, resized) &&
+            InitV22BoolVector(editor, field(0x2D04u), count, resized) &&
+            InitV22StdVector(editor, field(0x2CB8u), count, 4u, resized) &&
+            InitV22StdVector(editor, field(0x2B9Cu), count, 4u, resized);
+    }
+
+    bool FindV22EditorLevelSetup(u32 level, const V22EditorLayout& layout,
+                                 u32& string_object,
+                                 std::string& encoded) {
+        string_object = 0u;
+        encoded.clear();
+        if (layout.level_setup_hint &&
+            ReadGuestCowStringObject(level + layout.level_setup_hint, encoded,
+                                     32u * 1024u * 1024u) &&
+            !encoded.empty()) {
+            string_object = level + layout.level_setup_hint;
+            return true;
+        }
+
+        // The early beta moved GJGameLevel fields substantially. Find the
+        // compressed setup by COW-string validity and content/length rather
+        // than assigning a guessed early offset. The level setup is by far the
+        // largest string in normal GJGameLevel objects.
+        std::size_t best_score = 0u;
+        for (u32 offset = 0x80u; offset <= 0x500u; offset += 4u) {
+            std::string candidate;
+            if (!ReadGuestCowStringObject(level + offset, candidate,
+                                          32u * 1024u * 1024u))
+                continue;
+            if (candidate.empty()) continue;
+            std::size_t score = candidate.size();
+            if (candidate.find("kS38") != std::string::npos) score += 1u << 22;
+            if (candidate.find(';') != std::string::npos) score += 1u << 20;
+            if (candidate.size() > 128u) score += 1u << 18;
+            if (score <= best_score) continue;
+            best_score = score;
+            encoded = std::move(candidate);
+            string_object = level + offset;
+        }
+        if (string_object) return true;
+
+        if (runtime_.v22_game_level_id_offset &&
+            env_.IsMapped(level + runtime_.v22_game_level_id_offset, 4u)) {
+            const s32 level_id = static_cast<s32>(env_.MemoryRead32(
+                level + runtime_.v22_game_level_id_offset));
+            if (const auto found = v22_level_data_encoded_.find(level_id);
+                found != v22_level_data_encoded_.end()) {
+                encoded = found->second;
+                const u32 temporary = Allocate(4u);
+                if (!temporary) return false;
+                env_.MemoryWrite32(temporary, runtime_.v22_empty_string_data);
+                if (!BuildGuestStringFromBytes(temporary, encoded)) return false;
+                string_object = temporary;
+                return true;
+            }
+            if (const auto found = v22_level_data_decoded_.find(level_id);
+                found != v22_level_data_decoded_.end()) {
+                encoded = found->second;
+                string_object = 0u; // already decoded; handled by caller
+                return true;
+            }
+        }
+        if (v22_pending_level_setup_) {
+            encoded = *v22_pending_level_setup_;
+            string_object = 0u;
+            return true;
+        }
+        return false;
+    }
+
+    bool DecodeV22EditorLevelSetup(u32 level, const V22EditorLayout& layout,
+                                   std::string& decoded) {
+        decoded.clear();
+        u32 source_object = 0u;
+        std::string source;
+        if (!FindV22EditorLevelSetup(level, layout, source_object, source)) {
+            decoded =
+                "kS38,kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,"
+                "kA25,0,kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,"
+                "kA4,0,kA8,0,kA10,0;";
+            return true;
+        }
+        if (!source_object || source.find("kS38") != std::string::npos ||
+            source.find("kA13,") != std::string::npos) {
+            decoded = source;
+            return true;
+        }
+        const u32 unzip = V22PrimarySymbolAddress(
+            "_ZN7cocos2d8ZipUtils16decompressStringESsbi");
+        if (!unzip) return Fail("V22 editor restore ZipUtils symbol missing");
+        const u32 destination = Allocate(4u);
+        if (!destination) return Fail("V22 editor restore string allocation failed");
+        env_.MemoryWrite32(destination, runtime_.v22_empty_string_data);
+        u32 ignored = 0u;
+        if (!RunNestedPreservingState(unzip, {destination, source_object, 0u, 11u},
+                                      ignored,
+                                      "V22 editor restore decompress level",
+                                      1000000000u))
+            return false;
+        if (!ReadGuestCowStringObject(destination, decoded,
+                                      64u * 1024u * 1024u) ||
+            decoded.empty()) {
+            // Some community beta builds already keep a decoded setup in this
+            // field even when it does not begin with kS38. Preserve it rather
+            // than failing the editor entry.
+            decoded = source;
+        }
+        return true;
+    }
+
+    bool InitializeV22EditorCollections(u32 editor,
+                                        const V22EditorLayout& layout) {
+        for (u32 field : layout.array_fields) {
+            const bool capacity_array =
+                runtime_.v22_wrapper_editor_profile ==
+                    V22EditorRestoreProfile::Early2019 && field == 0x44Cu;
+            if (!CreateRetainedV22Field(
+                    editor, field,
+                    capacity_array
+                        ? "_ZN7cocos2d7CCArray18createWithCapacityEj"
+                        : "_ZN7cocos2d7CCArray6createEv",
+                    "V22 wrapper editor CCArray",
+                    100u, capacity_array))
+                return false;
+        }
+        for (u32 field : layout.dictionary_fields) {
+            if (!CreateRetainedV22Field(
+                    editor, field, "_ZN7cocos2d12CCDictionary6createEv",
+                    "V22 wrapper editor CCDictionary"))
+                return false;
+        }
+        return InitV22EditorVectors(editor, layout);
+    }
+
+    bool InitializeV22EditorFromWrapper(u32 editor, u32 level,
+                                        std::string_view source) {
+        const V22EditorLayout layout =
+            V22EditorLayoutFor(runtime_.v22_wrapper_editor_profile);
+        if (!layout.level_field || !layout.level_settings_field ||
+            !layout.object_layer_field || !layout.editor_ui_field)
+            return Fail("V22 wrapper editor restore has no active layout");
+        if (!env_.IsMapped(editor + layout.point_buffer_field, 4u) ||
+            !env_.IsMapped(editor + layout.editor_ui_field, 4u))
+            return Fail("V22 wrapper editor layout exceeds allocated object");
+
+        u32 ignored = 0u;
+        u32 game_manager = 0u;
+        if (!CallV22Primary("_ZN11GameManager11sharedStateEv", {}, game_manager,
+                            "V22 wrapper editor GameManager") ||
+            !game_manager)
+            return false;
+        if (env_.IsMapped(game_manager + layout.manager_flag_field, 1u))
+            env_.MemoryWrite8(game_manager + layout.manager_flag_field, 1u);
+        if (env_.IsMapped(game_manager + layout.manager_layer_field, 4u))
+            env_.MemoryWrite32(game_manager + layout.manager_layer_field, editor);
+
+        // The late stock constructors clear this byte before calling the
+        // intentionally stubbed init. The 2023 restoration donor sets it back
+        // to true at the start of the real editor init, and the 2022 layout
+        // uses the same field in its stock editor methods. Keep this narrowly
+        // scoped to the two late layouts; the 2019 ABI is unrelated.
+        if ((runtime_.v22_wrapper_editor_profile ==
+                 V22EditorRestoreProfile::Late2022 ||
+             runtime_.v22_wrapper_editor_profile ==
+                 V22EditorRestoreProfile::Late2023) &&
+            env_.IsMapped(editor + 0x2780u, 1u))
+            env_.MemoryWrite8(editor + 0x2780u, 1u);
+
+        if (!CallV22Primary("_ZN16LevelEditorLayer14setObjectCountEi",
+                            {editor, 0u}, ignored,
+                            "V22 wrapper editor setObjectCount"))
+            return false;
+        // updateOptions owns the version-specific GameManager preference fields
+        // and is much safer than transplanting the mod's raw option offsets.
+        if (!CallV22Primary("_ZN16LevelEditorLayer13updateOptionsEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor updateOptions"))
+            return false;
+
+        env_.MemoryWrite32(editor + layout.level_field, level);
+        if (!RetainV22Object(level, "V22 wrapper editor retain level"))
+            return false;
+        if (!RetainV22Object(editor, "V22 wrapper editor retain layer"))
+            return false;
+
+        u32 sound_manager = 0u;
+        if (CallV22Primary("_ZN16GameSoundManager13sharedManagerEv", {},
+                           sound_manager,
+                           "V22 wrapper editor sound manager", false) &&
+            sound_manager) {
+            CallV22Primary("_ZN16GameSoundManager19stopBackgroundMusicEv",
+                           {sound_manager}, ignored,
+                           "V22 wrapper editor stop background music", false);
+        }
+
+        if (!InitializeV22EditorCollections(editor, layout))
+            return Fail("V22 wrapper editor collection initialization failed");
+
+        // OBB2D::create(CCPoint(1,1),1,1,0). The ARM ABI places the two
+        // CCPoint floats in r0/r1, the next two floats in r2/r3 and the last
+        // float on the stack. Selection still works if a particular beta
+        // rejects this optional helper, so leave the field null in that case.
+        u32 obb = 0u;
+        if (CallV22Primary("_ZN5OBB2D6createEN7cocos2d7CCPointEfff",
+                           {0x3F800000u, 0x3F800000u, 0x3F800000u,
+                            0x3F800000u, 0u},
+                           obb, "V22 wrapper editor OBB", false) && obb) {
+            env_.MemoryWrite32(editor + layout.obb_field, obb);
+            RetainV22Object(obb, "V22 wrapper editor retain OBB");
+        }
+
+        const u32 point_bytes =
+            runtime_.v22_wrapper_editor_profile ==
+                    V22EditorRestoreProfile::Early2019
+                ? 0xC80u : 0x3200u;
+        if (!env_.MemoryRead32(editor + layout.point_buffer_field)) {
+            const u32 points = AllocateAligned(point_bytes, 16u);
+            if (!points) return Fail("V22 wrapper editor point buffer failed");
+            if (void* host = env_.HostPointer(points, point_bytes))
+                std::memset(host, 0, point_bytes);
+            env_.MemoryWrite32(editor + layout.point_buffer_field, points);
+        }
+
+        if (!CallV22Primary("_ZN15GJBaseGameLayer11setupLayersEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor setupLayers", true,
+                            2000000000u))
+            return false;
+        const u32 object_layer =
+            env_.MemoryRead32(editor + layout.object_layer_field);
+        if (!LooksLikeGuestObject(runtime_, env_, object_layer))
+            return Fail("V22 wrapper editor object layer was not created");
+
+        u32 draw_grid = 0u;
+        if (!CallV22Primary(
+                "_ZN13DrawGridLayer6createEPN7cocos2d6CCNodeEP16LevelEditorLayer",
+                {object_layer, editor}, draw_grid,
+                "V22 wrapper editor DrawGridLayer::create") ||
+            !draw_grid)
+            return false;
+        env_.MemoryWrite32(editor + layout.draw_grid_field, draw_grid);
+        const u32 add_child_z = V22PrimarySymbolAddress(
+            "_ZN7cocos2d6CCNode8addChildEPS0_i");
+        if (add_child_z &&
+            !RunNestedPreservingState(add_child_z,
+                                      {object_layer, draw_grid,
+                                       static_cast<u32>(-100)},
+                                      ignored,
+                                      "V22 wrapper editor add grid"))
+            return false;
+
+        if (runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Early2019) {
+            const u32 player_create = V22PrimarySymbolAddress(
+                "_ZN12PlayerObject6createEiiPN7cocos2d7CCLayerE");
+            if (!player_create)
+                return Fail("V22 early editor PlayerObject::create is missing");
+            for (u32 player_field : {0x284u, 0x288u}) {
+                u32 player = 0u;
+                if (!RunNestedPreservingState(
+                        player_create, {1u, 1u, object_layer}, player,
+                        "V22 early editor PlayerObject::create",
+                        1000000000u) || !player)
+                    return false;
+                env_.MemoryWrite32(editor + player_field, player);
+                if (add_child_z &&
+                    !RunNestedPreservingState(
+                        add_child_z, {object_layer, player, 10u}, ignored,
+                        "V22 early editor add player"))
+                    return false;
+            }
+        } else if (!CallV22Primary(
+                       "_ZN15GJBaseGameLayer12createPlayerEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor createPlayer", true,
+                       1500000000u)) {
+            return false;
+        }
+        if (!CallV22Primary("_ZN15GJBaseGameLayer26createPlayerCollisionBlockEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor collision block", false))
+            return false;
+        if (!CallV22Primary("_ZN16LevelEditorLayer23addPlayerCollisionBlockEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor add collision block", false))
+            return false;
+
+        std::string decoded_setup;
+        if (!DecodeV22EditorLevelSetup(level, layout, decoded_setup))
+            return false;
+        const u32 setup_object = Allocate(4u);
+        if (!setup_object) return Fail("V22 wrapper editor setup object allocation failed");
+        env_.MemoryWrite32(setup_object, runtime_.v22_empty_string_data);
+        if (!BuildGuestStringFromBytes(setup_object, decoded_setup))
+            return false;
+        if (layout.setup_cache_field &&
+            env_.IsMapped(editor + layout.setup_cache_field, 4u)) {
+            // The early ABI embeds std::string inline. The late bool ABI stores
+            // a pointer to a separately allocated std::string object. Never
+            // store the COW character-data pointer itself: teardown/save code
+            // dereferences this field as a C++ string object.
+            if (runtime_.v22_wrapper_editor_profile ==
+                V22EditorRestoreProfile::Early2019) {
+                env_.MemoryWrite32(editor + layout.setup_cache_field,
+                                   runtime_.v22_empty_string_data);
+                if (!BuildGuestStringFromBytes(
+                        editor + layout.setup_cache_field, decoded_setup))
+                    return false;
+            } else {
+                const u32 cached_string = Allocate(4u);
+                if (!cached_string)
+                    return Fail("V22 wrapper editor cached string allocation failed");
+                env_.MemoryWrite32(cached_string, runtime_.v22_empty_string_data);
+                if (!BuildGuestStringFromBytes(cached_string, decoded_setup))
+                    return false;
+                env_.MemoryWrite32(editor + layout.setup_cache_field,
+                                   cached_string);
+            }
+        }
+        if (!CallV22Primary("_ZN16LevelEditorLayer22createObjectsFromSetupESs",
+                            {editor, setup_object}, ignored,
+                            "V22 wrapper editor createObjectsFromSetup", true,
+                            3000000000u))
+            return false;
+        if (!CallV22Primary("_ZN15GJBaseGameLayer16createTextLayersEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor createTextLayers", false,
+                            1500000000u))
+            return false;
+
+        u32 level_settings =
+            env_.MemoryRead32(editor + layout.level_settings_field);
+        if (!LooksLikeGuestObject(runtime_, env_, level_settings)) {
+            if (!CallV22Primary("_ZN19LevelSettingsObject6createEv", {},
+                                level_settings,
+                                "V22 wrapper editor LevelSettingsObject") ||
+                !level_settings)
+                return false;
+            env_.MemoryWrite32(editor + layout.level_settings_field,
+                               level_settings);
+            // GJGameLevel pointer inside LevelSettingsObject moved from +0x114
+            // in the old ABI to +0x138 in the late bool ABI.
+            const u32 settings_level_field =
+                runtime_.v22_wrapper_editor_profile ==
+                        V22EditorRestoreProfile::Early2019
+                    ? 0x114u : 0x138u;
+            if (env_.IsMapped(level_settings + settings_level_field, 4u))
+                env_.MemoryWrite32(level_settings + settings_level_field, level);
+            if (!RetainV22Object(level_settings,
+                                 "V22 wrapper editor retain LevelSettingsObject"))
+                return false;
+        }
+
+        u32 editor_ui = 0u;
+        if (!CallV22Primary("_ZN8EditorUI6createEP16LevelEditorLayer",
+                            {editor}, editor_ui,
+                            "V22 wrapper editor EditorUI::create", true,
+                            2000000000u) ||
+            !editor_ui)
+            return false;
+        env_.MemoryWrite32(editor + layout.editor_ui_field, editor_ui);
+        if (add_child_z &&
+            !RunNestedPreservingState(add_child_z, {editor, editor_ui, 100u},
+                                      ignored,
+                                      "V22 wrapper editor add EditorUI"))
+            return false;
+
+        const u32 markers = V22PrimarySymbolAddress(
+            "_ZN13DrawGridLayer17updateTimeMarkersEv");
+        if (markers)
+            RunNestedPreservingState(markers, {draw_grid}, ignored,
+                                     "V22 wrapper editor time markers");
+
+        if (layout.late_background_api) {
+            const u32 create_background = V22PrimarySymbolAddress(
+                "_ZN15GJBaseGameLayer16createBackgroundEi");
+            const u32 create_middle = V22PrimarySymbolAddress(
+                "_ZN15GJBaseGameLayer18createMiddlegroundEi");
+            const u32 create_ground = V22PrimarySymbolAddress(
+                "_ZN15GJBaseGameLayer17createGroundLayerEii");
+            if (LooksLikeGuestObject(runtime_, env_, level_settings)) {
+                if (create_background && env_.IsMapped(level_settings + 0x11Cu, 4u))
+                    RunNestedPreservingState(
+                        create_background,
+                        {editor, env_.MemoryRead32(level_settings + 0x11Cu)},
+                        ignored, "V22 wrapper editor background");
+                if (create_middle && env_.IsMapped(level_settings + 0x128u, 4u))
+                    RunNestedPreservingState(
+                        create_middle,
+                        {editor, env_.MemoryRead32(level_settings + 0x128u)},
+                        ignored, "V22 wrapper editor middleground");
+                if (create_ground && env_.IsMapped(level_settings + 0x148u, 4u))
+                    RunNestedPreservingState(
+                        create_ground,
+                        {editor, env_.MemoryRead32(level_settings + 0x120u),
+                         env_.MemoryRead32(level_settings + 0x148u)},
+                        ignored, "V22 wrapper editor ground");
+            }
+        } else {
+            CallV22Primary("_ZN16LevelEditorLayer17createGroundLayerEv",
+                           {editor}, ignored,
+                           "V22 wrapper editor early ground", false);
+            CallV22Primary("_ZN16LevelEditorLayer16createBackgroundEv",
+                           {editor}, ignored,
+                           "V22 wrapper editor early background", false);
+        }
+
+        // Exact late-2023 initH behavior: this post-background byte is set to
+        // true before EditorUI::updateSlider. Its semantic field name is not
+        // exported, so do not guess an equivalent offset for 2019/2022.
+        if (runtime_.v22_wrapper_editor_profile ==
+                V22EditorRestoreProfile::Late2023 &&
+            env_.IsMapped(editor + 0x2A19u, 1u))
+            env_.MemoryWrite8(editor + 0x2A19u, 1u);
+
+        CallV22Primary("_ZN8EditorUI12updateSliderEv", {editor_ui}, ignored,
+                       "V22 wrapper editor update slider", false);
+        if (!CallV22Primary("_ZN15GJBaseGameLayer18resetGroupCountersEb",
+                            {editor, 0u}, ignored,
+                            "V22 wrapper editor reset groups", false))
+            return false;
+        if (!CallV22Primary("_ZN15GJBaseGameLayer16sortStickyGroupsEv",
+                            {editor}, ignored,
+                            "V22 wrapper editor sort sticky", false))
+            CallV22Primary("_ZN16LevelEditorLayer16sortStickyGroupsEv",
+                           {editor}, ignored,
+                           "V22 wrapper editor sort sticky early", false);
+        CallV22Primary("_ZN16LevelEditorLayer16updateEditorModeEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor update mode", false);
+        CallV22Primary("_ZN15GJBaseGameLayer24generateAreaTargetGroupsEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor area groups", false);
+        CallV22Primary("_ZN15GJBaseGameLayer27generateSpecialTargetGroupsEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor special groups", false);
+        CallV22Primary("_ZN7cocos2d6CCNode14scheduleUpdateEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor schedule update", false);
+        CallV22Primary("_ZN16LevelEditorLayer17updatePreviewAnimEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor preview animation", false);
+        CallV22Primary("_ZN16LevelEditorLayer22updatePreviewParticlesEv",
+                       {editor}, ignored,
+                       "V22 wrapper editor preview particles", false);
+
+        log_ << "RESULT: DYNARMIC_V22_WRAPPER_EDITOR_INIT_OK profile="
+             << layout.name << " editor=0x" << std::hex << editor
+             << " level=0x" << level << std::dec
+             << " setup-bytes=" << decoded_setup.size()
+             << " source=" << source << '\n';
+        log_.flush();
+        return true;
+    }
+
     bool EnterV22LevelEditor(u32 level, u32 create_mode,
                                bool set_editor_state,
                                std::string_view source) {
@@ -8136,11 +8944,15 @@ private:
         log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
-        // The selected late beta needs only this ABI-validated initializer.
-        // Do not run libgame.so constructors or ApplyHooks globally: they also
-        // install unrelated DPAD/GDPS/timer/shader hooks and can overwrite the
-        // wrapper's stable primary-library bridges.
-        if (runtime_.v22_companion_editor_init_enabled) {
+        // Stock 2.2 betas intentionally ship a four-byte editor initializer.
+        // gdpstweaks5 restores only that missing initialization in the host;
+        // no modded APK or libgame.so is required for known stock profiles.
+        if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
+            if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_INIT_SOURCE host-stock-restore profile="
+                 << V22EditorRestoreProfileName(runtime_.v22_wrapper_editor_profile)
+                 << " source=" << source << '\n';
+        } else if (runtime_.v22_companion_editor_init_enabled) {
             u32 companion_init_result = 0u;
             if (!RunNestedPreservingState(
                     runtime_.v22_companion_editor_init,
@@ -12721,7 +13533,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks4 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks5 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -13263,14 +14075,30 @@ int main(int argc,char** argv) {
             runtime.v22_game_level_id_offset == 260u;
         const bool primary_editor_initializer =
             HasV22PrimaryEditorInitializer(runtime, env);
+        runtime.v22_wrapper_editor_profile =
+            DetectV22EditorRestoreProfile(runtime, env);
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
-        if (runtime.v22_companion_editor_init_enabled)
+        // Preserve the proven late-beta visibility repair when the 2023
+        // companion exists, but stock-editor restoration itself never depends
+        // on that library. 2019 already has a real updateVisibility function.
+        if (runtime.v22_companion_editor_init_enabled) {
             visual_hooks = InstallV22SafeVisualHooks(runtime, env);
+        } else if (runtime.v22_wrapper_editor_profile ==
+                       V22EditorRestoreProfile::Late2022 ||
+                   runtime.v22_wrapper_editor_profile ==
+                       V22EditorRestoreProfile::Late2023) {
+            const auto stock_visibility =
+                InstallV22StockEditorVisibilityBridge(runtime, env);
+            if (stock_visibility.first + stock_visibility.second == 0u)
+                throw std::runtime_error(
+                    "stock late-beta editor visibility bridge was not installed");
+        }
 
         ResolveV22InputBridgeSymbols(runtime);
         const bool install_editor_bridge =
+            runtime.v22_wrapper_editor_profile != V22EditorRestoreProfile::None ||
             runtime.v22_companion_editor_init_enabled ||
             primary_editor_initializer;
         const std::size_t edit_button_pointers = install_editor_bridge
@@ -13282,6 +14110,10 @@ int main(int argc,char** argv) {
         const auto gameplay_edit_pointers = install_editor_bridge
             ? InstallV22GameplayEditButtonBridges(runtime, env)
             : std::pair<std::size_t, std::size_t>{};
+        emit(std::string("RESULT: DYNARMIC_V22_STOCK_EDITOR_PROFILE profile=") +
+             V22EditorRestoreProfileName(runtime.v22_wrapper_editor_profile) +
+             " primary-bytes=" + std::to_string(runtime.primary_file_bytes) +
+             " bridge=" + (install_editor_bridge ? "enabled" : "disabled"));
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"

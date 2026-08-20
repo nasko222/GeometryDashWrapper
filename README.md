@@ -1,8 +1,20 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks4
+# Geometry Dash Wrapper 0.9.6-gdpstweaks5
 
-`gdpstweaks4` continues the Android-only wrapper line with desktop usability tweaks and removes the abandoned 1.3 hybrid experiment.
+`gdpstweaks5` adds wrapper-owned editor restoration for known stock ARMv7 2.2 beta APKs while retaining the desktop usability work from tweaks4. No modded editor APK or `libgame.so` is required for the recognized 2019, 2022, and 2023 stock layouts.
 
-## gdpstweaks4 desktop defaults
+## Stock 2.2 beta editor restoration
+
+The ARMv7 backend recognizes three stock primary-library layouts and restores the editor initialization that those APKs intentionally stubbed out:
+
+- 2019 / early beta: `libcocos2dcpp.so` = 9,144,004 bytes.
+- 2022 / Lite 2.2.11-era beta: 9,541,500 bytes.
+- 2023 / SubZero 2.2.12-era beta: 9,578,364 bytes.
+
+For these layouts the wrapper owns the missing initialization: editor collections, level ownership, grid/player setup, level-string decompression/object creation, `EditorUI`, background/ground setup, and editor mode/group initialization. The 2022/2023 stubbed `updateVisibility` path is also redirected to the wrapper's host visibility bridge. Unknown layouts fail closed instead of receiving guessed offsets.
+
+The old targeted companion initializer remains only as a compatibility fallback for unrecognized modded builds; recognized stock profiles do not depend on it.
+
+## gdpstweaks5 desktop defaults
 
 Windows DPI scaling is now application-managed automatically on all wrapper processes. The gdpstweaks3 forced linear texture-filter workaround has been removed.
 
