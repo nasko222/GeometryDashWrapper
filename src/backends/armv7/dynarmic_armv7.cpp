@@ -1877,7 +1877,22 @@ static std::size_t InstallV22EditButtonBridge(ElfRuntime& runtime,
     runtime.v22_edit_verify_level_name = verify_name->address;
     runtime.v22_game_manager_shared = game_manager->address;
     runtime.v22_game_manager_editor_state_offset = editor_has_bool ? 0x1BCu : 0u;
-    runtime.v22_edit_level_pointer_offset = editor_has_bool ? 0x150u : 0x140u;
+    switch (runtime.v22_wrapper_editor_profile) {
+    case V22EditorRestoreProfile::Early2019:
+        runtime.v22_edit_level_pointer_offset = 0x140u;
+        break;
+    case V22EditorRestoreProfile::Late2022:
+        // Verified directly from the 9,541,500-byte EditLevelLayer::init:
+        //   str.w r10, [r4, #0x14c]
+        runtime.v22_edit_level_pointer_offset = 0x14Cu;
+        break;
+    case V22EditorRestoreProfile::Late2023:
+        runtime.v22_edit_level_pointer_offset = 0x150u;
+        break;
+    default:
+        runtime.v22_edit_level_pointer_offset = editor_has_bool ? 0x150u : 0x140u;
+        break;
+    }
     return patched;
 }
 
@@ -2054,11 +2069,16 @@ static std::size_t PatchV22CreatorLayerLockedButtons(
     const u32 end = std::min<u32>(begin + symbol->size, runtime.image_max);
     std::size_t patched = 0u;
 
-    // Lite/World preserve their real callbacks only when this BEQ skips the
-    // onOnlyFullVersion replacement and the 140-opacity tint block.
+    // Lite/World/SubZero preserve their real callbacks only when this BEQ
+    // skips the onOnlyFullVersion replacement and the 140-opacity tint block.
+    // Different 2.2 builds keep the per-button "full-only" flag in different
+    // registers (2022 uses r10, 2023/SubZero uses r9), so match the Thumb-2
+    // `cmp.w rN,#0` encoding rather than pinning the register to r10.
     for (u32 address = begin; address + 12u <= end; address += 2u) {
-        if (env.MemoryRead16(address) != 0xF1BAu ||
-            env.MemoryRead16(address + 2u) != 0x0F00u)
+        const u16 compare_first = env.MemoryRead16(address);
+        const u16 compare_second = env.MemoryRead16(address + 2u);
+        if ((compare_first & 0xFFF0u) != 0xF1B0u ||
+            compare_second != 0x0F00u)
             continue;
         const u32 branch_address = address + 4u;
         const u16 branch = env.MemoryRead16(branch_address);
@@ -4681,7 +4701,15 @@ public:
             !env_.IsMapped(ui_layer + 0x1C0u, 4u)) return;
         const u32 pause_item = env_.MemoryRead32(ui_layer + 0x1C0u);
         if (!LooksLikeGuestObject(runtime_, env_, pause_item)) return;
-        if (v22_pause_hidden_item_ == pause_item) return;
+        // Do not treat hiding as a one-shot operation. UILayer can make the
+        // same CCMenuItem visible again during level setup/restart. tweaks5
+        // remembered only the pointer, so a re-shown pause button could linger
+        // until the active layer changed. Reassert only when the Cocos visible
+        // byte says the same item has become visible again.
+        if (v22_pause_hidden_item_ == pause_item &&
+            env_.IsMapped(pause_item + 234u, 1u) &&
+            env_.MemoryRead8(pause_item + 234u) == 0u)
+            return;
         const SymbolRecord* set_visible = FindSymbol(
             runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
         if (!set_visible) return;
@@ -8244,6 +8272,10 @@ private:
             layout.setup_cache_field = 0x508u;
             layout.manager_layer_field = 0x15Cu;
             layout.manager_flag_field = 0x1AAu;
+            // Verified in the stock 9,144,004-byte PlayLayer::init: it loads
+            // PlayLayer+0x668 (GJGameLevel*), adds 0x110, copies that std::string
+            // and passes it to ZipUtils::decompressString(..., false, 11).
+            layout.level_setup_hint = 0x110u;
             layout.vector_capacity = 0x44Du;
             layout.vectors_are_resized = true;
             layout.late_background_api = false;
@@ -8543,10 +8575,28 @@ private:
         if (!ReadGuestCowStringObject(destination, decoded,
                                       64u * 1024u * 1024u) ||
             decoded.empty()) {
-            // Some community beta builds already keep a decoded setup in this
-            // field even when it does not begin with kS38. Preserve it rather
-            // than failing the editor entry.
-            decoded = source;
+            // Never feed a failed compressed/base64 payload to
+            // createObjectsFromSetup(). tweaks5 did that on the 2019 stock
+            // beta after selecting the wrong heuristic string and it eventually
+            // crashed in std::string cleanup. A genuinely pre-decoded community
+            // setup still has the normal comma/semicolon object syntax.
+            const bool looks_decoded =
+                source.find(',') != std::string::npos &&
+                source.find(';') != std::string::npos;
+            if (looks_decoded) {
+                decoded = source;
+            } else {
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_DECODE_FAILED profile="
+                     << V22EditorRestoreProfileName(
+                            runtime_.v22_wrapper_editor_profile)
+                     << " source-bytes=" << source.size()
+                     << " action=safe-empty-setup\n";
+                log_.flush();
+                decoded =
+                    "kS38,kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,"
+                    "kA25,0,kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,"
+                    "kA4,0,kA8,0,kA10,0;";
+            }
         }
         return true;
     }
@@ -8945,7 +8995,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks5 restores only that missing initialization in the host;
+        // gdpstweaks6 restores only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13533,7 +13583,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks5 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks6 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

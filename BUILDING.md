@@ -1,11 +1,12 @@
-# Building Geometry Dash Wrapper 0.9.6-gdpstweaks5
+# Building Geometry Dash Wrapper 0.9.6-gdpstweaks6
 
 Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use
 the project's pinned Zig 0.14.1, CMake, Ninja, Dynarmic and Boost dependencies
 and produce the launcher plus x86, legacy ARM and ARMv7 backends.
 
 The normal RUN batches set `I_LOST_THE_GAME=true` and `EDITOR_CONTROLLS=true`.
-Extras is temporarily disabled in this build.
+`REMOVE_PAUSE_BUTTON` and `HIDE_CURSOR_WHEN_PLAYING` remain false by default.
+Extras is temporarily disabled.
 
 This branch is Android-only. No APK, extracted game `.so`, built executable,
 DLL, or proprietary game asset is included in the source archive.
