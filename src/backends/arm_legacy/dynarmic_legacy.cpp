@@ -2979,10 +2979,15 @@ public:
         return true;
     }
 
+    void InvalidateDesktopGameplayState() { gameplay_check_at_ = {}; }
+
     void RefreshDesktopGameplayState() {
         const auto now = std::chrono::steady_clock::now();
         if (gameplay_check_at_.time_since_epoch().count() != 0 &&
             now - gameplay_check_at_ < std::chrono::milliseconds(500)) {
+            // The expensive scene scan can stay cached, but pause suppression
+            // itself must be reasserted every presented gameplay frame.
+            HideLegacyPauseButtonVisual();
             return;
         }
         gameplay_check_at_ = now;
@@ -3193,8 +3198,7 @@ public:
 
     void HideLegacyPauseButtonVisual() {
         if (!gd_settings_remove_pause_button() || !gameplay_active_cache_ ||
-            editor_active_cache_ || !active_play_layer_ ||
-            legacy_pause_hidden_for_layer_ == active_play_layer_) return;
+            editor_active_cache_ || !active_play_layer_) return;
         const SymbolRecord* set_visible = FindSymbol(
             runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
         if (!set_visible) return;
@@ -3211,12 +3215,14 @@ public:
                 if (RunFunction(set_visible->address, {node, 0u}, &ignored,
                                 "legacy hide top-right pause control", 0u,
                                 std::chrono::milliseconds(1000))) {
-                    legacy_pause_hidden_for_layer_ = active_play_layer_;
-                    log_ << "RESULT: DYNARMIC_LEGACY_PAUSE_BUTTON_HIDDEN ui=0x"
-                         << std::hex << ui << " node=0x" << node
-                         << " field=0x" << field << std::dec
-                         << " escape-pause=preserved\\n";
-                    log_.flush();
+                    if (legacy_pause_hidden_for_layer_ != active_play_layer_) {
+                        legacy_pause_hidden_for_layer_ = active_play_layer_;
+                        log_ << "RESULT: DYNARMIC_LEGACY_PAUSE_BUTTON_HIDDEN ui=0x"
+                             << std::hex << ui << " node=0x" << node
+                             << " field=0x" << field << std::dec
+                             << " escape-pause=preserved\n";
+                        log_.flush();
+                    }
                 }
                 return;
             }
@@ -7741,7 +7747,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks6 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks7 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8184,10 +8190,12 @@ int main(int argc,char** argv) {
                             runtime.native_touch_move,event.x,event.y);
                     break;
                 case HostEventType::TouchEnd:
-                    if(!native_paused)
+                    if(!native_paused) {
                         ok=executor.SendTouchPoint(
                             runtime.native_touch_end,event.x,event.y,
                             "nativeTouchesEnd");
+                        if(ok) executor.InvalidateDesktopGameplayState();
+                    }
                     break;
                 case HostEventType::KeyDown:
                     if(!native_paused){
@@ -8256,6 +8264,8 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
+            // Reassert desktop pause suppression before the guest draws.
+            executor.RefreshDesktopGameplayState();
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,
@@ -8263,7 +8273,6 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
-            executor.RefreshDesktopGameplayState();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;

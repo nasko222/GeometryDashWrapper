@@ -848,7 +848,6 @@ static void hide_pause_button_visual(void) {
     unsigned char *field;
     if (!g_host.remove_pause_button_option || !detect_gameplay_active() ||
         g_host.editor_cache_value || !g_host.active_play_layer ||
-        g_host.pause_hidden_for_play_layer == g_host.active_play_layer ||
         !g_host.pause_button_offset || !g_host.node_set_visible)
         return;
     ui_layer = find_active_ui_layer();
@@ -858,9 +857,11 @@ static void hide_pause_button_visual(void) {
     pause_item = *(void **)field;
     if (!object_type_contains(pause_item, "CCMenuItem")) return;
     g_host.node_set_visible(pause_item, 0);
-    g_host.pause_hidden_for_play_layer = g_host.active_play_layer;
-    runtime_log("PC gameplay: pause button hidden at UILayer+0x%lx; Escape preserved",
-                (unsigned long)g_host.pause_button_offset);
+    if (g_host.pause_hidden_for_play_layer != g_host.active_play_layer) {
+        g_host.pause_hidden_for_play_layer = g_host.active_play_layer;
+        runtime_log("PC gameplay: pause button hidden at UILayer+0x%lx; Escape preserved",
+                    (unsigned long)g_host.pause_button_offset);
+    }
 }
 
 static int point_is_pause_button(float x, float y) {
@@ -1413,6 +1414,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             else if (action != GD_EXTRAS_ACTION_NONE)
                 runtime_log("Extras action %d is unavailable on x86", action);
             if (!consumed) send_touch_end(x, y);
+            /* A release can synchronously enter/leave PlayLayer. Force the
+               next pre-render suppression pass to see the new scene. */
+            g_host.gameplay_cache_time = 0;
         }
         return 0;
     case WM_CAPTURECHANGED:
@@ -1428,6 +1432,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             else if (action != GD_EXTRAS_ACTION_NONE)
                 runtime_log("Extras action %d is unavailable on x86", action);
             if (!consumed) send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+            g_host.gameplay_cache_time = 0;
         }
         return 0;
     case WM_COMMAND: {
@@ -1636,9 +1641,11 @@ static int run_message_loop(void) {
             refresh_extras_visuals();
         }
         if (g_host.render && g_host.window_active) {
+            /* Apply suppression before guest drawing so the pause button never
+               reaches the presented back buffer when the option is enabled. */
+            refresh_cursor_and_pause_features();
             g_host.render(jni_shim_env(), NULL);
             SwapBuffers(g_host.device);
-            refresh_cursor_and_pause_features();
             /*
              * The game explicitly requests its animation interval through JNI.
              * Vsync alone follows the monitor (for example 144 Hz), while an

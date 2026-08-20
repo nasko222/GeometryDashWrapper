@@ -8637,6 +8637,19 @@ private:
             return Fail("V22 wrapper editor layout exceeds allocated object");
 
         u32 ignored = 0u;
+
+        // The working 2023 editor restoration starts by calling the inherited
+        // GJBaseGameLayer::init(). The stock beta stubs removed that call too.
+        // tweaks5/6 skipped it and then entered setupLayers/object parsing with
+        // partially uninitialized base-layer state.
+        u32 base_init_ok = 0u;
+        if (!CallV22Primary("_ZN15GJBaseGameLayer4initEv", {editor},
+                            base_init_ok,
+                            "V22 wrapper editor GJBaseGameLayer::init", true,
+                            2000000000u) ||
+            (base_init_ok & 0xffu) == 0u)
+            return Fail("V22 wrapper editor GJBaseGameLayer::init returned false");
+
         u32 game_manager = 0u;
         if (!CallV22Primary("_ZN11GameManager11sharedStateEv", {}, game_manager,
                             "V22 wrapper editor GameManager") ||
@@ -8995,7 +9008,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks6 restores only that missing initialization in the host;
+        // gdpstweaks7 restores only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13583,7 +13596,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks6 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks7 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -14695,6 +14708,9 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
+            // Apply pause/cursor visibility before guest drawing so a hidden
+            // pause item is not rendered for a frame before suppression lands.
+            executor.RefreshExtrasMenuVisibility();
             executor.ResetFrameClipState();
             if(!executor.UpdateV22EditorOverlayFrame())
                 throw std::runtime_error(executor.LastError());
@@ -14705,7 +14721,6 @@ int main(int argc,char** argv) {
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.EndGpuFrame();
-            executor.RefreshExtrasMenuVisibility();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;
