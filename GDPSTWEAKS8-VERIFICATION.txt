@@ -1,0 +1,36 @@
+Geometry Dash Wrapper 0.9.6-gdpstweaks8 verification
+
+Runtime status: NOT TESTED on Windows in this environment.
+These are source/static and supplied-binary audits.
+
+EDITOR CRASH DIAGNOSIS FROM SUPPLIED TWEAKS7 LOGS
+- 2019 stock 9,144,004-byte beta reached EditorUI::create and crashed with a null CCSpriteFrame.
+- 2022 stock 9,541,500-byte beta emitted Base64Utils decode failure before createObjectsFromSetup and then faulted at guest address 0x3a0.
+- 2023 stock 9,578,364-byte beta emitted Base64Utils decode failure and createObjectsFromSetup ran into the 3,000,000,000-tick watchdog.
+
+TWEAKS8 CORRECTIONS
+PASS: 2022 GJGameLevel setup field corrected to +0x11C.
+PASS: 2019 setup field remains verified +0x110.
+PASS: 2023 setup field remains verified +0x11C.
+PASS: exact setup fields accept an empty new-level string and no longer fall back to cross-field string scanning.
+PASS: editor setup decode uses host URL/base64 + gzip/zlib/raw-deflate handling and validates GD setup syntax before the parser.
+PASS: failed setup decode falls back to a known empty setup; compressed/garbage text is not passed to createObjectsFromSetup.
+PASS: 2022/2023 9999-entry editor vectors match the working 2023 mod: allocated/zeroed capacity with logical size zero.
+PASS: 2019 loads GJ_GameSheet, 02, 03, 04 and Glow sprite-frame plists before EditorUI::create.
+
+PAUSE BUTTON
+PASS: supplied 2019 UILayer::init first CCMenuItemSpriteExtra::create stores the returned item at +0x1B0.
+PASS: supplied 2022 UILayer::init first CCMenuItemSpriteExtra::create stores the returned item at +0x1BC.
+PASS: supplied 2023 UILayer::init first CCMenuItemSpriteExtra::create stores the returned item at +0x1C0.
+PASS: when REMOVE_PAUSE_BUTTON=true, that exact create call is redirected to a Thumb thunk that calls the original create, calls CCNode::setVisible(false), then returns the same item before CCMenu creation/addition.
+PASS: Escape pause callback is not patched.
+PASS: REMOVE_PAUSE_BUTTON remains default-on and independently toggleable.
+PASS: HIDE_CURSOR_WHEN_PLAYING remains default-on and independently toggleable.
+
+SOURCE CHECKS
+PASS: ARMv7 C++20 syntax check with lightweight Dynarmic interface stubs.
+PASS: legacy ARM C++20 syntax check with lightweight Dynarmic interface stubs.
+PASS: shared runtime_settings.c syntax check.
+PASS: ARMv7 braces and parentheses balanced.
+
+Windows/APK runtime testing is still required for editor entry and pause visibility.

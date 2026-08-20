@@ -1,4 +1,4 @@
-# Source contents — 0.9.6-gdpstweaks7
+# Source contents — 0.9.6-gdpstweaks8
 
 Included:
 
@@ -6,9 +6,11 @@ Included:
 - Dynarmic legacy ARM and ARMv7 wrapper source.
 - Shared Windows audio/network/storage/runtime bridges.
 - Wrapper-owned stock 2019/2022/2023 ARMv7 2.2 beta editor restoration.
-- Corrected 2019 setup-field and 2022 EditLevelLayer member profiles.
+- Exact stock editor setup-field profiles: 2019 `+0x110`, 2022/2023 `+0x11C`.
+- Strict host-side editor level decoding with no cross-field string heuristic.
+- 2019 Lite editor sprite-frame atlas preload before `EditorUI::create`.
 - ARMv7 FULL_BYPASS late CreatorLayer lock/tint bypass for register variants.
-- Reliable ARMv7 pause-button visual re-hide when the guest re-enables it.
+- Startup-level ARMv7 pause-item creation suppression plus the existing frame-time fallback.
 - Resizable/fullscreen DPI-aware Windows host code.
 - Windows build/launcher scripts and vendored third-party source/licenses.
 

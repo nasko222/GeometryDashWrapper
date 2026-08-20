@@ -1450,6 +1450,30 @@ static void WriteV22ThumbImportThunk(ProbeEnvironment& env, u32 address,
     env.MemoryWrite32(address + 4u, destination);
 }
 
+static void WriteV22ThumbCreateHiddenPauseThunk(
+    ProbeEnvironment& env, u32 address, u32 original_create,
+    u32 set_visible) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 pause-create thunk address is not aligned");
+    // Preserve the original CCMenuItemSpriteExtra::create ABI exactly. Once
+    // it returns, hide that same node before UILayer::init can add/render it.
+    // r4 survives the setVisible call and carries the original return value.
+    env.MemoryWrite16(address + 0u, 0xB510u); // push {r4,lr}
+    env.MemoryWrite16(address + 2u, 0xF8DFu); // ldr.w r12,[pc,#20]
+    env.MemoryWrite16(address + 4u, 0xC014u);
+    env.MemoryWrite16(address + 6u, 0x47E0u); // blx r12
+    env.MemoryWrite16(address + 8u, 0x4604u); // mov r4,r0
+    env.MemoryWrite16(address + 10u, 0x2100u); // movs r1,#0
+    env.MemoryWrite16(address + 12u, 0xF8DFu); // ldr.w r12,[pc,#12]
+    env.MemoryWrite16(address + 14u, 0xC00Cu);
+    env.MemoryWrite16(address + 16u, 0x47E0u); // blx r12
+    env.MemoryWrite16(address + 18u, 0x4620u); // mov r0,r4
+    env.MemoryWrite16(address + 20u, 0xBD10u); // pop {r4,pc}
+    env.MemoryWrite16(address + 22u, 0xBF00u); // alignment nop
+    env.MemoryWrite32(address + 24u, original_create);
+    env.MemoryWrite32(address + 28u, set_visible);
+}
+
 static void WriteV22ThumbCallThenImportThunk(
     ProbeEnvironment& env, u32 address, u32 original, u32 destination) {
     if ((address & 3u) != 0u)
@@ -1894,6 +1918,33 @@ static std::size_t InstallV22EditButtonBridge(ElfRuntime& runtime,
         break;
     }
     return patched;
+}
+
+static std::size_t InstallV22PauseCreationSuppression(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    if (!gd_settings_remove_pause_button()) return 0u;
+    const SymbolRecord* ui_init = FindSymbol(runtime, "_ZN7UILayer4initEv");
+    const SymbolRecord* create = FindSymbol(
+        runtime,
+        "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_"
+        "PNS0_8CCObjectEMS3_FvS4_E");
+    const SymbolRecord* set_visible = FindSymbol(
+        runtime, "_ZN7cocos2d6CCNode10setVisibleEb");
+    if (!ui_init || !create || !set_visible) return 0u;
+    const std::vector<u32> calls = FindThumbBlCallSitesInRange(
+        env, ui_init->address, ui_init->size, create->address);
+    if (calls.empty()) return 0u;
+
+    // In the supplied 2019, 2022 and 2023 ARMv7 betas the first
+    // CCMenuItemSpriteExtra::create in UILayer::init is the top-right pause
+    // item (stored at +0x1B0, +0x1BC and +0x1C0 respectively). Hook that one
+    // creation site rather than hiding the item after a rendered frame.
+    EnsureV22ThunkPage(env);
+    const u32 thunk = kV22ThunkBase + 0x100u;
+    WriteV22ThumbCreateHiddenPauseThunk(
+        env, thunk, create->address, set_visible->address);
+    WriteThumbBl(env, calls.front(), thunk);
+    return 1u;
 }
 
 static std::pair<std::size_t, std::size_t>
@@ -8302,9 +8353,11 @@ private:
             layout.setup_cache_field = 0x2C60u;
             layout.manager_layer_field = 0x16Cu;
             layout.manager_flag_field = 0x1BAu;
-            layout.level_setup_hint = 0x118u;
+            layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
-            layout.vectors_are_resized = true;
+            // The working 2023 restoration reserves/zeros 9999 entries but
+            // leaves std::vector::size() at zero. 2022 uses the same late ABI.
+            layout.vectors_are_resized = false;
             layout.late_background_api = true;
             layout.array_fields = {
                 0x2BCCu, 0x2BC4u, 0x2BBCu, 0x2BB8u,
@@ -8329,7 +8382,8 @@ private:
             layout.manager_flag_field = 0x1BAu;
             layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
-            layout.vectors_are_resized = true;
+            // Match LevelEditorLayerExt::initH exactly: capacity=9999, size=0.
+            layout.vectors_are_resized = false;
             layout.late_background_api = true;
             layout.array_fields = {
                 0x2C00u, 0x2BF8u, 0x2BF0u, 0x2BECu,
@@ -8484,35 +8538,17 @@ private:
                                  std::string& encoded) {
         string_object = 0u;
         encoded.clear();
-        if (layout.level_setup_hint &&
-            ReadGuestCowStringObject(level + layout.level_setup_hint, encoded,
-                                     32u * 1024u * 1024u) &&
-            !encoded.empty()) {
-            string_object = level + layout.level_setup_hint;
-            return true;
+        if (layout.level_setup_hint) {
+            // All three supported stock profiles now have a binary-verified
+            // GJGameLevel setup-string field. An empty string is a legitimate
+            // freshly-created level and must NOT trigger the old heuristic
+            // scan across unrelated name/description strings.
+            if (ReadGuestCowStringObject(level + layout.level_setup_hint, encoded,
+                                         32u * 1024u * 1024u)) {
+                string_object = level + layout.level_setup_hint;
+                return true;
+            }
         }
-
-        // The early beta moved GJGameLevel fields substantially. Find the
-        // compressed setup by COW-string validity and content/length rather
-        // than assigning a guessed early offset. The level setup is by far the
-        // largest string in normal GJGameLevel objects.
-        std::size_t best_score = 0u;
-        for (u32 offset = 0x80u; offset <= 0x500u; offset += 4u) {
-            std::string candidate;
-            if (!ReadGuestCowStringObject(level + offset, candidate,
-                                          32u * 1024u * 1024u))
-                continue;
-            if (candidate.empty()) continue;
-            std::size_t score = candidate.size();
-            if (candidate.find("kS38") != std::string::npos) score += 1u << 22;
-            if (candidate.find(';') != std::string::npos) score += 1u << 20;
-            if (candidate.size() > 128u) score += 1u << 18;
-            if (score <= best_score) continue;
-            best_score = score;
-            encoded = std::move(candidate);
-            string_object = level + offset;
-        }
-        if (string_object) return true;
 
         if (runtime_.v22_game_level_id_offset &&
             env_.IsMapped(level + runtime_.v22_game_level_id_offset, 4u)) {
@@ -8545,59 +8581,107 @@ private:
 
     bool DecodeV22EditorLevelSetup(u32 level, const V22EditorLayout& layout,
                                    std::string& decoded) {
+        static constexpr std::string_view kSafeEmptySetup =
+            "kS38,kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,"
+            "kA25,0,kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,"
+            "kA4,0,kA8,0,kA10,0;";
+        auto valid_setup = [](std::string_view value) {
+            if (value.size() < 4u || value.size() > 64u * 1024u * 1024u)
+                return false;
+            // Every usable GD setup begins with the level-settings record and
+            // contains at least one record terminator. Accept kS/kA variants
+            // used by these betas, but never generic comma/semicolon garbage.
+            const bool header = value.starts_with("kS") ||
+                                value.starts_with("kA");
+            return header && value.find(';') != std::string_view::npos &&
+                   value.find(',') != std::string_view::npos;
+        };
+
         decoded.clear();
         u32 source_object = 0u;
         std::string source;
-        if (!FindV22EditorLevelSetup(level, layout, source_object, source)) {
-            decoded =
-                "kS38,kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,"
-                "kA25,0,kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,"
-                "kA4,0,kA8,0,kA10,0;";
+        if (!FindV22EditorLevelSetup(level, layout, source_object, source) ||
+            source.empty()) {
+            decoded.assign(kSafeEmptySetup);
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_SOURCE_EMPTY profile="
+                 << V22EditorRestoreProfileName(
+                        runtime_.v22_wrapper_editor_profile)
+                 << " action=safe-empty-setup\n";
+            log_.flush();
             return true;
         }
-        if (!source_object || source.find("kS38") != std::string::npos ||
-            source.find("kA13,") != std::string::npos) {
+        if (valid_setup(source)) {
             decoded = source;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_READY profile="
+                 << V22EditorRestoreProfileName(
+                        runtime_.v22_wrapper_editor_profile)
+                 << " source=already-decoded bytes=" << decoded.size() << '\n';
+            log_.flush();
             return true;
         }
-        const u32 unzip = V22PrimarySymbolAddress(
-            "_ZN7cocos2d8ZipUtils16decompressStringESsbi");
-        if (!unzip) return Fail("V22 editor restore ZipUtils symbol missing");
-        const u32 destination = Allocate(4u);
-        if (!destination) return Fail("V22 editor restore string allocation failed");
-        env_.MemoryWrite32(destination, runtime_.v22_empty_string_data);
-        u32 ignored = 0u;
-        if (!RunNestedPreservingState(unzip, {destination, source_object, 0u, 11u},
-                                      ignored,
-                                      "V22 editor restore decompress level",
-                                      1000000000u))
-            return false;
-        if (!ReadGuestCowStringObject(destination, decoded,
-                                      64u * 1024u * 1024u) ||
-            decoded.empty()) {
-            // Never feed a failed compressed/base64 payload to
-            // createObjectsFromSetup(). tweaks5 did that on the 2019 stock
-            // beta after selecting the wrong heuristic string and it eventually
-            // crashed in std::string cleanup. A genuinely pre-decoded community
-            // setup still has the normal comma/semicolon object syntax.
-            const bool looks_decoded =
-                source.find(',') != std::string::npos &&
-                source.find(';') != std::string::npos;
-            if (looks_decoded) {
-                decoded = source;
-            } else {
-                log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_DECODE_FAILED profile="
-                     << V22EditorRestoreProfileName(
-                            runtime_.v22_wrapper_editor_profile)
-                     << " source-bytes=" << source.size()
-                     << " action=safe-empty-setup\n";
-                log_.flush();
-                decoded =
-                    "kS38,kA13,0,kA15,0,kA16,0,kA14,,kA6,0,kA7,0,"
-                    "kA25,0,kA17,1,kA18,0,kS39,0,kA2,0,kA3,0,"
-                    "kA4,0,kA8,0,kA10,0;";
+
+        auto inflate_encoded = [&](std::string_view encoded,
+                                   bool restore_gzip_prefix,
+                                   std::string& output) {
+            std::string completed;
+            if (restore_gzip_prefix) {
+                static constexpr std::string_view kPrefix = "H4sIAAAAAAAAA";
+                completed.reserve(kPrefix.size() + encoded.size());
+                completed.append(kPrefix);
+                completed.append(encoded);
+                encoded = completed;
             }
+            std::vector<u8> compressed = DecodeV22Base64(encoded);
+            if (compressed.empty()) return false;
+            std::string candidate;
+            if (!InflateV22Payload(compressed, candidate) ||
+                !valid_setup(candidate))
+                return false;
+            output = std::move(candidate);
+            return true;
+        };
+
+        bool restored_prefix = false;
+        if (!inflate_encoded(source, false, decoded)) {
+            restored_prefix = inflate_encoded(source, true, decoded);
         }
+        if (!valid_setup(decoded)) {
+            // Official-level catalog data is a second exact source when the
+            // level ID is known. It is safer than ever passing undecoded bytes
+            // into createObjectsFromSetup().
+            if (runtime_.v22_game_level_id_offset &&
+                env_.IsMapped(level + runtime_.v22_game_level_id_offset, 4u)) {
+                const s32 level_id = static_cast<s32>(env_.MemoryRead32(
+                    level + runtime_.v22_game_level_id_offset));
+                if (const std::string* official =
+                        GetV22OfficialLevelSetup(level_id);
+                    official && valid_setup(*official)) {
+                    decoded = *official;
+                    log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_READY profile="
+                         << V22EditorRestoreProfileName(
+                                runtime_.v22_wrapper_editor_profile)
+                         << " source=apk-catalog level=" << level_id
+                         << " bytes=" << decoded.size() << '\n';
+                    log_.flush();
+                    return true;
+                }
+            }
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_DECODE_FAILED profile="
+                 << V22EditorRestoreProfileName(
+                        runtime_.v22_wrapper_editor_profile)
+                 << " source-bytes=" << source.size()
+                 << " action=safe-empty-setup\n";
+            log_.flush();
+            decoded.assign(kSafeEmptySetup);
+            return true;
+        }
+        log_ << "RESULT: DYNARMIC_V22_EDITOR_SETUP_READY profile="
+             << V22EditorRestoreProfileName(runtime_.v22_wrapper_editor_profile)
+             << " source=host-base64-inflate gzip-prefix="
+             << (restored_prefix ? "restored" : "embedded")
+             << " encoded=" << source.size()
+             << " decoded=" << decoded.size() << '\n';
+        log_.flush();
         return true;
     }
 
@@ -8857,6 +8941,40 @@ private:
                 return false;
         }
 
+        if (runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Early2019) {
+            // Lite 2.21 contains the complete editor atlases, but its normal
+            // menu path never loads them. EditorUI::create otherwise receives
+            // a null CCSpriteFrame and crashes in CCSpriteFrame::getTexture.
+            u32 frame_cache = 0u;
+            if (!CallV22Primary(
+                    "_ZN7cocos2d18CCSpriteFrameCache22sharedSpriteFrameCacheEv",
+                    {}, frame_cache, "V22 early editor sprite-frame cache") ||
+                !frame_cache)
+                return false;
+            static constexpr std::array<const char*, 5> kEditorSheets = {
+                "GJ_GameSheet.plist",
+                "GJ_GameSheet02.plist",
+                "GJ_GameSheet03.plist",
+                "GJ_GameSheet04.plist",
+                "GJ_GameSheetGlow.plist",
+            };
+            for (const char* sheet : kEditorSheets) {
+                const u32 guest_name = AllocateString(sheet);
+                if (!guest_name)
+                    return Fail("V22 early editor sprite-sheet name allocation failed");
+                if (!CallV22Primary(
+                        "_ZN7cocos2d18CCSpriteFrameCache23addSpriteFramesWithFileEPKc",
+                        {frame_cache, guest_name}, ignored,
+                        std::string("V22 early editor load ") + sheet, true,
+                        1500000000u))
+                    return false;
+            }
+            log_ << "RESULT: DYNARMIC_V22_EARLY_EDITOR_SPRITES_READY sheets="
+                 << kEditorSheets.size() << '\n';
+            log_.flush();
+        }
+
         u32 editor_ui = 0u;
         if (!CallV22Primary("_ZN8EditorUI6createEP16LevelEditorLayer",
                             {editor}, editor_ui,
@@ -9008,7 +9126,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks7 restores only that missing initialization in the host;
+        // gdpstweaks8 restores only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13193,7 +13311,7 @@ private:
     u32 v22_ccstring_float_value_=0;
     u32 v22_ccstring_float_value_size_=0;
     u64 v22_level_catalog_decodes_=0;
-    u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x100u;
+    u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x120u;
     std::optional<std::string> v22_pending_level_setup_;
     std::unordered_map<s32,std::string> v22_level_data_encoded_;
     std::unordered_map<s32,std::string> v22_level_data_decoded_;
@@ -13596,7 +13714,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks7 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks8 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -14143,6 +14261,15 @@ int main(int argc,char** argv) {
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
+        const std::size_t pause_creation_suppression =
+            InstallV22PauseCreationSuppression(runtime, env);
+        if (gd_settings_remove_pause_button() &&
+            pause_creation_suppression == 0u)
+            emit("WARNING: DYNARMIC_V22_PAUSE_CREATION_SUPPRESSION_MISSING");
+        else if (pause_creation_suppression)
+            emit("RESULT: DYNARMIC_V22_PAUSE_CREATION_SUPPRESSION_READY "
+                 "count=" + std::to_string(pause_creation_suppression) +
+                 " stage=UILayer-init-before-render escape-pause=preserved");
         // Preserve the proven late-beta visibility repair when the 2023
         // companion exists, but stock-editor restoration itself never depends
         // on that library. 2019 already has a real updateVisibility function.
