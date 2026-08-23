@@ -15,8 +15,6 @@ int gd_settings_full_bypass(void);
 int gd_settings_force_highest_graphics(void);
 int gd_settings_i_lost_the_game(void);
 int gd_settings_editor_controls(void);
-int gd_settings_remove_pause_button(void);
-int gd_settings_hide_cursor_when_playing(void);
 int gd_settings_extras_menu(void);
 /* Uses the beta companion's complete editor visibility pass. */
 int gd_settings_v22_exact_editor_visibility(void);

@@ -1450,39 +1450,32 @@ static void WriteV22ThumbImportThunk(ProbeEnvironment& env, u32 address,
     env.MemoryWrite32(address + 4u, destination);
 }
 
-static void WriteV22ThumbInitThenHidePauseThunk(
-    ProbeEnvironment& env, u32 address, u32 original_init,
-    u32 set_visible, u32 pause_field) {
-    if ((address & 3u) != 0u || pause_field > 0x0FFFu)
-        throw std::runtime_error("V22 pause post-init thunk parameters invalid");
+static void WriteV22ThumbSpriteFrameFallbackThunk(
+    ProbeEnvironment& env, u32 address, u32 original, u32 fallback_import) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 sprite fallback thunk is not aligned");
     /*
-     * UILayer::create calls UILayer::init before the layer can ever be drawn.
-     * Run the complete original init first, then hide the exact pause member.
-     * This survives builds that re-enable the item later inside init and is
-     * earlier/more deterministic than gameplay scene detection.
+     * CCSpriteFrameCache::spriteFrameByName(this, name): preserve both input
+     * registers and call the untouched stock lookup first. Only a null result
+     * falls through to the host import, which receives the original name in r0.
+     * The host returns 0 outside the narrow stock EditorUI construction window.
      */
-    env.MemoryWrite16(address + 0x00u, 0xB530u); // push {r4,r5,lr}
-    env.MemoryWrite16(address + 0x02u, 0x4604u); // mov r4,r0 (UILayer*)
-    env.MemoryWrite16(address + 0x04u, 0xF8DFu); // ldr.w r12,[pc,#28]
-    env.MemoryWrite16(address + 0x06u, 0xC01Cu);
-    env.MemoryWrite16(address + 0x08u, 0x47E0u); // blx r12 (original init)
-    env.MemoryWrite16(address + 0x0Au, 0x4605u); // mov r5,r0 (bool result)
-    env.MemoryWrite16(address + 0x0Cu, 0x2D00u); // cmp r5,#0
-    env.MemoryWrite16(address + 0x0Eu, 0xD007u); // beq done
-    env.MemoryWrite16(address + 0x10u, 0xF8D4u); // ldr.w r0,[r4,#field]
-    env.MemoryWrite16(address + 0x12u,
-                      static_cast<u16>(pause_field & 0x0FFFu));
-    env.MemoryWrite16(address + 0x14u, 0x2800u); // cmp r0,#0
-    env.MemoryWrite16(address + 0x16u, 0xD003u); // beq done
-    env.MemoryWrite16(address + 0x18u, 0x2100u); // movs r1,#0
-    env.MemoryWrite16(address + 0x1Au, 0xF8DFu); // ldr.w r12,[pc,#12]
-    env.MemoryWrite16(address + 0x1Cu, 0xC00Cu);
-    env.MemoryWrite16(address + 0x1Eu, 0x47E0u); // blx r12 (setVisible)
-    env.MemoryWrite16(address + 0x20u, 0x4628u); // mov r0,r5
-    env.MemoryWrite16(address + 0x22u, 0xBD30u); // pop {r4,r5,pc}
-    env.MemoryWrite32(address + 0x24u, original_init);
-    env.MemoryWrite32(address + 0x28u, set_visible);
+    env.MemoryWrite16(address + 0x00u, 0xB503u); // push {r0,r1,lr}
+    env.MemoryWrite16(address + 0x02u, 0x4B05u); // ldr r3,[pc,#20] -> original
+    env.MemoryWrite16(address + 0x04u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x06u, 0x2800u); // cmp r0,#0
+    env.MemoryWrite16(address + 0x08u, 0xD102u); // bne done
+    env.MemoryWrite16(address + 0x0Au, 0x9801u); // ldr r0,[sp,#4] (name)
+    env.MemoryWrite16(address + 0x0Cu, 0x4B03u); // ldr r3,[pc,#12] -> host
+    env.MemoryWrite16(address + 0x0Eu, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x10u, 0xB002u); // add sp,#8
+    env.MemoryWrite16(address + 0x12u, 0xBD00u); // pop {pc}
+    env.MemoryWrite16(address + 0x14u, 0xBF00u);
+    env.MemoryWrite16(address + 0x16u, 0xBF00u);
+    env.MemoryWrite32(address + 0x18u, original);
+    env.MemoryWrite32(address + 0x1Cu, fallback_import);
 }
+
 
 static void WriteV22ThumbCallThenImportThunk(
     ProbeEnvironment& env, u32 address, u32 original, u32 destination) {
@@ -1930,47 +1923,25 @@ static std::size_t InstallV22EditButtonBridge(ElfRuntime& runtime,
     return patched;
 }
 
-static std::size_t InstallV22PauseCreationSuppression(
+
+static std::size_t InstallV22EditorSpriteFrameFallbackBridge(
     ElfRuntime& runtime, ProbeEnvironment& env) {
-    if (!gd_settings_remove_pause_button()) return 0u;
-    const SymbolRecord* ui_init = FindSymbol(runtime, "_ZN7UILayer4initEv");
-    const SymbolRecord* ui_vtable = FindSymbol(runtime, "_ZTV7UILayer");
-    const SymbolRecord* set_visible = FindSymbol(
-        runtime, "_ZN7cocos2d6CCNode10setVisibleEb");
-    if (!ui_init || !ui_vtable || !set_visible) return 0u;
-
-    u32 pause_field = 0u;
-    switch (runtime.v22_wrapper_editor_profile) {
-    case V22EditorRestoreProfile::Early2019: pause_field = 0x1B0u; break;
-    case V22EditorRestoreProfile::Late2022: pause_field = 0x1BCu; break;
-    case V22EditorRestoreProfile::Late2023: pause_field = 0x1C0u; break;
-    default: return 0u;
-    }
-
+    if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::None)
+        return 0u;
+    const SymbolRecord* lookup = FindSymbol(
+        runtime, "_ZN7cocos2d18CCSpriteFrameCache17spriteFrameByNameEPKc");
+    if (!lookup) return 0u;
+    const std::vector<u32> calls =
+        FindThumbBlCallSites(runtime, env, lookup->address);
+    if (calls.empty()) return 0u;
+    const u32 host = EnsureImport(
+        runtime, env, "__dynarmic_v22_editor_missing_sprite_frame");
     EnsureV22ThunkPage(env);
     const u32 thunk = kV22ThunkBase + 0x100u;
-    WriteV22ThumbInitThenHidePauseThunk(
-        env, thunk, ui_init->address, set_visible->address, pause_field);
-
-    /*
-     * UILayer::create invokes init virtually (BLX through _ZTV7UILayer), so
-     * patch the exact vtable slot rather than looking for a direct BL that does
-     * not exist in these betas. The thunk runs the untouched original init and
-     * hides the stored pause item before create() can return the layer.
-     */
-    const u32 start = ui_vtable->address & ~1u;
-    const u32 bytes = ui_vtable->size ? std::min<u32>(ui_vtable->size, 0x300u)
-                                      : 0x300u;
-    std::size_t patched = 0u;
-    for (u32 offset = 0u; offset + 4u <= bytes; offset += 4u) {
-        if (!env.IsMapped(start + offset, 4u)) break;
-        const u32 value = env.MemoryRead32(start + offset);
-        if ((value & ~1u) != (ui_init->address & ~1u)) continue;
-        env.MemoryWrite32(start + offset, thunk | 1u);
-        ++patched;
-        break;
-    }
-    return patched;
+    WriteV22ThumbSpriteFrameFallbackThunk(
+        env, thunk, lookup->address, host);
+    for (u32 call : calls) WriteThumbBl(env, call, thunk);
+    return calls.size();
 }
 
 static std::pair<std::size_t, std::size_t>
@@ -2033,16 +2004,27 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     runtime.v22_ui_on_delete_check = resolve(
         "_ZN7UILayer13onDeleteCheckEPN7cocos2d8CCObjectE");
 
-    // These offsets belong to the 9,578,364-byte late-beta ARM image. They are
-    // enabled from its independently discovered PlayLayer/GJGameLevel layout,
-    // not from an APK name or companion-module presence.
+    // Persistent editor-playtest state, verified from both
+    // LevelEditorLayer::onPlaytest() (stores 1) and onStopPlaytest()
+    // (stores 0) in each exact stock image.
+    if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Early2019)
+        runtime.v22_editor_playtest_state_offset = 0x04F0u;
+    else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2022)
+        runtime.v22_editor_playtest_state_offset = 0x2C58u;
+    else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2023)
+        runtime.v22_editor_playtest_state_offset = 0x2C8Cu;
+    else
+        runtime.v22_editor_playtest_state_offset = 0u;
+
+    // These remaining offsets belong to the 9,578,364-byte late-beta ARM
+    // image and are enabled from its independently discovered PlayLayer /
+    // GJGameLevel layout, not from an APK name or companion presence.
     if (runtime.v22_play_layer_level_offset == 820u &&
         runtime.v22_game_level_id_offset == 272u) {
         runtime.v22_ui_layer_offset = 11424u;
-        /* Disassembled from this exact 9,578,364-byte image:
-           PlayLayer::togglePracticeMode reads/writes byte +0x29A0. */
+        /* Disassembled from this exact image: PlayLayer::togglePracticeMode
+           reads/writes byte +0x29A0. */
         runtime.v22_practice_mode_offset = 0x29A0u;
-        runtime.v22_editor_playtest_state_offset = 11404u;
     }
 }
 
@@ -3365,8 +3347,6 @@ public:
         native_height_ = height;
         closed_ = false;
         active_ = true;
-        remove_pause_button_option_ = gd_settings_remove_pause_button() != 0;
-        hide_cursor_option_ = gd_settings_hide_cursor_when_playing() != 0;
         instance_ = GetModuleHandleA(nullptr);
         const char* class_name = "GeometryDashUnified ARMv7Window";
         WNDCLASSEXA wc{};
@@ -3586,24 +3566,12 @@ public:
     bool Ready() const { return context_ != nullptr; }
     bool Active() const { return active_ && !closed_; }
     void SetTitle(const std::string& title) { if (window_) SetWindowTextA(window_, title.c_str()); }
-    void SetGameplayActive(bool active, bool editor_active = false) {
-        gameplay_active_ = active;
-        editor_active_ = editor_active;
-        if (!active || editor_active) {
-            cursor_force_visible_ = false;
-            cursor_pause_click_seen_ = false;
-        }
-        UpdateCursorVisibility();
-    }
     void SetExtrasVisible(bool visible) {
         gd_extras_menu_set_visible(&extras_menu_, visible ? 1 : 0);
     }
 
     void SetTextInputActive(bool active) {
         text_input_active_ = active;
-        if (active) cursor_force_visible_ = true;
-        else if (gameplay_active_ && !editor_active_) cursor_force_visible_ = false;
-        UpdateCursorVisibility();
         if (active && keyboard_down_) {
             keyboard_down_ = false;
             Queue(HostEvent{HostEventType::PlatformButton,
@@ -3619,46 +3587,6 @@ public:
             Queue(HostEvent{HostEventType::PlatformButton,
                             0.0f, 0.0f, 3u, false});
         }
-    }
-    bool PauseButtonHit(float x, float y) const {
-        return remove_pause_button_option_ && gameplay_active_ && !editor_active_ &&
-               native_width_ > 0 && native_height_ > 0 &&
-               x >= static_cast<float>(native_width_) * 0.86f &&
-               y <= static_cast<float>(native_height_) * 0.22f;
-    }
-    void UpdateCursorVisibility() {
-        const bool hidden = hide_cursor_option_ && gameplay_active_ &&
-            !editor_active_ && active_ && !text_input_active_ &&
-            !cursor_force_visible_;
-        if (cursor_hidden_ == hidden) return;
-        cursor_hidden_ = hidden;
-        if (window_) SetCursor(hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
-    }
-    void ForceCursorVisible() {
-        cursor_force_visible_ = true;
-        cursor_pause_click_seen_ = false;
-        UpdateCursorVisibility();
-    }
-    void ConfirmKeyboardGameplayInput() {
-        if (gameplay_active_ && !editor_active_) {
-            cursor_force_visible_ = false;
-            cursor_pause_click_seen_ = false;
-            UpdateCursorVisibility();
-        }
-    }
-    void ConfirmMouseGameplayInput() {
-        if (!gameplay_active_ || editor_active_) return;
-        if (cursor_force_visible_) {
-            /* First click after Escape is normally Resume; keep the cursor for
-               that click. A following gameplay click hides it again. */
-            if (!cursor_pause_click_seen_) {
-                cursor_pause_click_seen_ = true;
-                return;
-            }
-            cursor_force_visible_ = false;
-            cursor_pause_click_seen_ = false;
-        }
-        UpdateCursorVisibility();
     }
 
     void RequestClose() {
@@ -3829,8 +3757,6 @@ private:
                     self->Queue(HostEvent{HostEventType::PlatformButton,
                                           0.0f, 0.0f, 1u, false});
                 }
-                if (!becoming_active) self->ForceCursorVisible();
-                else self->UpdateCursorVisibility();
                 self->Queue(HostEvent{becoming_active ? HostEventType::Resume : HostEventType::Pause});
             }
             return 0;
@@ -3840,22 +3766,10 @@ private:
         case WM_SIZE:
             self->resize_pending_ = true;
             return 0;
-        case WM_SETCURSOR:
-            if (LOWORD(lparam) == HTCLIENT && self->cursor_hidden_) {
-                SetCursor(nullptr);
-                return TRUE;
-            }
-            break;
         case WM_LBUTTONDOWN:
             self->ClientPoint(lparam, x, y);
             self->last_x_ = x; self->last_y_ = y;
             SetFocus(window);
-            if (self->PauseButtonHit(x, y)) {
-                self->pause_touch_blocked_ = true;
-                return 0;
-            }
-            self->pause_touch_blocked_ = false;
-            self->ConfirmMouseGameplayInput();
             self->mouse_down_ = true;
             SetCapture(window);
             self->Queue(HostEvent{HostEventType::TouchBegin, x, y, 0});
@@ -3868,10 +3782,6 @@ private:
             }
             return 0;
         case WM_LBUTTONUP:
-            if (self->pause_touch_blocked_) {
-                self->pause_touch_blocked_ = false;
-                return 0;
-            }
             if (self->mouse_down_) {
                 self->ClientPoint(lparam, x, y);
                 self->last_x_ = x; self->last_y_ = y;
@@ -3881,7 +3791,6 @@ private:
             }
             return 0;
         case WM_CAPTURECHANGED:
-            self->pause_touch_blocked_ = false;
             if (self->mouse_down_) {
                 self->mouse_down_ = false;
                 self->Queue(HostEvent{HostEventType::TouchEnd, self->last_x_, self->last_y_, 0});
@@ -3912,7 +3821,6 @@ private:
                 if (tag && wparam != 'A' && wparam != 'D') return 0;
             }
             if (wparam == VK_ESCAPE) {
-                self->ForceCursorVisible();
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
             }
@@ -3926,7 +3834,6 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'A' || wparam == VK_LEFT) &&
                 !self->platform_left_down_) {
-                self->ConfirmKeyboardGameplayInput();
                 self->platform_left_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 2u, true});
@@ -3935,7 +3842,6 @@ private:
             if (!self->text_input_active_ &&
                 (wparam == 'D' || wparam == VK_RIGHT) &&
                 !self->platform_right_down_) {
-                self->ConfirmKeyboardGameplayInput();
                 self->platform_right_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 3u, true});
@@ -3943,7 +3849,6 @@ private:
             }
             if ((wparam == VK_SPACE || wparam == VK_UP) &&
                 !self->text_input_active_ && !self->keyboard_down_) {
-                self->ConfirmKeyboardGameplayInput();
                 self->keyboard_down_ = true;
                 self->Queue(HostEvent{HostEventType::PlatformButton,
                                       0.0f, 0.0f, 1u, true});
@@ -4072,14 +3977,6 @@ private:
     bool platform_left_down_ = false;
     bool platform_right_down_ = false;
     bool text_input_active_ = false;
-    bool remove_pause_button_option_ = false;
-    bool pause_touch_blocked_ = false;
-    bool hide_cursor_option_ = false;
-    bool gameplay_active_ = false;
-    bool editor_active_ = false;
-    bool cursor_hidden_ = false;
-    bool cursor_force_visible_ = false;
-    bool cursor_pause_click_seen_ = false;
     bool fullscreen_ = false;
     bool resize_pending_ = true;
     bool have_guest_viewport_ = false;
@@ -4125,7 +4022,6 @@ public:
     bool Ready() const { return false; }
     bool Active() const { return false; }
     void SetTitle(const std::string&) {}
-    void SetGameplayActive(bool, bool = false) {}
     void SetExtrasVisible(bool) {}
     void SetTextInputActive(bool) {}
     void RequestClose() {}
@@ -4433,6 +4329,25 @@ public:
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
+        u32 playtest_editor = 0u;
+        if (IsV22EditorPlaytestActive(playtest_editor) &&
+            playtest_editor == editor) {
+            if (!v22_editor_overlay_playtest_active_) {
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_HOST_UPDATES_SUSPENDED "
+                     << "reason=playtest editor=0x" << std::hex << editor
+                     << std::dec << '\n';
+                log_.flush();
+            }
+            v22_editor_overlay_playtest_active_ = true;
+            return true;
+        }
+        if (v22_editor_overlay_playtest_active_) {
+            v22_editor_overlay_playtest_active_ = false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_HOST_UPDATES_RESUMED "
+                 << "reason=playtest-ended editor=0x" << std::hex << editor
+                 << std::dec << '\n';
+            log_.flush();
+        }
         const u32 draw_grid = FindV22DrawGridLayer(editor);
         ++v22_editor_overlay_frames_;
 
@@ -4762,44 +4677,9 @@ public:
         const bool editor = (v22_editor_visual_layer_ &&
             LooksLikeGuestObject(runtime_, env_, v22_editor_visual_layer_)) ||
             editor_playtest;
-        const bool gameplay = layer != 0u && !editor;
-        if (gameplay) HideV22PauseButtonVisual(layer);
-        else v22_pause_hidden_item_ = 0u;
-        gl_.SetGameplayActive(gameplay, editor);
         gl_.SetExtrasVisible(!layer && !editor);
     }
 
-    void HideV22PauseButtonVisual(u32 layer) {
-        if (!gd_settings_remove_pause_button() || !layer ||
-            !runtime_.v22_ui_layer_offset ||
-            !env_.IsMapped(layer + runtime_.v22_ui_layer_offset, 4u)) return;
-        const u32 ui_layer = env_.MemoryRead32(layer + runtime_.v22_ui_layer_offset);
-        if (!LooksLikeGuestObject(runtime_, env_, ui_layer) ||
-            !env_.IsMapped(ui_layer + 0x1C0u, 4u)) return;
-        const u32 pause_item = env_.MemoryRead32(ui_layer + 0x1C0u);
-        if (!LooksLikeGuestObject(runtime_, env_, pause_item)) return;
-        // Do not treat hiding as a one-shot operation. UILayer can make the
-        // same CCMenuItem visible again during level setup/restart. tweaks5
-        // remembered only the pointer, so a re-shown pause button could linger
-        // until the active layer changed. Reassert only when the Cocos visible
-        // byte says the same item has become visible again.
-        if (v22_pause_hidden_item_ == pause_item &&
-            env_.IsMapped(pause_item + 234u, 1u) &&
-            env_.MemoryRead8(pause_item + 234u) == 0u)
-            return;
-        const SymbolRecord* set_visible = FindSymbol(
-            runtime_, "_ZN7cocos2d6CCNode10setVisibleEb");
-        if (!set_visible) return;
-        if (RunFunction(set_visible->address, {pause_item, 0u}, nullptr,
-                        "V22 hide top-right pause control", 0u,
-                        std::chrono::milliseconds(1000))) {
-            v22_pause_hidden_item_ = pause_item;
-            log_ << "RESULT: DYNARMIC_V22_PAUSE_BUTTON_HIDDEN ui=0x"
-                 << std::hex << ui_layer << " item=0x" << pause_item
-                 << std::dec << " escape-pause=preserved\n";
-            log_.flush();
-        }
-    }
 
     bool HandleExtrasAction(u32 action) {
         log_ << "RESULT: DYNARMIC_EXTRAS_ACTION_UNAVAILABLE backend=armv7 action="
@@ -7630,6 +7510,12 @@ private:
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
         }
+        u32 playtest_editor = 0u;
+        if (IsV22EditorPlaytestActive(playtest_editor) &&
+            playtest_editor == editor_layer) {
+            v22_editor_overlay_playtest_active_ = true;
+            return true;
+        }
         ++v22_editor_visibility_passes_;
 
         u32 ignored = 0u;
@@ -8559,7 +8445,7 @@ private:
             InitV22StdVector(editor, field(0x2B9Cu), count, 4u, resized);
     }
 
-    bool PrepareV22StockEditorSpriteAliases() {
+    bool PrepareV22StockEditorSpriteFallback() {
         u32 cache = 0u;
         u32 ignored = 0u;
         if (!CallV22Primary(
@@ -8567,9 +8453,8 @@ private:
                 {}, cache, "V22 editor sprite-frame cache") || !cache)
             return false;
 
-        // The reduced Lite/SubZero APKs keep most editor art but omit several
-        // full-game-only frame entries. Ensure the stock sheet containing our
-        // fallback frame is loaded before installing aliases.
+        // Keep one known-good stock frame available as a placeholder for
+        // editor-only art omitted from reduced Lite/SubZero beta packages.
         const u32 sheet_name = AllocateString("GJ_GameSheet03.plist");
         if (!sheet_name) return false;
         CallV22Primary(
@@ -8585,35 +8470,11 @@ private:
                 {cache, fallback_name}, fallback_frame,
                 "V22 editor fallback sprite frame") || !fallback_frame)
             return Fail("V22 editor fallback sprite frame is unavailable");
-
-        static constexpr std::array<const char*, 2> kMissingStockFrames = {
-            // Standalone PNG in the reduced APK, but EditorUI asks for it as
-            // a frame-cache entry.
-            "GJ_button_04.png",
-            // Present in the 2023 editor-mod donor PixelSheet, absent from all
-            // three supplied stock 2.2 beta APKs.
-            "pixelb_03_01_001.png",
-        };
-        u32 aliases = 0u;
-        for (const char* alias : kMissingStockFrames) {
-            const u32 guest_alias = AllocateString(alias);
-            if (!guest_alias) return false;
-            u32 existing = 0u;
-            if (!CallV22Primary(
-                    "_ZN7cocos2d18CCSpriteFrameCache17spriteFrameByNameEPKc",
-                    {cache, guest_alias}, existing,
-                    "V22 editor probe sprite alias", false))
-                return false;
-            if (existing) continue;
-            if (!CallV22Primary(
-                    "_ZN7cocos2d18CCSpriteFrameCache14addSpriteFrameEPNS_13CCSpriteFrameEPKc",
-                    {cache, fallback_frame, guest_alias}, ignored,
-                    "V22 editor install sprite alias", true))
-                return false;
-            ++aliases;
-        }
-        log_ << "RESULT: DYNARMIC_V22_EDITOR_SPRITE_ALIASES_READY aliases="
-             << aliases << " fallback=GJ_arrow_02_001.png\n";
+        v22_editor_sprite_fallback_frame_ = fallback_frame;
+        v22_missing_editor_sprite_names_.clear();
+        log_ << "RESULT: DYNARMIC_V22_EDITOR_SPRITE_FALLBACK_READY "
+             << "fallback=GJ_arrow_02_001.png frame=0x" << std::hex
+             << fallback_frame << std::dec << "\n";
         log_.flush();
         return true;
     }
@@ -8829,6 +8690,23 @@ private:
         if (env_.IsMapped(game_manager + layout.manager_layer_field, 4u))
             env_.MemoryWrite32(game_manager + layout.manager_layer_field, editor);
 
+        // The working editor initializer reads a few options outside
+        // LevelEditorLayer::updateOptions(). Resolve them through the stock
+        // GameManager instead of hard-coding their values.
+        auto game_variable = [&](const char* key, bool& value) -> bool {
+            const u32 text = AllocateString(key ? key : "");
+            if (!text) return false;
+            u32 result = 0u;
+            if (!CallV22Primary("_ZN11GameManager15getGameVariableEPKc",
+                                {game_manager, text}, result,
+                                std::string("V22 wrapper editor option ") +
+                                    (key ? key : ""),
+                                false))
+                return false;
+            value = (result & 0xffu) != 0u;
+            return true;
+        };
+
         // The late stock constructors clear this byte before calling the
         // intentionally stubbed init. The 2023 restoration donor sets it back
         // to true at the start of the real editor init, and the 2022 layout
@@ -8916,10 +8794,15 @@ private:
         env_.MemoryWrite32(editor + layout.draw_grid_field, draw_grid);
         const u32 add_child_z = V22PrimarySymbolAddress(
             "_ZN7cocos2d6CCNode8addChildEPS0_i");
+        bool grid_in_front = false;
+        if (!game_variable("0039", grid_in_front))
+            return Fail("V22 wrapper editor could not read grid-layer option");
+        const u32 grid_z = grid_in_front
+            ? 0x270Fu
+            : static_cast<u32>(static_cast<s32>(-9999));
         if (add_child_z &&
             !RunNestedPreservingState(add_child_z,
-                                      {object_layer, draw_grid,
-                                       static_cast<u32>(-100)},
+                                      {object_layer, draw_grid, grid_z},
                                       ignored,
                                       "V22 wrapper editor add grid"))
             return false;
@@ -8959,6 +8842,35 @@ private:
                             {editor}, ignored,
                             "V22 wrapper editor add collision block", false))
             return false;
+
+        // The real late-beta editor init creates this hidden death/marker
+        // sprite before loading level objects. The field exists in all three
+        // profiled layouts and the frame is present in each stock APK. Leaving
+        // the field null can break editor/playtest paths long after init.
+        if (layout.arrow_field &&
+            env_.IsMapped(editor + layout.arrow_field, 4u) &&
+            !LooksLikeGuestObject(runtime_, env_,
+                                  env_.MemoryRead32(editor + layout.arrow_field))) {
+            const u32 frame_name = AllocateString("d_cross_01_001.png");
+            u32 marker = 0u;
+            if (frame_name &&
+                CallV22Primary(
+                    "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc",
+                    {frame_name}, marker,
+                    "V22 wrapper editor death marker", false) && marker) {
+                env_.MemoryWrite32(editor + layout.arrow_field, marker);
+                if (add_child_z)
+                    RunNestedPreservingState(
+                        add_child_z, {object_layer, marker, 10u}, ignored,
+                        "V22 wrapper editor add death marker");
+                CallV22Primary("_ZN7cocos2d6CCNode10setVisibleEb",
+                               {marker, 0u}, ignored,
+                               "V22 wrapper editor hide death marker", false);
+                CallV22Primary("_ZN7cocos2d6CCNode8setScaleEf",
+                               {marker, 0x3F333333u}, ignored,
+                               "V22 wrapper editor scale death marker", false);
+            }
+        }
 
         std::string decoded_setup;
         if (!DecodeV22EditorLevelSetup(level, layout, decoded_setup))
@@ -9003,6 +8915,15 @@ private:
                             1500000000u))
             return false;
 
+        bool high_capacity = false;
+        if (game_variable("0066", high_capacity) && high_capacity) {
+            if (!CallV22Primary(
+                    "_ZN15GJBaseGameLayer22enableHighCapacityModeEv",
+                    {editor}, ignored,
+                    "V22 wrapper editor high capacity mode", false))
+                return false;
+        }
+
         u32 level_settings =
             env_.MemoryRead32(editor + layout.level_settings_field);
         if (!LooksLikeGuestObject(runtime_, env_, level_settings)) {
@@ -9026,15 +8947,16 @@ private:
                 return false;
         }
 
-        if (!PrepareV22StockEditorSpriteAliases())
+        if (!PrepareV22StockEditorSpriteFallback())
             return false;
 
         u32 editor_ui = 0u;
-        if (!CallV22Primary("_ZN8EditorUI6createEP16LevelEditorLayer",
-                            {editor}, editor_ui,
-                            "V22 wrapper editor EditorUI::create", true,
-                            2000000000u) ||
-            !editor_ui)
+        v22_stock_editor_sprite_fallback_active_ = true;
+        const bool editor_ui_created = CallV22Primary(
+            "_ZN8EditorUI6createEP16LevelEditorLayer", {editor}, editor_ui,
+            "V22 wrapper editor EditorUI::create", true, 2000000000u);
+        v22_stock_editor_sprite_fallback_active_ = false;
+        if (!editor_ui_created || !editor_ui)
             return false;
         env_.MemoryWrite32(editor + layout.editor_ui_field, editor_ui);
         if (add_child_z &&
@@ -9087,9 +9009,12 @@ private:
         // true before EditorUI::updateSlider. Its semantic field name is not
         // exported, so do not guess an equivalent offset for 2019/2022.
         if (runtime_.v22_wrapper_editor_profile ==
-                V22EditorRestoreProfile::Late2023 &&
-            env_.IsMapped(editor + 0x2A19u, 1u))
-            env_.MemoryWrite8(editor + 0x2A19u, 1u);
+                V22EditorRestoreProfile::Late2023) {
+            if (env_.IsMapped(editor + 0x2A68u, 1u))
+                env_.MemoryWrite8(editor + 0x2A68u, 0u);
+            if (env_.IsMapped(editor + 0x2A19u, 1u))
+                env_.MemoryWrite8(editor + 0x2A19u, 1u);
+        }
 
         CallV22Primary("_ZN8EditorUI12updateSliderEv", {editor_ui}, ignored,
                        "V22 wrapper editor update slider", false);
@@ -9121,6 +9046,12 @@ private:
         CallV22Primary("_ZN16LevelEditorLayer22updatePreviewParticlesEv",
                        {editor}, ignored,
                        "V22 wrapper editor preview particles", false);
+
+        bool ground_enabled = false;
+        if (game_variable("0037", ground_enabled))
+            CallV22Primary("_ZN16LevelEditorLayer12toggleGroundEb",
+                           {editor, ground_enabled ? 1u : 0u}, ignored,
+                           "V22 wrapper editor toggle ground", false);
 
         log_ << "RESULT: DYNARMIC_V22_WRAPPER_EDITOR_INIT_OK profile="
              << layout.name << " editor=0x" << std::hex << editor
@@ -9180,7 +9111,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks9 continues restoring only that missing initialization in the host;
+        // gdpstweaks10 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -12502,6 +12433,24 @@ private:
         }
         if (name == "__dynarmic_v22_prepare_level_setup")
             return HostV22PrepareLevelSetup();
+        if (name == "__dynarmic_v22_editor_missing_sprite_frame") {
+            const bool editor_scope =
+                v22_stock_editor_sprite_fallback_active_ ||
+                (runtime_.v22_wrapper_editor_profile !=
+                     V22EditorRestoreProfile::None &&
+                 IsV22EditorSceneActive());
+            if (!editor_scope || !v22_editor_sprite_fallback_frame_)
+                return finish_hot(0u);
+            const std::string requested = ReadCString(r0, 256u);
+            if (v22_missing_editor_sprite_names_.insert(requested).second) {
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_MISSING_SPRITE_FRAME "
+                     << "name=\"" << requested << "\" action=stock-fallback"
+                     << " frame=0x" << std::hex
+                     << v22_editor_sprite_fallback_frame_ << std::dec << '\n';
+                log_.flush();
+            }
+            return finish_hot(v22_editor_sprite_fallback_frame_);
+        }
         if (name == "__dynarmic_v22_editor_visibility") {
             if (!HostV22EditorVisibility(r0, r1)) return false;
             return finish_hot(0u);
@@ -13348,6 +13297,9 @@ private:
     bool v22_editor_overlay_playtest_active_=false;
     bool v22_editor_level_settings_refreshed_=false;
     bool v22_editor_background_suppression_logged_=false;
+    u32 v22_editor_sprite_fallback_frame_=0u;
+    bool v22_stock_editor_sprite_fallback_active_=false;
+    std::unordered_set<std::string> v22_missing_editor_sprite_names_;
     u64 v22_editor_background_updates_suppressed_=0;
     u64 v22_batch_blend_repairs_=0;
     u64 v22_missing_batch_texture_fallbacks_=0;
@@ -13358,7 +13310,6 @@ private:
     bool v22_mouse_platformer_jump_down_=false;
     bool v22_mouse_platformer_playtest_fallback_ = false;
     u32 v22_mouse_platformer_touch_ui_=0;
-    u32 v22_pause_hidden_item_=0;
     u64 v22_companion_hooks_installed_=0;
     u64 v22_companion_hooks_skipped_=0;
     u64 v22_null_ccstring_float_recoveries_=0;
@@ -13768,7 +13719,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks9 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks10 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -14315,15 +14266,17 @@ int main(int argc,char** argv) {
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
-        const std::size_t pause_creation_suppression =
-            InstallV22PauseCreationSuppression(runtime, env);
-        if (gd_settings_remove_pause_button() &&
-            pause_creation_suppression == 0u)
-            emit("WARNING: DYNARMIC_V22_PAUSE_CREATION_SUPPRESSION_MISSING");
-        else if (pause_creation_suppression)
-            emit("RESULT: DYNARMIC_V22_PAUSE_CREATION_SUPPRESSION_READY "
-                 "count=" + std::to_string(pause_creation_suppression) +
-                 " stage=UILayer-create-post-init-before-render escape-pause=preserved");
+        const std::size_t editor_sprite_fallback_calls =
+            InstallV22EditorSpriteFrameFallbackBridge(runtime, env);
+        if (runtime.v22_wrapper_editor_profile !=
+                V22EditorRestoreProfile::None) {
+            if (!editor_sprite_fallback_calls)
+                emit("WARNING: DYNARMIC_V22_EDITOR_SPRITE_FALLBACK_BRIDGE_MISSING");
+            else
+                emit("RESULT: DYNARMIC_V22_EDITOR_SPRITE_FALLBACK_BRIDGE_READY calls=" +
+                     std::to_string(editor_sprite_fallback_calls) +
+                     " scope=stock-editor-runtime-only");
+        }
         // Preserve the proven late-beta visibility repair when the 2023
         // companion exists, but stock-editor restoration itself never depends
         // on that library. 2019 already has a real updateVisibility function.
@@ -14418,10 +14371,6 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
-             " remove-pause-button="+
-             (gd_settings_remove_pause_button() ? "true" : "false")+
-             " hide-cursor-when-playing="+
-             (gd_settings_hide_cursor_when_playing() ? "true" : "false")+
              " practice-zx="+
              ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
                 runtime.v22_practice_mode_offset)
@@ -14889,8 +14838,7 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
-            // Apply pause/cursor visibility before guest drawing so a hidden
-            // pause item is not rendered for a frame before suppression lands.
+            // Refresh optional wrapper-owned UI state before guest drawing.
             executor.RefreshExtrasMenuVisibility();
             executor.ResetFrameClipState();
             if(!executor.UpdateV22EditorOverlayFrame())

@@ -1,20 +1,23 @@
-# Source contents — 0.9.6-gdpstweaks9
+# Source contents — 0.9.6-gdpstweaks10
+
+This archive contains the complete source tree for Geometry Dash Wrapper `0.9.6-gdpstweaks10`.
 
 Included:
 
-- x86 Android wrapper source.
-- Dynarmic legacy ARM and ARMv7 wrapper source.
-- Shared Windows audio/network/storage/runtime bridges.
-- Wrapper-owned stock 2019/2022/2023 ARMv7 2.2 beta editor restoration.
-- Exact stock editor setup-field profiles: 2019 `+0x110`, 2022/2023 `+0x11C`.
-- Strict host-side editor level decoding with no cross-field string heuristic.
-- 2019 Lite editor sprite-frame atlas preload before `EditorUI::create`.
-- ARMv7 FULL_BYPASS late CreatorLayer lock/tint bypass for register variants.
-- Startup-level ARMv7 pause-item creation suppression plus the existing frame-time fallback.
-- Resizable/fullscreen DPI-aware Windows host code.
-- Windows build/launcher scripts and vendored third-party source/licenses.
+- native launcher and shared runtime settings;
+- x86 backend for supported native Android x86 Geometry Dash builds;
+- legacy ARM Dynarmic backend;
+- ARMv7 Dynarmic backend for 2.2-era builds;
+- Windows build scripts and pinned build metadata;
+- project documentation and branch-history notes;
+- wrapper-side stock 2.2 editor restoration code.
 
-Excluded:
+Not included:
 
-- iOS backend and iOS public-test code.
-- APKs, extracted proprietary game libraries, EXEs and DLLs.
+- Geometry Dash APKs;
+- extracted game `.so` libraries;
+- modded APKs or `libgame.so` donor binaries;
+- compiled wrapper `.exe`/`.dll` outputs;
+- object/static-library build products.
+
+The pause-button-removal and cursor-hiding experiments are removed from current source. Historical documentation files may still mention them because those files describe older branches.

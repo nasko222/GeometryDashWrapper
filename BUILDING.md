@@ -1,12 +1,15 @@
-# Building Geometry Dash Wrapper 0.9.6-gdpstweaks9
+# Building Geometry Dash Wrapper 0.9.6-gdpstweaks10 on Windows
 
-Use `BUILD_ALL.cmd` from a Windows command prompt. The build scripts fetch/use
-the project's pinned Zig 0.14.1, CMake, Ninja, Dynarmic and Boost dependencies
-and produce the launcher plus x86, legacy ARM and ARMv7 backends.
+Use the normal project build entry point:
 
-The normal RUN batches set `I_LOST_THE_GAME=true` and `EDITOR_CONTROLLS=true`.
-`REMOVE_PAUSE_BUTTON` and `HIDE_CURSOR_WHEN_PLAYING` default to true in tweaks8 and remain individually toggleable with the launch environment.
-Extras is temporarily disabled.
+```bat
+BUILD_ALL.cmd
+```
 
-This branch is Android-only. No APK, extracted game `.so`, built executable,
-DLL, or proprietary game asset is included in the source archive.
+Individual components can still be built with `BUILD_X86.cmd`, `BUILD_DYNARMIC.cmd`, and `BUILD_LAUNCHER.cmd`.
+
+`gdpstweaks10` changes x86/legacy/ARMv7 desktop input/UI code, ARMv7 editor restoration, shared runtime settings, launcher metadata and Dynarmic build metadata. Rebuild all wrapper executables; do not reuse tweaks9 binaries.
+
+The removed `REMOVE_PAUSE_BUTTON` and `HIDE_CURSOR_WHEN_PLAYING` environment variables are no longer settings in this branch.
+
+No APK is included. Supply your own game APK at runtime through the existing launcher flow.

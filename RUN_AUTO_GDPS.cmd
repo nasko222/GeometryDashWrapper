@@ -10,8 +10,6 @@ set "MUSIC_PULSE_MAX=0.30"
 set "VERSION_ISOLATED_SAVES=true"
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
-set "REMOVE_PAUSE_BUTTON=true"
-set "HIDE_CURSOR_WHEN_PLAYING=true"
 
 if not exist "GeometryDashLauncher.exe" (
   echo GeometryDashLauncher.exe is missing. Build the wrapper with BUILD_ALL.cmd.
