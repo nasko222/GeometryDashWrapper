@@ -1,8 +1,8 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks11
+# Geometry Dash Wrapper 0.9.6-gdpstweaks12
 
 Cross-version Windows wrapper for Geometry Dash Android builds.
 
-## gdpstweaks11 regression-fix branch
+## gdpstweaks12 regression-fix branch
 
 This branch closes the regressions reported against `0.9.6-gdpstweaks10` in the 2017 x86 and 2019/2022/2023 ARMv7 beta families.
 
@@ -46,4 +46,4 @@ A/D/W/S/Q/E no longer rebuild the full Cocos scene tree for every key press. `Ed
 
 No APK, modded APK, `libgame.so`, or game asset is included. Missing textures that are genuinely absent from an APK remain an APK-content issue; this branch prevents the wrapper from treating nonexistent selector indices as valid.
 
-See `GDPSTWEAKS11.md` and `GDPSTWEAKS11-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
+See `GDPSTWEAKS12.md` and `GDPSTWEAKS12-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.

@@ -1,0 +1,524 @@
+diff --git a/BRANCH.txt b/BRANCH.txt
+--- a/BRANCH.txt
++++ b/BRANCH.txt
+@@ -1 +1 @@
+-gdpstweaks11
++gdpstweaks12
+diff --git a/BUILDING.md b/BUILDING.md
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -1,4 +1,4 @@
+-# Building Geometry Dash Wrapper 0.9.6-gdpstweaks11 on Windows
++# Building Geometry Dash Wrapper 0.9.6-gdpstweaks12 on Windows
+ 
+ Use the normal project build entry point:
+ 
+@@ -8,7 +8,7 @@
+ 
+ Individual components can still be built with `BUILD_X86.cmd`, `BUILD_DYNARMIC.cmd`, and `BUILD_LAUNCHER.cmd`.
+ 
+-`gdpstweaks11` changes the x86 backend, ARMv7 editor/input/visual paths, the shared Windows audio backend, and version/build metadata. **Rebuild all wrapper executables; do not reuse gdpstweaks10 binaries.**
++`gdpstweaks12` changes the x86 backend, ARMv7 editor/input/visual paths, the shared Windows audio backend, and version/build metadata. **Rebuild all wrapper executables; do not reuse gdpstweaks10 binaries.**
+ 
+ The removed `REMOVE_PAUSE_BUTTON` and `HIDE_CURSOR_WHEN_PLAYING` environment variables remain absent.
+ 
+diff --git a/GDPSTWEAKS12-VERIFICATION.txt b/GDPSTWEAKS12-VERIFICATION.txt
+--- /dev/null
++++ b/GDPSTWEAKS12-VERIFICATION.txt
+@@ -0,0 +1,44 @@
++Geometry Dash Wrapper 0.9.6-gdpstweaks12
++Static/binary verification from 2026-08-24 diagnostics
++
++Passed 35/35 focused checks.
++
++01. PASS: four ARMv7 beta logs present [['20-37-25__com.robtopx.geometrydashsubzero__v2.2.12__armv7', '20-37-59__com.robtopx.geometryjumplite__v2.21__armv7', '20-37-41__com.robtopx.geometrydashsubzero__v2.2.12__armv7', '20-38-18__com.robtopx.geometryjumplite__v2.2.11__armv7']]
++02. PASS: all four fail while wrapper is inside EditorUI::create
++03. PASS: 2019 failure is null editor pointer plus 0x40A
++04. PASS: 2022 failure is null editor pointer plus 0x2B9A
++05. PASS: 2023 failures are null editor pointer plus 0x2BCE
++06. PASS: 2019 PlayLayer::init stores GameManager active layer +0x158
++07. PASS: 2019 createRotateAction loads GameManager editor layer +0x15C
++08. PASS: 2019 createRotateAction dereferences editor field +0x40A
++09. PASS: 2022 PlayLayer::init stores GameManager active layer +0x168
++10. PASS: 2022 createRotateAction loads GameManager editor layer +0x16C
++11. PASS: 2022 createRotateAction dereferences editor field +0x2B9A
++12. PASS: 2023 PlayLayer::init stores GameManager active layer +0x168
++13. PASS: 2023 createRotateAction loads GameManager editor layer +0x16C
++14. PASS: 2023 createRotateAction dereferences editor field +0x2BCE
++15. PASS: runtime has separate active/editor GameManager offsets
++16. PASS: 2019 source contains active 0x158u and editor 0x15Cu
++17. PASS: 2022 source contains active 0x168u and editor 0x16Cu
++18. PASS: 2023 source contains active 0x168u and editor 0x16Cu
++19. PASS: restored editor writes both GameManager slots
++20. PASS: normal/platformer layer resolver still uses active slot only
++21. PASS: x86 resolves GameManager::sharedState
++22. PASS: x86 has GameManager-registered editor gate
++23. PASS: x86 caches discovered GameManager editor slot
++24. PASS: x86 uses exact CCDirector::getRunningScene when exported
++25. PASS: x86 validates editor parent chain against running scene
++26. PASS: x86 hotkey function hard-gates before editor subtree walk
++27. PASS: x86 menu hotkey path no longer calls full refresh_scene_tree_state
++28. PASS: x86 editor search walks confirmed editor subtree, not scene root
++29. PASS: shared audio source byte-identical to tweaks11 [370ce61dd043b65f9b84dfe9ee9738a3d86b0eccc967a080aade77a22331dbc7]
++30. PASS: legacy ARM executable behavior source differs only version line
++31. PASS: VERSION.txt = 0.9.6-gdpstweaks12
++32. PASS: BRANCH.txt = gdpstweaks12
++33. PASS: build_info updated
++34. PASS: launcher version updated
++35. PASS: Dynarmic builder revision updated
++
++RUNTIME BOUNDARY
++----------------
++The uploaded Windows logs prove the tweaks11 ARM failure cause at the exact binary instructions. This Linux environment cannot execute the Windows wrapper, so the fixes still require runtime confirmation on Windows. The 1.0 audio implementation is intentionally unchanged because the user confirmed it is now correct.
+diff --git a/GDPSTWEAKS12.md b/GDPSTWEAKS12.md
+--- /dev/null
++++ b/GDPSTWEAKS12.md
+@@ -0,0 +1,36 @@
++# GDPSTWEAKS12
++
++`0.9.6-gdpstweaks12` is a narrow regression fix based on the 2026-08-24 runtime logs from the x86 2017/SubZero family and the restored ARMv7 2019/2022/2023 2.2-beta editors.
++
++## 1. ARMv7 restored-editor crash in EditorUI::create
++
++Tweaks11 treated one GameManager pointer as the only current game/editor layer pointer. The exact binaries show two adjacent pointers with different consumers:
++
++- 2019 `PlayLayer::init` stores the current `GJBaseGameLayer` at `GameManager + 0x158`, while `GameObject::createRotateAction` loads the editor pointer from `GameManager + 0x15C`.
++- 2022/2023 `PlayLayer::init` stores the current `GJBaseGameLayer` at `GameManager + 0x168`, while `GameObject::createRotateAction` loads the editor pointer from `GameManager + 0x16C`.
++
++The uploaded failures match those missing editor slots exactly: the 2019 run faults through a null base plus `0x40A`; the 2022 run faults through a null base plus `0x2B9A`; and the 2023 runs fault through a null base plus `0x2BCE`.
++
++The host-restored editor now writes itself to both GameManager slots. The first remains the generic active `GJBaseGameLayer` slot used by input/player paths; the adjacent slot is the explicit editor pointer used by editor/GameObject helpers. The input resolver continues using only the generic active slot, so normal gameplay does not get redirected to the editor-specific field.
++
++## 2. x86 editor hotkeys leaking into menus
++
++Tweaks11 cached `EditorUI` against a guessed running `CCScene`. Cocos can retain an old scene while level-select or another menu is active, so A/D/W/S/Q/E could still hit the stale editor object and cause visible spikes.
++
++Tweaks12 changes the shortcut gate:
++
++- a shortcut is allowed only if `GameManager::sharedState()` currently contains a `LevelEditorLayer`;
++- once discovered, the exact GameManager slot is cached, making normal editor hotkeys an O(1) pointer validation;
++- if no editor is registered, the key is ignored immediately and the full Cocos scene tree is not walked;
++- entering an editor performs only a bounded GameManager scan and then searches the confirmed editor subtree for `EditorUI` once;
++- `CCDirector::getRunningScene()` is used when exported, avoiding the old heuristic scan of CCDirector memory and its retained-scene ambiguity.
++
++This keeps the working 2017 x86 editor shortcuts while preventing editor actions from firing in level select and other menus.
++
++## 3. Audio
++
++No audio behavior is changed in this branch. The shared software-volume implementation from tweaks11 is retained byte-for-byte; the confirmed 1.0 music fix is intentionally left alone.
++
++## Runtime-test boundary
++
++The uploaded logs prove the tweaks11 ARM crash cause at the exact failing instructions. This environment cannot execute the Windows wrapper, so tweaks12 still needs a Windows test for the next runtime point after `EditorUI::create()` and for x86 menu hotkey suppression.
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,8 @@
+-# Geometry Dash Wrapper 0.9.6-gdpstweaks11
++# Geometry Dash Wrapper 0.9.6-gdpstweaks12
+ 
+ Cross-version Windows wrapper for Geometry Dash Android builds.
+ 
+-## gdpstweaks11 regression-fix branch
++## gdpstweaks12 regression-fix branch
+ 
+ This branch closes the regressions reported against `0.9.6-gdpstweaks10` in the 2017 x86 and 2019/2022/2023 ARMv7 beta families.
+ 
+@@ -46,4 +46,4 @@
+ 
+ No APK, modded APK, `libgame.so`, or game asset is included. Missing textures that are genuinely absent from an APK remain an APK-content issue; this branch prevents the wrapper from treating nonexistent selector indices as valid.
+ 
+-See `GDPSTWEAKS11.md` and `GDPSTWEAKS11-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
++See `GDPSTWEAKS12.md` and `GDPSTWEAKS12-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
+diff --git a/SOURCE-CONTENTS.md b/SOURCE-CONTENTS.md
+--- a/SOURCE-CONTENTS.md
++++ b/SOURCE-CONTENTS.md
+@@ -1,6 +1,6 @@
+-# Source contents — 0.9.6-gdpstweaks11
++# Source contents — 0.9.6-gdpstweaks12
+ 
+-This archive contains the complete source tree for Geometry Dash Wrapper `0.9.6-gdpstweaks11`.
++This archive contains the complete source tree for Geometry Dash Wrapper `0.9.6-gdpstweaks12`.
+ 
+ Included:
+ 
+@@ -21,4 +21,4 @@
+ - compiled wrapper `.exe`/`.dll` outputs;
+ - object/static-library build products.
+ 
+-Historical documentation files may describe behavior from older branches; current changes are summarized in `GDPSTWEAKS11.md`.
++Historical documentation files may describe behavior from older branches; current changes are summarized in `GDPSTWEAKS12.md`.
+diff --git a/VERSION.txt b/VERSION.txt
+--- a/VERSION.txt
++++ b/VERSION.txt
+@@ -1 +1 @@
+-0.9.6-gdpstweaks11
++0.9.6-gdpstweaks12
+diff --git a/build_dynarmic.ps1 b/build_dynarmic.ps1
+--- a/build_dynarmic.ps1
++++ b/build_dynarmic.ps1
+@@ -32,7 +32,7 @@
+ $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
+ $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
+ $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
+-$BuilderRevision = "dynarmic-x64-builder102-0.9.6-gdpstweaks11"
++$BuilderRevision = "dynarmic-x64-builder103-0.9.6-gdpstweaks12"
+ $CompatibleBuilderRevisions = @($BuilderRevision)
+ 
+ function Invoke-External {
+diff --git a/src/backends/arm_legacy/dynarmic_legacy.cpp b/src/backends/arm_legacy/dynarmic_legacy.cpp
+--- a/src/backends/arm_legacy/dynarmic_legacy.cpp
++++ b/src/backends/arm_legacy/dynarmic_legacy.cpp
+@@ -7631,7 +7631,7 @@
+             allocations += sample.allocation_calls;
+             frees += sample.free_calls;
+         }
+-        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks11 legacy ARM debug profile\n";
++        file << "Geometry Dash Wrapper 0.9.6-gdpstweaks12 legacy ARM debug profile\n";
+         file << "frames=" << samples_.size() << '\n';
+         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
+         file << "slow_frames=" << slow_frame_count_ << '\n';
+diff --git a/src/backends/armv7/dynarmic_armv7.cpp b/src/backends/armv7/dynarmic_armv7.cpp
+--- a/src/backends/armv7/dynarmic_armv7.cpp
++++ b/src/backends/armv7/dynarmic_armv7.cpp
+@@ -1284,7 +1284,11 @@
+     u32 v22_gjbase_queue_button = 0;
+     u32 v22_gjbase_push_button = 0;
+     u32 v22_gjbase_release_button = 0;
++    // GameManager keeps gameplay and editor layer pointers in adjacent slots.
++    // They are not interchangeable: normal UILayer/input paths use the first
++    // slot, while GameObject/editor helpers read the second one.
+     u32 v22_game_manager_active_layer_offset = 0;
++    u32 v22_game_manager_editor_layer_offset = 0;
+     u32 v22_apk_ground_asset_max = 0;
+     u32 v22_apk_background_asset_max = 0;
+     u32 v22_ui_key_down = 0;
+@@ -2119,15 +2123,19 @@
+     if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Early2019) {
+         runtime.v22_editor_playtest_state_offset = 0x04F0u;
+         runtime.v22_game_manager_active_layer_offset = 0x158u;
++        runtime.v22_game_manager_editor_layer_offset = 0x15Cu;
+     } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2022) {
+         runtime.v22_editor_playtest_state_offset = 0x2C58u;
+         runtime.v22_game_manager_active_layer_offset = 0x168u;
++        runtime.v22_game_manager_editor_layer_offset = 0x16Cu;
+     } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2023) {
+         runtime.v22_editor_playtest_state_offset = 0x2C8Cu;
+         runtime.v22_game_manager_active_layer_offset = 0x168u;
++        runtime.v22_game_manager_editor_layer_offset = 0x16Cu;
+     } else {
+         runtime.v22_editor_playtest_state_offset = 0u;
+         runtime.v22_game_manager_active_layer_offset = 0u;
++        runtime.v22_game_manager_editor_layer_offset = 0u;
+     }
+ 
+     // These remaining offsets belong to the 9,578,364-byte late-beta ARM
+@@ -8407,7 +8415,6 @@
+         u32 point_buffer_field = 0u;
+         u32 arrow_field = 0u;
+         u32 setup_cache_field = 0u;
+-        u32 manager_layer_field = 0u;
+         u32 manager_flag_field = 0u;
+         u32 level_setup_hint = 0u;
+         u32 vector_capacity = 0u;
+@@ -8432,7 +8439,6 @@
+             layout.point_buffer_field = 0x50Cu;
+             layout.arrow_field = 0x4A4u;
+             layout.setup_cache_field = 0x508u;
+-            layout.manager_layer_field = 0x158u;
+             layout.manager_flag_field = 0x1AAu;
+             // Verified in the stock 9,144,004-byte PlayLayer::init: it loads
+             // PlayLayer+0x668 (GJGameLevel*), adds 0x110, copies that std::string
+@@ -8462,7 +8468,6 @@
+             layout.point_buffer_field = 0x2C64u;
+             layout.arrow_field = 0x2C2Cu;
+             layout.setup_cache_field = 0x2C60u;
+-            layout.manager_layer_field = 0x168u;
+             layout.manager_flag_field = 0x1BAu;
+             layout.level_setup_hint = 0x11Cu;
+             layout.vector_capacity = 0x270Fu;
+@@ -8489,7 +8494,6 @@
+             layout.point_buffer_field = 0x2C98u;
+             layout.arrow_field = 0x2C60u;
+             layout.setup_cache_field = 0x2C94u;
+-            layout.manager_layer_field = 0x168u;
+             layout.manager_flag_field = 0x1BAu;
+             layout.level_setup_hint = 0x11Cu;
+             layout.vector_capacity = 0x270Fu;
+@@ -8886,8 +8890,21 @@
+             return false;
+         if (env_.IsMapped(game_manager + layout.manager_flag_field, 1u))
+             env_.MemoryWrite8(game_manager + layout.manager_flag_field, 1u);
+-        if (env_.IsMapped(game_manager + layout.manager_layer_field, 4u))
+-            env_.MemoryWrite32(game_manager + layout.manager_layer_field, editor);
++        // A restored LevelEditorLayer must populate both GameManager slots.
++        // The first is the current GJBaseGameLayer used by input/player code;
++        // the adjacent slot is the explicit editor pointer used by helpers such
++        // as GameObject::createRotateAction. Tweaks11 populated only the first,
++        // so EditorUI::create dereferenced null at +0x15C/+0x16C.
++        const u32 active_layer_offset =
++            runtime_.v22_game_manager_active_layer_offset;
++        const u32 editor_layer_offset =
++            runtime_.v22_game_manager_editor_layer_offset;
++        if (!active_layer_offset || !editor_layer_offset)
++            return Fail("V22 wrapper editor GameManager layer offsets are unavailable");
++        if (env_.IsMapped(game_manager + active_layer_offset, 4u))
++            env_.MemoryWrite32(game_manager + active_layer_offset, editor);
++        if (env_.IsMapped(game_manager + editor_layer_offset, 4u))
++            env_.MemoryWrite32(game_manager + editor_layer_offset, editor);
+ 
+         // The working editor initializer reads a few options outside
+         // LevelEditorLayer::updateOptions(). Resolve them through the stock
+@@ -9315,7 +9332,7 @@
+              << std::hex << editor << std::dec << " source=create\n";
+         log_.flush();
+         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
+-        // gdpstweaks11 continues restoring only that missing initialization in the host;
++        // gdpstweaks12 continues restoring only that missing initialization in the host;
+         // no modded APK or libgame.so is required for known stock profiles.
+         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
+             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
+@@ -13933,7 +13950,7 @@
+             allocations += sample.allocation_calls;
+             frees += sample.free_calls;
+         }
+-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks11 debug-everything profile\n";
++        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks12 debug-everything profile\n";
+         file << "frames=" << samples_.size() << '\n';
+         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
+         file << "slow_frames=" << slow_frame_count_ << '\n';
+diff --git a/src/backends/x86/main.c b/src/backends/x86/main.c
+--- a/src/backends/x86/main.c
++++ b/src/backends/x86/main.c
+@@ -44,6 +44,8 @@
+ typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
+ typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
+ typedef void *(__cdecl *CcDirectorSharedFunction)(void);
++typedef void *(__cdecl *CcDirectorGetRunningSceneFunction)(void *self);
++typedef void *(__cdecl *CcNodeGetParentFunction)(void *self);
+ typedef void *(__cdecl *CcNodeGetChildrenFunction)(void *self);
+ typedef unsigned int (__cdecl *CcNodeGetChildrenCountFunction)(void *self);
+ typedef void *(__cdecl *CcArrayObjectAtIndexFunction)(void *self, unsigned int index);
+@@ -105,6 +107,8 @@
+     EditorTransformObjectCallFunction editor_transform_object_call;
+     EditorTransformEditCommandFunction editor_transform_edit_command;
+     CcDirectorSharedFunction cc_director_shared;
++    CcDirectorGetRunningSceneFunction cc_director_get_running_scene;
++    CcNodeGetParentFunction ccnode_get_parent;
+     CcNodeGetChildrenFunction ccnode_get_children;
+     CcNodeGetChildrenCountFunction ccnode_get_children_count;
+     CcArrayObjectAtIndexFunction ccarray_object_at_index;
+@@ -117,6 +121,7 @@
+     void *active_editor_ui;
+     void *active_menu_layer;
+     void *active_scene_root;
++    size_t active_editor_manager_offset;
+     void *extras_scene_root;
+     void *extras_main_button;
+     void *extras_overlay;
+@@ -689,7 +694,17 @@
+     size_t offset;
+     if (!g_host.cc_director_shared) return NULL;
+     director = g_host.cc_director_shared();
+-    if (!director || !memory_range_is_readable(director, 0x500u)) return NULL;
++    if (!director || !memory_range_is_readable(director, sizeof(void *))) return NULL;
++
++    /* Prefer Cocos' own accessor. The old fallback scanned CCDirector memory and
++       could select a retained previous CCScene, which made cached EditorUI state
++       survive into level-select/menu screens. */
++    if (g_host.cc_director_get_running_scene) {
++        void *running = g_host.cc_director_get_running_scene(director);
++        if (object_type_contains(running, "CCScene")) return running;
++    }
++
++    if (!memory_range_is_readable(director, 0x500u)) return NULL;
+     for (offset = 0; offset + sizeof(void *) <= 0x500u; offset += sizeof(void *)) {
+         void *candidate = *(void **)((unsigned char *)director + offset);
+         if (object_type_contains(candidate, "CCScene")) return candidate;
+@@ -806,16 +821,93 @@
+ 
+ 
+ 
++/*
++ * Editor shortcuts must be gated by GameManager, not only by a cached Cocos
++ * scene pointer. Old scenes can remain reachable while level-select/menu layers
++ * are current, which made tweaks11 dispatch A/D/W/S/Q/E to a stale EditorUI.
++ *
++ * Cache the GameManager slot after the first editor discovery. In the common
++ * case this is one pointer read per hotkey. If it changes, do one bounded scan
++ * of GameManager's small state block; never scan the full scene from a menu.
++ */
++static int node_is_in_running_scene(void *node) {
++    void *scene;
++    unsigned int depth;
++    if (!node || !g_host.ccnode_get_parent) return 1;
++    scene = find_running_scene();
++    if (!scene) return 0;
++    for (depth = 0u; node && depth < 32u; ++depth) {
++        if (node == scene) return 1;
++        node = g_host.ccnode_get_parent(node);
++    }
++    return 0;
++}
++
++static void *find_registered_editor_layer(void) {
++    void *manager;
++    size_t offset;
++    void *candidate;
++
++    if (!g_host.game_manager_shared_state) return NULL;
++    manager = g_host.game_manager_shared_state();
++    if (!manager || !memory_range_is_readable(manager, 0x600u)) return NULL;
++
++    if (g_host.active_editor_manager_offset >= 0x40u &&
++        g_host.active_editor_manager_offset + sizeof(void *) <= 0x600u) {
++        candidate = *(void **)((unsigned char *)manager +
++                               g_host.active_editor_manager_offset);
++        if (candidate && object_type_contains(candidate, "LevelEditorLayer") &&
++            node_is_in_running_scene(candidate)) {
++            g_host.active_editor_layer = candidate;
++            return candidate;
++        }
++        g_host.active_editor_manager_offset = 0u;
++    }
++
++    /* If we already know the editor object, first look for that exact pointer.
++       This is cheap and avoids RTTI probes across every non-null manager field. */
++    if (g_host.active_editor_layer) {
++        for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
++             offset += sizeof(void *)) {
++            candidate = *(void **)((unsigned char *)manager + offset);
++            if (candidate == g_host.active_editor_layer &&
++                node_is_in_running_scene(candidate)) {
++                g_host.active_editor_manager_offset = offset;
++                return candidate;
++            }
++        }
++        g_host.active_editor_layer = NULL;
++        g_host.active_editor_ui = NULL;
++    }
++
++    /* New editor entry: bounded GameManager discovery only. */
++    for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
++         offset += sizeof(void *)) {
++        candidate = *(void **)((unsigned char *)manager + offset);
++        if (candidate && object_type_contains(candidate, "LevelEditorLayer") &&
++            node_is_in_running_scene(candidate)) {
++            g_host.active_editor_manager_offset = offset;
++            g_host.active_editor_layer = candidate;
++            return candidate;
++        }
++    }
++    return NULL;
++}
++
+ static void *find_active_editor_ui(void) {
+     unsigned int visited = 0;
+-    void *scene = find_running_scene();
+-
+-    /* gdpstweaks10 rebuilt the entire Cocos scene tree on every A/D/W/S/Q/E
+-       press. On the 2017 x86 beta that can visit thousands of nodes and causes
+-       the visible frame spike. Reuse the discovered EditorUI while the scene
+-       is unchanged and validate only the cached object. */
+-    if (scene && scene == g_host.active_scene_root &&
+-        g_host.active_editor_ui &&
++    void *registered_editor = find_registered_editor_layer();
++
++    /* Hard gate: no GameManager-registered LevelEditorLayer means this is not
++       an editor shortcut context. Do not inspect the scene tree at all. */
++    if (!registered_editor) {
++        g_host.active_editor_ui = NULL;
++        if (g_host.editor_hotkey_miss_logs++ < 8u)
++            runtime_log("Editor controls: key ignored; GameManager has no active editor");
++        return NULL;
++    }
++
++    if (g_host.active_editor_ui &&
+         object_type_contains(g_host.active_editor_ui, "EditorUI")) {
+         if (g_host.ccnode_is_visible &&
+             !g_host.ccnode_is_visible(g_host.active_editor_ui))
+@@ -823,25 +915,19 @@
+         return g_host.active_editor_ui;
+     }
+ 
+-    refresh_scene_tree_state();
++    /* The editor is definitely active. Search only its subtree once to locate
++       EditorUI, then use the GameManager slot + cached UI on later key presses. */
++    g_host.active_editor_ui = NULL;
++    walk_scene_tree(registered_editor, 0u, &visited);
+     if (g_host.active_editor_ui) {
+         if (g_host.ccnode_is_visible &&
+             !g_host.ccnode_is_visible(g_host.active_editor_ui))
+             return NULL;
+         return g_host.active_editor_ui;
+     }
+-    if (g_host.active_editor_layer) {
+-        walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
+-        if (g_host.active_editor_ui) {
+-            if (g_host.ccnode_is_visible &&
+-                !g_host.ccnode_is_visible(g_host.active_editor_ui))
+-                return NULL;
+-            return g_host.active_editor_ui;
+-        }
+-    }
++
+     if (g_host.editor_hotkey_miss_logs++ < 8u)
+-        runtime_log("Editor controls: key ignored; no active visible EditorUI found (editor-layer=%s)",
+-                    g_host.active_editor_layer ? "yes" : "no");
++        runtime_log("Editor controls: key ignored; active editor has no visible EditorUI");
+     return NULL;
+ }
+ 
+@@ -1680,6 +1766,14 @@
+             &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
+     g_host.cc_director_shared = (CcDirectorSharedFunction)elf_image_find_export(
+         &image, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
++    g_host.cc_director_get_running_scene =
++        (CcDirectorGetRunningSceneFunction)elf_image_find_export(
++            &image, "_ZN7cocos2d10CCDirector15getRunningSceneEv");
++    g_host.ccnode_get_parent = (CcNodeGetParentFunction)elf_image_find_export(
++        &image, "_ZN7cocos2d6CCNode9getParentEv");
++    if (!g_host.ccnode_get_parent)
++        g_host.ccnode_get_parent = (CcNodeGetParentFunction)elf_image_find_export(
++            &image, "_ZNK7cocos2d6CCNode9getParentEv");
+     g_host.ccnode_get_children = (CcNodeGetChildrenFunction)elf_image_find_export(
+         &image, "_ZN7cocos2d6CCNode11getChildrenEv");
+     g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(
+diff --git a/src/launcher/native_launcher.c b/src/launcher/native_launcher.c
+--- a/src/launcher/native_launcher.c
++++ b/src/launcher/native_launcher.c
+@@ -40,7 +40,7 @@
+ #include "zlib.h"
+ #include "win_dpi.h"
+ 
+-#define LAUNCHER_VERSION "0.9.6-gdpstweaks11"
++#define LAUNCHER_VERSION "0.9.6-gdpstweaks12"
+ #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
+ #define MAX_UTF8_TEXT 512
+ #define MAX_COMMAND_LINE 32768
+diff --git a/src/shared/build_info.h b/src/shared/build_info.h
+--- a/src/shared/build_info.h
++++ b/src/shared/build_info.h
+@@ -1,8 +1,8 @@
+ #ifndef GD_BUILD_INFO_H
+ #define GD_BUILD_INFO_H
+ 
+-#define GD_WRAPPER_VERSION "0.9.6-gdpstweaks11"
+-#define GD_WRAPPER_BRANCH "gdpstweaks11"
++#define GD_WRAPPER_VERSION "0.9.6-gdpstweaks12"
++#define GD_WRAPPER_BRANCH "gdpstweaks12"
+ #define GD_X86_BACKEND_NAME "x86-native/0.9.3-alpha3"
+ #define GD_ARM_LEGACY_BACKEND_NAME "arm-dynarmic/dynarmictest14-fix1"
+ #define GD_ARMV7_BACKEND_NAME "armv7-dynarmic/0.9.4-milestone1"
+diff --git a/src/shared/runtime_settings.c b/src/shared/runtime_settings.c
+--- a/src/shared/runtime_settings.c
++++ b/src/shared/runtime_settings.c
+@@ -147,7 +147,7 @@
+ }
+ 
+ int gd_settings_extras_menu(void) {
+-    /* Extras remains temporarily removed in gdpstweaks11. */
++    /* Extras remains temporarily removed in gdpstweaks12. */
+     return 0;
+ }
+ 

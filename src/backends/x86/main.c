@@ -44,6 +44,8 @@ typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
 typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
 typedef void *(__cdecl *CcDirectorSharedFunction)(void);
+typedef void *(__cdecl *CcDirectorGetRunningSceneFunction)(void *self);
+typedef void *(__cdecl *CcNodeGetParentFunction)(void *self);
 typedef void *(__cdecl *CcNodeGetChildrenFunction)(void *self);
 typedef unsigned int (__cdecl *CcNodeGetChildrenCountFunction)(void *self);
 typedef void *(__cdecl *CcArrayObjectAtIndexFunction)(void *self, unsigned int index);
@@ -105,6 +107,8 @@ typedef struct {
     EditorTransformObjectCallFunction editor_transform_object_call;
     EditorTransformEditCommandFunction editor_transform_edit_command;
     CcDirectorSharedFunction cc_director_shared;
+    CcDirectorGetRunningSceneFunction cc_director_get_running_scene;
+    CcNodeGetParentFunction ccnode_get_parent;
     CcNodeGetChildrenFunction ccnode_get_children;
     CcNodeGetChildrenCountFunction ccnode_get_children_count;
     CcArrayObjectAtIndexFunction ccarray_object_at_index;
@@ -117,6 +121,7 @@ typedef struct {
     void *active_editor_ui;
     void *active_menu_layer;
     void *active_scene_root;
+    size_t active_editor_manager_offset;
     void *extras_scene_root;
     void *extras_main_button;
     void *extras_overlay;
@@ -689,7 +694,17 @@ static void *find_running_scene(void) {
     size_t offset;
     if (!g_host.cc_director_shared) return NULL;
     director = g_host.cc_director_shared();
-    if (!director || !memory_range_is_readable(director, 0x500u)) return NULL;
+    if (!director || !memory_range_is_readable(director, sizeof(void *))) return NULL;
+
+    /* Prefer Cocos' own accessor. The old fallback scanned CCDirector memory and
+       could select a retained previous CCScene, which made cached EditorUI state
+       survive into level-select/menu screens. */
+    if (g_host.cc_director_get_running_scene) {
+        void *running = g_host.cc_director_get_running_scene(director);
+        if (object_type_contains(running, "CCScene")) return running;
+    }
+
+    if (!memory_range_is_readable(director, 0x500u)) return NULL;
     for (offset = 0; offset + sizeof(void *) <= 0x500u; offset += sizeof(void *)) {
         void *candidate = *(void **)((unsigned char *)director + offset);
         if (object_type_contains(candidate, "CCScene")) return candidate;
@@ -806,16 +821,93 @@ static void *find_active_ui_layer(void) {
 
 
 
+/*
+ * Editor shortcuts must be gated by GameManager, not only by a cached Cocos
+ * scene pointer. Old scenes can remain reachable while level-select/menu layers
+ * are current, which made tweaks11 dispatch A/D/W/S/Q/E to a stale EditorUI.
+ *
+ * Cache the GameManager slot after the first editor discovery. In the common
+ * case this is one pointer read per hotkey. If it changes, do one bounded scan
+ * of GameManager's small state block; never scan the full scene from a menu.
+ */
+static int node_is_in_running_scene(void *node) {
+    void *scene;
+    unsigned int depth;
+    if (!node || !g_host.ccnode_get_parent) return 1;
+    scene = find_running_scene();
+    if (!scene) return 0;
+    for (depth = 0u; node && depth < 32u; ++depth) {
+        if (node == scene) return 1;
+        node = g_host.ccnode_get_parent(node);
+    }
+    return 0;
+}
+
+static void *find_registered_editor_layer(void) {
+    void *manager;
+    size_t offset;
+    void *candidate;
+
+    if (!g_host.game_manager_shared_state) return NULL;
+    manager = g_host.game_manager_shared_state();
+    if (!manager || !memory_range_is_readable(manager, 0x600u)) return NULL;
+
+    if (g_host.active_editor_manager_offset >= 0x40u &&
+        g_host.active_editor_manager_offset + sizeof(void *) <= 0x600u) {
+        candidate = *(void **)((unsigned char *)manager +
+                               g_host.active_editor_manager_offset);
+        if (candidate && object_type_contains(candidate, "LevelEditorLayer") &&
+            node_is_in_running_scene(candidate)) {
+            g_host.active_editor_layer = candidate;
+            return candidate;
+        }
+        g_host.active_editor_manager_offset = 0u;
+    }
+
+    /* If we already know the editor object, first look for that exact pointer.
+       This is cheap and avoids RTTI probes across every non-null manager field. */
+    if (g_host.active_editor_layer) {
+        for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
+             offset += sizeof(void *)) {
+            candidate = *(void **)((unsigned char *)manager + offset);
+            if (candidate == g_host.active_editor_layer &&
+                node_is_in_running_scene(candidate)) {
+                g_host.active_editor_manager_offset = offset;
+                return candidate;
+            }
+        }
+        g_host.active_editor_layer = NULL;
+        g_host.active_editor_ui = NULL;
+    }
+
+    /* New editor entry: bounded GameManager discovery only. */
+    for (offset = 0x40u; offset + sizeof(void *) <= 0x600u;
+         offset += sizeof(void *)) {
+        candidate = *(void **)((unsigned char *)manager + offset);
+        if (candidate && object_type_contains(candidate, "LevelEditorLayer") &&
+            node_is_in_running_scene(candidate)) {
+            g_host.active_editor_manager_offset = offset;
+            g_host.active_editor_layer = candidate;
+            return candidate;
+        }
+    }
+    return NULL;
+}
+
 static void *find_active_editor_ui(void) {
     unsigned int visited = 0;
-    void *scene = find_running_scene();
+    void *registered_editor = find_registered_editor_layer();
 
-    /* gdpstweaks10 rebuilt the entire Cocos scene tree on every A/D/W/S/Q/E
-       press. On the 2017 x86 beta that can visit thousands of nodes and causes
-       the visible frame spike. Reuse the discovered EditorUI while the scene
-       is unchanged and validate only the cached object. */
-    if (scene && scene == g_host.active_scene_root &&
-        g_host.active_editor_ui &&
+    /* Hard gate: no GameManager-registered LevelEditorLayer means this is not
+       an editor shortcut context. Do not inspect the scene tree at all. */
+    if (!registered_editor) {
+        g_host.active_editor_ui = NULL;
+        if (g_host.editor_hotkey_miss_logs++ < 8u)
+            runtime_log("Editor controls: key ignored; GameManager has no active editor");
+        return NULL;
+    }
+
+    if (g_host.active_editor_ui &&
         object_type_contains(g_host.active_editor_ui, "EditorUI")) {
         if (g_host.ccnode_is_visible &&
             !g_host.ccnode_is_visible(g_host.active_editor_ui))
@@ -823,25 +915,19 @@ static void *find_active_editor_ui(void) {
         return g_host.active_editor_ui;
     }
 
-    refresh_scene_tree_state();
+    /* The editor is definitely active. Search only its subtree once to locate
+       EditorUI, then use the GameManager slot + cached UI on later key presses. */
+    g_host.active_editor_ui = NULL;
+    walk_scene_tree(registered_editor, 0u, &visited);
     if (g_host.active_editor_ui) {
         if (g_host.ccnode_is_visible &&
             !g_host.ccnode_is_visible(g_host.active_editor_ui))
             return NULL;
         return g_host.active_editor_ui;
     }
-    if (g_host.active_editor_layer) {
-        walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
-        if (g_host.active_editor_ui) {
-            if (g_host.ccnode_is_visible &&
-                !g_host.ccnode_is_visible(g_host.active_editor_ui))
-                return NULL;
-            return g_host.active_editor_ui;
-        }
-    }
+
     if (g_host.editor_hotkey_miss_logs++ < 8u)
-        runtime_log("Editor controls: key ignored; no active visible EditorUI found (editor-layer=%s)",
-                    g_host.active_editor_layer ? "yes" : "no");
+        runtime_log("Editor controls: key ignored; active editor has no visible EditorUI");
     return NULL;
 }
 
@@ -1680,6 +1766,14 @@ int main(int argc, char **argv) {
             &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
     g_host.cc_director_shared = (CcDirectorSharedFunction)elf_image_find_export(
         &image, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
+    g_host.cc_director_get_running_scene =
+        (CcDirectorGetRunningSceneFunction)elf_image_find_export(
+            &image, "_ZN7cocos2d10CCDirector15getRunningSceneEv");
+    g_host.ccnode_get_parent = (CcNodeGetParentFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9getParentEv");
+    if (!g_host.ccnode_get_parent)
+        g_host.ccnode_get_parent = (CcNodeGetParentFunction)elf_image_find_export(
+            &image, "_ZNK7cocos2d6CCNode9getParentEv");
     g_host.ccnode_get_children = (CcNodeGetChildrenFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode11getChildrenEv");
     g_host.ccnode_get_children_count = (CcNodeGetChildrenCountFunction)elf_image_find_export(

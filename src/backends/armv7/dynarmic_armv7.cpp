@@ -1284,7 +1284,11 @@ struct ElfRuntime {
     u32 v22_gjbase_queue_button = 0;
     u32 v22_gjbase_push_button = 0;
     u32 v22_gjbase_release_button = 0;
+    // GameManager keeps gameplay and editor layer pointers in adjacent slots.
+    // They are not interchangeable: normal UILayer/input paths use the first
+    // slot, while GameObject/editor helpers read the second one.
     u32 v22_game_manager_active_layer_offset = 0;
+    u32 v22_game_manager_editor_layer_offset = 0;
     u32 v22_apk_ground_asset_max = 0;
     u32 v22_apk_background_asset_max = 0;
     u32 v22_ui_key_down = 0;
@@ -2119,15 +2123,19 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Early2019) {
         runtime.v22_editor_playtest_state_offset = 0x04F0u;
         runtime.v22_game_manager_active_layer_offset = 0x158u;
+        runtime.v22_game_manager_editor_layer_offset = 0x15Cu;
     } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2022) {
         runtime.v22_editor_playtest_state_offset = 0x2C58u;
         runtime.v22_game_manager_active_layer_offset = 0x168u;
+        runtime.v22_game_manager_editor_layer_offset = 0x16Cu;
     } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2023) {
         runtime.v22_editor_playtest_state_offset = 0x2C8Cu;
         runtime.v22_game_manager_active_layer_offset = 0x168u;
+        runtime.v22_game_manager_editor_layer_offset = 0x16Cu;
     } else {
         runtime.v22_editor_playtest_state_offset = 0u;
         runtime.v22_game_manager_active_layer_offset = 0u;
+        runtime.v22_game_manager_editor_layer_offset = 0u;
     }
 
     // These remaining offsets belong to the 9,578,364-byte late-beta ARM
@@ -8407,7 +8415,6 @@ private:
         u32 point_buffer_field = 0u;
         u32 arrow_field = 0u;
         u32 setup_cache_field = 0u;
-        u32 manager_layer_field = 0u;
         u32 manager_flag_field = 0u;
         u32 level_setup_hint = 0u;
         u32 vector_capacity = 0u;
@@ -8432,7 +8439,6 @@ private:
             layout.point_buffer_field = 0x50Cu;
             layout.arrow_field = 0x4A4u;
             layout.setup_cache_field = 0x508u;
-            layout.manager_layer_field = 0x158u;
             layout.manager_flag_field = 0x1AAu;
             // Verified in the stock 9,144,004-byte PlayLayer::init: it loads
             // PlayLayer+0x668 (GJGameLevel*), adds 0x110, copies that std::string
@@ -8462,7 +8468,6 @@ private:
             layout.point_buffer_field = 0x2C64u;
             layout.arrow_field = 0x2C2Cu;
             layout.setup_cache_field = 0x2C60u;
-            layout.manager_layer_field = 0x168u;
             layout.manager_flag_field = 0x1BAu;
             layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
@@ -8489,7 +8494,6 @@ private:
             layout.point_buffer_field = 0x2C98u;
             layout.arrow_field = 0x2C60u;
             layout.setup_cache_field = 0x2C94u;
-            layout.manager_layer_field = 0x168u;
             layout.manager_flag_field = 0x1BAu;
             layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
@@ -8886,8 +8890,21 @@ private:
             return false;
         if (env_.IsMapped(game_manager + layout.manager_flag_field, 1u))
             env_.MemoryWrite8(game_manager + layout.manager_flag_field, 1u);
-        if (env_.IsMapped(game_manager + layout.manager_layer_field, 4u))
-            env_.MemoryWrite32(game_manager + layout.manager_layer_field, editor);
+        // A restored LevelEditorLayer must populate both GameManager slots.
+        // The first is the current GJBaseGameLayer used by input/player code;
+        // the adjacent slot is the explicit editor pointer used by helpers such
+        // as GameObject::createRotateAction. Tweaks11 populated only the first,
+        // so EditorUI::create dereferenced null at +0x15C/+0x16C.
+        const u32 active_layer_offset =
+            runtime_.v22_game_manager_active_layer_offset;
+        const u32 editor_layer_offset =
+            runtime_.v22_game_manager_editor_layer_offset;
+        if (!active_layer_offset || !editor_layer_offset)
+            return Fail("V22 wrapper editor GameManager layer offsets are unavailable");
+        if (env_.IsMapped(game_manager + active_layer_offset, 4u))
+            env_.MemoryWrite32(game_manager + active_layer_offset, editor);
+        if (env_.IsMapped(game_manager + editor_layer_offset, 4u))
+            env_.MemoryWrite32(game_manager + editor_layer_offset, editor);
 
         // The working editor initializer reads a few options outside
         // LevelEditorLayer::updateOptions(). Resolve them through the stock
@@ -9315,7 +9332,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks11 continues restoring only that missing initialization in the host;
+        // gdpstweaks12 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13933,7 +13950,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks11 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks12 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
