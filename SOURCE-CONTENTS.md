@@ -1,6 +1,6 @@
-# Source contents — 0.9.6-gdpstweaks12
+# Source contents — 0.9.6-gdpstweaks13
 
-This archive contains the complete source tree for Geometry Dash Wrapper `0.9.6-gdpstweaks12`.
+This archive contains the complete source tree for Geometry Dash Wrapper `0.9.6-gdpstweaks13`.
 
 Included:
 
@@ -21,4 +21,4 @@ Not included:
 - compiled wrapper `.exe`/`.dll` outputs;
 - object/static-library build products.
 
-Historical documentation files may describe behavior from older branches; current changes are summarized in `GDPSTWEAKS12.md`.
+Historical documentation files may describe behavior from older branches; current changes are summarized in `GDPSTWEAKS13.md`.

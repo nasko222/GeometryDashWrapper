@@ -7602,11 +7602,16 @@ private:
         const std::string key = ReadCString(key_address, 16u);
         if (key != "0036") return true;
         v22_editor_preview_mode_enabled_ = value != 0u;
+        v22_editor_preview_refresh_pending_ = true;
+        // Both ON and OFF transitions need several native camera-background
+        // updates.  tweaks12 suppressed the first OFF update immediately, so
+        // the preview background could stick until playtest changed it again.
+        v22_editor_preview_background_grace_frames_ = 8u;
         ++v22_editor_preview_mode_changes_;
         log_ << "RESULT: DYNARMIC_V22_EDITOR_PREVIEW_MODE state="
              << (v22_editor_preview_mode_enabled_ ? 1 : 0)
              << " changes=" << v22_editor_preview_mode_changes_
-             << " policy=allow-native-background-update-while-enabled\n";
+             << " policy=refresh-preview-and-grace-native-background\n";
         log_.flush();
         return true;
     }
@@ -7619,7 +7624,8 @@ private:
         const bool playtest = IsV22EditorPlaytestActive(playtest_editor);
         if (layer && layer == v22_editor_visual_layer_ &&
             IsV22EditorSceneActive() && !playtest &&
-            !v22_editor_preview_mode_enabled_) {
+            !v22_editor_preview_mode_enabled_ &&
+            v22_editor_preview_background_grace_frames_ == 0u) {
             suppress = 1u;
             ++v22_editor_background_updates_suppressed_;
             if (!v22_editor_background_suppression_logged_) {
@@ -7713,6 +7719,8 @@ private:
             v22_editor_overlay_playtest_active_ = false;
             v22_editor_level_settings_refreshed_ = false;
             v22_editor_background_suppression_logged_ = false;
+            v22_editor_preview_refresh_pending_ = false;
+            v22_editor_preview_background_grace_frames_ = 0u;
             log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
                  << std::hex << editor_layer << std::dec << '\n';
             log_.flush();
@@ -7723,6 +7731,28 @@ private:
             v22_editor_overlay_playtest_active_ = true;
             return true;
         }
+
+        if (v22_editor_preview_refresh_pending_) {
+            u32 preview_ignored = 0u;
+            if (!CallV22Primary("_ZN16LevelEditorLayer17updatePreviewAnimEv",
+                                {editor_layer}, preview_ignored,
+                                "V22 editor preview-mode animation refresh",
+                                false) ||
+                !CallV22Primary("_ZN16LevelEditorLayer22updatePreviewParticlesEv",
+                                {editor_layer}, preview_ignored,
+                                "V22 editor preview-mode particle refresh",
+                                false))
+                return false;
+            v22_editor_preview_refresh_pending_ = false;
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_PREVIEW_REFRESH editor=0x"
+                 << std::hex << editor_layer << std::dec
+                 << " state=" << (v22_editor_preview_mode_enabled_ ? 1 : 0)
+                 << " background-grace="
+                 << v22_editor_preview_background_grace_frames_ << '\n';
+            log_.flush();
+        }
+        if (v22_editor_preview_background_grace_frames_)
+            --v22_editor_preview_background_grace_frames_;
         ++v22_editor_visibility_passes_;
 
         u32 ignored = 0u;
@@ -7950,6 +7980,12 @@ private:
                         (object_flag_236 && color_pending)) {
                         opacity = 0u;
                         ++opacity_hidden;
+                    } else if (v22_editor_preview_mode_enabled_) {
+                        // Preview Mode is meant to display gameplay colours at
+                        // normal opacity. The editor-selection 70-alpha policy
+                        // from the host bridge must not override it.
+                        opacity = 255u;
+                        ++opacity_full;
                     } else {
                         const u32 primary_group =
                             env_.IsMapped(object + 0x450u, 4u)
@@ -8055,6 +8091,7 @@ private:
                  << ",255:" << opacity_full
                  << " hide-0121="
                  << (hide_special_editor_objects ? 1 : 0)
+                 << " preview=" << (v22_editor_preview_mode_enabled_ ? 1 : 0)
                  << " pass=" << v22_editor_visibility_passes_ << '\n';
             log_.flush();
         }
@@ -8450,6 +8487,10 @@ private:
             // These fields are mapped from the last full pre-stub editor
             // initializer by destructor order and matching class methods.
             layout.array_fields = {
+                // onPlaytest() removes/adds objects through +0x2A4 before
+                // touching the later editor-only collections.  Stock 2019's
+                // stub initializer never constructs this CCArray either.
+                0x2A4u,
                 0x418u, 0x41Cu, 0x428u, 0x5D0u, 0x42Cu,
                 0x430u, 0x434u, 0x440u, 0x448u, 0x47Cu,
                 0x44Cu, 0x458u, 0x43Cu, 0x4CCu, 0x4D0u};
@@ -8545,20 +8586,64 @@ private:
                               ignored, label);
     }
 
+    u32 V22CcArrayDataOffset() const {
+        return runtime_.v22_wrapper_editor_profile ==
+                       V22EditorRestoreProfile::Early2019
+                   ? 0x20u
+                   : 0x30u;
+    }
+
+    bool IsUsableV22CcArray(u32 object) {
+        if (!LooksLikeGuestObject(runtime_, env_, object)) return false;
+        const u32 data_offset = V22CcArrayDataOffset();
+        if (!env_.IsMapped(object + data_offset, 4u)) return false;
+        const u32 data = env_.MemoryRead32(object + data_offset);
+        if (!data || !env_.IsMapped(data, 12u)) return false;
+
+        // cocos2d::ccArray starts with num, max and the object-pointer array.
+        // A placeholder CCArray object left by GJBaseGameLayer::init can have a
+        // valid vtable while this internal pointer is still null.  That was the
+        // tweaks12 Play crash: removeAllObjects/addObject dereferenced data=0.
+        const u32 count = env_.MemoryRead32(data + 0u);
+        const u32 capacity = env_.MemoryRead32(data + 4u);
+        const u32 elements = env_.MemoryRead32(data + 8u);
+        if (count > capacity || capacity > 10000000u) return false;
+        if (capacity &&
+            (!elements || !env_.IsMapped(elements, 4u)))
+            return false;
+        return true;
+    }
+
     bool CreateRetainedV22Field(u32 editor, u32 field,
                                 const char* create_symbol,
                                 std::string_view label,
                                 u32 create_argument = 0u,
-                                bool has_argument = false) {
+                                bool has_argument = false,
+                                bool require_ccarray_storage = false) {
         if (!field || !env_.IsMapped(editor + field, 4u))
             return Fail("V22 editor restore field is outside LevelEditorLayer");
         const u32 existing = env_.MemoryRead32(editor + field);
-        if (LooksLikeGuestObject(runtime_, env_, existing)) return true;
+        const bool existing_valid = require_ccarray_storage
+            ? IsUsableV22CcArray(existing)
+            : LooksLikeGuestObject(runtime_, env_, existing);
+        if (existing_valid) return true;
+
+        if (existing && require_ccarray_storage) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_ARRAY_REBUILD field=0x"
+                 << std::hex << field << " old=0x" << existing << std::dec
+                 << " data-offset=0x" << std::hex << V22CcArrayDataOffset()
+                 << std::dec << " reason=invalid-native-ccarray\n";
+            log_.flush();
+        }
+
         u32 object = 0u;
         const std::vector<u32> args = has_argument
             ? std::vector<u32>{create_argument} : std::vector<u32>{};
         if (!CallV22Primary(create_symbol, args, object, label) || !object)
             return Fail(std::string(label) + " returned null");
+        if (require_ccarray_storage && !IsUsableV22CcArray(object))
+            return Fail(std::string(label) +
+                        " returned an uninitialized native CCArray");
         env_.MemoryWrite32(editor + field, object);
         return RetainV22Object(object, std::string(label) + " retain");
     }
@@ -8846,7 +8931,7 @@ private:
                         ? "_ZN7cocos2d7CCArray18createWithCapacityEj"
                         : "_ZN7cocos2d7CCArray6createEv",
                     "V22 wrapper editor CCArray",
-                    100u, capacity_array))
+                    100u, capacity_array, true))
                 return false;
         }
         for (u32 field : layout.dictionary_fields) {
@@ -9264,8 +9349,11 @@ private:
                        "V22 wrapper editor preview particles", false);
 
         bool preview_enabled = false;
-        if (game_variable("0036", preview_enabled))
+        if (game_variable("0036", preview_enabled)) {
             v22_editor_preview_mode_enabled_ = preview_enabled;
+            v22_editor_preview_refresh_pending_ = true;
+            v22_editor_preview_background_grace_frames_ = 8u;
+        }
 
         bool ground_enabled = false;
         if (game_variable("0037", ground_enabled))
@@ -9328,11 +9416,13 @@ private:
         v22_editor_overlay_frames_ = 0u;
         v22_editor_overlay_playtest_active_ = false;
         v22_editor_preview_mode_enabled_ = false;
+        v22_editor_preview_refresh_pending_ = false;
+        v22_editor_preview_background_grace_frames_ = 0u;
         log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks12 continues restoring only that missing initialization in the host;
+        // gdpstweaks13 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -13531,6 +13621,8 @@ private:
     std::unordered_set<std::string> v22_missing_editor_sprite_names_;
     u64 v22_editor_background_updates_suppressed_=0;
     bool v22_editor_preview_mode_enabled_=false;
+    bool v22_editor_preview_refresh_pending_=false;
+    u32 v22_editor_preview_background_grace_frames_=0;
     u64 v22_editor_preview_mode_changes_=0;
     u64 v22_batch_blend_repairs_=0;
     u64 v22_missing_batch_texture_fallbacks_=0;
@@ -13950,7 +14042,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks12 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks13 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

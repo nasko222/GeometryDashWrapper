@@ -1,49 +1,33 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks12
+# Geometry Dash Wrapper 0.9.6-gdpstweaks13
 
 Cross-version Windows wrapper for Geometry Dash Android builds.
 
-## gdpstweaks12 regression-fix branch
+## gdpstweaks13 regression-repair branch
 
-This branch closes the regressions reported against `0.9.6-gdpstweaks10` in the 2017 x86 and 2019/2022/2023 ARMv7 beta families.
+This branch is a narrow correction to `gdpstweaks12`, based on the 2026-08-24 runtime logs. It deliberately leaves the confirmed 1.0 audio fix untouched.
 
-### ARMv7 editor Play input
+### x86 editor hotkeys
 
-The editor Play input path is now profile-correct instead of pretending every beta has the same ABI:
+The tweaks12 GameManager hard gate is removed. The 1.5/2.11-era x86 builds do not reliably expose their active `LevelEditorLayer` through the GameManager block, which is why every A/D/W/S/Q/E press was rejected in the editor.
 
-- 2019 uses the stock `GJBaseGameLayer::pushButton(int,bool)` / `releaseButton(int,bool)` path with the editor-player flag set.
-- 2022/2023 use stock `GJBaseGameLayer::queueButton(int,bool,bool)` with the final editor-player boolean set to `true`.
-- The wrapper-restored GameManager active-layer field is corrected to `+0x158` for 2019 and `+0x168` for 2022/2023.
+Hotkey discovery is now tied to the actual Cocos running scene. A positive **or negative** EditorUI lookup is cached for that scene, so level-select/menu screens do not rescan thousands of nodes on every key press. A hidden EditorUI still blocks editor shortcuts during editor Play.
 
-This targets the non-moving cube/mode in editor Play and the late-beta null active-layer crash path.
+### ARMv7 editor Play crash
 
-### Background/ground selector safety
+The 2022/2023 Play crash was an uninitialized native `ccArray` inside an otherwise valid-looking `CCArray` object. The wrapper now validates the internal storage before reusing an inherited collection and rebuilds only invalid editor arrays.
 
-Art limits are no longer hard-coded. The wrapper reads the APK central directory, determines the contiguous packaged ground/background ranges, and lowers the beta's own load/get clamps to the last texture actually present. A fixed APK with additional recreated contiguous textures is therefore allowed to expose those textures automatically.
-
-Observed stock/reduced APK inventories used for this audit:
-
-- 2019: 17 grounds, 20 backgrounds
-- 2022: 18 grounds, 21 backgrounds
-- 2023/SubZero: 18 grounds, 21 backgrounds
-
-This restores the intended out-of-range behavior: resolve to the final packaged asset instead of continuing into a null-texture/freeze path.
+The internal `CCArray` layout is profile-correct: stock 2019 uses object `+0x20`, while the 2022/2023 Cocos builds use object `+0x30`. The stock Play paths themselves were audited: 2019 uses editor field `+0x2A4`, 2022 uses `+0x350`, and 2023 uses `+0x354`. The missing 2019 Play array is now part of the restored collection set as well.
 
 ### Preview Mode
 
-The wrapper now observes GameManager variable `0036` (Preview Mode). Editor-only background freezing is disabled while Preview Mode is enabled or while editor Play is active, so the game's own background update path can run. The wrapper no longer requires entering Play once before the blue Preview Mode background appears.
+Game variable `0036` is still observed, but both ON and OFF transitions now receive a short native background-update grace period. The previous implementation could suppress the first OFF transition update immediately. Preview animation and particle refresh callbacks are also requested on the next editor frame, and the host opacity bridge no longer forces ordinary editor dimming while Preview Mode is enabled.
 
-### Windows audio volume isolation
+### Preserved fixes
 
-The shared Windows effects backend no longer calls `waveOutSetVolume`. Effect/master gain is applied to PCM data before `waveOutWrite`, keeping wrapper SFX volume internal instead of moving the Windows mixer/session control. This shared backend is used by the x86, legacy ARM and ARMv7 wrappers.
-
-Music keeps its existing private MCI stream-volume path; no endpoint/master Windows mixer setter is used by the wrapper.
-
-### 2017 x86 editor hotkeys
-
-A/D/W/S/Q/E no longer rebuild the full Cocos scene tree for every key press. `EditorUI` is cached while the scene is unchanged and validated directly. Hidden `EditorUI` is treated as editor Play/gameplay ownership, so edit shortcuts are not dispatched while the editor UI is hidden for Play.
+The APK-derived background/ground limits, dual GameManager gameplay/editor slots, 2019-vs-late editor input ABI split, null texture guards, and the internal Windows audio-volume behavior from tweaks11/12 remain in place.
 
 ### Scope
 
 No APK, modded APK, `libgame.so`, or game asset is included. Missing textures that are genuinely absent from an APK remain an APK-content issue; this branch prevents the wrapper from treating nonexistent selector indices as valid.
 
-See `GDPSTWEAKS12.md` and `GDPSTWEAKS12-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
+See `GDPSTWEAKS13.md` and `GDPSTWEAKS13-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
