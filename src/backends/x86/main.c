@@ -38,6 +38,7 @@ typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
 typedef int (__cdecl *CcNodeGetTagFunction)(void *self);
 typedef void (__cdecl *CcNodeSetTagFunction)(void *self, int tag);
+typedef int (__cdecl *CcNodeIsVisibleFunction)(void *self);
 typedef void (__cdecl *EditorMoveObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
 typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
@@ -98,6 +99,7 @@ typedef struct {
     UiCheckpointNoSenderFunction ui_on_delete_check_no_sender;
     CcNodeGetTagFunction ccnode_get_tag;
     CcNodeSetTagFunction ccnode_set_tag;
+    CcNodeIsVisibleFunction ccnode_is_visible;
     EditorMoveObjectCallFunction editor_move_object_call;
     EditorMoveEditCommandFunction editor_move_edit_command;
     EditorTransformObjectCallFunction editor_transform_object_call;
@@ -806,14 +808,39 @@ static void *find_active_ui_layer(void) {
 
 static void *find_active_editor_ui(void) {
     unsigned int visited = 0;
+    void *scene = find_running_scene();
+
+    /* gdpstweaks10 rebuilt the entire Cocos scene tree on every A/D/W/S/Q/E
+       press. On the 2017 x86 beta that can visit thousands of nodes and causes
+       the visible frame spike. Reuse the discovered EditorUI while the scene
+       is unchanged and validate only the cached object. */
+    if (scene && scene == g_host.active_scene_root &&
+        g_host.active_editor_ui &&
+        object_type_contains(g_host.active_editor_ui, "EditorUI")) {
+        if (g_host.ccnode_is_visible &&
+            !g_host.ccnode_is_visible(g_host.active_editor_ui))
+            return NULL;
+        return g_host.active_editor_ui;
+    }
+
     refresh_scene_tree_state();
-    if (g_host.active_editor_ui) return g_host.active_editor_ui;
+    if (g_host.active_editor_ui) {
+        if (g_host.ccnode_is_visible &&
+            !g_host.ccnode_is_visible(g_host.active_editor_ui))
+            return NULL;
+        return g_host.active_editor_ui;
+    }
     if (g_host.active_editor_layer) {
         walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
-        if (g_host.active_editor_ui) return g_host.active_editor_ui;
+        if (g_host.active_editor_ui) {
+            if (g_host.ccnode_is_visible &&
+                !g_host.ccnode_is_visible(g_host.active_editor_ui))
+                return NULL;
+            return g_host.active_editor_ui;
+        }
     }
     if (g_host.editor_hotkey_miss_logs++ < 8u)
-        runtime_log("Editor controls: key ignored; no active EditorUI found (editor-layer=%s)",
+        runtime_log("Editor controls: key ignored; no active visible EditorUI found (editor-layer=%s)",
                     g_host.active_editor_layer ? "yes" : "no");
     return NULL;
 }
@@ -1626,6 +1653,11 @@ int main(int argc, char **argv) {
             &image, "_ZNK7cocos2d6CCNode6getTagEv");
     g_host.ccnode_set_tag = (CcNodeSetTagFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode6setTagEi");
+    g_host.ccnode_is_visible = (CcNodeIsVisibleFunction)elf_image_find_export(
+        &image, "_ZNK7cocos2d6CCNode9isVisibleEv");
+    if (!g_host.ccnode_is_visible)
+        g_host.ccnode_is_visible = (CcNodeIsVisibleFunction)elf_image_find_export(
+            &image, "_ZN7cocos2d6CCNode9isVisibleEv");
     g_host.editor_move_object_call =
         (EditorMoveObjectCallFunction)elf_image_find_export(
             &image, "_ZN8EditorUI14moveObjectCallEPN7cocos2d6CCNodeE");
@@ -1692,6 +1724,8 @@ int main(int argc, char **argv) {
                 g_host.editor_transform_object_call ? "ready" : "missing",
                 g_host.ccnode_get_tag ? "ready" : "missing",
                 g_host.ccnode_set_tag ? "ready" : "missing");
+    runtime_log("Editor controls: cached-ui visibility-guard=%s scene-walk=on-scene-change-only",
+                g_host.ccnode_is_visible ? "ready" : "unavailable");
     runtime_log("Practice Z/X callbacks: place=%s remove=%s guard_offset=0x%lx abi=%s",
                 (g_host.ui_on_check || g_host.ui_on_check_no_sender)
                     ? "ready" : "unavailable",

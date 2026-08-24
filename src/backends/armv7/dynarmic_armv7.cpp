@@ -392,6 +392,84 @@ static std::vector<ZipNativeLibraryInfo> ListZipNativeLibraries(
     return result;
 }
 
+static std::pair<u32, u32> DetectV22ApkArtAssetLimits(
+    const std::vector<u8>& zip) {
+    constexpr u32 kEocdSignature = 0x06054B50u;
+    constexpr u32 kCentralSignature = 0x02014B50u;
+    const std::size_t search_start =
+        zip.size() > (0xFFFFu + 22u) ? zip.size() - (0xFFFFu + 22u) : 0u;
+    std::optional<std::size_t> eocd;
+    if (zip.size() >= 22u) {
+        for (std::size_t pos = zip.size() - 22u;; --pos) {
+            if (ReadLe32(zip, pos) == kEocdSignature) {
+                eocd = pos;
+                break;
+            }
+            if (pos == search_start) break;
+        }
+    }
+    if (!eocd)
+        throw std::runtime_error(
+            "APK end-of-central-directory record not found while detecting art");
+
+    std::unordered_set<std::string> members;
+    const u16 count = ReadLe16(zip, *eocd + 10u);
+    std::size_t pos = ReadLe32(zip, *eocd + 16u);
+    members.reserve(count);
+    for (u16 index = 0; index < count; ++index) {
+        if (pos + 46u > zip.size() ||
+            ReadLe32(zip, pos) != kCentralSignature)
+            throw std::runtime_error(
+                "invalid APK central-directory entry while detecting art");
+        const u16 name_length = ReadLe16(zip, pos + 28u);
+        const u16 extra_length = ReadLe16(zip, pos + 30u);
+        const u16 comment_length = ReadLe16(zip, pos + 32u);
+        const std::size_t next =
+            pos + 46ull + name_length + extra_length + comment_length;
+        if (next > zip.size())
+            throw std::runtime_error(
+                "truncated APK central-directory entry while detecting art");
+        std::string name(reinterpret_cast<const char*>(zip.data() + pos + 46u),
+                         name_length);
+        std::replace(name.begin(), name.end(), '\\', '/');
+        members.insert(std::move(name));
+        pos = next;
+    }
+
+    const auto has = [&members](const std::string& name) {
+        return members.find(name) != members.end();
+    };
+    u32 ground_max = 0u;
+    for (u32 index = 1u; index <= 30u; ++index) {
+        char normal[96];
+        char hd[96];
+        char uhd[96];
+        std::snprintf(normal, sizeof(normal),
+                      "assets/groundSquare_%02u_001.png", index);
+        std::snprintf(hd, sizeof(hd),
+                      "assets/groundSquare_%02u_001-hd.png", index);
+        std::snprintf(uhd, sizeof(uhd),
+                      "assets/groundSquare_%02u_001-uhd.png", index);
+        if (!has(normal) && !has(hd) && !has(uhd)) break;
+        ground_max = index;
+    }
+    u32 background_max = 0u;
+    for (u32 index = 1u; index <= 45u; ++index) {
+        char normal[96];
+        char hd[96];
+        char uhd[96];
+        std::snprintf(normal, sizeof(normal),
+                      "assets/game_bg_%02u_001.png", index);
+        std::snprintf(hd, sizeof(hd),
+                      "assets/game_bg_%02u_001-hd.png", index);
+        std::snprintf(uhd, sizeof(uhd),
+                      "assets/game_bg_%02u_001-uhd.png", index);
+        if (!has(normal) && !has(hd) && !has(uhd)) break;
+        background_max = index;
+    }
+    return {ground_max, background_max};
+}
+
 static bool IsElf32ArmImage(const std::vector<u8>& bytes) {
     if (bytes.size() < sizeof(Elf32Ehdr)) return false;
     const Elf32Ehdr header = ReadPod<Elf32Ehdr>(bytes, 0);
@@ -1204,6 +1282,11 @@ struct ElfRuntime {
     u32 v22_draw_grid_update_time_markers = 0;
     u32 v22_level_editor_level_settings_updated = 0;
     u32 v22_gjbase_queue_button = 0;
+    u32 v22_gjbase_push_button = 0;
+    u32 v22_gjbase_release_button = 0;
+    u32 v22_game_manager_active_layer_offset = 0;
+    u32 v22_apk_ground_asset_max = 0;
+    u32 v22_apk_background_asset_max = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
     u32 v22_ui_on_check = 0;
@@ -1495,6 +1578,28 @@ static void WriteV22ThumbCallThenImportThunk(
     env.MemoryWrite16(address + 14u, 0xBF00u); // nop/alignment
     env.MemoryWrite32(address + 16u, original);
     env.MemoryWrite32(address + 20u, destination);
+}
+
+static void WriteV22ThumbObserveThenCallThunk(
+    ProbeEnvironment& env, u32 address, u32 observer_import, u32 original) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 observer thunk address is not aligned");
+    // Preserve the three register arguments, let the host observe them, then
+    // execute the untouched guest function with the exact original ABI.
+    env.MemoryWrite16(address + 0x00u, 0xB507u); // push {r0,r1,r2,lr}
+    env.MemoryWrite16(address + 0x02u, 0x4B05u); // ldr r3,[pc,#20] -> observer
+    env.MemoryWrite16(address + 0x04u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x06u, 0x9800u); // ldr r0,[sp,#0]
+    env.MemoryWrite16(address + 0x08u, 0x9901u); // ldr r1,[sp,#4]
+    env.MemoryWrite16(address + 0x0Au, 0x9A02u); // ldr r2,[sp,#8]
+    env.MemoryWrite16(address + 0x0Cu, 0x4B03u); // ldr r3,[pc,#12] -> original
+    env.MemoryWrite16(address + 0x0Eu, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x10u, 0xB003u); // add sp,#12
+    env.MemoryWrite16(address + 0x12u, 0xBD00u); // pop {pc}
+    env.MemoryWrite16(address + 0x14u, 0xBF00u);
+    env.MemoryWrite16(address + 0x16u, 0xBF00u);
+    env.MemoryWrite32(address + 0x18u, observer_import);
+    env.MemoryWrite32(address + 0x1Cu, original);
 }
 
 static void WriteV22ThumbConditionalImportThenCallThunk(
@@ -1995,6 +2100,10 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
             resolve("_ZN11GameManager11sharedStateEv");
     runtime.v22_gjbase_queue_button =
         resolve("_ZN15GJBaseGameLayer11queueButtonEibb");
+    runtime.v22_gjbase_push_button =
+        resolve("_ZN15GJBaseGameLayer10pushButtonEib");
+    runtime.v22_gjbase_release_button =
+        resolve("_ZN15GJBaseGameLayer13releaseButtonEib");
     runtime.v22_ui_key_down =
         resolve("_ZN7UILayer7keyDownEN7cocos2d12enumKeyCodesE");
     runtime.v22_ui_key_up =
@@ -2007,14 +2116,19 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
     // Persistent editor-playtest state, verified from both
     // LevelEditorLayer::onPlaytest() (stores 1) and onStopPlaytest()
     // (stores 0) in each exact stock image.
-    if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Early2019)
+    if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Early2019) {
         runtime.v22_editor_playtest_state_offset = 0x04F0u;
-    else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2022)
+        runtime.v22_game_manager_active_layer_offset = 0x158u;
+    } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2022) {
         runtime.v22_editor_playtest_state_offset = 0x2C58u;
-    else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2023)
+        runtime.v22_game_manager_active_layer_offset = 0x168u;
+    } else if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::Late2023) {
         runtime.v22_editor_playtest_state_offset = 0x2C8Cu;
-    else
+        runtime.v22_game_manager_active_layer_offset = 0x168u;
+    } else {
         runtime.v22_editor_playtest_state_offset = 0u;
+        runtime.v22_game_manager_active_layer_offset = 0u;
+    }
 
     // These remaining offsets belong to the 9,578,364-byte late-beta ARM
     // image and are enabled from its independently discovered PlayLayer /
@@ -2026,6 +2140,25 @@ static void ResolveV22InputBridgeSymbols(ElfRuntime& runtime) {
            reads/writes byte +0x29A0. */
         runtime.v22_practice_mode_offset = 0x29A0u;
     }
+}
+
+static std::size_t InstallV22PreviewModeObserver(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    if (runtime.v22_wrapper_editor_profile == V22EditorRestoreProfile::None)
+        return 0u;
+    const SymbolRecord* setter = FindSymbol(
+        runtime, "_ZN11GameManager15setGameVariableEPKcb");
+    if (!setter) return 0u;
+    const std::vector<u32> calls =
+        FindThumbBlCallSites(runtime, env, setter->address);
+    if (calls.empty()) return 0u;
+    EnsureV22ThunkPage(env);
+    const u32 observer = EnsureImport(
+        runtime, env, "__dynarmic_v22_game_variable_changed");
+    const u32 thunk = kV22ThunkBase + 0x140u;
+    WriteV22ThumbObserveThenCallThunk(env, thunk, observer, setter->address);
+    for (u32 call : calls) WriteThumbBl(env, call, thunk);
+    return calls.size();
 }
 
 static std::size_t InstallV22InflateMemoryHook(ElfRuntime& runtime,
@@ -2646,50 +2779,66 @@ static std::pair<u32, u32> PatchV22ArtAssetLimits(
     if (!load_ground || !get_ground || !load_background || !get_background)
         throw std::runtime_error(
             "V22 art asset-limit symbols are unavailable");
+    if (!runtime.v22_apk_ground_asset_max ||
+        !runtime.v22_apk_background_asset_max)
+        throw std::runtime_error(
+            "V22 APK art asset limits were not detected");
 
-    /*
-     * This community beta exposes the later game's selector ranges (30 ground
-     * slots and 45 background slots), while its APK contains only 18 ground
-     * textures and 26 background textures.  Selecting an absent entry creates
-     * a SpriteBatchNode with a null texture.  Do not let that invalid object
-     * enter initWithTexture: clamp the beta's own load/get functions to the
-     * assets actually packaged in this APK.  Every patched halfword is checked
-     * first so a different binary layout fails closed instead of being edited.
-     */
     struct LimitPatch {
         const SymbolRecord* symbol;
         u32 compare_offset;
-        u32 move_offset;
-        u16 expected_compare;
-        u16 expected_move;
-        u16 replacement_compare;
-        u16 replacement_move;
+        u32 packaged_max;
     };
     const std::array<LimitPatch, 4> patches{{
-        {load_ground,       8u, 12u, 0x291Eu, 0x211Eu, 0x2912u, 0x2112u},
-        {get_ground,        6u, 10u, 0x291Eu, 0x211Eu, 0x2912u, 0x2112u},
-        {load_background,   8u, 12u, 0x292Du, 0x212Du, 0x291Au, 0x211Au},
-        {get_background,    6u, 10u, 0x292Du, 0x212Du, 0x291Au, 0x211Au},
+        {load_ground,       8u, runtime.v22_apk_ground_asset_max},
+        {get_ground,        6u, runtime.v22_apk_ground_asset_max},
+        {load_background,   8u, runtime.v22_apk_background_asset_max},
+        {get_background,    6u, runtime.v22_apk_background_asset_max},
     }};
+    u32 ground_target = runtime.v22_apk_ground_asset_max;
+    u32 background_target = runtime.v22_apk_background_asset_max;
     for (const LimitPatch& patch : patches) {
         const u32 begin = patch.symbol->address & ~1u;
-        if (!env.IsMapped(begin + patch.compare_offset, 2u) ||
-            !env.IsMapped(begin + patch.move_offset, 2u) ||
-            env.MemoryRead16(begin + patch.compare_offset) !=
-                patch.expected_compare ||
-            env.MemoryRead16(begin + patch.move_offset) !=
-                patch.expected_move)
+        if (!env.IsMapped(begin + patch.compare_offset, 2u))
             throw std::runtime_error(
-                "V22 art asset-limit instruction validation failed");
-    }
-    for (const LimitPatch& patch : patches) {
-        const u32 begin = patch.symbol->address & ~1u;
+                "V22 art asset-limit comparison is unmapped");
+        const u16 compare = env.MemoryRead16(begin + patch.compare_offset);
+        if ((compare & 0xFF00u) != 0x2900u)
+            throw std::runtime_error(
+                "V22 art asset-limit comparison validation failed");
+        const u32 binary_max = compare & 0x00FFu;
+        const u32 target = std::min(binary_max, patch.packaged_max);
+
+        // 2019 uses `ite lt; movlt r4,r1; movge r4,#max`; 2022/23 use
+        // `it ge; movge r1,#max`. Find the immediate move by semantics rather
+        // than pinning the clamp to one donor instruction layout.
+        u32 move_address = 0u;
+        u16 move_opcode = 0u;
+        for (u32 delta = 2u; delta <= 8u; delta += 2u) {
+            const u32 address = begin + patch.compare_offset + delta;
+            if (!env.IsMapped(address, 2u)) continue;
+            const u16 instruction = env.MemoryRead16(address);
+            const u16 op = instruction & 0xFF00u;
+            if ((op == 0x2100u || op == 0x2400u) &&
+                (instruction & 0x00FFu) == binary_max) {
+                move_address = address;
+                move_opcode = op;
+                break;
+            }
+        }
+        if (!move_address)
+            throw std::runtime_error(
+                "V22 art asset-limit move validation failed");
         env.MemoryWrite16(begin + patch.compare_offset,
-                          patch.replacement_compare);
-        env.MemoryWrite16(begin + patch.move_offset,
-                          patch.replacement_move);
+                          static_cast<u16>(0x2900u | target));
+        env.MemoryWrite16(move_address,
+                          static_cast<u16>(move_opcode | target));
+        if (patch.symbol == load_ground || patch.symbol == get_ground)
+            ground_target = std::min(ground_target, target);
+        else
+            background_target = std::min(background_target, target);
     }
-    return {18u, 26u};
+    return {ground_target, background_target};
 }
 
 static V22VisualHookCounts InstallV22SafeVisualHooks(
@@ -4565,9 +4714,11 @@ public:
         if (!RunFunction(runtime_.v22_game_manager_shared, {}, &game_manager,
                          "V22 GameManager::sharedState for platformer key"))
             return false;
-        if (!game_manager || !env_.IsMapped(game_manager + 0x168u, 4u))
+        const u32 active_offset = runtime_.v22_game_manager_active_layer_offset;
+        if (!game_manager || !active_offset ||
+            !env_.IsMapped(game_manager + active_offset, 4u))
             return true;
-        const u32 candidate = env_.MemoryRead32(game_manager + 0x168u);
+        const u32 candidate = env_.MemoryRead32(game_manager + active_offset);
         if (LooksLikeGuestObject(runtime_, env_, candidate))
             layer = candidate;
         return true;
@@ -4739,17 +4890,31 @@ public:
         // playtesting. LevelEditorLayer is itself a GJBaseGameLayer, so queue
         // the same player command directly without touching EditorUI.
         if (editor_playtest) {
-            if (!runtime_.v22_gjbase_queue_button) return true;
+            if (runtime_.v22_gjbase_queue_button) {
+                LogHostDispatch(
+                    "editorPlatformerQueueButton",
+                    runtime_.v22_gjbase_queue_button,
+                    std::string("button=") + name +
+                        " pressed=" + (pressed ? "1" : "0") +
+                        " editor-player=1");
+                return RunFunction(
+                    runtime_.v22_gjbase_queue_button,
+                    {editor, button, pressed ? 1u : 0u, 1u}, nullptr,
+                    "LevelEditorLayer::queueButton", 0u,
+                    std::chrono::milliseconds(10000));
+            }
+            const u32 function = pressed ? runtime_.v22_gjbase_push_button
+                                         : runtime_.v22_gjbase_release_button;
+            if (!function) return true;
             LogHostDispatch(
-                "editorPlatformerQueueButton",
-                runtime_.v22_gjbase_queue_button,
-                std::string("button=") + name +
-                    " pressed=" + (pressed ? "1" : "0"));
+                pressed ? "editorPushButton" : "editorReleaseButton",
+                function, std::string("button=") + name +
+                    " editor-player=1 profile=early2019");
             return RunFunction(
-                runtime_.v22_gjbase_queue_button,
-                {editor, button, pressed ? 1u : 0u, 0u}, nullptr,
-                "LevelEditorLayer::queueButton", 0u,
-                std::chrono::milliseconds(10000));
+                function, {editor, button, 1u}, nullptr,
+                pressed ? "LevelEditorLayer::pushButton"
+                        : "LevelEditorLayer::releaseButton",
+                0u, std::chrono::milliseconds(10000));
         }
 
         // Use the game's UILayer keyboard path when available. Besides queuing
@@ -4776,14 +4941,31 @@ public:
             }
         }
 
-        if (!layer || !runtime_.v22_gjbase_queue_button) return true;
-        LogHostDispatch("platformerQueueButton", runtime_.v22_gjbase_queue_button,
-                        std::string("button=") + name +
-                        " pressed=" + (pressed ? "1" : "0"));
-        return RunFunction(runtime_.v22_gjbase_queue_button,
-                           {layer, button, pressed ? 1u : 0u, 0u}, nullptr,
-                           "GJBaseGameLayer::queueButton", 0u,
-                           std::chrono::milliseconds(10000));
+        if (!layer) return true;
+        if (runtime_.v22_gjbase_queue_button) {
+            LogHostDispatch("platformerQueueButton",
+                            runtime_.v22_gjbase_queue_button,
+                            std::string("button=") + name +
+                                " pressed=" + (pressed ? "1" : "0"));
+            return RunFunction(runtime_.v22_gjbase_queue_button,
+                               {layer, button, pressed ? 1u : 0u, 0u}, nullptr,
+                               "GJBaseGameLayer::queueButton", 0u,
+                               std::chrono::milliseconds(10000));
+        }
+
+        // Early 2019 predates queueButton. Its normal UILayer path uses the
+        // same push/release pair with the non-editor player selector false.
+        const u32 function = pressed ? runtime_.v22_gjbase_push_button
+                                     : runtime_.v22_gjbase_release_button;
+        if (!function) return true;
+        LogHostDispatch(pressed ? "platformerPushButton"
+                                : "platformerReleaseButton",
+                        function, std::string("button=") + name +
+                            " editor-player=0 profile=early2019");
+        return RunFunction(function, {layer, button, 0u}, nullptr,
+                           pressed ? "GJBaseGameLayer::pushButton"
+                                   : "GJBaseGameLayer::releaseButton",
+                           0u, std::chrono::milliseconds(10000));
     }
 
     bool PrepareV22MousePlatformerTouch() {
@@ -7407,19 +7589,36 @@ private:
         return 0u;
     }
 
+    bool HostV22GameVariableChanged(u32 key_address, u32 value) {
+        if (!key_address) return true;
+        const std::string key = ReadCString(key_address, 16u);
+        if (key != "0036") return true;
+        v22_editor_preview_mode_enabled_ = value != 0u;
+        ++v22_editor_preview_mode_changes_;
+        log_ << "RESULT: DYNARMIC_V22_EDITOR_PREVIEW_MODE state="
+             << (v22_editor_preview_mode_enabled_ ? 1 : 0)
+             << " changes=" << v22_editor_preview_mode_changes_
+             << " policy=allow-native-background-update-while-enabled\n";
+        log_.flush();
+        return true;
+    }
+
     bool HostV22UpdateCameraBackground(
         u32 layer, u32 point_address, u32& suppress) {
         (void)point_address;
         suppress = 0u;
+        u32 playtest_editor = 0u;
+        const bool playtest = IsV22EditorPlaytestActive(playtest_editor);
         if (layer && layer == v22_editor_visual_layer_ &&
-            IsV22EditorSceneActive()) {
+            IsV22EditorSceneActive() && !playtest &&
+            !v22_editor_preview_mode_enabled_) {
             suppress = 1u;
             ++v22_editor_background_updates_suppressed_;
             if (!v22_editor_background_suppression_logged_) {
                 v22_editor_background_suppression_logged_ = true;
                 log_ << "RESULT: DYNARMIC_V22_EDITOR_BACKGROUND_UPDATE_SUPPRESSED"
                      << " editor=0x" << std::hex << layer << std::dec
-                     << " callsites=3 policy=editor-only-gameplay-original\n";
+                     << " callsites=3 policy=editor-static-only-preview-and-play-native\n";
                 log_.flush();
             }
         }
@@ -8233,7 +8432,7 @@ private:
             layout.point_buffer_field = 0x50Cu;
             layout.arrow_field = 0x4A4u;
             layout.setup_cache_field = 0x508u;
-            layout.manager_layer_field = 0x15Cu;
+            layout.manager_layer_field = 0x158u;
             layout.manager_flag_field = 0x1AAu;
             // Verified in the stock 9,144,004-byte PlayLayer::init: it loads
             // PlayLayer+0x668 (GJGameLevel*), adds 0x110, copies that std::string
@@ -8263,7 +8462,7 @@ private:
             layout.point_buffer_field = 0x2C64u;
             layout.arrow_field = 0x2C2Cu;
             layout.setup_cache_field = 0x2C60u;
-            layout.manager_layer_field = 0x16Cu;
+            layout.manager_layer_field = 0x168u;
             layout.manager_flag_field = 0x1BAu;
             layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
@@ -8290,7 +8489,7 @@ private:
             layout.point_buffer_field = 0x2C98u;
             layout.arrow_field = 0x2C60u;
             layout.setup_cache_field = 0x2C94u;
-            layout.manager_layer_field = 0x16Cu;
+            layout.manager_layer_field = 0x168u;
             layout.manager_flag_field = 0x1BAu;
             layout.level_setup_hint = 0x11Cu;
             layout.vector_capacity = 0x270Fu;
@@ -9047,6 +9246,10 @@ private:
                        {editor}, ignored,
                        "V22 wrapper editor preview particles", false);
 
+        bool preview_enabled = false;
+        if (game_variable("0036", preview_enabled))
+            v22_editor_preview_mode_enabled_ = preview_enabled;
+
         bool ground_enabled = false;
         if (game_variable("0037", ground_enabled))
             CallV22Primary("_ZN16LevelEditorLayer12toggleGroundEb",
@@ -9107,11 +9310,12 @@ private:
         v22_draw_grid_layer_ = 0u;
         v22_editor_overlay_frames_ = 0u;
         v22_editor_overlay_playtest_active_ = false;
+        v22_editor_preview_mode_enabled_ = false;
         log_ << "RESULT: DYNARMIC_V22_EDITOR_OVERLAY_SESSION_RESET editor=0x"
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks10 continues restoring only that missing initialization in the host;
+        // gdpstweaks11 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -9205,9 +9409,13 @@ private:
             !RunNestedPreservingState(runtime_.v22_game_manager_shared, {},
                                       game_manager,
                                       "V22 GameManager::sharedState") ||
-            !game_manager || !env_.IsMapped(game_manager + 0x168u, 4u))
+            !game_manager || !runtime_.v22_game_manager_active_layer_offset ||
+            !env_.IsMapped(
+                game_manager + runtime_.v22_game_manager_active_layer_offset,
+                4u))
             return Fail("V22 gameplay editor bridge cannot find GameManager");
-        const u32 play_layer = env_.MemoryRead32(game_manager + 0x168u);
+        const u32 play_layer = env_.MemoryRead32(
+            game_manager + runtime_.v22_game_manager_active_layer_offset);
         if (!play_layer || !env_.IsMapped(play_layer + 0x13Cu, 4u))
             return Fail("V22 gameplay editor bridge cannot find PlayLayer");
         const u32 level = env_.MemoryRead32(play_layer + 0x13Cu);
@@ -12459,6 +12667,10 @@ private:
             if (!HostV22PlayVisibility(r0)) return false;
             return finish_hot(0u);
         }
+        if (name == "__dynarmic_v22_game_variable_changed") {
+            if (!HostV22GameVariableChanged(r1, r2)) return false;
+            return finish_hot(0u);
+        }
         if (name == "__dynarmic_v22_update_camera_background") {
             u32 suppress = 0u;
             if (!HostV22UpdateCameraBackground(r0, r1, suppress)) return false;
@@ -13301,6 +13513,8 @@ private:
     bool v22_stock_editor_sprite_fallback_active_=false;
     std::unordered_set<std::string> v22_missing_editor_sprite_names_;
     u64 v22_editor_background_updates_suppressed_=0;
+    bool v22_editor_preview_mode_enabled_=false;
+    u64 v22_editor_preview_mode_changes_=0;
     u64 v22_batch_blend_repairs_=0;
     u64 v22_missing_batch_texture_fallbacks_=0;
     u64 v22_null_batch_texture_rejections_=0;
@@ -13316,7 +13530,7 @@ private:
     u32 v22_ccstring_float_value_=0;
     u32 v22_ccstring_float_value_size_=0;
     u64 v22_level_catalog_decodes_=0;
-    u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x120u;
+    u32 v22_hook_thunk_cursor_=kV22ThunkBase + 0x160u;
     std::optional<std::string> v22_pending_level_setup_;
     std::unordered_map<s32,std::string> v22_level_data_encoded_;
     std::unordered_map<s32,std::string> v22_level_data_decoded_;
@@ -13719,7 +13933,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks10 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks11 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -14205,6 +14419,14 @@ int main(int argc,char** argv) {
         }
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
+        if (input_is_apk) {
+            const auto art_limits = DetectV22ApkArtAssetLimits(apk);
+            runtime.v22_apk_ground_asset_max = art_limits.first;
+            runtime.v22_apk_background_asset_max = art_limits.second;
+            emit("RESULT: DYNARMIC_V22_APK_ART_INVENTORY ground=" +
+                 std::to_string(art_limits.first) +
+                 " background=" + std::to_string(art_limits.second));
+        }
         ElfRuntime companion_runtime{};
         V22VisualHookCounts visual_hooks{};
         if (!companion_libgame.empty())
@@ -14263,6 +14485,23 @@ int main(int argc,char** argv) {
             HasV22PrimaryEditorInitializer(runtime, env);
         runtime.v22_wrapper_editor_profile =
             DetectV22EditorRestoreProfile(runtime, env);
+        if (input_is_apk &&
+            runtime.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
+            const auto art_limits = PatchV22ArtAssetLimits(runtime, env);
+            visual_hooks.ground_asset_max = art_limits.first;
+            visual_hooks.background_asset_max = art_limits.second;
+            emit("RESULT: DYNARMIC_V22_ART_ASSET_LIMITS ground=" +
+                 std::to_string(art_limits.first) +
+                 " background=" + std::to_string(art_limits.second) +
+                 " policy=contiguous-apk-assets-clamp-binary-range");
+        }
+        const std::size_t preview_mode_observer_calls =
+            InstallV22PreviewModeObserver(runtime, env);
+        if (runtime.v22_wrapper_editor_profile !=
+                V22EditorRestoreProfile::None &&
+            preview_mode_observer_calls == 0u)
+            throw std::runtime_error(
+                "stock beta Preview Mode observer was not installed");
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
@@ -14311,6 +14550,9 @@ int main(int argc,char** argv) {
              V22EditorRestoreProfileName(runtime.v22_wrapper_editor_profile) +
              " primary-bytes=" + std::to_string(runtime.primary_file_bytes) +
              " bridge=" + (install_editor_bridge ? "enabled" : "disabled"));
+        emit("RESULT: DYNARMIC_V22_PREVIEW_MODE_OBSERVER calls=" +
+             std::to_string(preview_mode_observer_calls) +
+             " variable=0036");
         {
             std::ostringstream line;
             line<<"Image: 0x"<<std::hex<<runtime.image_min<<"-0x"
@@ -14519,7 +14761,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_PLATFORMER_WINDOWS_INPUT_READY "
              "mouse=native-touch-id-ownership+host-jump "
              "keyboard=Space,Up,A,D,Left,Right "
-             "editor-playtest=LevelEditorLayer-queueButton "
+             "editor-playtest=profile-native-button-dispatch "
              "button-visuals=UILayer-key-path "
              "buttons=jump:1,left:2,right:3 queueButton="+
              std::to_string(runtime.v22_gjbase_queue_button != 0u)+

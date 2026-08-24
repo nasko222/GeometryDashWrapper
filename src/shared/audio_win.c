@@ -37,6 +37,11 @@ typedef struct {
     WAVEHDR header;
     unsigned char *wave_file;
     size_t wave_file_size;
+    unsigned char *pcm_original;
+    DWORD pcm_size;
+    DWORD pcm_offset;
+    WORD format_tag;
+    WORD bits_per_sample;
     char path[MAX_PATH * 2];
 } EffectSlot;
 
@@ -836,11 +841,17 @@ static void close_effect_slot(EffectSlot *slot) {
                 slot->output, &slot->header, sizeof(slot->header));
         waveOutClose(slot->output);
     }
+    free(slot->pcm_original);
     free(slot->wave_file);
     memset(&slot->header, 0, sizeof(slot->header));
     slot->output = NULL;
     slot->wave_file = NULL;
     slot->wave_file_size = 0;
+    slot->pcm_original = NULL;
+    slot->pcm_size = 0;
+    slot->pcm_offset = 0;
+    slot->format_tag = 0;
+    slot->bits_per_sample = 0;
     slot->open = 0;
     slot->paused = 0;
     slot->loop = 0;
@@ -977,10 +988,46 @@ static int load_wave_file(const char *path, unsigned char **file_data,
     return 1;
 }
 
-static void set_waveout_volume(EffectSlot *slot, float volume) {
-    const DWORD channel = (DWORD)(clamp_volume(volume) * 65535.0f + 0.5f);
-    if (slot && slot->output)
-        waveOutSetVolume(slot->output, channel | (channel << 16));
+static short clamp_pcm16(int value) {
+    if (value > 32767) return 32767;
+    if (value < -32768) return -32768;
+    return (short)value;
+}
+
+static void prepare_effect_pcm_gain(EffectSlot *slot, float volume) {
+    DWORD index;
+    unsigned char *pcm;
+    const float gain = clamp_volume(volume);
+    if (!slot || !slot->wave_file || !slot->pcm_original ||
+        !slot->pcm_size || slot->pcm_offset > slot->wave_file_size ||
+        slot->pcm_size > slot->wave_file_size - slot->pcm_offset)
+        return;
+    pcm = slot->wave_file + slot->pcm_offset;
+    memcpy(pcm, slot->pcm_original, slot->pcm_size);
+    if (gain >= 0.9999f) return;
+
+    /* APK OGG effects are materialized as signed PCM16 WAVs. Keep a small
+       PCM8 fallback for already-WAV assets. Unsupported formats are left at
+       unity rather than touching the Windows endpoint/session mixer. */
+    if (slot->format_tag == WAVE_FORMAT_PCM && slot->bits_per_sample == 16u) {
+        for (index = 0; index + 1u < slot->pcm_size; index += 2u) {
+            short sample;
+            int scaled;
+            memcpy(&sample, pcm + index, sizeof(sample));
+            scaled = (int)((float)sample * gain);
+            sample = clamp_pcm16(scaled);
+            memcpy(pcm + index, &sample, sizeof(sample));
+        }
+    } else if (slot->format_tag == WAVE_FORMAT_PCM &&
+               slot->bits_per_sample == 8u) {
+        for (index = 0; index < slot->pcm_size; ++index) {
+            int centered = (int)slot->pcm_original[index] - 128;
+            int scaled = (int)((float)centered * gain) + 128;
+            if (scaled < 0) scaled = 0;
+            if (scaled > 255) scaled = 255;
+            pcm[index] = (unsigned char)scaled;
+        }
+    }
 }
 
 static EffectSlot *open_effect_slot(const char *path, int report_error) {
@@ -1013,6 +1060,16 @@ static EffectSlot *open_effect_slot(const char *path, int report_error) {
         close_effect_slot(slot);
         return NULL;
     }
+    slot->pcm_original = (unsigned char *)malloc(pcm_size);
+    if (!slot->pcm_original) {
+        close_effect_slot(slot);
+        return NULL;
+    }
+    memcpy(slot->pcm_original, pcm_data, pcm_size);
+    slot->pcm_size = pcm_size;
+    slot->pcm_offset = (DWORD)(pcm_data - slot->wave_file);
+    slot->format_tag = format->wFormatTag;
+    slot->bits_per_sample = format->wBitsPerSample;
     memset(&slot->header, 0, sizeof(slot->header));
     slot->header.lpData = (LPSTR)pcm_data;
     slot->header.dwBufferLength = pcm_size;
@@ -1087,8 +1144,9 @@ void audio_initialize(const char *executable_directory) {
     initialize_output_meter();
     initialize_effect_worker();
     runtime_log(
-        "Windows audio bridge initialized; music=MCI effects=waveOut APK cache: %s",
+        "Windows audio bridge initialized; music=MCI effects=waveOut software-volume-only APK cache: %s",
         g_audio_cache_directory);
+    runtime_log("RESULT: AUDIO_WINDOWS_MIXER_VOLUME_UNTOUCHED effects=pcm-software-gain");
 }
 
 void audio_set_writable_directory(const char *writable_directory) {
@@ -1375,7 +1433,7 @@ static unsigned play_effect_now(const char *path, int loop,
     slot->header.dwLoops = loop ? MAXDWORD : 0;
     if (loop)
         slot->header.dwFlags |= WHDR_BEGINLOOP | WHDR_ENDLOOP;
-    set_waveout_volume(slot, g_effects_volume * slot->volume);
+    prepare_effect_pcm_gain(slot, g_effects_volume * slot->volume);
     status = waveOutWrite(slot->output, &slot->header, sizeof(slot->header));
     if (status != MMSYSERR_NOERROR) {
         waveOutGetErrorTextA(status, error_text, sizeof(error_text));
@@ -1394,8 +1452,9 @@ static unsigned play_effect_now(const char *path, int loop,
 static void set_effect_volume_now(unsigned identifier, float volume) {
     EffectSlot *slot = find_effect(identifier);
     if (!slot) return;
+    /* Do not rewrite a buffer while waveOut owns it. The new gain is applied
+       internally the next time this slot is queued. */
     slot->volume = clamp_volume(volume);
-    set_waveout_volume(slot, g_effects_volume * slot->volume);
 }
 
 static void pause_effect_now(unsigned identifier) {
@@ -1454,14 +1513,10 @@ static void unload_effect_now(const char *path) {
 }
 
 static void apply_master_effect_volume_now(void) {
-    unsigned index;
-    for (index = 0; index < MAX_EFFECT_SLOTS; ++index) {
-        if (g_effects[index].open) {
-            set_waveout_volume(
-                &g_effects[index],
-                g_effects_volume * g_effects[index].volume);
-        }
-    }
+    /* waveOutSetVolume can move the Windows mixer/session control on real
+       systems. Master SFX volume is therefore software-only and is applied to
+       PCM before each future waveOutWrite. Existing in-flight buffers are not
+       modified while the driver owns them. */
 }
 
 static void process_effect_command(const EffectCommand *command) {

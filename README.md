@@ -1,39 +1,49 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks10
+# Geometry Dash Wrapper 0.9.6-gdpstweaks11
 
 Cross-version Windows wrapper for Geometry Dash Android builds.
 
-## gdpstweaks10
+## gdpstweaks11 regression-fix branch
 
-This branch removes the desktop pause-button and cursor-hiding experiments completely and continues the ARMv7 stock-2.2 editor restoration from the latest runtime logs.
+This branch closes the regressions reported against `0.9.6-gdpstweaks10` in the 2017 x86 and 2019/2022/2023 ARMv7 beta families.
 
-### Pause button and cursor rollback
+### ARMv7 editor Play input
 
-The wrapper no longer exposes or implements `REMOVE_PAUSE_BUTTON` or `HIDE_CURSOR_WHEN_PLAYING` on x86, legacy ARM, or ARMv7. The game owns its native pause button and Windows cursor behavior again.
+The editor Play input path is now profile-correct instead of pretending every beta has the same ABI:
 
-Removing the x86 feature also removes its recurring pause/cursor gameplay polling path, which is the main wrapper-side suspect for the periodic hitch reported while touching/swiping the 1.5/1.6 level selector.
+- 2019 uses the stock `GJBaseGameLayer::pushButton(int,bool)` / `releaseButton(int,bool)` path with the editor-player flag set.
+- 2022/2023 use stock `GJBaseGameLayer::queueButton(int,bool,bool)` with the final editor-player boolean set to `true`.
+- The wrapper-restored GameManager active-layer field is corrected to `+0x158` for 2019 and `+0x168` for 2022/2023.
 
-### Stock 2.2 beta editor restoration
+This targets the non-moving cube/mode in editor Play and the late-beta null active-layer crash path.
 
-Recognized stock ARMv7 editor profiles remain:
+### Background/ground selector safety
 
-- 9,144,004-byte primary library — early 2019 Lite beta
-- 9,541,500-byte primary library — 2022 Lite beta
-- 9,578,364-byte primary library — 2023/SubZero beta
+Art limits are no longer hard-coded. The wrapper reads the APK central directory, determines the contiguous packaged ground/background ranges, and lowers the beta's own load/get clamps to the last texture actually present. A fixed APK with additional recreated contiguous textures is therefore allowed to expose those textures automatically.
 
-The latest logs showed all three restored stock editors reaching `EditorUI::create()` and then crashing when reduced APKs returned a null `CCSpriteFrame`. Tweaks10 replaces one-off sprite aliases with a wrapper-side `CCSpriteFrameCache::spriteFrameByName` bridge. Native lookup always runs first; only a missing frame while a recognized stock editor is active receives a known-valid stock placeholder, and the requested missing name is logged.
+Observed stock/reduced APK inventories used for this audit:
 
-The host editor initializer also carries forward the known stock/mod initializer corrections from tweaks8/9: strict level-setup decoding, correct late-vector layout, base-game-layer initialization, grid z-order, hidden editor marker, high-capacity option, background state, and ground visibility.
+- 2019: 17 grounds, 20 backgrounds
+- 2022: 18 grounds, 21 backgrounds
+- 2023/SubZero: 18 grounds, 21 backgrounds
 
-### 2.2 editor playtest isolation
+This restores the intended out-of-range behavior: resolve to the final packaged asset instead of continuing into a null-texture/freeze path.
 
-Wrapper-owned editor overlay/visibility mutation is suspended while the stock editor is in playtest. The persistent playtest fields were verified from each exact binary's `LevelEditorLayer::onPlaytest()` and `onStopPlaytest()`:
+### Preview Mode
 
-- 2019: `LevelEditorLayer + 0x4F0`
-- 2022: `LevelEditorLayer + 0x2C58`
-- 2023: `LevelEditorLayer + 0x2C8C`
+The wrapper now observes GameManager variable `0036` (Preview Mode). Editor-only background freezing is disabled while Preview Mode is enabled or while editor Play is active, so the game's own background update path can run. The wrapper no longer requires entering Play once before the blue Preview Mode background appears.
 
-This targets the freeze observed when pressing Play in the 2023 editor while the wrapper was still running its camera/visibility repair every frame.
+### Windows audio volume isolation
 
-No modded APK or `libgame.so` is bundled with this source package.
+The shared Windows effects backend no longer calls `waveOutSetVolume`. Effect/master gain is applied to PCM data before `waveOutWrite`, keeping wrapper SFX volume internal instead of moving the Windows mixer/session control. This shared backend is used by the x86, legacy ARM and ARMv7 wrappers.
 
-See `GDPSTWEAKS10.md` and `GDPSTWEAKS10-VERIFICATION.txt` for implementation and verification notes. Historical `GDPSTWEAKS*.md` files are retained as branch history.
+Music keeps its existing private MCI stream-volume path; no endpoint/master Windows mixer setter is used by the wrapper.
+
+### 2017 x86 editor hotkeys
+
+A/D/W/S/Q/E no longer rebuild the full Cocos scene tree for every key press. `EditorUI` is cached while the scene is unchanged and validated directly. Hidden `EditorUI` is treated as editor Play/gameplay ownership, so edit shortcuts are not dispatched while the editor UI is hidden for Play.
+
+### Scope
+
+No APK, modded APK, `libgame.so`, or game asset is included. Missing textures that are genuinely absent from an APK remain an APK-content issue; this branch prevents the wrapper from treating nonexistent selector indices as valid.
+
+See `GDPSTWEAKS11.md` and `GDPSTWEAKS11-VERIFICATION.txt` for the exact audit and remaining runtime-test boundary. Historical `GDPSTWEAKS*.md` files are retained as branch history.
