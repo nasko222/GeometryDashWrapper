@@ -128,6 +128,7 @@ typedef struct {
     void *extras_close_button;
     void *extras_empty_button;
     unsigned int editor_hotkey_miss_logs;
+    int editor_hotkey_negative_cached;
     GdExtrasMenu extras_menu;
     uint32_t practice_mode_offset;
     LARGE_INTEGER frame_clock_frequency;
@@ -749,15 +750,6 @@ static void *find_running_scene(void) {
         if (object_type_contains(running, "CCScene")) return running;
     }
 
-    if (g_host.cc_director_running_scene_offset &&
-        memory_range_is_readable((unsigned char *)director +
-                                 g_host.cc_director_running_scene_offset,
-                                 sizeof(void *))) {
-        void *running = *(void **)((unsigned char *)director +
-                                   g_host.cc_director_running_scene_offset);
-        if (object_type_contains(running, "CCScene")) return running;
-    }
-
     if (!memory_range_is_readable(director, 0x500u)) return NULL;
     for (offset = 0; offset + sizeof(void *) <= 0x500u; offset += sizeof(void *)) {
         void *candidate = *(void **)((unsigned char *)director + offset);
@@ -887,28 +879,22 @@ static void *find_active_ui_layer(void) {
  * no-op, so edit shortcuts cannot fire while Play owns keyboard input.
  */
 static void *find_active_editor_ui(void) {
+    unsigned int visited = 0;
     void *scene = find_running_scene();
 
-    if (!scene) {
-        g_host.active_scene_root = NULL;
-        g_host.active_editor_ui = NULL;
-        return NULL;
-    }
-
-    if (scene == g_host.active_scene_root) {
-        if (!g_host.active_editor_ui) return NULL; /* cached non-editor scene */
-        if (object_type_contains(g_host.active_editor_ui, "EditorUI")) {
-            if (g_host.ccnode_is_visible &&
-                !g_host.ccnode_is_visible(g_host.active_editor_ui))
-                return NULL;
-            return g_host.active_editor_ui;
-        }
-        /* Stale/destroyed cached object in the same scene: rebuild once. */
-        g_host.active_editor_ui = NULL;
-    }
-
-    refresh_scene_tree_state();
-    if (g_host.active_editor_ui &&
+    /*
+     * Restore the discovery path that actually worked before tweaks12/13.
+     * Those builds made a speculative CCDirector running-scene derivation a
+     * hard gate; on the user's real 1.50 x86 APK it selected a scene that did
+     * not expose EditorUI and disabled every editor shortcut.
+     *
+     * Keep the good part of the optimization: a failed discovery is cached so
+     * A/D/W/S/Q/E in menus do not recursively walk thousands of Cocos nodes on
+     * every keypress.  The miss is scoped to the current CCScene; entering the
+     * editor changes the scene and automatically permits one fresh discovery.
+     */
+    if (scene && scene == g_host.active_scene_root &&
+        g_host.active_editor_ui &&
         object_type_contains(g_host.active_editor_ui, "EditorUI")) {
         if (g_host.ccnode_is_visible &&
             !g_host.ccnode_is_visible(g_host.active_editor_ui))
@@ -916,8 +902,38 @@ static void *find_active_editor_ui(void) {
         return g_host.active_editor_ui;
     }
 
+    if (scene && scene == g_host.active_scene_root &&
+        g_host.editor_hotkey_negative_cached)
+        return NULL;
+
+    refresh_scene_tree_state();
+    if (g_host.active_editor_ui &&
+        object_type_contains(g_host.active_editor_ui, "EditorUI")) {
+        g_host.editor_hotkey_negative_cached = 0;
+        if (g_host.ccnode_is_visible &&
+            !g_host.ccnode_is_visible(g_host.active_editor_ui))
+            return NULL;
+        return g_host.active_editor_ui;
+    }
+
+    /* Some 1.5/2.11-era layouts expose LevelEditorLayer in the scene while
+       EditorUI is reachable only below that layer.  tweaks11 had this second
+       pass and it is required on the user's working x86 editor-control build. */
+    if (g_host.active_editor_layer) {
+        walk_scene_tree(g_host.active_editor_layer, 0u, &visited);
+        if (g_host.active_editor_ui &&
+            object_type_contains(g_host.active_editor_ui, "EditorUI")) {
+            g_host.editor_hotkey_negative_cached = 0;
+            if (g_host.ccnode_is_visible &&
+                !g_host.ccnode_is_visible(g_host.active_editor_ui))
+                return NULL;
+            return g_host.active_editor_ui;
+        }
+    }
+
+    g_host.editor_hotkey_negative_cached = 1;
     if (g_host.editor_hotkey_miss_logs++ < 8u)
-        runtime_log("Editor controls: key ignored; current running scene has no visible EditorUI");
+        runtime_log("Editor controls: key ignored; no active visible EditorUI found (cached for current scene)");
     return NULL;
 }
 
@@ -1398,8 +1414,9 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             else if (action != GD_EXTRAS_ACTION_NONE)
                 runtime_log("Extras action %d is unavailable on x86", action);
             if (!consumed) send_touch_end(x, y);
-            /* A release can synchronously enter/leave PlayLayer. Force the
-               next pre-render suppression pass to see the new scene. */
+            /* A release can synchronously enter/leave PlayLayer.  Editor
+               hotkey misses are cached per scene and are invalidated naturally
+               when find_running_scene() observes the next scene. */
             g_host.gameplay_cache_time = 0;
         }
         return 0;
@@ -1805,11 +1822,9 @@ int main(int argc, char **argv) {
                 g_host.editor_transform_object_call ? "ready" : "missing",
                 g_host.ccnode_get_tag ? "ready" : "missing",
                 g_host.ccnode_set_tag ? "ready" : "missing");
-    runtime_log("Editor controls: cached-ui visibility-guard=%s running-scene=%s offset=0x%lx scene-walk=on-scene-change-only",
+    runtime_log("Editor controls: cached-ui visibility-guard=%s running-scene=%s fallback=director-scene-scan miss-cache=per-scene",
                 g_host.ccnode_is_visible ? "ready" : "unavailable",
-                g_host.cc_director_get_running_scene ? "accessor" :
-                    (g_host.cc_director_running_scene_offset ? "derived" : "fallback"),
-                (unsigned long)g_host.cc_director_running_scene_offset);
+                g_host.cc_director_get_running_scene ? "accessor" : "fallback-scan");
     runtime_log("Practice Z/X callbacks: place=%s remove=%s guard_offset=0x%lx abi=%s",
                 (g_host.ui_on_check || g_host.ui_on_check_no_sender)
                     ? "ready" : "unavailable",

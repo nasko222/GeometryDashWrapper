@@ -8600,13 +8600,20 @@ private:
         const u32 data = env_.MemoryRead32(object + data_offset);
         if (!data || !env_.IsMapped(data, 12u)) return false;
 
-        // cocos2d::ccArray starts with num, max and the object-pointer array.
-        // A placeholder CCArray object left by GJBaseGameLayer::init can have a
-        // valid vtable while this internal pointer is still null.  That was the
-        // tweaks12 Play crash: removeAllObjects/addObject dereferenced data=0.
+        // The beta families use two different native ccArray ABIs. Exact
+        // objectAtIndex disassembly proves Early2019 is the older 12-byte
+        // layout (CCObject** at +0x08), while Late2022/Late2023 use the
+        // 16-byte layout (bookkeeping at +0x08, CCObject** at +0x0C).
+        // tweaks13 validated +0x08 for every profile, which is why both late
+        // profiles falsely rejected every freshly-created CCArray.
+        const bool early2019 = runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Early2019;
+        const u32 native_size = early2019 ? 12u : 16u;
+        const u32 elements_offset = early2019 ? 8u : 12u;
+        if (!env_.IsMapped(data, native_size)) return false;
         const u32 count = env_.MemoryRead32(data + 0u);
         const u32 capacity = env_.MemoryRead32(data + 4u);
-        const u32 elements = env_.MemoryRead32(data + 8u);
+        const u32 elements = env_.MemoryRead32(data + elements_offset);
         if (count > capacity || capacity > 10000000u) return false;
         if (capacity &&
             (!elements || !env_.IsMapped(elements, 4u)))
@@ -9422,7 +9429,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks13 continues restoring only that missing initialization in the host;
+        // gdpstweaks14 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -14042,7 +14049,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks13 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks14 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
