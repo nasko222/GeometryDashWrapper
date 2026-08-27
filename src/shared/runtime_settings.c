@@ -147,7 +147,7 @@ int gd_settings_editor_controls(void) {
 }
 
 int gd_settings_extras_menu(void) {
-    /* Extras remains temporarily removed in gdpstweaks16. */
+    /* Extras behavior is carried unchanged into COF1. */
     return 0;
 }
 

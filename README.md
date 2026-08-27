@@ -1,14 +1,52 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks16
+# Geometry Dash Wrapper 0.9.7-cof1
 
-Tweaks16 is a focused ARMv7 2.2-beta editor repair based on the 2026-08-27 runtime logs and on the older EnduranceTest editor path where the song-position line and BPM guidelines were observed running.
+`cof1` means **Cleanup Optimization Fixes 1**.
 
-- **2019 stock beta:** the wrapper now constructs/revalidates the exact `LevelEditorLayer::draw()` CCArray fields used at `+0x444` and `+0x298`, in addition to the `onPlaytest()` array at `+0x2A4`. The uploaded tweak15 run reached `EDITOR_INIT_OK` but crashed on the first editor draw because `+0x444` was null.
-- **2022/2023 stock betas:** the exact Play scratch arrays (`+0x350` / `+0x354`) are revalidated after full editor construction, before editor touches, and before rendered editor frames. This targets arrays that can be replaced or degraded after the wrapper's first construction pass.
-- **Song line / BPM guidelines:** the existing known-good per-frame overlay updater now uses the exact per-profile DrawGrid field first (`2019 +0x4E8`, `2022 +0x2C54`, `2023 +0x2C88`) and caches the DrawGrid object at creation. `levelSettingsUpdated()` remains the session-once native setup path for time markers.
-- **Preview Mode:** variable `0036` was already being detected. When Preview is already enabled at editor entry, the stock preview animation/particle callbacks are reapplied after `levelSettingsUpdated()` has restored the editor settings/grid state.
-- **x86 editor controls:** unchanged from tweaks15/tweaks14, where the user confirmed the key/menu issue fixed.
-- **1.0 audio/music:** unchanged from tweaks15; the user-confirmed internal-volume fix is preserved.
+This branch deliberately ends the wrapper-owned stock 2.2 beta editor experiment.
+The ARMv7 backend no longer tries to fabricate the missing editor runtime shipped
+as four-byte stubs in the reduced 2019/2022/2023 APKs.
 
-This branch is source/static and exact-binary audited here, but it has not been executed as a Windows wrapper in this environment. The 2019 first-render and 2023 Play paths therefore remain runtime test targets rather than claimed confirmed fixes.
+## ARMv7 2.2 policy
 
-See `GDPSTWEAKS16.md` and `GDPSTWEAKS16-VERIFICATION.txt`.
+- The modded/selected 2023 beta uses the old Endurance/Bringup capability path:
+  `LevelEditorLayer::create` -> validated `LevelEditorLayerExt::initH` from the
+  APK's own compatible `libgame.so` -> normal Cocos scene.
+- The EnduranceTest10 editor visibility, song-guide/BPM overlay, background,
+  blend, platformer input and editor-entry handlers are restored exactly.
+- No global `libgame.so` constructors or `ApplyHooks` pass is run. Only the
+  validated editor capability is used.
+- Stock 2019/2022/2023 editor stubs are intentionally **not repaired by the
+  wrapper**. Their normal gameplay may still run, but editor support should be
+  provided later by an APK-side mod/compatible companion rather than host-side
+  object reconstruction.
+- ARMv7 wrapper-owned W/A/S/D/Q/E editor movement/rotation injection is removed.
+  Editor keyboard behavior belongs to the game/companion; A/D remain normal
+  platformer controls.
+
+## Preserved backends and fixes
+
+The x86 backend is carried byte-for-byte from the accepted `gdpstweaks16`
+source. The legacy ARM backend is also carried forward; only its displayed
+version string changes to `0.9.7-cof1`.
+
+The shared Windows audio implementation is byte-for-byte unchanged, preserving
+the confirmed internal SFX/master-volume behavior that does not move the
+Windows Volume Mixer.
+
+Existing GDPS/network, save, launcher, DPI, graphics, FULL_BYPASS and other
+non-editor functionality remains in the unified source unless specifically
+noted in `COF1.md`.
+
+## Build
+
+On 64-bit Windows run:
+
+```bat
+BUILD_ALL.cmd
+```
+
+The complete unified output is written to `dist-unified\`.
+Drag an APK onto `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd`.
+
+The source package contains no APK, no extracted proprietary `.so`, and no
+prebuilt game binary.

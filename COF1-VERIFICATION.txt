@@ -1,0 +1,71 @@
+Geometry Dash Wrapper 0.9.7-cof1 verification
+================================================
+
+Focused audit: 60/60 checks passed.
+
+01. PASS: version file
+02. PASS: branch file
+03. PASS: build info version
+04. PASS: build info branch
+05. PASS: launcher version
+06. PASS: builder revision
+07. PASS: x86 backend byte-identical to tweaks16 [a7e54abb142ddca388a1ac4167f918204c790b3cecaac43e8871ef377ff41c8f]
+08. PASS: shared audio byte-identical to tweaks16 [d15cb21d9b0c0015f9dde9b50bfc5caeb2eff67f16a008b9484a490d6f36c02d]
+09. PASS: legacy ARM behavior identical except version diagnostic
+10. PASS: ARMv7 retired code absent: InitializeV22EditorFromWrapper
+11. PASS: ARMv7 retired code absent: EnsureV22CriticalEditorCollections
+12. PASS: ARMv7 retired code absent: DetectV22EditorRestoreProfile
+13. PASS: ARMv7 retired code absent: InstallV22PreviewModeObserver
+14. PASS: ARMv7 retired code absent: InstallV22EditorSpriteFrameFallbackBridge
+15. PASS: ARMv7 retired code absent: InstallV22StockEditorVisibilityBridge
+16. PASS: ARMv7 retired code absent: V22EditorRestoreProfile
+17. PASS: ARMv7 retired code absent: HostV22GameVariableChanged
+18. PASS: ARMv7 retired code absent: HostV22RejectNullBatchTexture
+19. PASS: ARMv7 retired code absent: WriteV22ThumbSpriteFrameFallbackThunk
+20. PASS: ARMv7 retired code absent: WriteV22ThumbSpriteFrameEarlyFastFallbackThunk
+21. PASS: ARMv7 retired code absent: WriteV22ThumbObserveThenCallThunk
+22. PASS: ARMv7 retired code absent: WriteV22ThumbNullTextureGuardThunk
+23. PASS: ARMv7 retired code absent: SendEditorCommand
+24. PASS: ARMv7 retired code absent: HostEventType::EditorCommand
+25. PASS: ARMv7 retired code absent: gd_settings_editor_controls()
+26. PASS: COF1 stock restore policy explicitly disabled
+27. PASS: old dynamic thunk cursor restored
+28. PASS: EnduranceTest10 exact function: static void ResolveV22InputBridgeSymbols
+29. PASS: EnduranceTest10 exact function: static std::pair<u32, u32> PatchV22ArtAssetLimits
+30. PASS: EnduranceTest10 exact function: static std::size_t InstallV22EditButtonBridge
+31. PASS: EnduranceTest10 exact function: static V22VisualHookCounts InstallV22SafeVisualHooks
+32. PASS: EnduranceTest10 exact function: u32 FindV22DrawGridLayer
+33. PASS: EnduranceTest10 exact function: bool UpdateV22EditorOverlayFrame
+34. PASS: EnduranceTest10 exact function: bool HostV22UpdateCameraBackground
+35. PASS: EnduranceTest10 exact function: bool HostV22EditorVisibility
+36. PASS: EnduranceTest10 exact function: bool HostV22BatchUpdateBlend
+37. PASS: EnduranceTest10 exact function: bool EnterV22LevelEditor
+38. PASS: EnduranceTest10 exact function: bool SendPlatformerButton
+39. PASS: EnduranceTest10 exact function: bool PrepareV22MousePlatformerTouch
+40. PASS: EnduranceTest10 exact function: bool SyncV22MousePlatformerJump
+41. PASS: EnduranceTest10 exact function: static bool HasCompatibleV22CompanionEditorInitializer
+42. PASS: EnduranceTest10 exact function: static bool HasV22PrimaryEditorInitializer
+43. PASS: EnduranceTest10 exact function: static ElfRuntime MapAndRelocateV22CompanionElf
+44. PASS: ARMv7 C++20 syntax check
+45. PASS: legacy ARM C++20 syntax check
+46. PASS: runtime_settings C11 syntax check
+47. PASS: selected 2023 APK SHA-256 [b0b4c1dfc63040531c856a178e15dcc28312511ece245766844b59fcbe326fb1]
+48. PASS: selected primary library exact size [9578364]
+49. PASS: selected companion library present [636668]
+50. PASS: companion initH export size 2044 [2044]
+51. PASS: primary 2023 editor initializer remains 4-byte stub [4]
+52. PASS: companion initH writes LevelEditorLayer+0x13C
+53. PASS: companion initH writes LevelEditorLayer+0x354
+54. PASS: active source contains no game/built binary payload
+55. PASS: GDPSTWEAKS editor repair docs removed from active tree
+56. PASS: retired tweaks16 ARMv7 source backup exists
+57. PASS: retired GDPSTWEAKS1..16 docs backup exists
+58. PASS: full source ZIP round-trip reproduces the COF1 tree exactly
+59. PASS: hotfix replacement + deletion manifest reproduces the COF1 tree exactly
+60. PASS: tweaks16-to-COF1 patch applies with patch -p1 and reproduces the COF1 tree exactly
+
+Runtime boundary:
+- Windows/Dynarmic live execution is not available in this container.
+- The selected modded 2023 APK was used only for static compatibility verification.
+- COF1 intentionally does not reconstruct stock 2019/2022/2023 editor stubs.
+- x86 and confirmed audio behavior are preserved by byte-identical source checks.
