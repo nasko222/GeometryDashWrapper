@@ -1,10 +1,11 @@
-# Geometry Dash Wrapper 0.9.6-gdpstweaks14
+# Geometry Dash Wrapper 0.9.6-gdpstweaks15
 
-Tweaks14 is a narrow regression repair based directly on the 2026-08-24 tweaks13 runtime logs.
+Tweaks15 is an ARMv7-only 2.2-beta editor repair based on the 2026-08-24 tweaks14 runtime logs.
 
-- ARMv7 2.2 editor: fixes the false CCArray validation failure that caused the wrapper itself to abort editor creation.
-- x86 editor controls: restores the last user-confirmed working discovery path and caches non-editor misses per scene to avoid repeated menu spikes.
-- Preview Mode: unchanged in this pass; retest only after the ARM editor can stay open.
+- 2023 editor Play: reject/rebuild zero-capacity CCArray shells before `onPlaytest()` can enter `ccArrayDoubleCapacity` with a null element buffer.
+- 2019 editor button: accelerate the reduced-APK EditorUI construction by pre-indexing packaged sprite-frame names and bypassing stock dictionary lookups only for frames proven absent from that APK; suppress thousands of synchronous per-frame log flushes.
+- x86 editor controls: unchanged from tweaks14 (user-confirmed fixed).
+- Preview Mode: unchanged in this pass.
 - 1.0 music/audio: unchanged.
 
-See `GDPSTWEAKS14.md` and `GDPSTWEAKS14-VERIFICATION.txt`.
+See `GDPSTWEAKS15.md` and `GDPSTWEAKS15-VERIFICATION.txt`.

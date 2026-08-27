@@ -558,6 +558,16 @@ public:
         return bytes;
     }
 
+    std::vector<std::string> NamesEndingWith(std::string_view suffix) const {
+        std::vector<std::string> names;
+        for (const auto& [name, entry] : entries_) {
+            (void)entry;
+            if (name.ends_with(suffix)) names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
     std::pair<std::size_t, u64> PrecacheBackgroundMusic(
         const std::filesystem::path& writable_path) {
         std::vector<std::string> music_names;
@@ -1564,6 +1574,47 @@ static void WriteV22ThumbSpriteFrameFallbackThunk(
 }
 
 
+static void WriteV22ThumbSpriteFrameEarlyFastFallbackThunk(
+    ProbeEnvironment& env, u32 address, u32 precheck_import,
+    u32 original, u32 fallback_import) {
+    if ((address & 3u) != 0u)
+        throw std::runtime_error("V22 early sprite fallback thunk is not aligned");
+    /*
+     * The stripped 2019 Lite APK is missing well over a thousand frames that
+     * the later editor UI asks for.  Calling the stock dictionary lookup for
+     * every known-absent frame creates millions of guest libc crossings.
+     * Ask the host first only for this profile.  A non-zero precheck result is
+     * a packaged-frame-index-proven miss and can use the fallback immediately.
+     * Unknown/present names still run the untouched stock lookup; a stock null
+     * result then falls through to the normal fallback import just like the
+     * original bridge.
+     */
+    env.MemoryWrite16(address + 0x00u, 0xB503u); // push {r0,r1,lr}
+    env.MemoryWrite16(address + 0x02u, 0x4608u); // mov r0,r1 (name)
+    env.MemoryWrite16(address + 0x04u, 0x4B08u); // precheck literal +0x28
+    env.MemoryWrite16(address + 0x06u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x08u, 0x2800u); // cmp r0,#0
+    env.MemoryWrite16(address + 0x0Au, 0xD108u); // bne done
+    env.MemoryWrite16(address + 0x0Cu, 0x9800u); // restore cache
+    env.MemoryWrite16(address + 0x0Eu, 0x9901u); // restore name
+    env.MemoryWrite16(address + 0x10u, 0x4B06u); // original literal +0x2c
+    env.MemoryWrite16(address + 0x12u, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x14u, 0x2800u); // cmp r0,#0
+    env.MemoryWrite16(address + 0x16u, 0xD102u); // bne done
+    env.MemoryWrite16(address + 0x18u, 0x9801u); // name -> r0
+    env.MemoryWrite16(address + 0x1Au, 0x4B05u); // fallback literal +0x30
+    env.MemoryWrite16(address + 0x1Cu, 0x4798u); // blx r3
+    env.MemoryWrite16(address + 0x1Eu, 0xB002u); // done: add sp,#8
+    env.MemoryWrite16(address + 0x20u, 0xBD00u); // pop {pc}
+    env.MemoryWrite16(address + 0x22u, 0xBF00u);
+    env.MemoryWrite16(address + 0x24u, 0xBF00u);
+    env.MemoryWrite16(address + 0x26u, 0xBF00u);
+    env.MemoryWrite32(address + 0x28u, precheck_import);
+    env.MemoryWrite32(address + 0x2Cu, original);
+    env.MemoryWrite32(address + 0x30u, fallback_import);
+}
+
+
 static void WriteV22ThumbCallThenImportThunk(
     ProbeEnvironment& env, u32 address, u32 original, u32 destination) {
     if ((address & 3u) != 0u)
@@ -2047,8 +2098,16 @@ static std::size_t InstallV22EditorSpriteFrameFallbackBridge(
         runtime, env, "__dynarmic_v22_editor_missing_sprite_frame");
     EnsureV22ThunkPage(env);
     const u32 thunk = kV22ThunkBase + 0x100u;
-    WriteV22ThumbSpriteFrameFallbackThunk(
-        env, thunk, lookup->address, host);
+    if (runtime.v22_wrapper_editor_profile ==
+        V22EditorRestoreProfile::Early2019) {
+        const u32 precheck = EnsureImport(
+            runtime, env, "__dynarmic_v22_editor_sprite_frame_precheck");
+        WriteV22ThumbSpriteFrameEarlyFastFallbackThunk(
+            env, thunk, precheck, lookup->address, host);
+    } else {
+        WriteV22ThumbSpriteFrameFallbackThunk(
+            env, thunk, lookup->address, host);
+    }
     for (u32 call : calls) WriteThumbBl(env, call, thunk);
     return calls.size();
 }
@@ -8614,9 +8673,13 @@ private:
         const u32 count = env_.MemoryRead32(data + 0u);
         const u32 capacity = env_.MemoryRead32(data + 4u);
         const u32 elements = env_.MemoryRead32(data + elements_offset);
-        if (count > capacity || capacity > 10000000u) return false;
-        if (capacity &&
-            (!elements || !env_.IsMapped(elements, 4u)))
+        // CCArray::init() calls initWithCapacity(1) in every supported beta.
+        // A zero-capacity shell is therefore not a usable collection.  Keeping
+        // one caused onPlaytest() to enter ccArrayDoubleCapacity with 0 -> 0
+        // and realloc(nullptr, 0) on the 2023 beta.
+        if (capacity == 0u || count > capacity || capacity > 10000000u)
+            return false;
+        if (!elements || !env_.IsMapped(elements, 4u))
             return false;
         return true;
     }
@@ -8740,6 +8803,83 @@ private:
             InitV22StdVector(editor, field(0x2B9Cu), count, 4u, resized);
     }
 
+    bool BuildV22EarlyEditorPackagedSpriteFrameIndex() {
+        if (runtime_.v22_wrapper_editor_profile !=
+            V22EditorRestoreProfile::Early2019)
+            return true;
+        if (v22_packaged_editor_sprite_index_ready_) return true;
+
+        v22_packaged_editor_sprite_names_.clear();
+        std::vector<std::string> plist_names =
+            apk_member_cache_.NamesEndingWith(".plist");
+        std::size_t sheets = 0u;
+        for (const std::string& name : plist_names) {
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char value) {
+                               return static_cast<char>(std::tolower(value));
+                           });
+            if (!lower.starts_with("assets/") ||
+                lower.find("sheet") == std::string::npos)
+                continue;
+
+            // Frame names are resolution-independent. Prefer the normal plist
+            // when it exists so we do not inflate identical -hd/-uhd copies.
+            if (lower.ends_with("-hd.plist") || lower.ends_with("-uhd.plist")) {
+                const std::size_t dash = name.rfind('-');
+                if (dash != std::string::npos) {
+                    const std::string normal = name.substr(0u, dash) + ".plist";
+                    if (apk_member_cache_.Exists(normal)) continue;
+                }
+            }
+
+            const std::shared_ptr<const std::vector<u8>> bytes =
+                apk_member_cache_.Load(name);
+            if (!bytes || bytes->empty()) continue;
+            ++sheets;
+            const std::string_view text(
+                reinterpret_cast<const char*>(bytes->data()), bytes->size());
+            std::size_t cursor = 0u;
+            while ((cursor = text.find("<key>", cursor)) !=
+                   std::string_view::npos) {
+                const std::size_t begin = cursor + 5u;
+                const std::size_t end = text.find("</key>", begin);
+                if (end == std::string_view::npos) break;
+                const std::string_view key = text.substr(begin, end - begin);
+                if (key.size() <= 255u && key.ends_with(".png"))
+                    v22_packaged_editor_sprite_names_.emplace(key);
+                cursor = end + 6u;
+            }
+        }
+        v22_packaged_editor_sprite_index_ready_ = true;
+        log_ << "RESULT: DYNARMIC_V22_EARLY_EDITOR_SPRITE_INDEX_READY sheets="
+             << sheets << " frames="
+             << v22_packaged_editor_sprite_names_.size() << '\n';
+        log_.flush();
+        return !v22_packaged_editor_sprite_names_.empty();
+    }
+
+    void RecordV22MissingEditorSprite(std::string_view requested,
+                                      std::string_view path) {
+        if (!v22_missing_editor_sprite_names_.emplace(requested).second)
+            return;
+        ++v22_missing_editor_sprite_count_;
+        // Thousands of synchronous flushes were a large part of the 2019
+        // editor-button stall. Keep enough names for diagnosis, then summarize.
+        if (v22_missing_editor_sprite_count_ <= 32u) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_MISSING_SPRITE_FRAME name=\""
+                 << requested << "\" action=stock-fallback path=" << path
+                 << " frame=0x" << std::hex
+                 << v22_editor_sprite_fallback_frame_ << std::dec << '\n';
+        } else if (v22_missing_editor_sprite_count_ == 33u) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_MISSING_SPRITE_FRAME "
+                    "additional-names-suppressed=1\n";
+        } else if ((v22_missing_editor_sprite_count_ & 0xFFu) == 0u) {
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_MISSING_SPRITE_SUMMARY count="
+                 << v22_missing_editor_sprite_count_ << '\n';
+        }
+    }
+
     bool PrepareV22StockEditorSpriteFallback() {
         u32 cache = 0u;
         u32 ignored = 0u;
@@ -8767,6 +8907,13 @@ private:
             return Fail("V22 editor fallback sprite frame is unavailable");
         v22_editor_sprite_fallback_frame_ = fallback_frame;
         v22_missing_editor_sprite_names_.clear();
+        v22_missing_editor_sprite_count_ = 0u;
+        if (!BuildV22EarlyEditorPackagedSpriteFrameIndex() &&
+            runtime_.v22_wrapper_editor_profile ==
+                V22EditorRestoreProfile::Early2019) {
+            log_ << "RESULT: DYNARMIC_V22_EARLY_EDITOR_SPRITE_INDEX_UNAVAILABLE "
+                    "action=stock-lookup-fallback\n";
+        }
         log_ << "RESULT: DYNARMIC_V22_EDITOR_SPRITE_FALLBACK_READY "
              << "fallback=GJ_arrow_02_001.png frame=0x" << std::hex
              << fallback_frame << std::dec << "\n";
@@ -9266,6 +9413,14 @@ private:
         v22_stock_editor_sprite_fallback_active_ = false;
         if (!editor_ui_created || !editor_ui)
             return false;
+        if (runtime_.v22_wrapper_editor_profile ==
+            V22EditorRestoreProfile::Early2019) {
+            log_ << "RESULT: DYNARMIC_V22_EARLY_EDITOR_UI_CREATED fast-misses="
+                 << v22_early_editor_sprite_fast_misses_
+                 << " unique-fallbacks=" << v22_missing_editor_sprite_count_
+                 << '\n';
+            log_.flush();
+        }
         env_.MemoryWrite32(editor + layout.editor_ui_field, editor_ui);
         if (add_child_z &&
             !RunNestedPreservingState(add_child_z, {editor, editor_ui, 100u},
@@ -9429,7 +9584,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks14 continues restoring only that missing initialization in the host;
+        // gdpstweaks15 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -12755,6 +12910,23 @@ private:
         }
         if (name == "__dynarmic_v22_prepare_level_setup")
             return HostV22PrepareLevelSetup();
+        if (name == "__dynarmic_v22_editor_sprite_frame_precheck") {
+            const bool editor_scope =
+                runtime_.v22_wrapper_editor_profile ==
+                    V22EditorRestoreProfile::Early2019 &&
+                v22_stock_editor_sprite_fallback_active_;
+            if (!editor_scope || !v22_editor_sprite_fallback_frame_ ||
+                !v22_packaged_editor_sprite_index_ready_)
+                return finish_hot(0u);
+            const std::string requested = ReadCString(r0, 256u);
+            if (requested.empty() ||
+                v22_packaged_editor_sprite_names_.find(requested) !=
+                    v22_packaged_editor_sprite_names_.end())
+                return finish_hot(0u);
+            ++v22_early_editor_sprite_fast_misses_;
+            RecordV22MissingEditorSprite(requested, "early-fast");
+            return finish_hot(v22_editor_sprite_fallback_frame_);
+        }
         if (name == "__dynarmic_v22_editor_missing_sprite_frame") {
             const bool editor_scope =
                 v22_stock_editor_sprite_fallback_active_ ||
@@ -12764,13 +12936,7 @@ private:
             if (!editor_scope || !v22_editor_sprite_fallback_frame_)
                 return finish_hot(0u);
             const std::string requested = ReadCString(r0, 256u);
-            if (v22_missing_editor_sprite_names_.insert(requested).second) {
-                log_ << "RESULT: DYNARMIC_V22_EDITOR_MISSING_SPRITE_FRAME "
-                     << "name=\"" << requested << "\" action=stock-fallback"
-                     << " frame=0x" << std::hex
-                     << v22_editor_sprite_fallback_frame_ << std::dec << '\n';
-                log_.flush();
-            }
+            RecordV22MissingEditorSprite(requested, "stock-null");
             return finish_hot(v22_editor_sprite_fallback_frame_);
         }
         if (name == "__dynarmic_v22_editor_visibility") {
@@ -13626,6 +13792,10 @@ private:
     u32 v22_editor_sprite_fallback_frame_=0u;
     bool v22_stock_editor_sprite_fallback_active_=false;
     std::unordered_set<std::string> v22_missing_editor_sprite_names_;
+    std::unordered_set<std::string> v22_packaged_editor_sprite_names_;
+    bool v22_packaged_editor_sprite_index_ready_=false;
+    u64 v22_missing_editor_sprite_count_=0u;
+    u64 v22_early_editor_sprite_fast_misses_=0u;
     u64 v22_editor_background_updates_suppressed_=0;
     bool v22_editor_preview_mode_enabled_=false;
     bool v22_editor_preview_refresh_pending_=false;
@@ -14049,7 +14219,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks14 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks15 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
