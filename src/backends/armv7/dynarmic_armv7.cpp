@@ -4545,6 +4545,13 @@ public:
             return true;
         }
         const u32 editor = v22_editor_visual_layer_;
+        // Some stock-stub setup paths replace editor collections after the
+        // wrapper's initial construction pass. Revalidate only the exact
+        // arrays proven to be dereferenced by draw()/onPlaytest(), immediately
+        // before each rendered editor frame. This is cheap when healthy and
+        // repairs a late zero-capacity shell before Play can touch it.
+        if (!EnsureV22CriticalEditorCollections(editor, "pre-render"))
+            return false;
         u32 playtest_editor = 0u;
         if (IsV22EditorPlaytestActive(playtest_editor) &&
             playtest_editor == editor) {
@@ -4608,6 +4615,28 @@ public:
                  << "mode=level-settings-updated frame="
                  << v22_editor_overlay_frames_ << '\n';
             log_.flush();
+
+            // Preview can already be enabled when a restored editor opens.
+            // Refreshing it before levelSettingsUpdated() means the preview
+            // callbacks run against incomplete editor/grid state. Reapply the
+            // stock preview callbacks once after the settings/BPM setup path
+            // has completed, then leave later toggles to the 0036 observer.
+            if (v22_editor_preview_mode_enabled_) {
+                u32 preview_ignored = 0u;
+                if (!CallV22Primary(
+                        "_ZN16LevelEditorLayer17updatePreviewAnimEv",
+                        {editor}, preview_ignored,
+                        "V22 preview reapply after level settings", false) ||
+                    !CallV22Primary(
+                        "_ZN16LevelEditorLayer22updatePreviewParticlesEv",
+                        {editor}, preview_ignored,
+                        "V22 preview particles after level settings", false))
+                    return false;
+                v22_editor_preview_background_grace_frames_ = 8u;
+                log_ << "RESULT: DYNARMIC_V22_EDITOR_PREVIEW_REAPPLIED "
+                     << "reason=level-settings-ready state=1\n";
+                log_.flush();
+            }
         }
 
         /* Never call LevelEditorLayer::updateGridLayer from the host. */
@@ -4736,6 +4765,16 @@ public:
 
     bool SendTouchPoint(u32 function, float x, float y, const std::string& label) {
         if (!function) return true;
+        // Touch callbacks can invoke LevelEditorLayer::onPlaytest() before the
+        // next host render-frame guard. Keep the exact Play/render collections
+        // valid before dispatching the click as well as before nativeRender.
+        if (v22_editor_visual_layer_ && IsV22EditorSceneActive() &&
+            runtime_.v22_wrapper_editor_profile !=
+                V22EditorRestoreProfile::None) {
+            if (!EnsureV22CriticalEditorCollections(
+                    v22_editor_visual_layer_, "pre-touch"))
+                return false;
+        }
         std::ostringstream details;
         details << std::fixed << std::setprecision(2) << "x=" << x << " y=" << y;
         LogHostDispatch(label, function, details.str());
@@ -7637,8 +7676,47 @@ private:
     }
 
     u32 FindV22DrawGridLayer(u32 editor_layer) {
-        if (v22_draw_grid_layer_ && LooksLikeGuestObject(runtime_, env_, v22_draw_grid_layer_))
+        if (v22_draw_grid_layer_ &&
+            LooksLikeGuestObject(runtime_, env_, v22_draw_grid_layer_))
             return v22_draw_grid_layer_;
+
+        // The wrapper itself creates DrawGridLayer and stores it in a
+        // profile-verified LevelEditorLayer field.  The EnduranceTest7-10
+        // implementation found that field and drove the song guide/BPM
+        // helpers every editor frame.  Later restoration work kept the
+        // updater but accidentally made discovery depend only on a broad
+        // vtable scan.  The 2026-08-27 logs show that scan finding nothing in
+        // both restored editors, so the known-good updater never ran.
+        u32 profile_field = 0u;
+        switch (runtime_.v22_wrapper_editor_profile) {
+        case V22EditorRestoreProfile::Early2019:
+            profile_field = 0x4E8u;
+            break;
+        case V22EditorRestoreProfile::Late2022:
+            profile_field = 0x2C54u;
+            break;
+        case V22EditorRestoreProfile::Late2023:
+            profile_field = 0x2C88u;
+            break;
+        default:
+            break;
+        }
+        if (profile_field && env_.IsMapped(editor_layer + profile_field, 4u)) {
+            const u32 candidate = env_.MemoryRead32(editor_layer + profile_field);
+            if (LooksLikeGuestObject(runtime_, env_, candidate)) {
+                v22_draw_grid_layer_ = candidate;
+                log_ << "RESULT: DYNARMIC_V22_DRAW_GRID_FOUND editor=0x"
+                     << std::hex << editor_layer << " grid=0x" << candidate
+                     << " field=0x" << profile_field << std::dec
+                     << " source=profile-field\n";
+                log_.flush();
+                return candidate;
+            }
+        }
+
+        // Retain the historical vtable scan as a compatibility fallback for
+        // community builds whose editor object layout differs from the three
+        // exact stock profiles.
         const u32 expected = runtime_.v22_draw_grid_vtable + 8u;
         for (u32 offset = 0x100u; offset < 0x4000u; offset += 4u) {
             if (!env_.IsMapped(editor_layer + offset, 4u)) continue;
@@ -7648,7 +7726,8 @@ private:
                 v22_draw_grid_layer_ = candidate;
                 log_ << "RESULT: DYNARMIC_V22_DRAW_GRID_FOUND editor=0x"
                      << std::hex << editor_layer << " grid=0x" << candidate
-                     << " field=0x" << offset << std::dec << '\n';
+                     << " field=0x" << offset << std::dec
+                     << " source=vtable-scan\n";
                 log_.flush();
                 return candidate;
             }
@@ -8550,9 +8629,19 @@ private:
                 // touching the later editor-only collections.  Stock 2019's
                 // stub initializer never constructs this CCArray either.
                 0x2A4u,
+                // draw() also treats +0x298 as a CCArray when the editor's
+                // group-overlay flag is enabled. Reuse it when healthy and
+                // construct an empty native array only when the stock stub left
+                // the field invalid.
+                0x298u,
                 0x418u, 0x41Cu, 0x428u, 0x5D0u, 0x42Cu,
-                0x430u, 0x434u, 0x440u, 0x448u, 0x47Cu,
-                0x44Cu, 0x458u, 0x43Cu, 0x4CCu, 0x4D0u};
+                0x430u, 0x434u, 0x440u,
+                // LevelEditorLayer::draw() dereferences +0x444 before doing
+                // any other editor-specific render work. tweaks15 left this
+                // stock-2019 CCArray null, so the very first rendered frame
+                // crashed in CCArray::count().
+                0x444u,
+                0x448u, 0x47Cu, 0x44Cu, 0x458u, 0x43Cu, 0x4CCu, 0x4D0u};
             layout.dictionary_fields = {
                 0x420u, 0x474u, 0x484u, 0x488u,
                 0x438u, 0x454u, 0x4FCu};
@@ -8716,6 +8805,78 @@ private:
                         " returned an uninitialized native CCArray");
         env_.MemoryWrite32(editor + field, object);
         return RetainV22Object(object, std::string(label) + " retain");
+    }
+
+    bool EnsureV22CriticalEditorCollections(u32 editor,
+                                            std::string_view phase) {
+        std::array<u32, 3> fields{};
+        std::size_t count = 0u;
+        switch (runtime_.v22_wrapper_editor_profile) {
+        case V22EditorRestoreProfile::Early2019:
+            // +0x444 is used by LevelEditorLayer::draw() on the first frame;
+            // +0x2A4 is the exact onPlaytest scratch collection.
+            fields[0] = 0x444u;
+            fields[1] = 0x298u;
+            fields[2] = 0x2A4u;
+            count = 3u;
+            break;
+        case V22EditorRestoreProfile::Late2022:
+            fields[0] = 0x350u;
+            count = 1u;
+            break;
+        case V22EditorRestoreProfile::Late2023:
+            fields[0] = 0x354u;
+            count = 1u;
+            break;
+        default:
+            return true;
+        }
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const u32 field = fields[i];
+            if (!env_.IsMapped(editor + field, 4u))
+                return Fail("V22 critical editor CCArray field is unmapped");
+            const u32 before = env_.MemoryRead32(editor + field);
+            if (IsUsableV22CcArray(before)) {
+                if (phase == "post-init") {
+                    const u32 data_offset = V22CcArrayDataOffset();
+                    const u32 data = env_.MemoryRead32(before + data_offset);
+                    const bool early2019 =
+                        runtime_.v22_wrapper_editor_profile ==
+                            V22EditorRestoreProfile::Early2019;
+                    const u32 elements_offset = early2019 ? 8u : 12u;
+                    log_ << "RESULT: DYNARMIC_V22_EDITOR_CRITICAL_ARRAY_READY "
+                         << "profile="
+                         << V22EditorRestoreProfileName(
+                                runtime_.v22_wrapper_editor_profile)
+                         << " field=0x" << std::hex << field
+                         << " object=0x" << before
+                         << " data=0x" << data
+                         << " elements=0x"
+                         << env_.MemoryRead32(data + elements_offset)
+                         << std::dec
+                         << " count=" << env_.MemoryRead32(data)
+                         << " capacity=" << env_.MemoryRead32(data + 4u)
+                         << '\n';
+                    log_.flush();
+                }
+                continue;
+            }
+            if (!CreateRetainedV22Field(
+                    editor, field, "_ZN7cocos2d7CCArray6createEv",
+                    "V22 critical editor CCArray repair", 0u, false, true))
+                return false;
+            const u32 after = env_.MemoryRead32(editor + field);
+            log_ << "RESULT: DYNARMIC_V22_EDITOR_CRITICAL_ARRAY_REPAIRED "
+                 << "profile="
+                 << V22EditorRestoreProfileName(
+                        runtime_.v22_wrapper_editor_profile)
+                 << " field=0x" << std::hex << field
+                 << " old=0x" << before << " new=0x" << after
+                 << std::dec << " phase=" << phase << '\n';
+            log_.flush();
+        }
+        return true;
     }
 
     bool InitV22StdVector(u32 editor, u32 field, u32 count,
@@ -9247,6 +9408,9 @@ private:
             !draw_grid)
             return false;
         env_.MemoryWrite32(editor + layout.draw_grid_field, draw_grid);
+        // We just created this object ourselves; keep the exact pointer instead
+        // of forcing the per-frame overlay path to rediscover it heuristically.
+        v22_draw_grid_layer_ = draw_grid;
         const u32 add_child_z = V22PrimarySymbolAddress(
             "_ZN7cocos2d6CCNode8addChildEPS0_i");
         bool grid_in_front = false;
@@ -9523,6 +9687,13 @@ private:
                            {editor, ground_enabled ? 1u : 0u}, ignored,
                            "V22 wrapper editor toggle ground", false);
 
+        // setupLayers, object creation and EditorUI construction can replace
+        // inherited CCArray shells after the first initialization pass. Catch
+        // that before returning to the render loop; the pre-render guard keeps
+        // the same invariant alive afterward.
+        if (!EnsureV22CriticalEditorCollections(editor, "post-init"))
+            return false;
+
         log_ << "RESULT: DYNARMIC_V22_WRAPPER_EDITOR_INIT_OK profile="
              << layout.name << " editor=0x" << std::hex << editor
              << " level=0x" << level << std::dec
@@ -9584,7 +9755,7 @@ private:
              << std::hex << editor << std::dec << " source=create\n";
         log_.flush();
         // Stock 2.2 betas intentionally ship a four-byte editor initializer.
-        // gdpstweaks15 continues restoring only that missing initialization in the host;
+        // gdpstweaks16 continues restoring only that missing initialization in the host;
         // no modded APK or libgame.so is required for known stock profiles.
         if (runtime_.v22_wrapper_editor_profile != V22EditorRestoreProfile::None) {
             if (!InitializeV22EditorFromWrapper(editor, level, source)) return false;
@@ -14219,7 +14390,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks15 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.6-gdpstweaks16 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
