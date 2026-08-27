@@ -1,6 +1,6 @@
-# Geometry Dash Wrapper 0.9.7-cof1
+# Geometry Dash Wrapper 0.9.7-cof2
 
-`cof1` means **Cleanup Optimization Fixes 1**.
+`cof2` means **Cleanup Optimization Fixes 2**. It keeps the COF1 cleanup and fixes two ARMv7 regressions found in Windows testing.
 
 This branch deliberately ends the wrapper-owned stock 2.2 beta editor experiment.
 The ARMv7 backend no longer tries to fabricate the missing editor runtime shipped
@@ -27,7 +27,7 @@ as four-byte stubs in the reduced 2019/2022/2023 APKs.
 
 The x86 backend is carried byte-for-byte from the accepted `gdpstweaks16`
 source. The legacy ARM backend is also carried forward; only its displayed
-version string changes to `0.9.7-cof1`.
+version string changes to `0.9.7-cof2`.
 
 The shared Windows audio implementation is byte-for-byte unchanged, preserving
 the confirmed internal SFX/master-volume behavior that does not move the
@@ -50,3 +50,11 @@ Drag an APK onto `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd`.
 
 The source package contains no APK, no extracted proprietary `.so`, and no
 prebuilt game binary.
+
+## COF2 regression fixes
+
+- Restores EnduranceTest10 `GameManager +0x168` active-layer resolution for platformer keyboard input and gameplay Edit callbacks.
+- Installs the verified 18-ground / 26-background OOB clamp independently of editor companion detection.
+- Does not restore wrapper-owned stock 2.2 editor reconstruction.
+
+See `COF2.md` for details.

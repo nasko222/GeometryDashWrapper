@@ -1201,7 +1201,6 @@ struct ElfRuntime {
     // GameManager keeps gameplay and editor layer pointers in adjacent slots.
     // They are not interchangeable: normal UILayer/input paths use the first
     // slot, while GameObject/editor helpers read the second one.
-    u32 v22_game_manager_active_layer_offset = 0;
     u32 v22_ui_key_down = 0;
     u32 v22_ui_key_up = 0;
     u32 v22_ui_on_check = 0;
@@ -2543,20 +2542,27 @@ static std::pair<u32, u32> PatchV22ArtAssetLimits(
     for (const LimitPatch& patch : patches) {
         const u32 begin = patch.symbol->address & ~1u;
         if (!env.IsMapped(begin + patch.compare_offset, 2u) ||
-            !env.IsMapped(begin + patch.move_offset, 2u) ||
-            env.MemoryRead16(begin + patch.compare_offset) !=
-                patch.expected_compare ||
-            env.MemoryRead16(begin + patch.move_offset) !=
-                patch.expected_move)
+            !env.IsMapped(begin + patch.move_offset, 2u))
             throw std::runtime_error(
                 "V22 art asset-limit instruction validation failed");
-    }
-    for (const LimitPatch& patch : patches) {
-        const u32 begin = patch.symbol->address & ~1u;
-        env.MemoryWrite16(begin + patch.compare_offset,
-                          patch.replacement_compare);
-        env.MemoryWrite16(begin + patch.move_offset,
-                          patch.replacement_move);
+        const u16 current_compare =
+            env.MemoryRead16(begin + patch.compare_offset);
+        const u16 current_move = env.MemoryRead16(begin + patch.move_offset);
+        const bool original =
+            current_compare == patch.expected_compare &&
+            current_move == patch.expected_move;
+        const bool already_patched =
+            current_compare == patch.replacement_compare &&
+            current_move == patch.replacement_move;
+        if (!original && !already_patched)
+            throw std::runtime_error(
+                "V22 art asset-limit instruction validation failed");
+        if (original) {
+            env.MemoryWrite16(begin + patch.compare_offset,
+                              patch.replacement_compare);
+            env.MemoryWrite16(begin + patch.move_offset,
+                              patch.replacement_move);
+        }
     }
     return {18u, 26u};
 }
@@ -4328,11 +4334,9 @@ public:
         if (!RunFunction(runtime_.v22_game_manager_shared, {}, &game_manager,
                          "V22 GameManager::sharedState for platformer key"))
             return false;
-        const u32 active_offset = runtime_.v22_game_manager_active_layer_offset;
-        if (!game_manager || !active_offset ||
-            !env_.IsMapped(game_manager + active_offset, 4u))
+        if (!game_manager || !env_.IsMapped(game_manager + 0x168u, 4u))
             return true;
-        const u32 candidate = env_.MemoryRead32(game_manager + active_offset);
+        const u32 candidate = env_.MemoryRead32(game_manager + 0x168u);
         if (LooksLikeGuestObject(runtime_, env_, candidate))
             layer = candidate;
         return true;
@@ -8001,13 +8005,9 @@ private:
             !RunNestedPreservingState(runtime_.v22_game_manager_shared, {},
                                       game_manager,
                                       "V22 GameManager::sharedState") ||
-            !game_manager || !runtime_.v22_game_manager_active_layer_offset ||
-            !env_.IsMapped(
-                game_manager + runtime_.v22_game_manager_active_layer_offset,
-                4u))
+            !game_manager || !env_.IsMapped(game_manager + 0x168u, 4u))
             return Fail("V22 gameplay editor bridge cannot find GameManager");
-        const u32 play_layer = env_.MemoryRead32(
-            game_manager + runtime_.v22_game_manager_active_layer_offset);
+        const u32 play_layer = env_.MemoryRead32(game_manager + 0x168u);
         if (!play_layer || !env_.IsMapped(play_layer + 0x13Cu, 4u))
             return Fail("V22 gameplay editor bridge cannot find PlayLayer");
         const u32 level = env_.MemoryRead32(play_layer + 0x13Cu);
@@ -12492,7 +12492,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-cof1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-cof2 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -13040,6 +13040,19 @@ int main(int argc,char** argv) {
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
+
+        // COF2: the 2023 primary library exposes selector indices beyond the
+        // art packaged by the APK.  This safety clamp is a primary-library
+        // compatibility fix, not editor reconstruction, so install it for the
+        // known late layout regardless of how the editor implementation is
+        // supplied.  InstallV22SafeVisualHooks calls the same idempotent clamp
+        // again when the validated companion is active.
+        if (late_beta_layout) {
+            const auto [ground_max, background_max] =
+                PatchV22ArtAssetLimits(runtime, env);
+            visual_hooks.ground_asset_max = ground_max;
+            visual_hooks.background_asset_max = background_max;
+        }
         if (runtime.v22_companion_editor_init_enabled)
             visual_hooks = InstallV22SafeVisualHooks(runtime, env);
 
@@ -13055,7 +13068,7 @@ int main(int argc,char** argv) {
         const auto gameplay_edit_pointers = install_editor_bridge
             ? InstallV22GameplayEditButtonBridges(runtime, env)
             : std::pair<std::size_t, std::size_t>{};
-        emit(std::string("RESULT: COF1_V22_EDITOR_POLICY mode=") +
+        emit(std::string("RESULT: COF2_V22_EDITOR_POLICY mode=") +
              (runtime.v22_companion_editor_init_enabled
                   ? "validated-companion-initH"
                   : (primary_editor_initializer
@@ -13266,7 +13279,7 @@ int main(int argc,char** argv) {
         emit("RESULT: DYNARMIC_V22_PLATFORMER_WINDOWS_INPUT_READY "
              "mouse=native-touch-id-ownership+host-jump "
              "keyboard=Space,Up,A,D,Left,Right "
-             "editor-playtest=profile-native-button-dispatch "
+             "editor-playtest=LevelEditorLayer-queueButton "
              "button-visuals=UILayer-key-path "
              "buttons=jump:1,left:2,right:3 queueButton="+
              std::to_string(runtime.v22_gjbase_queue_button != 0u)+

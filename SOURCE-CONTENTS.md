@@ -1,4 +1,4 @@
-# Source contents — 0.9.7-cof1
+# Source contents — 0.9.7-cof2
 
 Included:
 
@@ -28,3 +28,5 @@ COF1 source tree.
 
 No APK, IPA, proprietary game `.so`, built EXE/DLL, or save data is included in
 the source archive.
+
+COF2 adds `COF2.md` and keeps `COF1.md` / `COF1-VERIFICATION.txt` as branch history.

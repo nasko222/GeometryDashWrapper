@@ -1,4 +1,4 @@
-# Building Geometry Dash Wrapper 0.9.7-cof1 on Windows
+# Building Geometry Dash Wrapper 0.9.7-cof2 on Windows
 
 Use a fresh extracted COF1 source directory on 64-bit Windows and run:
 
@@ -15,7 +15,7 @@ dist-unified\
 
 The build scripts fetch their pinned public toolchain/dependencies as needed.
 The ARMv7 builder revision for this branch is
-`dynarmic-x64-builder105-0.9.7-cof1`.
+`dynarmic-x64-builder106-0.9.7-cof2`.
 
 Do not reuse a `gdpstweaks16` ARMv7 executable: the point of COF1 is to compile
 out the stock editor reconstruction path and return to the Endurance/companion
