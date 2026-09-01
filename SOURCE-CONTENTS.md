@@ -1,19 +1,14 @@
-# Source contents — 0.9.7-cof3
+# Source contents — 0.9.7-cof4
 
 Included:
 
-- unified native launcher and Windows build scripts;
-- x86, ARM-legacy and ARMv7 backends;
-- shared Windows audio/network/storage/runtime bridges;
-- shared high-resolution FPS cap implementation;
-- Geometry Dash / Lite 1.02-generation native comments hotkey support in ARM-legacy, gated by manifest build identity plus native capability;
-- COF2 late-2023 OOB art clamp and Endurance gameplay/editor routing;
-- GDPS/account/save/network and desktop support code;
-- source/licenses required by the project build.
+- Native launcher and x86/ARM/ARMv7 wrapper source.
+- Shared Windows audio/network/storage/runtime and frame-pacing code.
+- COF2 Endurance-era ARMv7 rollback/fixes.
+- COF3 FPS/VSync selector shared by all backends.
+- COF4 corrected hidden 1.02 comments hotkey using native `InfoLayer::loadPage(0)`.
+- Build scripts and vendored third-party source/licenses.
 
-The retired wrapper-owned stock 2019/2022/2023 editor reconstruction remains
-absent from the active ARMv7 runtime. See the separate COF1 retired-editor backup
-artifact if that historical source is needed.
+Not included:
 
-No APK, IPA, proprietary game `.so`, built EXE/DLL, or save data is included in
-the source archive.
+- APKs, IPAs, extracted proprietary game libraries or Windows build outputs.

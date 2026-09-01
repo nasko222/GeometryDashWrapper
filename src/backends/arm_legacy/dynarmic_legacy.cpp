@@ -1020,6 +1020,8 @@ struct ElfRuntime {
     u32 end_level_on_menu = 0;
     u32 level_info_on_info = 0;
     u32 info_layer_create = 0;
+    u32 info_layer_show = 0;
+    u32 info_layer_load_page = 0;
     u32 game_level_manager_get_level_comments = 0;
     u32 game_level_manager_upload_comment = 0;
     u32 button_sprite_create = 0;
@@ -1575,6 +1577,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.level_info_on_info = address;
             else if (name == "_ZN9InfoLayer6createEP11GJGameLevel")
                 runtime.info_layer_create = address;
+            else if (name == "_ZN9InfoLayer4showEv")
+                runtime.info_layer_show = address;
+            else if (name == "_ZN9InfoLayer8loadPageEi")
+                runtime.info_layer_load_page = address;
             else if (name == "_ZN16GameLevelManager16getLevelCommentsEii")
                 runtime.game_level_manager_get_level_comments = address;
             else if (name == "_ZN16GameLevelManager13uploadCommentEiSs")
@@ -2687,8 +2693,9 @@ public:
 
     bool HasGd102CommentCapability() const {
         return IsGd102CommentBuildIdentity() &&
-               runtime_.level_info_on_info != 0u &&
                runtime_.info_layer_create != 0u &&
+               runtime_.info_layer_show != 0u &&
+               runtime_.info_layer_load_page != 0u &&
                runtime_.game_level_manager_get_level_comments != 0u &&
                runtime_.game_level_manager_upload_comment != 0u;
     }
@@ -2840,13 +2847,46 @@ public:
             return true;
         }
 
-        LogHostDispatch("gd102CommentsHotkey", runtime_.level_info_on_info,
-                        "build=early-102 key=C action=LevelInfoLayer::onInfo");
-        if (!RunFunction(runtime_.level_info_on_info, {level_info}, nullptr,
-                         "LevelInfoLayer::onInfo early-1.02 comments hotkey", 0u,
+        /* LevelInfoLayer::onInfo() is NOT the comments browser in 1.02.
+           It creates InfoLayer and leaves it on setupLevelInfo(), which is the
+           brown description popup. The dormant comments path is InfoLayer::loadPage(0).
+
+           Exact 1.02 ABI (verified from the shipped ARM library):
+             LevelInfoLayer + 0x150 -> GJGameLevel*
+             InfoLayer::create(level)
+             InfoLayer::show()
+             InfoLayer::loadPage(0) -> setupCommentsBrowser(nullptr) ->
+                                       GameLevelManager::getLevelComments(levelID, 0)
+        */
+        if (!env_.IsMapped(level_info + 0x150u, 4u))
+            return Fail("1.02 comments hotkey: LevelInfoLayer level field is unmapped");
+        const u32 level = env_.MemoryRead32(level_info + 0x150u);
+        if (!level || !env_.IsMapped(level, 4u)) {
+            log_ << "RESULT: GD102_COMMENTS_IGNORED reason=no-level\n";
+            log_.flush();
+            return true;
+        }
+
+        u32 info = 0u;
+        LogHostDispatch("gd102CommentsCreate", runtime_.info_layer_create,
+                        "build=early-102 key=C action=InfoLayer::create");
+        if (!RunFunction(runtime_.info_layer_create, {level}, &info,
+                         "InfoLayer::create early-1.02 comments hotkey", 0u,
                          std::chrono::milliseconds(10000)))
             return false;
-        log_ << "RESULT: GD102_COMMENTS_OPENED key=C\n";
+        if (!info || !env_.IsMapped(info, 4u))
+            return Fail("1.02 comments hotkey: InfoLayer::create returned null/invalid");
+
+        if (!RunFunction(runtime_.info_layer_show, {info}, nullptr,
+                         "InfoLayer::show early-1.02 comments hotkey", 0u,
+                         std::chrono::milliseconds(10000)))
+            return false;
+        if (!RunFunction(runtime_.info_layer_load_page, {info, 0u}, nullptr,
+                         "InfoLayer::loadPage(0) early-1.02 comments hotkey", 0u,
+                         std::chrono::milliseconds(10000)))
+            return false;
+
+        log_ << "RESULT: GD102_COMMENTS_OPENED key=C page=0 native-browser=1\n";
         log_.flush();
         return true;
     }
@@ -7739,7 +7779,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-cof3 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-cof4 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
