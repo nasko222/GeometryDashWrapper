@@ -1636,7 +1636,7 @@ int main(int argc, char **argv) {
     (void)gd_enable_application_dpi_awareness();
     if (!gd_settings_i_lost_the_game()) {
         MessageBoxA(NULL,
-                    "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch Geometry Dash Wrapper through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",
+                    "You lost the game. Launch through launch.cmd instead",
                     "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
         return 69;
     }

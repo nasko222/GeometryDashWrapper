@@ -1018,12 +1018,6 @@ struct ElfRuntime {
     u32 ccnode_get_children_count = 0;
     u32 ccarray_object_at_index = 0;
     u32 end_level_on_menu = 0;
-    u32 level_info_on_info = 0;
-    u32 info_layer_create = 0;
-    u32 info_layer_show = 0;
-    u32 info_layer_load_page = 0;
-    u32 game_level_manager_get_level_comments = 0;
-    u32 game_level_manager_upload_comment = 0;
     u32 button_sprite_create = 0;
     u32 ccnode_add_child = 0;
     u32 ccnode_add_child_z = 0;
@@ -1573,18 +1567,6 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccarray_object_at_index = address;
             else if (name == "_ZN13EndLevelLayer6onMenuEv")
                 runtime.end_level_on_menu = address;
-            else if (name == "_ZN14LevelInfoLayer6onInfoEv")
-                runtime.level_info_on_info = address;
-            else if (name == "_ZN9InfoLayer6createEP11GJGameLevel")
-                runtime.info_layer_create = address;
-            else if (name == "_ZN9InfoLayer4showEv")
-                runtime.info_layer_show = address;
-            else if (name == "_ZN9InfoLayer8loadPageEi")
-                runtime.info_layer_load_page = address;
-            else if (name == "_ZN16GameLevelManager16getLevelCommentsEii")
-                runtime.game_level_manager_get_level_comments = address;
-            else if (name == "_ZN16GameLevelManager13uploadCommentEiSs")
-                runtime.game_level_manager_upload_comment = address;
             else if (name == "_ZN12ButtonSprite6createEPKc")
                 runtime.button_sprite_create = address;
             else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_")
@@ -1798,7 +1780,6 @@ enum class HostEventType {
     TextInput,
     DeleteBackward,
     PracticeCheckpoint,
-    OpenComments102,
     EditorCommand,
     ExtrasAction,
     Pause,
@@ -1811,24 +1792,6 @@ struct HostEvent {
     float y = 0.0f;
     u32 value = 0;
 };
-
-static bool IsGd102CommentBuildIdentity() {
-    const char* package_name = std::getenv("GD_GAME_PACKAGE");
-    const char* version_code = std::getenv("GD_GAME_VERSION_CODE");
-    char* end = nullptr;
-    unsigned long code = 0ul;
-    if (!package_name || !version_code || !*version_code) return false;
-    if (std::strcmp(package_name, "com.robtopx.geometryjump") != 0 &&
-        std::strcmp(package_name, "com.robtopx.geometryjumplite") != 0)
-        return false;
-    errno = 0;
-    code = std::strtoul(version_code, &end, 10);
-    if (errno != 0 || end == version_code || !end || *end != '\0') return false;
-    /* The original 1.02 release generation is manifest versionCode 4.
-       Use the numeric build identity rather than versionName text so full and
-       Lite builds from the same generation can share this capability gate. */
-    return code == 4ul;
-}
 
 #ifdef _WIN32
 #ifndef GL_ARRAY_BUFFER
@@ -2104,10 +2067,6 @@ public:
     bool ExtrasTimeMachineAvailable() const {
         return extras_menu_.time_machine_beta_available != 0;
     }
-    void SetComments102Available(bool available) {
-        comments_102_available_ = available;
-    }
-    bool Comments102Available() const { return comments_102_available_; }
     GdExtrasLayout ExtrasLayout() const {
         GdExtrasLayout layout{};
         gd_extras_menu_get_layout(&extras_menu_, native_width_, native_height_, &layout);
@@ -2377,11 +2336,6 @@ private:
                     return 0;
                 }
             }
-            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
-                wparam == 'C' && self->comments_102_available_) {
-                self->Queue(HostEvent{HostEventType::OpenComments102});
-                return 0;
-            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -2508,7 +2462,6 @@ private:
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
     bool text_input_active_ = false;
-    bool comments_102_available_ = false;
     bool fullscreen_ = false;
     bool resize_pending_ = true;
     bool have_guest_viewport_ = false;
@@ -2559,8 +2512,6 @@ public:
     bool ExtrasOverlayOpen() const { return false; }
     bool ExtrasEarlyFullVersion() const { return false; }
     bool ExtrasTimeMachineAvailable() const { return false; }
-    void SetComments102Available(bool) {}
-    bool Comments102Available() const { return false; }
     GdExtrasLayout ExtrasLayout() const { return GdExtrasLayout{}; }
     void SetTextInputActive(bool) {}
     void RequestClose() {}
@@ -2691,22 +2642,9 @@ public:
         }
     }
 
-    bool HasGd102CommentCapability() const {
-        return IsGd102CommentBuildIdentity() &&
-               runtime_.info_layer_create != 0u &&
-               runtime_.info_layer_show != 0u &&
-               runtime_.info_layer_load_page != 0u &&
-               runtime_.game_level_manager_get_level_comments != 0u &&
-               runtime_.game_level_manager_upload_comment != 0u;
-    }
-
     bool CreateOpenGlWindow(int width, int height) {
         native_width_ = width;
         native_height_ = height;
-        gl_.SetComments102Available(HasGd102CommentCapability());
-        log_ << "RESULT: GD102_COMMENTS_CAPABILITY build-id="
-             << (IsGd102CommentBuildIdentity() ? "early-102" : "other")
-             << " native=" << (HasGd102CommentCapability() ? 1 : 0) << '\n';
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
@@ -2818,76 +2756,6 @@ public:
                          std::chrono::milliseconds(10000)))
             return false;
         handled = true;
-        return true;
-    }
-
-    bool Open102Comments() {
-        if (!HasGd102CommentCapability()) return true;
-
-        u32 scene = 0u;
-        if (!ResolveRunningScene(scene)) return false;
-        if (!scene) return true;
-
-        /* Do not stack another browser while the native InfoLayer is already open.
-           Itanium RTTI stores InfoLayer as "9InfoLayer"; using the length prefix
-           avoids accidentally matching LevelInfoLayer itself. */
-        u32 comments_info = 0u;
-        unsigned visited = 0u;
-        if (!FindSceneNodeByType(scene, "9InfoLayer", comments_info, 0u, visited))
-            return false;
-        if (comments_info) return true;
-
-        u32 level_info = 0u;
-        visited = 0u;
-        if (!FindSceneNodeByType(scene, "LevelInfoLayer", level_info, 0u, visited))
-            return false;
-        if (!level_info) {
-            log_ << "RESULT: GD102_COMMENTS_IGNORED reason=no-LevelInfoLayer\n";
-            log_.flush();
-            return true;
-        }
-
-        /* LevelInfoLayer::onInfo() is NOT the comments browser in 1.02.
-           It creates InfoLayer and leaves it on setupLevelInfo(), which is the
-           brown description popup. The dormant comments path is InfoLayer::loadPage(0).
-
-           Exact 1.02 ABI (verified from the shipped ARM library):
-             LevelInfoLayer + 0x150 -> GJGameLevel*
-             InfoLayer::create(level)
-             InfoLayer::show()
-             InfoLayer::loadPage(0) -> setupCommentsBrowser(nullptr) ->
-                                       GameLevelManager::getLevelComments(levelID, 0)
-        */
-        if (!env_.IsMapped(level_info + 0x150u, 4u))
-            return Fail("1.02 comments hotkey: LevelInfoLayer level field is unmapped");
-        const u32 level = env_.MemoryRead32(level_info + 0x150u);
-        if (!level || !env_.IsMapped(level, 4u)) {
-            log_ << "RESULT: GD102_COMMENTS_IGNORED reason=no-level\n";
-            log_.flush();
-            return true;
-        }
-
-        u32 info = 0u;
-        LogHostDispatch("gd102CommentsCreate", runtime_.info_layer_create,
-                        "build=early-102 key=C action=InfoLayer::create");
-        if (!RunFunction(runtime_.info_layer_create, {level}, &info,
-                         "InfoLayer::create early-1.02 comments hotkey", 0u,
-                         std::chrono::milliseconds(10000)))
-            return false;
-        if (!info || !env_.IsMapped(info, 4u))
-            return Fail("1.02 comments hotkey: InfoLayer::create returned null/invalid");
-
-        if (!RunFunction(runtime_.info_layer_show, {info}, nullptr,
-                         "InfoLayer::show early-1.02 comments hotkey", 0u,
-                         std::chrono::milliseconds(10000)))
-            return false;
-        if (!RunFunction(runtime_.info_layer_load_page, {info, 0u}, nullptr,
-                         "InfoLayer::loadPage(0) early-1.02 comments hotkey", 0u,
-                         std::chrono::milliseconds(10000)))
-            return false;
-
-        log_ << "RESULT: GD102_COMMENTS_OPENED key=C page=0 native-browser=1\n";
-        log_.flush();
         return true;
     }
 
@@ -7779,7 +7647,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-cof4 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-cof5 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7918,7 +7786,7 @@ int main(int argc,char** argv) {
     if (!gd_settings_i_lost_the_game()) {
 #ifdef _WIN32
         MessageBoxA(nullptr,
-                    "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",
+                    "You lost the game. Launch through launch.cmd instead",
                     "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
 #endif
         return 69;
@@ -8249,9 +8117,6 @@ int main(int argc,char** argv) {
                 case HostEventType::PracticeCheckpoint:
                     if(!native_paused)
                         ok=executor.SendPracticeCheckpoint(event.value != 0u);
-                    break;
-                case HostEventType::OpenComments102:
-                    if(!native_paused) ok=executor.Open102Comments();
                     break;
                 case HostEventType::EditorCommand:
                     if(!native_paused) ok=executor.SendEditorCommand(event.value);

@@ -12508,7 +12508,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-cof4 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-cof5 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12735,7 +12735,7 @@ int main(int argc,char** argv) {
     (void)gd_enable_application_dpi_awareness();
     if (!gd_settings_i_lost_the_game()) {
 #ifdef _WIN32
-        MessageBoxA(nullptr, "I_LOST_THE_GAME is false. You lost the game.\n\nLaunch through a RUN_AUTO batch file.", "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
+        MessageBoxA(nullptr, "You lost the game. Launch through launch.cmd instead", "Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
 #endif
         return 69;
     }

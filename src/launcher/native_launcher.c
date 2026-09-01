@@ -40,7 +40,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-cof4"
+#define LAUNCHER_VERSION "0.9.7-cof5"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -1097,7 +1097,7 @@ int wmain(int argc, wchar_t **argv) {
     LauncherContext context;
     if (!GetBooleanSetting(L"I_LOST_THE_GAME", 0)) {
         MessageBoxW(NULL,
-                    L"I_LOST_THE_GAME is false. You lost the game.\n\nLaunch this through RUN_AUTO_GDPS.cmd or RUN_AUTO_BOOMLINGS.cmd.",
+                    L"You lost the game. Launch through launch.cmd instead",
                     L"Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
         return 69;
     }
@@ -1121,13 +1121,6 @@ int wmain(int argc, wchar_t **argv) {
         if (Utf8ToWide(context.metadata.version_name, version_wide,
                        ARRAY_COUNT(version_wide))) {
             SetEnvironmentVariableW(L"GD_GAME_VERSION", version_wide);
-        }
-    }
-    {
-        wchar_t version_code_wide[MAX_UTF8_TEXT];
-        if (Utf8ToWide(context.metadata.version_code, version_code_wide,
-                       ARRAY_COUNT(version_code_wide))) {
-            SetEnvironmentVariableW(L"GD_GAME_VERSION_CODE", version_code_wide);
         }
     }
     SetEnvironmentVariableW(L"GD_X86_API_CONNECT_MODE",
