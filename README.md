@@ -1,41 +1,52 @@
-# Geometry Dash Wrapper 0.9.7-cof2
+# Geometry Dash Wrapper 0.9.7-cof3
 
-`cof2` means **Cleanup Optimization Fixes 2**. It keeps the COF1 cleanup and fixes two ARMv7 regressions found in Windows testing.
+`cof3` means **Cleanup Optimization Fixes 3**. It builds directly on COF2 and
+keeps the cleaned-up Endurance/companion handling for the modded 2023 beta.
 
-This branch deliberately ends the wrapper-owned stock 2.2 beta editor experiment.
-The ARMv7 backend no longer tries to fabricate the missing editor runtime shipped
-as four-byte stubs in the reduced 2019/2022/2023 APKs.
+## COF3 additions
+
+### Geometry Dash 1.02 comments
+
+Only the **Geometry Dash / Geometry Dash Lite 1.02 release generation** gets the new comments shortcut. Detection uses the
+manifest build generation plus the native comment capability rather than a
+literal `"1.02"` version-name comparison. On its normal level information
+screen, press **C** to call the game's own `LevelInfoLayer::onInfo()` and open
+the original native comments browser.
+
+The accepted package families are `com.robtopx.geometryjump` and
+`com.robtopx.geometryjumplite`; the 1.02 release generation is manifest
+versionCode 4 and must also expose the native comment functions. 1.0 and 1.1+
+do not get the hotkey. No dislike control is added.
+
+### FPS / VSync
+
+Both launch scripts now default to:
+
+```bat
+set "FPS=VSYNC"
+```
+
+You can replace it with a numeric cap, for example:
+
+```bat
+set "FPS=144"
+set "FPS=240"
+set "FPS=9999"
+```
+
+- `FPS=VSYNC`: swap interval 1, no numeric host cap.
+- numeric FPS: swap interval 0, high-resolution host cap at that FPS.
+- valid numeric range: 1-10000.
+- invalid/missing values fall back to VSYNC.
+
+The setting applies consistently to x86, ARM-legacy and ARMv7.
 
 ## ARMv7 2.2 policy
 
-- The modded/selected 2023 beta uses the old Endurance/Bringup capability path:
-  `LevelEditorLayer::create` -> validated `LevelEditorLayerExt::initH` from the
-  APK's own compatible `libgame.so` -> normal Cocos scene.
-- The EnduranceTest10 editor visibility, song-guide/BPM overlay, background,
-  blend, platformer input and editor-entry handlers are restored exactly.
-- No global `libgame.so` constructors or `ApplyHooks` pass is run. Only the
-  validated editor capability is used.
-- Stock 2019/2022/2023 editor stubs are intentionally **not repaired by the
-  wrapper**. Their normal gameplay may still run, but editor support should be
-  provided later by an APK-side mod/compatible companion rather than host-side
-  object reconstruction.
-- ARMv7 wrapper-owned W/A/S/D/Q/E editor movement/rotation injection is removed.
-  Editor keyboard behavior belongs to the game/companion; A/D remain normal
-  platformer controls.
-
-## Preserved backends and fixes
-
-The x86 backend is carried byte-for-byte from the accepted `gdpstweaks16`
-source. The legacy ARM backend is also carried forward; only its displayed
-version string changes to `0.9.7-cof2`.
-
-The shared Windows audio implementation is byte-for-byte unchanged, preserving
-the confirmed internal SFX/master-volume behavior that does not move the
-Windows Volume Mixer.
-
-Existing GDPS/network, save, launcher, DPI, graphics, FULL_BYPASS and other
-non-editor functionality remains in the unified source unless specifically
-noted in `COF1.md`.
+The COF1/COF2 cleanup remains unchanged: the wrapper does **not** fabricate the
+stock 2019/2022/2023 2.2 editor runtime. The modded/selected 2023 beta uses its
+validated APK-provided `LevelEditorLayerExt::initH` companion path, with the
+Endurance-era gameplay/editor fixes retained.
 
 ## Build
 
@@ -45,16 +56,7 @@ On 64-bit Windows run:
 BUILD_ALL.cmd
 ```
 
-The complete unified output is written to `dist-unified\`.
-Drag an APK onto `RUN_AUTO_GDPS.cmd` or `RUN_AUTO_BOOMLINGS.cmd`.
+Output is written to `dist-unified\`. Drag an APK onto `RUN_AUTO_GDPS.cmd` or
+`RUN_AUTO_BOOMLINGS.cmd`.
 
-The source package contains no APK, no extracted proprietary `.so`, and no
-prebuilt game binary.
-
-## COF2 regression fixes
-
-- Restores EnduranceTest10 `GameManager +0x168` active-layer resolution for platformer keyboard input and gameplay Edit callbacks.
-- Installs the verified 18-ground / 26-background OOB clamp independently of editor companion detection.
-- Does not restore wrapper-owned stock 2.2 editor reconstruction.
-
-See `COF2.md` for details.
+See `COF1.md`, `COF2.md`, and `COF3.md` for branch details.

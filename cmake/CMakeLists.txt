@@ -43,6 +43,7 @@ set(GD_SHARED_SOURCES
     "${GD_ROOT}/src/shared/embedded_effects_stub.c"
     "${GD_ROOT}/src/shared/net_compat_win.c"
     "${GD_ROOT}/src/shared/runtime_settings.c"
+    "${GD_ROOT}/src/shared/frame_pacing_win.c"
     "${GD_ROOT}/src/shared/extras_menu_win.c"
     "${GD_ROOT}/src/shared/song_http_win.c"
     "${GD_ROOT}/src/shared/window_icon_win.c"

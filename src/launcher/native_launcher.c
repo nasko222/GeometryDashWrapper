@@ -40,7 +40,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-cof2"
+#define LAUNCHER_VERSION "0.9.7-cof3"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -737,6 +737,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t full_bypass[64];
     wchar_t highest[64];
     wchar_t pulse[64];
+    wchar_t fps[64];
     wchar_t isolated_saves[64];
     wchar_t network_mode[64];
     wchar_t lost_game[64];
@@ -774,6 +775,8 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"FORCE_HIGHEST_GRAPHICS", L"true", highest, ARRAY_COUNT(highest)));
     fwprintf(file, L"music_pulse_max=%ls\n",
              GetSetting(L"MUSIC_PULSE_MAX", L"0.30", pulse, ARRAY_COUNT(pulse)));
+    fwprintf(file, L"fps=%ls\n",
+             GetSetting(L"FPS", L"VSYNC", fps, ARRAY_COUNT(fps)));
     fwprintf(file, L"version_isolated_saves=%ls\n",
              GetSetting(L"VERSION_ISOLATED_SAVES", L"true", isolated_saves,
                         ARRAY_COUNT(isolated_saves)));
@@ -1118,6 +1121,13 @@ int wmain(int argc, wchar_t **argv) {
         if (Utf8ToWide(context.metadata.version_name, version_wide,
                        ARRAY_COUNT(version_wide))) {
             SetEnvironmentVariableW(L"GD_GAME_VERSION", version_wide);
+        }
+    }
+    {
+        wchar_t version_code_wide[MAX_UTF8_TEXT];
+        if (Utf8ToWide(context.metadata.version_code, version_code_wide,
+                       ARRAY_COUNT(version_code_wide))) {
+            SetEnvironmentVariableW(L"GD_GAME_VERSION_CODE", version_code_wide);
         }
     }
     SetEnvironmentVariableW(L"GD_X86_API_CONNECT_MODE",

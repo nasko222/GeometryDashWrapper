@@ -14,6 +14,7 @@
 #include "runtime.h"
 #include "build_info.h"
 #include "runtime_settings.h"
+#include "frame_pacing_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "win_dpi.h"
@@ -131,8 +132,8 @@ typedef struct {
     int editor_hotkey_negative_cached;
     GdExtrasMenu extras_menu;
     uint32_t practice_mode_offset;
-    LARGE_INTEGER frame_clock_frequency;
-    LONGLONG next_frame_deadline;
+    GdFramePacer frame_pacer;
+    double fps_limit;
 } GameHost;
 
 static GameHost g_host;
@@ -1109,45 +1110,7 @@ static int send_practice_checkpoint_hotkey(int place) {
 }
 
 static void pace_x86_frame(void) {
-    LARGE_INTEGER now;
-    double interval = jni_shim_frame_interval();
-    LONGLONG interval_ticks;
-
-    /* Broken clients occasionally report zero or absurd values. */
-    if (interval < 1.0 / 240.0 || interval > 1.0 / 20.0)
-        interval = 1.0 / 60.0;
-    if (!g_host.frame_clock_frequency.QuadPart &&
-        !QueryPerformanceFrequency(&g_host.frame_clock_frequency))
-        return;
-    QueryPerformanceCounter(&now);
-    interval_ticks = (LONGLONG)(
-        interval * (double)g_host.frame_clock_frequency.QuadPart + 0.5);
-    if (interval_ticks < 1) interval_ticks = 1;
-
-    if (!g_host.next_frame_deadline) {
-        /* Let the first SwapBuffers establish the display's phase. */
-        g_host.next_frame_deadline = now.QuadPart;
-        return;
-    }
-    if (now.QuadPart >
-        g_host.next_frame_deadline + interval_ticks * 3) {
-        g_host.next_frame_deadline = now.QuadPart;
-    }
-    g_host.next_frame_deadline += interval_ticks;
-
-    for (;;) {
-        double remaining_ms;
-        QueryPerformanceCounter(&now);
-        if (now.QuadPart >= g_host.next_frame_deadline) break;
-        remaining_ms =
-            (double)(g_host.next_frame_deadline - now.QuadPart) * 1000.0 /
-            (double)g_host.frame_clock_frequency.QuadPart;
-        if (remaining_ms > 2.0) {
-            Sleep((DWORD)(remaining_ms - 1.0));
-        } else {
-            SwitchToThread();
-        }
-    }
+    gd_frame_pacer_wait(&g_host.frame_pacer);
 }
 
 static void pause_native_game(const char *reason) {
@@ -1554,12 +1517,22 @@ static int create_opengl_window(int client_width, int client_height) {
         return 0;
     }
     update_display_size(g_host.window);
+    g_host.fps_limit = gd_settings_fps_limit();
     swap_interval = (SwapIntervalFunction)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval) {
-        g_host.vsync_enabled = swap_interval(1) != FALSE;
+    if (gd_settings_fps_vsync()) {
+        if (swap_interval) g_host.vsync_enabled = swap_interval(1) != FALSE;
+        if (!g_host.vsync_enabled) {
+            /* Preserve a sane fallback if the driver has no swap-control extension. */
+            gd_frame_pacer_init(&g_host.frame_pacer, 60.0);
+        }
+        runtime_log("Frame pacing: FPS=VSYNC swap-interval=%s",
+                    g_host.vsync_enabled ? "1" : "unavailable; fallback=60");
+    } else {
+        if (swap_interval) (void)swap_interval(0);
+        gd_frame_pacer_init(&g_host.frame_pacer, g_host.fps_limit);
+        runtime_log("Frame pacing: FPS=%.3f swap-interval=0 host-cap=enabled",
+                    g_host.fps_limit);
     }
-    runtime_log("Frame pacing: swap-interval=%s jni-deadline-scheduler=enabled",
-                g_host.vsync_enabled ? "1" : "unavailable");
     runtime_log("OpenGL vendor: %s", glGetString(GL_VENDOR));
     runtime_log("OpenGL renderer: %s", glGetString(GL_RENDERER));
     runtime_log("OpenGL version: %s", glGetString(GL_VERSION));
@@ -1569,6 +1542,7 @@ static int create_opengl_window(int client_width, int client_height) {
 }
 
 static void destroy_opengl_window(void) {
+    gd_frame_pacer_destroy(&g_host.frame_pacer);
     gd_extras_menu_destroy(&g_host.extras_menu);
     if (g_host.context) {
         wglMakeCurrent(NULL, NULL);
@@ -1646,6 +1620,7 @@ static int run_message_loop(void) {
              */
             pace_x86_frame();
         } else {
+            gd_frame_pacer_reset(&g_host.frame_pacer);
             /* Do not alternate stale front/back buffers while the app is
                inactive. This also avoids advancing the game behind a pause. */
             Sleep(16);

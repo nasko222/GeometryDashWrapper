@@ -20,6 +20,10 @@ int gd_settings_extras_menu(void);
 int gd_settings_v22_exact_editor_visibility(void);
 float gd_settings_music_pulse_max(void);
 
+/* FPS=VSYNC (default) enables swap-interval 1. Numeric FPS disables vsync and caps the host render loop. */
+int gd_settings_fps_vsync(void);
+double gd_settings_fps_limit(void);
+
 /* Returns the configured GDPS base, or the official default. */
 const char *gd_settings_server(void);
 

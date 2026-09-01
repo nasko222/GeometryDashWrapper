@@ -69,6 +69,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "frame_pacing_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "build_info.h"
@@ -3208,13 +3209,26 @@ public:
         InitializeGpuProfiler();
 
         using SwapInterval = BOOL (WINAPI*)(int);
-        if (auto* swap = reinterpret_cast<SwapInterval>(Resolve("wglSwapIntervalEXT"))) swap(1);
+        const double fps_limit = gd_settings_fps_limit();
+        auto* swap = reinterpret_cast<SwapInterval>(Resolve("wglSwapIntervalEXT"));
+        if (gd_settings_fps_vsync()) {
+            const bool enabled = swap && swap(1) != FALSE;
+            if (!enabled) gd_frame_pacer_init(&frame_pacer_, 60.0);
+            log << "RESULT: FRAME_PACING mode=VSYNC swap-interval="
+                << (enabled ? "1" : "unavailable fallback=60") << '\n';
+        } else {
+            if (swap) (void)swap(0);
+            gd_frame_pacer_init(&frame_pacer_, fps_limit);
+            log << "RESULT: FRAME_PACING mode=CAP fps=" << fps_limit
+                << " swap-interval=0\n";
+        }
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         return true;
     }
 
     void Destroy() {
+        gd_frame_pacer_destroy(&frame_pacer_);
         gd_extras_menu_destroy(&extras_menu_);
         DestroyGpuProfiler();
         if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
@@ -3325,6 +3339,7 @@ public:
             resize_pending_ = false;
         }
         if (device_) SwapBuffers(device_);
+        gd_frame_pacer_wait(&frame_pacer_);
     }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -3779,6 +3794,7 @@ private:
     float last_x_ = 0.0f;
     float last_y_ = 0.0f;
     GdExtrasMenu extras_menu_{};
+    GdFramePacer frame_pacer_{};
     std::deque<HostEvent> events_;
     std::unordered_map<std::string, void*> functions_;
     bool gpu_profiler_ready_ = false;
@@ -12492,7 +12508,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-cof2 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-cof3 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';

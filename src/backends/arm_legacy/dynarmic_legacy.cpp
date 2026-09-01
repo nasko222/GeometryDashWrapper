@@ -59,6 +59,7 @@ extern "C" {
 #include "audio_win.h"
 #include "net_compat_win.h"
 #include "runtime_settings.h"
+#include "frame_pacing_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "win_dpi.h"
@@ -1017,6 +1018,10 @@ struct ElfRuntime {
     u32 ccnode_get_children_count = 0;
     u32 ccarray_object_at_index = 0;
     u32 end_level_on_menu = 0;
+    u32 level_info_on_info = 0;
+    u32 info_layer_create = 0;
+    u32 game_level_manager_get_level_comments = 0;
+    u32 game_level_manager_upload_comment = 0;
     u32 button_sprite_create = 0;
     u32 ccnode_add_child = 0;
     u32 ccnode_add_child_z = 0;
@@ -1566,6 +1571,14 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccarray_object_at_index = address;
             else if (name == "_ZN13EndLevelLayer6onMenuEv")
                 runtime.end_level_on_menu = address;
+            else if (name == "_ZN14LevelInfoLayer6onInfoEv")
+                runtime.level_info_on_info = address;
+            else if (name == "_ZN9InfoLayer6createEP11GJGameLevel")
+                runtime.info_layer_create = address;
+            else if (name == "_ZN16GameLevelManager16getLevelCommentsEii")
+                runtime.game_level_manager_get_level_comments = address;
+            else if (name == "_ZN16GameLevelManager13uploadCommentEiSs")
+                runtime.game_level_manager_upload_comment = address;
             else if (name == "_ZN12ButtonSprite6createEPKc")
                 runtime.button_sprite_create = address;
             else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_")
@@ -1779,6 +1792,7 @@ enum class HostEventType {
     TextInput,
     DeleteBackward,
     PracticeCheckpoint,
+    OpenComments102,
     EditorCommand,
     ExtrasAction,
     Pause,
@@ -1791,6 +1805,24 @@ struct HostEvent {
     float y = 0.0f;
     u32 value = 0;
 };
+
+static bool IsGd102CommentBuildIdentity() {
+    const char* package_name = std::getenv("GD_GAME_PACKAGE");
+    const char* version_code = std::getenv("GD_GAME_VERSION_CODE");
+    char* end = nullptr;
+    unsigned long code = 0ul;
+    if (!package_name || !version_code || !*version_code) return false;
+    if (std::strcmp(package_name, "com.robtopx.geometryjump") != 0 &&
+        std::strcmp(package_name, "com.robtopx.geometryjumplite") != 0)
+        return false;
+    errno = 0;
+    code = std::strtoul(version_code, &end, 10);
+    if (errno != 0 || end == version_code || !end || *end != '\0') return false;
+    /* The original 1.02 release generation is manifest versionCode 4.
+       Use the numeric build identity rather than versionName text so full and
+       Lite builds from the same generation can share this capability gate. */
+    return code == 4ul;
+}
 
 #ifdef _WIN32
 #ifndef GL_ARRAY_BUFFER
@@ -1890,13 +1922,26 @@ public:
         InitializeGpuProfiler();
 
         using SwapInterval = BOOL (WINAPI*)(int);
-        if (auto* swap = reinterpret_cast<SwapInterval>(Resolve("wglSwapIntervalEXT"))) swap(1);
+        const double fps_limit = gd_settings_fps_limit();
+        auto* swap = reinterpret_cast<SwapInterval>(Resolve("wglSwapIntervalEXT"));
+        if (gd_settings_fps_vsync()) {
+            const bool enabled = swap && swap(1) != FALSE;
+            if (!enabled) gd_frame_pacer_init(&frame_pacer_, 60.0);
+            log << "RESULT: FRAME_PACING mode=VSYNC swap-interval="
+                << (enabled ? "1" : "unavailable fallback=60") << '\n';
+        } else {
+            if (swap) (void)swap(0);
+            gd_frame_pacer_init(&frame_pacer_, fps_limit);
+            log << "RESULT: FRAME_PACING mode=CAP fps=" << fps_limit
+                << " swap-interval=0\n";
+        }
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         return true;
     }
 
     void Destroy() {
+        gd_frame_pacer_destroy(&frame_pacer_);
         gd_extras_menu_destroy(&extras_menu_);
         DestroyGpuProfiler();
         if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
@@ -2003,6 +2048,7 @@ public:
             resize_pending_ = false;
         }
         if (device_) SwapBuffers(device_);
+        gd_frame_pacer_wait(&frame_pacer_);
     }
     void BeginGpuFrame(u64 frame) {
         PollGpuProfiler();
@@ -2052,6 +2098,10 @@ public:
     bool ExtrasTimeMachineAvailable() const {
         return extras_menu_.time_machine_beta_available != 0;
     }
+    void SetComments102Available(bool available) {
+        comments_102_available_ = available;
+    }
+    bool Comments102Available() const { return comments_102_available_; }
     GdExtrasLayout ExtrasLayout() const {
         GdExtrasLayout layout{};
         gd_extras_menu_get_layout(&extras_menu_, native_width_, native_height_, &layout);
@@ -2321,6 +2371,11 @@ private:
                     return 0;
                 }
             }
+            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
+                wparam == 'C' && self->comments_102_available_) {
+                self->Queue(HostEvent{HostEventType::OpenComments102});
+                return 0;
+            }
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -2447,6 +2502,7 @@ private:
     bool mouse_down_ = false;
     bool keyboard_down_ = false;
     bool text_input_active_ = false;
+    bool comments_102_available_ = false;
     bool fullscreen_ = false;
     bool resize_pending_ = true;
     bool have_guest_viewport_ = false;
@@ -2461,6 +2517,7 @@ private:
     float last_x_ = 0.0f;
     float last_y_ = 0.0f;
     GdExtrasMenu extras_menu_{};
+    GdFramePacer frame_pacer_{};
     std::deque<HostEvent> events_;
     std::unordered_map<std::string, void*> functions_;
     bool gpu_profiler_ready_ = false;
@@ -2496,6 +2553,8 @@ public:
     bool ExtrasOverlayOpen() const { return false; }
     bool ExtrasEarlyFullVersion() const { return false; }
     bool ExtrasTimeMachineAvailable() const { return false; }
+    void SetComments102Available(bool) {}
+    bool Comments102Available() const { return false; }
     GdExtrasLayout ExtrasLayout() const { return GdExtrasLayout{}; }
     void SetTextInputActive(bool) {}
     void RequestClose() {}
@@ -2626,9 +2685,21 @@ public:
         }
     }
 
+    bool HasGd102CommentCapability() const {
+        return IsGd102CommentBuildIdentity() &&
+               runtime_.level_info_on_info != 0u &&
+               runtime_.info_layer_create != 0u &&
+               runtime_.game_level_manager_get_level_comments != 0u &&
+               runtime_.game_level_manager_upload_comment != 0u;
+    }
+
     bool CreateOpenGlWindow(int width, int height) {
         native_width_ = width;
         native_height_ = height;
+        gl_.SetComments102Available(HasGd102CommentCapability());
+        log_ << "RESULT: GD102_COMMENTS_CAPABILITY build-id="
+             << (IsGd102CommentBuildIdentity() ? "early-102" : "other")
+             << " native=" << (HasGd102CommentCapability() ? 1 : 0) << '\n';
         return gl_.Create(width, height, log_);
     }
     bool PumpMessages() { return gl_.PumpMessages(); }
@@ -2740,6 +2811,43 @@ public:
                          std::chrono::milliseconds(10000)))
             return false;
         handled = true;
+        return true;
+    }
+
+    bool Open102Comments() {
+        if (!HasGd102CommentCapability()) return true;
+
+        u32 scene = 0u;
+        if (!ResolveRunningScene(scene)) return false;
+        if (!scene) return true;
+
+        /* Do not stack another browser while the native InfoLayer is already open.
+           Itanium RTTI stores InfoLayer as "9InfoLayer"; using the length prefix
+           avoids accidentally matching LevelInfoLayer itself. */
+        u32 comments_info = 0u;
+        unsigned visited = 0u;
+        if (!FindSceneNodeByType(scene, "9InfoLayer", comments_info, 0u, visited))
+            return false;
+        if (comments_info) return true;
+
+        u32 level_info = 0u;
+        visited = 0u;
+        if (!FindSceneNodeByType(scene, "LevelInfoLayer", level_info, 0u, visited))
+            return false;
+        if (!level_info) {
+            log_ << "RESULT: GD102_COMMENTS_IGNORED reason=no-LevelInfoLayer\n";
+            log_.flush();
+            return true;
+        }
+
+        LogHostDispatch("gd102CommentsHotkey", runtime_.level_info_on_info,
+                        "build=early-102 key=C action=LevelInfoLayer::onInfo");
+        if (!RunFunction(runtime_.level_info_on_info, {level_info}, nullptr,
+                         "LevelInfoLayer::onInfo early-1.02 comments hotkey", 0u,
+                         std::chrono::milliseconds(10000)))
+            return false;
+        log_ << "RESULT: GD102_COMMENTS_OPENED key=C\n";
+        log_.flush();
         return true;
     }
 
@@ -7631,7 +7739,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-cof2 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-cof3 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8101,6 +8209,9 @@ int main(int argc,char** argv) {
                 case HostEventType::PracticeCheckpoint:
                     if(!native_paused)
                         ok=executor.SendPracticeCheckpoint(event.value != 0u);
+                    break;
+                case HostEventType::OpenComments102:
+                    if(!native_paused) ok=executor.Open102Comments();
                     break;
                 case HostEventType::EditorCommand:
                     if(!native_paused) ok=executor.SendEditorCommand(event.value);

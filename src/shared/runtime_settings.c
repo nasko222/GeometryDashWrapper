@@ -159,6 +159,28 @@ float gd_settings_music_pulse_max(void) {
     return gd_setting_float("MUSIC_PULSE_MAX", 0.30f, 0.0f, 1.0f);
 }
 
+int gd_settings_fps_vsync(void) {
+    const char *value = getenv("FPS");
+    char *end = NULL;
+    double parsed;
+    if (!value || !*value || ascii_equal_ci(value, "vsync")) return 1;
+    parsed = strtod(value, &end);
+    if (end == value || *end != 0 || parsed != parsed || parsed < 1.0 || parsed > 10000.0)
+        return 1;
+    return 0;
+}
+
+double gd_settings_fps_limit(void) {
+    const char *value = getenv("FPS");
+    char *end = NULL;
+    double parsed;
+    if (!value || !*value || ascii_equal_ci(value, "vsync")) return 0.0;
+    parsed = strtod(value, &end);
+    if (end == value || *end != 0 || parsed != parsed || parsed < 1.0 || parsed > 10000.0)
+        return 0.0;
+    return parsed;
+}
+
 const char *gd_settings_server(void) {
     const char *value = getenv("GDPS_SERVER");
     return value && *value ? value : GD_DEFAULT_SERVER;
