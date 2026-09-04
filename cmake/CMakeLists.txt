@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashWrapperUnified7Fix5 LANGUAGES C CXX)
+project(GeometryDashWrapperNewEra1 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -90,4 +90,3 @@ gd_add_dynarmic_backend(
     "GeometryDashArmV7"
     "${GD_ROOT}/src/backends/armv7"
 )
-

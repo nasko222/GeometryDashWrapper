@@ -76,14 +76,14 @@ static char *g_optarg;
 static int g_optind = 1;
 static uint32_t g_lcg_state = 1;
 
-static int g_display_native_width = 1280;
-static int g_display_native_height = 720;
-static int g_display_client_width = 1280;
-static int g_display_client_height = 720;
+static int g_display_native_width = 1140;
+static int g_display_native_height = 640;
+static int g_display_client_width = 1140;
+static int g_display_client_height = 640;
 static int g_have_guest_viewport;
 static int g_have_guest_scissor;
-static int g_guest_viewport[4] = {0, 0, 1280, 720};
-static int g_guest_scissor[4] = {0, 0, 1280, 720};
+static int g_guest_viewport[4] = {0, 0, 1140, 640};
+static int g_guest_scissor[4] = {0, 0, 1140, 640};
 
 static void scale_display_rect(int x, int y, int width, int height,
                                int *scaled_x, int *scaled_y,

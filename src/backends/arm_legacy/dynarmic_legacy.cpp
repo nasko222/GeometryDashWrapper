@@ -1008,6 +1008,8 @@ struct ElfRuntime {
     u32 editor_move_edit_command = 0;
     u32 editor_transform_object_call = 0;
     u32 editor_transform_edit_command = 0;
+    u32 editor_pause_layer_create = 0;
+    u32 editor_pause_layer_save_and_test = 0;
     u32 level_tools_get_level = 0;
     u32 gj_game_level_create = 0;
     u32 play_layer_scene = 0;
@@ -1547,6 +1549,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.editor_transform_object_call = address;
             else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand")
                 runtime.editor_transform_edit_command = address;
+            else if (name == "_ZN16EditorPauseLayer6createEP16LevelEditorLayer")
+                runtime.editor_pause_layer_create = address;
+            else if (name == "_ZN16EditorPauseLayer13onSaveAndTestEv")
+                runtime.editor_pause_layer_save_and_test = address;
             else if (name == "_ZN10LevelTools8getLevelEi")
                 runtime.level_tools_get_level = address;
             else if (name == "_ZN11GJGameLevel6createEv")
@@ -1781,6 +1787,7 @@ enum class HostEventType {
     DeleteBackward,
     PracticeCheckpoint,
     EditorCommand,
+    OldVersionPlaytest,
     ExtrasAction,
     Pause,
     Resume
@@ -1791,9 +1798,32 @@ struct HostEvent {
     float x = 0.0f;
     float y = 0.0f;
     u32 value = 0;
+    std::string text;
 };
 
 #ifdef _WIN32
+static std::string ClipboardTextUtf8(HWND window) {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(window))
+        return {};
+    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t* wide = handle
+        ? static_cast<const wchar_t*>(GlobalLock(handle)) : nullptr;
+    std::string result;
+    if (wide && *wide) {
+        const int length = WideCharToMultiByte(
+            CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+        if (length > 1) {
+            result.resize(static_cast<std::size_t>(length));
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, result.data(), length,
+                                nullptr, nullptr);
+            result.resize(static_cast<std::size_t>(length - 1));
+        }
+    }
+    if (wide) GlobalUnlock(handle);
+    CloseClipboard();
+    return result;
+}
+
 #ifndef GL_ARRAY_BUFFER
 #define GL_ARRAY_BUFFER 0x8892
 #endif
@@ -2321,6 +2351,19 @@ private:
             break;
         }
         case WM_KEYDOWN:
+            if (!(lparam & (1L << 30)) && self->text_input_active_ &&
+                (GetKeyState(VK_CONTROL) & 0x8000) && wparam == 'V') {
+                HostEvent event;
+                event.type = HostEventType::TextInput;
+                event.text = ClipboardTextUtf8(window);
+                if (!event.text.empty()) self->Queue(std::move(event));
+                return 0;
+            }
+            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
+                wparam == VK_F5 && gd_settings_old_ver_playtest()) {
+                self->Queue(HostEvent{HostEventType::OldVersionPlaytest});
+                return 0;
+            }
             if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
                 gd_settings_editor_controls()) {
                 const bool small = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2469,10 +2512,10 @@ private:
     LONG_PTR windowed_style_ = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
     LONG_PTR windowed_ex_style_ = 0;
     WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
-    std::array<GLint, 4> guest_viewport_{0, 0, 1280, 720};
-    std::array<GLint, 4> guest_scissor_{0, 0, 1280, 720};
-    int native_width_ = 1280;
-    int native_height_ = 720;
+    std::array<GLint, 4> guest_viewport_{0, 0, 1140, 640};
+    std::array<GLint, 4> guest_scissor_{0, 0, 1140, 640};
+    int native_width_ = 1140;
+    int native_height_ = 640;
     float last_x_ = 0.0f;
     float last_y_ = 0.0f;
     GdExtrasMenu extras_menu_{};
@@ -3117,6 +3160,39 @@ public:
         const bool ok = PlayBuiltInLevel(10u, "placeholder");
         if (!ok) placeholder_no_music_ = false;
         return ok;
+    }
+
+    bool StartOldVersionPlaytest() {
+        if (!gd_settings_old_ver_playtest()) return true;
+        gameplay_check_at_ = {};
+        RefreshDesktopGameplayState();
+        if (!active_editor_layer_) return true;
+        if (!runtime_.editor_pause_layer_create ||
+            !runtime_.editor_pause_layer_save_and_test) {
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_UNAVAILABLE reason=missing-game-symbol\n";
+            log_.flush();
+            return true;
+        }
+        u32 pause_layer = 0u;
+        if (!RunFunction(runtime_.editor_pause_layer_create,
+                         {active_editor_layer_}, &pause_layer,
+                         "EditorPauseLayer::create old-version playtest", 0u,
+                         std::chrono::milliseconds(3000)) || !pause_layer) {
+            return false;
+        }
+        LogHostDispatch("oldVersionPlaytest",
+                        runtime_.editor_pause_layer_save_and_test,
+                        "action=EditorPauseLayer::onSaveAndTest");
+        if (!RunFunction(runtime_.editor_pause_layer_save_and_test,
+                         {pause_layer}, nullptr,
+                         "EditorPauseLayer::onSaveAndTest", 0u,
+                         std::chrono::milliseconds(10000))) {
+            return false;
+        }
+        InvalidateDesktopGameplayState();
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED key=F5\n";
+        log_.flush();
+        return true;
     }
 
     bool HandleExtrasAction(u32 action) {
@@ -7314,8 +7390,8 @@ private:
     u32 extras_empty_button_ = 0u;
     u64 scene_scan_logs_ = 0u;
     u64 editor_hotkey_miss_logs_ = 0u;
-    int native_width_ = 1280;
-    int native_height_ = 720;
+    int native_width_ = 1140;
+    int native_height_ = 640;
     WinGlHost gl_;
     double frame_interval_=1.0/60.0;
     std::unordered_map<u32,u32> gl_string_cache_;
@@ -7647,7 +7723,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-cof5 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-newera1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7851,7 +7927,8 @@ int main(int argc,char** argv) {
 
         std::string apk_path="game.apk";
         bool probe_only=false;
-        int width=1280,height=720,max_frames=0;
+        int width=0,height=0,max_frames=0;
+        gd_settings_resolution(&width, &height);
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
             if(argument=="--probe-only") probe_only=true;
@@ -7969,6 +8046,10 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()) +
+             " resolution=" + std::to_string(width) + "x" +
+             std::to_string(height) +
+             " old-ver-playtest=" +
+             (gd_settings_old_ver_playtest() ? "true" : "false") +
              " practice-zx=" +
              ((runtime.ui_on_check && runtime.ui_on_delete_check &&
                 runtime.play_layer_get_practice_mode)
@@ -8107,7 +8188,8 @@ int main(int argc,char** argv) {
                     if(!native_paused)
                         ok=executor.SendText(
                             runtime.native_insert_text,
-                            Utf8FromCodepoint(event.value));
+                            event.text.empty()
+                                ? Utf8FromCodepoint(event.value) : event.text);
                     break;
                 case HostEventType::DeleteBackward:
                     if(!native_paused)
@@ -8120,6 +8202,9 @@ int main(int argc,char** argv) {
                     break;
                 case HostEventType::EditorCommand:
                     if(!native_paused) ok=executor.SendEditorCommand(event.value);
+                    break;
+                case HostEventType::OldVersionPlaytest:
+                    if(!native_paused) ok=executor.StartOldVersionPlaytest();
                     break;
                 case HostEventType::ExtrasAction:
                     if(!native_paused) ok=executor.HandleExtrasAction(event.value);
@@ -8342,4 +8427,3 @@ int main(int argc,char** argv) {
         return 1;
     }
 }
-

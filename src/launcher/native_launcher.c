@@ -1,23 +1,3 @@
-/*
- * Geometry Dash Wrapper native launcher
- * =====================================
- *
- * This file replaces run_auto.py at runtime.  It is deliberately written as
- * straightforward Win32 C with many comments for developers coming from C# or
- * Java.  Think of LauncherContext as a small C# record that is filled in once
- * and then passed to helper methods.
- *
- * Responsibilities:
- *   1. Read APK packages as ZIP files and preserve the existing Android path.
- *   2. Extract package/version metadata from AndroidManifest.xml.
- *   3. Select the x86, legacy ARM, or ARMv7 backend for APKs.
- *   5. Create one dated log folder per Android launch.
- *   6. Set the shared save/title/icon/server environment variables.
- *   7. Start the Android backend and wait for it to exit.
- *
- * No Python installation is required on the user's PC.
- */
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -40,7 +20,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-cof5"
+#define LAUNCHER_VERSION "0.9.7-newera1"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -58,10 +38,6 @@
 #define AXML_UTF8_FLAG 0x00000100u
 #define AXML_NO_INDEX 0xffffffffu
 
-/*
- * C# analogy: ApkArchive is similar to a disposable FileStream + MemoryMappedFile.
- * ApkArchiveClose is the manual equivalent of using/Dispose.
- */
 typedef struct ApkArchive {
     HANDLE file;
     HANDLE mapping;
@@ -200,7 +176,6 @@ static int DirectoryExists(const wchar_t *path) {
            (attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* Recursive directory creation, equivalent to Directory.CreateDirectory in C#. */
 static int EnsureDirectory(const wchar_t *path) {
     wchar_t copy[MAX_PATH * 4];
     wchar_t *cursor;
@@ -710,11 +685,6 @@ static const wchar_t *GetSetting(const wchar_t *name, const wchar_t *fallback,
     return buffer;
 }
 
-/*
- * Environment switches use the same friendly values as .NET configuration:
- * true/false, yes/no, on/off, and 1/0. Unknown non-empty values keep the
- * supplied default instead of silently changing behaviour.
- */
 static int GetBooleanSetting(const wchar_t *name, int fallback) {
     wchar_t value[64];
     DWORD length = GetEnvironmentVariableW(name, value, ARRAY_COUNT(value));
@@ -743,6 +713,9 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t lost_game[64];
     wchar_t editor_controls[64];
     wchar_t extras_menu[64];
+    wchar_t resolution[64];
+    wchar_t show_command_prompt[64];
+    wchar_t old_ver_playtest[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
     if (_wfopen_s(&file, path, L"wb, ccs=UTF-8") != 0 || !file) return 0;
@@ -786,6 +759,15 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"EDITOR_CONTROLLS", L"false", editor_controls, ARRAY_COUNT(editor_controls)));
     fwprintf(file, L"extras_menu=%ls\n",
              GetSetting(L"EXTRAS_MENU", L"false", extras_menu, ARRAY_COUNT(extras_menu)));
+    fwprintf(file, L"resolution=%ls\n",
+             GetSetting(L"RESOLUTION", L"1140x640", resolution,
+                        ARRAY_COUNT(resolution)));
+    fwprintf(file, L"show_command_prompt=%ls\n",
+             GetSetting(L"SHOW_COMMAND_PROMPT", L"false", show_command_prompt,
+                        ARRAY_COUNT(show_command_prompt)));
+    fwprintf(file, L"old_ver_playtest=%ls\n",
+             GetSetting(L"OLD_VER_PLAYTEST", L"false", old_ver_playtest,
+                        ARRAY_COUNT(old_ver_playtest)));
     fwprintf(file, L"x86_api_connect_mode=%ls\n",
              GetSetting(L"GD_X86_API_CONNECT_MODE",
                         IsX86Version211(context) ? L"real" : L"synthetic",
@@ -1092,6 +1074,21 @@ static int InitializeLauncherContext(int argc, wchar_t **argv, LauncherContext *
     return 1;
 }
 
+static HWND hidden_console;
+
+static void RestoreCommandPrompt(void) {
+    if (hidden_console) ShowWindow(hidden_console, SW_SHOW);
+}
+
+static void ConfigureCommandPrompt(void) {
+    if (GetBooleanSetting(L"SHOW_COMMAND_PROMPT", 0)) return;
+    hidden_console = GetConsoleWindow();
+    if (hidden_console && IsWindowVisible(hidden_console)) {
+        ShowWindow(hidden_console, SW_HIDE);
+        atexit(RestoreCommandPrompt);
+    }
+}
+
 int wmain(int argc, wchar_t **argv) {
     (void)gd_enable_application_dpi_awareness();
     LauncherContext context;
@@ -1101,6 +1098,7 @@ int wmain(int argc, wchar_t **argv) {
                     L"Geometry Dash Wrapper", MB_OK | MB_ICONINFORMATION);
         return 69;
     }
+    ConfigureCommandPrompt();
     wchar_t launcher_error[1024];
     DWORD exit_code;
     launcher_error[0] = L'\0';

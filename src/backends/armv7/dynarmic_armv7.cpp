@@ -3103,9 +3103,32 @@ struct HostEvent {
     float y = 0.0f;
     u32 value = 0;
     bool pressed = false;
+    std::string text;
 };
 
 #ifdef _WIN32
+static std::string ClipboardTextUtf8(HWND window) {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(window))
+        return {};
+    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t* wide = handle
+        ? static_cast<const wchar_t*>(GlobalLock(handle)) : nullptr;
+    std::string result;
+    if (wide && *wide) {
+        const int length = WideCharToMultiByte(
+            CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+        if (length > 1) {
+            result.resize(static_cast<std::size_t>(length));
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, result.data(), length,
+                                nullptr, nullptr);
+            result.resize(static_cast<std::size_t>(length - 1));
+        }
+    }
+    if (wide) GlobalUnlock(handle);
+    CloseClipboard();
+    return result;
+}
+
 #ifndef GL_ARRAY_BUFFER
 #define GL_ARRAY_BUFFER 0x8892
 #endif
@@ -3620,9 +3643,15 @@ private:
             break;
         }
         case WM_KEYDOWN:
-            // COF1 ARMv7 deliberately has no wrapper-owned editor movement/
-            // rotation shortcuts. A/D remain platformer controls; all editor
-            // keyboard behavior belongs to the APK/validated companion.
+            if (!(lparam & (1L << 30)) && self->text_input_active_ &&
+                (GetKeyState(VK_CONTROL) & 0x8000) && wparam == 'V') {
+                HostEvent event;
+                event.type = HostEventType::TextInput;
+                event.text = ClipboardTextUtf8(window);
+                if (!event.text.empty()) self->Queue(std::move(event));
+                return 0;
+            }
+            // A/D remain platformer controls; ARMv7 editor input is game-owned.
             if (wparam == VK_ESCAPE) {
                 self->Queue(HostEvent{HostEventType::KeyDown, 0.0f, 0.0f, 4u});
                 return 0;
@@ -3787,10 +3816,10 @@ private:
     LONG_PTR windowed_style_ = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
     LONG_PTR windowed_ex_style_ = 0;
     WINDOWPLACEMENT windowed_placement_{sizeof(WINDOWPLACEMENT)};
-    std::array<GLint, 4> guest_viewport_{0, 0, 1280, 720};
-    std::array<GLint, 4> guest_scissor_{0, 0, 1280, 720};
-    int native_width_ = 1280;
-    int native_height_ = 720;
+    std::array<GLint, 4> guest_viewport_{0, 0, 1140, 640};
+    std::array<GLint, 4> guest_scissor_{0, 0, 1140, 640};
+    int native_width_ = 1140;
+    int native_height_ = 640;
     float last_x_ = 0.0f;
     float last_y_ = 0.0f;
     GdExtrasMenu extras_menu_{};
@@ -3816,7 +3845,7 @@ public:
     void* Resolve(const char*) { return nullptr; }
     bool PumpMessages() { return false; }
     std::vector<HostEvent> TakeEvents() { return {}; }
-    std::pair<int, int> ClientSize() const { return {1280, 720}; }
+    std::pair<int, int> ClientSize() const { return {1140, 640}; }
     void ResetFrameClipState(bool) {}
     void Swap() {}
     void BeginGpuFrame(u64) {}
@@ -12508,7 +12537,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-cof5 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-newera1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12812,7 +12841,8 @@ int main(int argc,char** argv) {
         V22CompanionHookMode companion_hook_mode = V22CompanionHookMode::Off;
         bool probe_only=false;
         bool probe_only_explicit=false;
-        int width=1280,height=720,max_frames=0;
+        int width=0,height=0,max_frames=0;
+        gd_settings_resolution(&width, &height);
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
             if(argument=="--probe-only") { probe_only=true; probe_only_explicit=true; }
@@ -13050,19 +13080,11 @@ int main(int argc,char** argv) {
             runtime.v22_game_level_id_offset == 260u;
         const bool primary_editor_initializer =
             HasV22PrimaryEditorInitializer(runtime, env);
-        // COF1 deliberately does not recognize or reconstruct stock 2.2 editor
-        // stubs. The selected/modded 2023 APK uses its validated companion
-        // LevelEditorLayerExt::initH, matching the old Endurance/Bringup path.
         runtime.v22_companion_editor_init_enabled =
             HasCompatibleV22CompanionEditorInitializer(
                 runtime, env, late_beta_layout);
 
-        // COF2: the 2023 primary library exposes selector indices beyond the
-        // art packaged by the APK.  This safety clamp is a primary-library
-        // compatibility fix, not editor reconstruction, so install it for the
-        // known late layout regardless of how the editor implementation is
-        // supplied.  InstallV22SafeVisualHooks calls the same idempotent clamp
-        // again when the validated companion is active.
+        // The late beta exposes selector indices beyond its packaged art.
         if (late_beta_layout) {
             const auto [ground_max, background_max] =
                 PatchV22ArtAssetLimits(runtime, env);
@@ -13151,6 +13173,8 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
+             " resolution="+std::to_string(width)+"x"+
+             std::to_string(height)+
              " practice-zx="+
              ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
                 runtime.v22_practice_mode_offset)
@@ -13552,7 +13576,8 @@ int main(int argc,char** argv) {
                     if(!native_paused)
                         ok=executor.SendText(
                             runtime.native_insert_text,
-                            Utf8FromCodepoint(event.value));
+                            event.text.empty()
+                                ? Utf8FromCodepoint(event.value) : event.text);
                     break;
                 case HostEventType::DeleteBackward:
                     if(!native_paused)

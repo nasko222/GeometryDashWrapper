@@ -16,6 +16,8 @@ int gd_settings_force_highest_graphics(void);
 int gd_settings_i_lost_the_game(void);
 int gd_settings_editor_controls(void);
 int gd_settings_extras_menu(void);
+int gd_settings_old_ver_playtest(void);
+void gd_settings_resolution(int *width, int *height);
 /* Uses the beta companion's complete editor visibility pass. */
 int gd_settings_v22_exact_editor_visibility(void);
 float gd_settings_music_pulse_max(void);

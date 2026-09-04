@@ -147,8 +147,35 @@ int gd_settings_editor_controls(void) {
 }
 
 int gd_settings_extras_menu(void) {
-    /* Extras behavior is carried unchanged into COF1. */
     return 0;
+}
+
+int gd_settings_old_ver_playtest(void) {
+    return gd_setting_bool("OLD_VER_PLAYTEST", 0);
+}
+
+void gd_settings_resolution(int *width, int *height) {
+    const char *value = getenv("RESOLUTION");
+    long parsed_width = 1140;
+    long parsed_height = 640;
+    if (value && *value) {
+        char *separator = NULL;
+        char *end = NULL;
+        parsed_width = strtol(value, &separator, 10);
+        if (separator && (*separator == 'x' || *separator == 'X')) {
+            parsed_height = strtol(separator + 1, &end, 10);
+            if (!end || *end || parsed_width < 320 || parsed_width > 7680 ||
+                parsed_height < 240 || parsed_height > 4320) {
+                parsed_width = 1140;
+                parsed_height = 640;
+            }
+        } else {
+            parsed_width = 1140;
+            parsed_height = 640;
+        }
+    }
+    if (width) *width = (int)parsed_width;
+    if (height) *height = (int)parsed_height;
 }
 
 int gd_settings_v22_exact_editor_visibility(void) {

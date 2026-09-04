@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder108-0.9.7-cof5"
+$BuilderRevision = "dynarmic-x64-builder109-0.9.7-newera1"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -462,6 +462,8 @@ $LegacyRun = @'
 cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
+set "RESOLUTION=1140x640"
+set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
@@ -476,6 +478,8 @@ $LegacyDebug = @'
 cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
+set "RESOLUTION=1140x640"
+set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
@@ -490,6 +494,8 @@ $ArmV7Run = @'
 cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
+set "RESOLUTION=1140x640"
+set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause
@@ -504,6 +510,8 @@ $ArmV7Debug = @'
 cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
+set "RESOLUTION=1140x640"
+set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause

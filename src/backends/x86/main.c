@@ -1276,6 +1276,41 @@ static void send_text_character(WPARAM character) {
     g_host.insert_text(jni_shim_env(), NULL, text);
 }
 
+static void paste_clipboard_text(HWND window) {
+    HANDLE handle;
+    const WCHAR *wide;
+    char *utf8;
+    int utf8_length;
+    int converted = 0;
+    void *text;
+    if (!g_host.native_ready || !g_host.insert_text ||
+        !jni_shim_text_input_active() ||
+        !IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(window)) {
+        return;
+    }
+    handle = GetClipboardData(CF_UNICODETEXT);
+    wide = handle ? (const WCHAR *)GlobalLock(handle) : NULL;
+    if (!wide || !*wide) {
+        if (wide) GlobalUnlock(handle);
+        CloseClipboard();
+        return;
+    }
+    utf8_length = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0,
+                                      NULL, NULL);
+    utf8 = utf8_length > 1 ? (char *)malloc((size_t)utf8_length) : NULL;
+    if (utf8) {
+        converted = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8,
+                                        utf8_length, NULL, NULL) > 0;
+    }
+    GlobalUnlock(handle);
+    CloseClipboard();
+    if (converted) {
+        text = jni_shim_new_string(utf8);
+        if (text) g_host.insert_text(jni_shim_env(), NULL, text);
+    }
+    free(utf8);
+}
+
 static LRESULT CALLBACK window_procedure(HWND window, UINT message,
                                          WPARAM wparam, LPARAM lparam) {
     float x = (float)GET_X_LPARAM(lparam);
@@ -1408,6 +1443,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         break;
     }
     case WM_KEYDOWN:
+        if (!(lparam & (1L << 30)) && (GetKeyState(VK_CONTROL) & 0x8000) &&
+            (wparam == 'V') && jni_shim_text_input_active()) {
+            paste_clipboard_text(window);
+            return 0;
+        }
         if (!(lparam & (1L << 30)) && !jni_shim_text_input_active()) {
             const int editor_tag = editor_tag_for_key(wparam);
             if (editor_tag && send_editor_hotkey(editor_tag, (int)wparam))
@@ -1657,8 +1697,7 @@ int main(int argc, char **argv) {
     int i;
 
     memset(&g_host, 0, sizeof(g_host));
-    g_host.native_width = 1280;
-    g_host.native_height = 720;
+    gd_settings_resolution(&g_host.native_width, &g_host.native_height);
     g_host.window_active = 1;
 
     /*
@@ -1904,6 +1943,8 @@ int main(int argc, char **argv) {
         return 8;
     }
     runtime_log("RESULT: OPENGL_HOST_OK");
+    runtime_log("Render surface: RESOLUTION=%dx%d",
+                g_host.native_width, g_host.native_height);
     runtime_log("Calling authentic Android nativeInit(%d, %d)",
                 g_host.native_width, g_host.native_height);
     native_init(jni_shim_env(), NULL, g_host.native_width, g_host.native_height);
