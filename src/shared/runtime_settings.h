@@ -26,8 +26,12 @@ enum {
 };
 
 int gd_settings_texture_filtering_mode(void);
+const char *gd_settings_texture_filtering_name(void);
 int gd_settings_linear_texture_filtering(void);
 int gd_settings_resolution(int *width, int *height);
+int gd_settings_msaa_samples(void);
+int gd_settings_fxaa(void);
+const char *gd_settings_antialiasing_name(void);
 /* Uses the beta companion's complete editor visibility pass. */
 int gd_settings_v22_exact_editor_visibility(void);
 float gd_settings_music_pulse_max(void);

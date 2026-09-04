@@ -166,19 +166,55 @@ int gd_settings_old_ver_playtest_supported_version(void) {
 
 int gd_settings_texture_filtering_mode(void) {
     const char *value = getenv("TEXTURE_FILTERING");
-    if (!value || !*value) return GD_TEXTURE_FILTERING_LINEAR;
-    if (ascii_equal_ci(value, "game") || ascii_equal_ci(value, "default") ||
-        ascii_equal_ci(value, "original") || ascii_equal_ci(value, "off") ||
-        strcmp(value, "0") == 0) return GD_TEXTURE_FILTERING_GAME;
+    if (!value || !*value || ascii_equal_ci(value, "game") ||
+        ascii_equal_ci(value, "default") || ascii_equal_ci(value, "original") ||
+        ascii_equal_ci(value, "off") || strcmp(value, "0") == 0)
+        return GD_TEXTURE_FILTERING_GAME;
+    if (ascii_equal_ci(value, "linear") || ascii_equal_ci(value, "smooth") ||
+        ascii_equal_ci(value, "bilinear") || strcmp(value, "1") == 0)
+        return GD_TEXTURE_FILTERING_LINEAR;
     if (ascii_equal_ci(value, "nearest") || ascii_equal_ci(value, "point") ||
         ascii_equal_ci(value, "pixel") || ascii_equal_ci(value, "pixels") ||
-        ascii_equal_ci(value, "false") || strcmp(value, "2") == 0)
+        strcmp(value, "2") == 0)
         return GD_TEXTURE_FILTERING_NEAREST;
-    return GD_TEXTURE_FILTERING_LINEAR;
+    return GD_TEXTURE_FILTERING_GAME;
+}
+
+const char *gd_settings_texture_filtering_name(void) {
+    const int mode = gd_settings_texture_filtering_mode();
+    if (mode == GD_TEXTURE_FILTERING_LINEAR) return "linear";
+    if (mode == GD_TEXTURE_FILTERING_NEAREST) return "nearest";
+    return "game";
 }
 
 int gd_settings_linear_texture_filtering(void) {
     return gd_settings_texture_filtering_mode() == GD_TEXTURE_FILTERING_LINEAR;
+}
+
+int gd_settings_msaa_samples(void) {
+    const char *value = getenv("ANTIALIASING");
+    if (!value || !*value) return 0;
+    if (ascii_equal_ci(value, "msaa8") || ascii_equal_ci(value, "8x")) return 8;
+    if (ascii_equal_ci(value, "msaa4") || ascii_equal_ci(value, "4x")) return 4;
+    if (ascii_equal_ci(value, "msaa2") || ascii_equal_ci(value, "2x")) return 2;
+    return 0;
+}
+
+int gd_settings_fxaa(void) {
+    const char *value = getenv("ANTIALIASING");
+    return value && *value && ascii_equal_ci(value, "fxaa");
+}
+
+const char *gd_settings_antialiasing_name(void) {
+    const char *value = getenv("ANTIALIASING");
+    if (value && ascii_equal_ci(value, "fxaa")) return "FXAA";
+    if (value && (ascii_equal_ci(value, "msaa8") || ascii_equal_ci(value, "8x")))
+        return "MSAA8";
+    if (value && (ascii_equal_ci(value, "msaa4") || ascii_equal_ci(value, "4x")))
+        return "MSAA4";
+    if (value && (ascii_equal_ci(value, "msaa2") || ascii_equal_ci(value, "2x")))
+        return "MSAA2";
+    return "NONE";
 }
 
 int gd_settings_resolution(int *width, int *height) {

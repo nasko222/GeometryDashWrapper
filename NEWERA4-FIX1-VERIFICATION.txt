@@ -1,0 +1,36 @@
+Geometry Dash Wrapper 0.9.7-newera4-fix1 verification
+=====================================================
+
+Crash evidence from the supplied 2026-09-04 logs
+-------------------------------------------------
+ARM legacy 1.1:
+- newera4 entered OLD_VER_PLAYTEST mode=editor-bridge with player=reparented.
+- nativeRender then faulted in cocos2d::CCMotionStreak::update(float) at ELF+0x1beb2e.
+- the preceding CCMotionStreak creation also produced implausibly huge guest allocations.
+
+x86 1.60:
+- newera4 entered OLD_VER_PLAYTEST mode=editor-bridge with player=reparented.
+- Windows exception 0xc0000005 occurred at ELF+0x00234f28.
+- Mapping the matching historical x86 libgame.so symbols gives:
+  ELF+0x00234f28 = cocos2d::CCPoint::setPoint(float,float)+0x8
+  stack ELF+0x00287a40 = cocos2d::CCMotionStreak::update(float)+0x2f0
+  stack ELF+0x001772ab = PlayLayer::update(float)+0x37b
+
+Fix1 design
+-----------
+- Removes CCMotionStreak from the pre-1.8 bridge entirely.
+- Never reparents the real PlayerObject. The hidden PlayLayer retains ownership and remains the physics authority.
+- Creates editor-side sprite proxies for the selected player icon and mirrors position/rotation/scale from the real hidden player.
+- Breadcrumbs use ordinary green streak.png CCSprites under a dedicated CCNode, avoiding scheduled CCMotionStreak::update callbacks.
+- Existing hidden-PlayLayer camera sync, death/retry guard, visible stop button, Escape stop, and Attempt-2 pre-present guard remain.
+
+Static/source checks performed
+------------------------------
+- Confirmed no active CCMotionStreak bridge references remain in x86 or ARM legacy playtest source.
+- Confirmed no live-player reparent path remains.
+- Confirmed all newly used CCNode/CCSprite/player getter exports exist in both the historical x86 comparison library and old ARM library used for source auditing.
+- src/shared/runtime_settings.c passes clang -std=c11 -Wall -Wextra -Werror -fsyntax-only.
+- git diff --check reports no whitespace errors.
+- Dynarmic builder revision bumped to builder113 so Windows BUILD_ALL cannot silently reuse the newera4 Dynarmic binary cache.
+
+A full Windows cross-build was not executed in this Linux container; BUILD_ALL.cmd remains the authoritative compile/runtime test on Windows.

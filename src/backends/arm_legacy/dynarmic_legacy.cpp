@@ -60,6 +60,7 @@ extern "C" {
 #include "net_compat_win.h"
 #include "runtime_settings.h"
 #include "frame_pacing_win.h"
+#include "antialias_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "win_dpi.h"
@@ -1010,15 +1011,35 @@ struct ElfRuntime {
     u32 editor_transform_edit_command = 0;
     u32 old_playtest_callback = 0;
     u32 level_editor_get_level = 0;
+    u32 level_editor_get_game_layer = 0;
     u32 level_editor_get_level_string = 0;
     u32 gj_game_level_set_level_string = 0;
     u32 play_layer_create = 0;
     u32 play_layer_start_game = 0;
     u32 play_layer_get_test_mode = 0;
+    u32 play_layer_get_player = 0;
+    u32 play_layer_get_game_layer = 0;
+    u32 play_layer_get_attempts = 0;
+    u32 player_get_is_dead = 0;
+    u32 game_manager_get_player_frame = 0;
     u32 sprite_create_with_frame = 0;
+    u32 sprite_create_file = 0;
+    u32 sprite_set_color = 0;
     u32 menu_item_sprite_extra_create = 0;
     u32 cc_menu_create = 0;
     u32 ccnode_set_visible = 0;
+    u32 ccnode_get_position_x = 0;
+    u32 ccnode_get_position_y = 0;
+    u32 ccnode_get_rotation = 0;
+    u32 ccnode_get_scale_x = 0;
+    u32 ccnode_get_scale_y = 0;
+    u32 ccnode_set_scale = 0;
+    u32 ccnode_set_rotation = 0;
+    u32 ccnode_set_scale_x = 0;
+    u32 ccnode_set_scale_y = 0;
+    u32 ccnode_create = 0;
+    u32 ccobject_retain = 0;
+    u32 ccobject_release = 0;
     u32 level_tools_get_level = 0;
     u32 gj_game_level_create = 0;
     u32 play_layer_scene = 0;
@@ -1560,6 +1581,8 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.editor_transform_edit_command = address;
             else if (name == "_ZNK16LevelEditorLayer8getLevelEv")
                 runtime.level_editor_get_level = address;
+            else if (name == "_ZNK16LevelEditorLayer12getGameLayerEv")
+                runtime.level_editor_get_game_layer = address;
             else if (name == "_ZN16LevelEditorLayer14getLevelStringEv")
                 runtime.level_editor_get_level_string = address;
             else if (name == "_ZN11GJGameLevel14setLevelStringESs")
@@ -1570,8 +1593,22 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.play_layer_start_game = address;
             else if (name == "_ZNK9PlayLayer11getTestModeEv")
                 runtime.play_layer_get_test_mode = address;
+            else if (name == "_ZNK9PlayLayer9getPlayerEv")
+                runtime.play_layer_get_player = address;
+            else if (name == "_ZNK9PlayLayer12getGameLayerEv")
+                runtime.play_layer_get_game_layer = address;
+            else if (name == "_ZNK9PlayLayer11getAttemptsEv")
+                runtime.play_layer_get_attempts = address;
+            else if (name == "_ZNK12PlayerObject9getIsDeadEv")
+                runtime.player_get_is_dead = address;
+            else if (name == "_ZNK11GameManager14getPlayerFrameEv")
+                runtime.game_manager_get_player_frame = address;
             else if (name == "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc")
                 runtime.sprite_create_with_frame = address;
+            else if (name == "_ZN7cocos2d8CCSprite6createEPKc")
+                runtime.sprite_create_file = address;
+            else if (name == "_ZN7cocos2d8CCSprite8setColorERKNS_10_ccColor3BE")
+                runtime.sprite_set_color = address;
             else if (name == "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_PNS0_8CCObjectEMS3_FvS4_E")
                 runtime.menu_item_sprite_extra_create = address;
             else if (name == "_ZN7cocos2d6CCMenu6createEv")
@@ -1606,6 +1643,30 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccnode_add_child_z = address;
             else if (name == "_ZN7cocos2d6CCNode11setPositionEff")
                 runtime.ccnode_set_position_ff = address;
+            else if (name == "_ZN7cocos2d6CCNode12getPositionXEv")
+                runtime.ccnode_get_position_x = address;
+            else if (name == "_ZN7cocos2d6CCNode12getPositionYEv")
+                runtime.ccnode_get_position_y = address;
+            else if (name == "_ZN7cocos2d6CCNode11getRotationEv")
+                runtime.ccnode_get_rotation = address;
+            else if (name == "_ZN7cocos2d6CCNode9getScaleXEv")
+                runtime.ccnode_get_scale_x = address;
+            else if (name == "_ZN7cocos2d6CCNode9getScaleYEv")
+                runtime.ccnode_get_scale_y = address;
+            else if (name == "_ZN7cocos2d6CCNode8setScaleEf")
+                runtime.ccnode_set_scale = address;
+            else if (name == "_ZN7cocos2d6CCNode11setRotationEf")
+                runtime.ccnode_set_rotation = address;
+            else if (name == "_ZN7cocos2d6CCNode9setScaleXEf")
+                runtime.ccnode_set_scale_x = address;
+            else if (name == "_ZN7cocos2d6CCNode9setScaleYEf")
+                runtime.ccnode_set_scale_y = address;
+            else if (name == "_ZN7cocos2d6CCNode6createEv")
+                runtime.ccnode_create = address;
+            else if (name == "_ZN7cocos2d8CCObject6retainEv")
+                runtime.ccobject_retain = address;
+            else if (name == "_ZN7cocos2d8CCObject7releaseEv")
+                runtime.ccobject_release = address;
             else if (name == "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb")
                 runtime.ccnode_remove_from_parent_cleanup = address;
             else if (name == "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE")
@@ -1930,8 +1991,16 @@ public:
         pfd.cDepthBits = 24;
         pfd.cStencilBits = 8;
         pfd.iLayerType = PFD_MAIN_PLANE;
-        const int format = ChoosePixelFormat(device_, &pfd);
+        int actual_msaa = 0;
+        const int requested_msaa = gd_settings_msaa_samples();
+        const int format = gd_gl_choose_pixel_format(device_, &pfd, requested_msaa,
+                                                     &actual_msaa);
+        if (format) DescribePixelFormat(device_, format, sizeof(pfd), &pfd);
         if (!format || !SetPixelFormat(device_, format, &pfd)) return Fail("SetPixelFormat failed");
+        log << "RESULT: ANTIALIASING requested=" << gd_settings_antialiasing_name()
+            << " msaa=" << actual_msaa
+            << (requested_msaa && !actual_msaa ? " fallback=off" : "")
+            << " fxaa=" << (gd_settings_fxaa() ? "on" : "off") << '\n';
         context_ = wglCreateContext(device_);
         if (!context_ || !wglMakeCurrent(device_, context_)) return Fail("wglCreateContext/wglMakeCurrent failed");
         const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
@@ -1967,7 +2036,12 @@ public:
         gd_frame_pacer_destroy(&frame_pacer_);
         gd_extras_menu_destroy(&extras_menu_);
         DestroyGpuProfiler();
-        if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
+        if (context_) {
+            if (wglGetCurrentContext() == context_) gd_fxaa_shutdown();
+            wglMakeCurrent(nullptr, nullptr);
+            wglDeleteContext(context_);
+            context_ = nullptr;
+        }
         if (device_ && window_) { ReleaseDC(window_, device_); device_ = nullptr; }
         if (window_) { DestroyWindow(window_); window_ = nullptr; }
         if (opengl_) { FreeLibrary(opengl_); opengl_ = nullptr; }
@@ -2070,7 +2144,10 @@ public:
             ReapplyGuestRects();
             resize_pending_ = false;
         }
-        if (device_) SwapBuffers(device_);
+        if (device_) {
+            if (gd_settings_fxaa()) (void)gd_fxaa_apply(window_);
+            SwapBuffers(device_);
+        }
         gd_frame_pacer_wait(&frame_pacer_);
     }
     void BeginGpuFrame(u64 frame) {
@@ -3073,6 +3150,7 @@ public:
 
     bool SendEditorCommand(u32 tag) {
         if (!gd_settings_editor_controls()) return true;
+        if (old_playtest_layer_) return true;
         const u32 editor_ui = FindActiveEditorUi();
         if (!editor_ui) return true;
 
@@ -3183,14 +3261,22 @@ public:
 
     bool OldVersionPlaytestSymbolsReady() const {
         return runtime_.old_playtest_callback && runtime_.level_editor_get_level &&
+               runtime_.level_editor_get_game_layer &&
                runtime_.level_editor_get_level_string &&
                runtime_.gj_game_level_set_level_string &&
                runtime_.play_layer_create && runtime_.play_layer_start_game &&
-               runtime_.play_layer_get_test_mode &&
-               runtime_.sprite_create_with_frame &&
-               runtime_.menu_item_sprite_extra_create && runtime_.cc_menu_create &&
-               runtime_.ccnode_set_visible && runtime_.ccnode_set_position_ff &&
-               runtime_.ccnode_remove_from_parent_cleanup &&
+               runtime_.play_layer_get_test_mode && runtime_.play_layer_get_player &&
+               runtime_.play_layer_get_game_layer && runtime_.play_layer_get_attempts &&
+               runtime_.player_get_is_dead && runtime_.sprite_create_with_frame &&
+               runtime_.sprite_create_file && runtime_.sprite_set_color &&
+               runtime_.menu_item_sprite_extra_create &&
+               runtime_.cc_menu_create && runtime_.ccnode_set_visible &&
+               runtime_.ccnode_set_position_ff && runtime_.ccnode_get_position_x &&
+               runtime_.ccnode_get_position_y && runtime_.ccnode_get_rotation &&
+               runtime_.ccnode_get_scale_x && runtime_.ccnode_get_scale_y &&
+               runtime_.ccnode_set_scale && runtime_.ccnode_set_rotation &&
+               runtime_.ccnode_set_scale_x && runtime_.ccnode_set_scale_y &&
+               runtime_.ccnode_create && runtime_.ccnode_remove_from_parent_cleanup &&
                (runtime_.ccnode_add_child_z || runtime_.ccnode_add_child);
     }
 
@@ -3244,6 +3330,117 @@ public:
         return true;
     }
 
+    bool GuestFloatGetter(u32 function, u32 object, float& value,
+                          const char* label) {
+        u32 raw = 0u;
+        if (!RunFunction(function, {object}, &raw, label, 0u,
+                         std::chrono::milliseconds(500))) return false;
+        value = WordToFloat(raw);
+        return true;
+    }
+
+    bool ClearOldVersionPlaytestTrail() {
+        if (old_playtest_trail_ && env_.IsMapped(old_playtest_trail_, 4u) &&
+            !RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                         {old_playtest_trail_, 1u}, nullptr,
+                         "remove old playtest trail", 0u,
+                         std::chrono::milliseconds(1000))) return false;
+        old_playtest_trail_ = 0u;
+        old_playtest_trail_has_last_ = false;
+        old_playtest_trail_segments_ = 0u;
+        return true;
+    }
+
+    bool AppendOldVersionPlaytestTrailSegment(float x, float y) {
+        if (!old_playtest_trail_) return true;
+        if (!old_playtest_trail_has_last_) {
+            old_playtest_trail_last_x_ = x;
+            old_playtest_trail_last_y_ = y;
+            old_playtest_trail_has_last_ = true;
+            return true;
+        }
+        const float dx = x - old_playtest_trail_last_x_;
+        const float dy = y - old_playtest_trail_last_y_;
+        const float distance_squared = dx * dx + dy * dy;
+        if (distance_squared < 9.0f) return true;
+        if (dx > 192.0f || dx < -192.0f || dy > 192.0f || dy < -192.0f ||
+            old_playtest_trail_segments_ >= 4096u) {
+            old_playtest_trail_last_x_ = x;
+            old_playtest_trail_last_y_ = y;
+            return true;
+        }
+        if (!old_playtest_streak_name_) {
+            old_playtest_streak_name_ = AllocateString("streak.png");
+            if (!old_playtest_streak_name_) return false;
+        }
+        if (!old_playtest_green_color_) {
+            old_playtest_green_color_ = Allocate(4u);
+            if (!old_playtest_green_color_) return false;
+            env_.MemoryWrite32(old_playtest_green_color_, 0x0000ff00u);
+        }
+        u32 crumb = 0u;
+        if (!RunFunction(runtime_.sprite_create_file, {old_playtest_streak_name_},
+                         &crumb, "CCSprite::create breadcrumb", 0u,
+                         std::chrono::milliseconds(1000)) || !crumb ||
+            !RunFunction(runtime_.sprite_set_color,
+                         {crumb, old_playtest_green_color_}, nullptr,
+                         "CCSprite::setColor breadcrumb green", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {crumb, FloatToWord(x), FloatToWord(y)}, nullptr,
+                         "CCNode::setPosition breadcrumb", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.ccnode_set_scale,
+                         {crumb, FloatToWord(0.08f)}, nullptr,
+                         "CCNode::setScale breadcrumb", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !AddExtrasChild(old_playtest_trail_, crumb,
+                            static_cast<int>(old_playtest_trail_segments_)))
+            return false;
+        ++old_playtest_trail_segments_;
+        old_playtest_trail_last_x_ = x;
+        old_playtest_trail_last_y_ = y;
+        return true;
+    }
+
+    bool UpdateOldVersionPlaytestProxyTransform() {
+        if (!old_playtest_player_ || !old_playtest_proxy_primary_) return true;
+        float x = 0.0f, y = 0.0f, rotation = 0.0f;
+        float scale_x = 1.0f, scale_y = 1.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_x, old_playtest_player_,
+                              x, "CCNode::getPositionX playtest player") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y, old_playtest_player_,
+                              y, "CCNode::getPositionY playtest player") ||
+            !GuestFloatGetter(runtime_.ccnode_get_rotation, old_playtest_player_,
+                              rotation, "CCNode::getRotation playtest player") ||
+            !GuestFloatGetter(runtime_.ccnode_get_scale_x, old_playtest_player_,
+                              scale_x, "CCNode::getScaleX playtest player") ||
+            !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
+                              scale_y, "CCNode::getScaleY playtest player")) return false;
+        auto update_sprite = [&](u32 sprite) -> bool {
+            if (!sprite) return true;
+            return RunFunction(runtime_.ccnode_set_position_ff,
+                               {sprite, FloatToWord(x), FloatToWord(y)}, nullptr,
+                               "CCNode::setPosition playtest proxy", 0u,
+                               std::chrono::milliseconds(500)) &&
+                   RunFunction(runtime_.ccnode_set_rotation,
+                               {sprite, FloatToWord(rotation)}, nullptr,
+                               "CCNode::setRotation playtest proxy", 0u,
+                               std::chrono::milliseconds(500)) &&
+                   RunFunction(runtime_.ccnode_set_scale_x,
+                               {sprite, FloatToWord(scale_x)}, nullptr,
+                               "CCNode::setScaleX playtest proxy", 0u,
+                               std::chrono::milliseconds(500)) &&
+                   RunFunction(runtime_.ccnode_set_scale_y,
+                               {sprite, FloatToWord(scale_y)}, nullptr,
+                               "CCNode::setScaleY playtest proxy", 0u,
+                               std::chrono::milliseconds(500));
+        };
+        if (!update_sprite(old_playtest_proxy_secondary_) ||
+            !update_sprite(old_playtest_proxy_primary_)) return false;
+        return AppendOldVersionPlaytestTrailSegment(x, y);
+    }
+
     bool StartInlineOldVersionPlaytest() {
         if (old_playtest_layer_) return true;
         const u32 editor_ui = FindActiveEditorUi();
@@ -3257,6 +3454,7 @@ public:
             LogOldVersionPlaytestUnavailable("unknown-PlayLayer-test-mode-layout");
             return true;
         }
+        if (!ClearOldVersionPlaytestTrail()) return false;
 
         u32 level = 0u;
         if (!RunFunction(runtime_.level_editor_get_level,
@@ -3284,6 +3482,98 @@ public:
             return true;
         }
         env_.MemoryWrite8(play_layer + test_mode_offset, 1u);
+        if (!AddExtrasChild(active_editor_layer_, play_layer, -10000) ||
+            !RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
+                         "PlayLayer::startGame inline playtest", 0u,
+                         std::chrono::milliseconds(10000))) return false;
+
+        u32 player = 0u, play_game_layer = 0u, editor_game_layer = 0u;
+        if (!RunFunction(runtime_.play_layer_get_player, {play_layer}, &player,
+                         "PlayLayer::getPlayer inline playtest", 0u,
+                         std::chrono::milliseconds(1000)) || !player ||
+            !RunFunction(runtime_.play_layer_get_game_layer, {play_layer}, &play_game_layer,
+                         "PlayLayer::getGameLayer inline playtest", 0u,
+                         std::chrono::milliseconds(1000)) || !play_game_layer ||
+            !RunFunction(runtime_.level_editor_get_game_layer, {active_editor_layer_},
+                         &editor_game_layer,
+                         "LevelEditorLayer::getGameLayer inline playtest", 0u,
+                         std::chrono::milliseconds(1000)) || !editor_game_layer)
+            return false;
+
+        u32 trail = 0u;
+        if (!RunFunction(runtime_.ccnode_create, {}, &trail,
+                         "CCNode::create playtest trail root", 0u,
+                         std::chrono::milliseconds(1000)) || !trail ||
+            !AddExtrasChild(editor_game_layer, trail, 9998)) return false;
+        old_playtest_trail_ = trail;
+
+        u32 frame_id = 1u;
+        if (runtime_.game_manager_shared_state && runtime_.game_manager_get_player_frame) {
+            u32 manager = 0u;
+            if (RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                            "GameManager::sharedState playtest icon", 0u,
+                            std::chrono::milliseconds(500)) && manager) {
+                u32 value = 1u;
+                if (RunFunction(runtime_.game_manager_get_player_frame, {manager}, &value,
+                                "GameManager::getPlayerFrame playtest icon", 0u,
+                                std::chrono::milliseconds(500)))
+                    frame_id = value;
+            }
+        }
+        if (frame_id > 99u) frame_id = 1u;
+        char primary_name[64];
+        char secondary_name[64];
+        std::snprintf(primary_name, sizeof(primary_name),
+                      "player_%02u_001.png", frame_id);
+        std::snprintf(secondary_name, sizeof(secondary_name),
+                      "player_%02u_2_001.png", frame_id);
+        u32 primary_name_guest = AllocateString(primary_name);
+        u32 secondary_name_guest = AllocateString(secondary_name);
+        u32 proxy_primary = 0u, proxy_secondary = 0u;
+        if (!primary_name_guest ||
+            !RunFunction(runtime_.sprite_create_with_frame, {primary_name_guest},
+                         &proxy_primary, "create playtest proxy primary", 0u,
+                         std::chrono::milliseconds(1000)) || !proxy_primary) {
+            primary_name_guest = AllocateString("player_01_001.png");
+            secondary_name_guest = AllocateString("player_01_2_001.png");
+            if (!primary_name_guest ||
+                !RunFunction(runtime_.sprite_create_with_frame, {primary_name_guest},
+                             &proxy_primary, "create fallback playtest proxy", 0u,
+                             std::chrono::milliseconds(1000)) || !proxy_primary)
+                return false;
+        }
+        if (secondary_name_guest)
+            (void)RunFunction(runtime_.sprite_create_with_frame, {secondary_name_guest},
+                              &proxy_secondary, "create playtest proxy secondary", 0u,
+                              std::chrono::milliseconds(1000));
+        if ((proxy_secondary &&
+             !AddExtrasChild(editor_game_layer, proxy_secondary, 9999)) ||
+            !AddExtrasChild(editor_game_layer, proxy_primary, 10000)) return false;
+
+        float editor_x = 0.0f, editor_y = 0.0f;
+        float camera_x = 0.0f, camera_y = 0.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
+                              editor_x, "CCNode::getPositionX editor") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y, editor_game_layer,
+                              editor_y, "CCNode::getPositionY editor") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_x, play_game_layer,
+                              camera_x, "CCNode::getPositionX play") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y, play_game_layer,
+                              camera_y, "CCNode::getPositionY play")) return false;
+
+        /* Keep the real PlayerObject inside PlayLayer. Both ARM and x86 game
+           code assume that hierarchy during update; reparenting it is unsafe. */
+        if (!RunFunction(runtime_.ccnode_set_visible, {play_layer, 0u}, nullptr,
+                         "hide backing PlayLayer", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {editor_game_layer, FloatToWord(camera_x), FloatToWord(camera_y)},
+                         nullptr, "sync editor camera to play camera", 0u,
+                         std::chrono::milliseconds(500))) return false;
+        old_playtest_player_ = player;
+        old_playtest_proxy_primary_ = proxy_primary;
+        old_playtest_proxy_secondary_ = proxy_secondary;
+        if (!UpdateOldVersionPlaytestProxyTransform()) return false;
 
         u32 stop_menu = 0u, stop_button = 0u;
         if (!RunFunction(runtime_.cc_menu_create, {}, &stop_menu,
@@ -3299,19 +3589,29 @@ public:
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {stop_button, FloatToWord(30.0f), FloatToWord(186.0f)},
                          nullptr, "CCNode::setPosition playtest stop", 0u,
-                         std::chrono::milliseconds(1000))) return false;
+                         std::chrono::milliseconds(1000)) ||
+            !AddExtrasChild(editor_ui, stop_menu, 10001)) return false;
 
+        u32 attempts = 0u;
+        if (!RunFunction(runtime_.play_layer_get_attempts, {play_layer}, &attempts,
+                         "PlayLayer::getAttempts inline playtest", 0u,
+                         std::chrono::milliseconds(500))) return false;
         old_playtest_scene_ = active_scene_root_;
         old_playtest_editor_ = active_editor_layer_;
         old_playtest_ui_ = editor_ui;
         old_playtest_layer_ = play_layer;
         old_playtest_stop_menu_ = stop_menu;
-        if (!AddExtrasChild(active_editor_layer_, play_layer, 0) ||
-            !AddExtrasChild(editor_ui, stop_menu, 10001) ||
-            !RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
-                         "PlayLayer::startGame inline playtest", 0u,
-                         std::chrono::milliseconds(10000))) return false;
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-overlay unsaved-level=live\n";
+        old_playtest_player_ = player;
+        old_playtest_play_game_layer_ = play_game_layer;
+        old_playtest_editor_game_layer_ = editor_game_layer;
+        old_playtest_initial_attempts_ = attempts;
+        old_playtest_editor_game_x_ = editor_x;
+        old_playtest_editor_game_y_ = editor_y;
+        if (old_playtest_play_menu_ &&
+            !RunFunction(runtime_.ccnode_set_visible, {old_playtest_play_menu_, 0u},
+                         nullptr, "hide playtest play button", 0u,
+                         std::chrono::milliseconds(500))) return false;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden\n";
         log_.flush();
         return true;
     }
@@ -3319,26 +3619,89 @@ public:
     bool StopInlineOldVersionPlaytest() {
         if (!old_playtest_layer_) return true;
         bool ok = true;
-        if (old_playtest_stop_menu_)
+        if (ok && old_playtest_stop_menu_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_stop_menu_, 1u}, nullptr,
                              "remove inline playtest stop menu", 0u,
-                             std::chrono::milliseconds(3000));
+                             std::chrono::milliseconds(1000));
+        if (ok && old_playtest_proxy_primary_)
+            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {old_playtest_proxy_primary_, 1u}, nullptr,
+                             "remove playtest proxy primary", 0u,
+                             std::chrono::milliseconds(1000));
+        if (ok && old_playtest_proxy_secondary_)
+            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {old_playtest_proxy_secondary_, 1u}, nullptr,
+                             "remove playtest proxy secondary", 0u,
+                             std::chrono::milliseconds(1000));
+        if (ok && old_playtest_editor_game_layer_)
+            ok = RunFunction(runtime_.ccnode_set_position_ff,
+                             {old_playtest_editor_game_layer_,
+                              FloatToWord(old_playtest_editor_game_x_),
+                              FloatToWord(old_playtest_editor_game_y_)}, nullptr,
+                             "restore editor camera", 0u,
+                             std::chrono::milliseconds(1000));
         if (ok && old_playtest_layer_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_layer_, 1u}, nullptr,
-                             "remove inline PlayLayer", 0u,
-                             std::chrono::milliseconds(5000));
+                             "remove hidden inline PlayLayer", 0u,
+                             std::chrono::milliseconds(3000));
+        if (ok && old_playtest_play_menu_)
+            ok = RunFunction(runtime_.ccnode_set_visible,
+                             {old_playtest_play_menu_, 1u}, nullptr,
+                             "restore playtest play button", 0u,
+                             std::chrono::milliseconds(500));
         old_playtest_layer_ = 0u;
         old_playtest_stop_menu_ = 0u;
         old_playtest_editor_ = 0u;
         old_playtest_ui_ = 0u;
+        old_playtest_player_ = 0u;
+        old_playtest_play_game_layer_ = 0u;
+        old_playtest_editor_game_layer_ = 0u;
+        old_playtest_proxy_primary_ = 0u;
+        old_playtest_proxy_secondary_ = 0u;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-overlay editor=preserved\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained\n";
             log_.flush();
         }
         return ok;
+    }
+
+    bool UpdateInlineOldVersionPlaytest() {
+        if (!old_playtest_layer_) return true;
+        if (!old_playtest_player_ || !old_playtest_play_game_layer_ ||
+            !old_playtest_editor_game_layer_) return false;
+        u32 current_player = 0u, dead = 0u, attempts = 0u;
+        if (!RunFunction(runtime_.play_layer_get_player, {old_playtest_layer_},
+                         &current_player, "PlayLayer::getPlayer playtest bridge", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.player_get_is_dead, {old_playtest_player_},
+                         &dead, "PlayerObject::getIsDead playtest bridge", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.play_layer_get_attempts, {old_playtest_layer_},
+                         &attempts, "PlayLayer::getAttempts playtest bridge", 0u,
+                         std::chrono::milliseconds(500))) return false;
+        if (!current_player || current_player != old_playtest_player_ || dead ||
+            attempts != old_playtest_initial_attempts_) {
+            /* Stop before the next rendered frame so the normal PlayLayer
+               retry flow never appears as Attempt 2 in the editor. */
+            return StopInlineOldVersionPlaytest();
+        }
+        float camera_x = 0.0f, camera_y = 0.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_x,
+                              old_playtest_play_game_layer_, camera_x,
+                              "CCNode::getPositionX playtest camera") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y,
+                              old_playtest_play_game_layer_, camera_y,
+                              "CCNode::getPositionY playtest camera") ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {old_playtest_editor_game_layer_, FloatToWord(camera_x),
+                          FloatToWord(camera_y)}, nullptr,
+                         "sync editor playtest camera", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !UpdateOldVersionPlaytestProxyTransform()) return false;
+        return true;
     }
 
     bool EnsureOldVersionPlaytestButton() {
@@ -3352,7 +3715,14 @@ public:
             old_playtest_ui_ = 0u;
             old_playtest_layer_ = 0u;
             old_playtest_stop_menu_ = 0u;
+            old_playtest_player_ = 0u;
+            old_playtest_play_game_layer_ = 0u;
+            old_playtest_editor_game_layer_ = 0u;
+            old_playtest_proxy_primary_ = 0u;
+            old_playtest_proxy_secondary_ = 0u;
             old_playtest_request_ = 0u;
+            /* The outgoing scene owns the retained trail node. */
+            old_playtest_trail_ = 0u;
             old_playtest_scene_ = active_scene_root_;
         }
         if (!editor_ui || old_playtest_layer_) return true;
@@ -3366,7 +3736,7 @@ public:
                          "CCMenu::create editor playtest", 0u,
                          std::chrono::milliseconds(1500)) || !menu) return false;
         u32 button = 0u;
-        if (!CreateOldVersionPlaytestItem(editor_ui, "GJ_playBtn_001.png",
+        if (!CreateOldVersionPlaytestItem(editor_ui, "GJ_playBtn2_001.png",
                                           &button)) return false;
         if (!AddExtrasChild(menu, button, 0) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
@@ -3377,10 +3747,14 @@ public:
                          {button, FloatToWord(30.0f), FloatToWord(186.0f)}, nullptr,
                          "CCNode::setPosition editor playtest", 0u,
                          std::chrono::milliseconds(1000)) ||
+            !RunFunction(runtime_.ccnode_set_scale,
+                         {button, FloatToWord(0.65f)}, nullptr,
+                         "CCNode::setScale editor playtest", 0u,
+                         std::chrono::milliseconds(1000)) ||
             !AddExtrasChild(editor_ui, menu, 10000)) return false;
         old_playtest_play_menu_ = menu;
         old_playtest_play_button_ = button;
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-overlay\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-bridge-safe sprite=GJ_playBtn2_001.png\n";
         log_.flush();
         return true;
     }
@@ -3787,6 +4161,10 @@ public:
             log_.flush();
         }
         return true;
+    }
+
+    bool OldVersionPlaytestActive() const {
+        return old_playtest_layer_ != 0u;
     }
 
 private:
@@ -7616,6 +7994,21 @@ private:
     u32 old_playtest_play_button_ = 0u;
     u32 old_playtest_layer_ = 0u;
     u32 old_playtest_stop_menu_ = 0u;
+    u32 old_playtest_player_ = 0u;
+    u32 old_playtest_play_game_layer_ = 0u;
+    u32 old_playtest_editor_game_layer_ = 0u;
+    u32 old_playtest_proxy_primary_ = 0u;
+    u32 old_playtest_proxy_secondary_ = 0u;
+    u32 old_playtest_initial_attempts_ = 0u;
+    float old_playtest_editor_game_x_ = 0.0f;
+    float old_playtest_editor_game_y_ = 0.0f;
+    u32 old_playtest_trail_ = 0u;
+    float old_playtest_trail_last_x_ = 0.0f;
+    float old_playtest_trail_last_y_ = 0.0f;
+    bool old_playtest_trail_has_last_ = false;
+    u32 old_playtest_trail_segments_ = 0u;
+    u32 old_playtest_streak_name_ = 0u;
+    u32 old_playtest_green_color_ = 0u;
     u32 old_playtest_test_mode_offset_ = 0u;
     bool old_playtest_unavailable_logged_ = false;
     u64 scene_scan_logs_ = 0u;
@@ -7953,7 +8346,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-newera3-fix1 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-newera4-fix1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -8282,7 +8675,7 @@ int main(int argc,char** argv) {
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()) +
              " texture-filtering=" +
-             (gd_settings_linear_texture_filtering() ? "linear" : "game") +
+             gd_settings_texture_filtering_name() +
              " old-ver-playtest=" +
              (gd_settings_old_ver_playtest() ? "true" : "false") +
              " practice-zx=" +
@@ -8484,12 +8877,32 @@ int main(int argc,char** argv) {
             executor.RefreshDesktopGameplayState();
             if (!executor.EnsureOldVersionPlaytestButton())
                 throw std::runtime_error(executor.LastError());
+            if (!executor.UpdateInlineOldVersionPlaytest())
+                throw std::runtime_error(executor.LastError());
+            const bool old_playtest_active_before_render =
+                executor.OldVersionPlaytestActive();
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,
                     "nativeRender",0u,
                     std::chrono::milliseconds(30000)))
                 throw std::runtime_error(executor.LastError());
+            if (old_playtest_active_before_render &&
+                executor.OldVersionPlaytestActive()) {
+                if (!executor.UpdateInlineOldVersionPlaytest())
+                    throw std::runtime_error(executor.LastError());
+                if (!executor.OldVersionPlaytestActive()) {
+                    /* nativeRender advances the hidden PlayLayer before drawing.
+                       If it entered its normal death/retry path, redraw the
+                       restored editor before SwapBuffers so Attempt 2/end-wall
+                       visuals never become a presented frame. */
+                    if(!executor.RunFunction(
+                            runtime.native_render,{kEnvObject,0u},&result,
+                            "nativeRender post-playtest-stop",0u,
+                            std::chrono::milliseconds(30000)))
+                        throw std::runtime_error(executor.LastError());
+                }
+            }
             if(profile_enabled) executor.EndGpuFrame();
             const auto render_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GeometryDashWrapperNewEra2 LANGUAGES C CXX)
+project(GeometryDashWrapperNewEra4 LANGUAGES C CXX)
 
 if(NOT DEFINED DYNARMIC_SOURCE_DIR)
     message(FATAL_ERROR "Pass -DDYNARMIC_SOURCE_DIR=<official Dynarmic source directory>")
@@ -44,6 +44,7 @@ set(GD_SHARED_SOURCES
     "${GD_ROOT}/src/shared/net_compat_win.c"
     "${GD_ROOT}/src/shared/runtime_settings.c"
     "${GD_ROOT}/src/shared/frame_pacing_win.c"
+    "${GD_ROOT}/src/shared/antialias_win.c"
     "${GD_ROOT}/src/shared/extras_menu_win.c"
     "${GD_ROOT}/src/shared/song_http_win.c"
     "${GD_ROOT}/src/shared/window_icon_win.c"

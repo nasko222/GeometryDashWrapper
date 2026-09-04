@@ -70,6 +70,7 @@ extern "C" {
 #include "net_compat_win.h"
 #include "runtime_settings.h"
 #include "frame_pacing_win.h"
+#include "antialias_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "build_info.h"
@@ -3217,8 +3218,16 @@ public:
         pfd.cDepthBits = 24;
         pfd.cStencilBits = 8;
         pfd.iLayerType = PFD_MAIN_PLANE;
-        const int format = ChoosePixelFormat(device_, &pfd);
+        int actual_msaa = 0;
+        const int requested_msaa = gd_settings_msaa_samples();
+        const int format = gd_gl_choose_pixel_format(device_, &pfd, requested_msaa,
+                                                     &actual_msaa);
+        if (format) DescribePixelFormat(device_, format, sizeof(pfd), &pfd);
         if (!format || !SetPixelFormat(device_, format, &pfd)) return Fail("SetPixelFormat failed");
+        log << "RESULT: ANTIALIASING requested=" << gd_settings_antialiasing_name()
+            << " msaa=" << actual_msaa
+            << (requested_msaa && !actual_msaa ? " fallback=off" : "")
+            << " fxaa=" << (gd_settings_fxaa() ? "on" : "off") << '\n';
         context_ = wglCreateContext(device_);
         if (!context_ || !wglMakeCurrent(device_, context_)) return Fail("wglCreateContext/wglMakeCurrent failed");
         const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
@@ -3254,7 +3263,12 @@ public:
         gd_frame_pacer_destroy(&frame_pacer_);
         gd_extras_menu_destroy(&extras_menu_);
         DestroyGpuProfiler();
-        if (context_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(context_); context_ = nullptr; }
+        if (context_) {
+            if (wglGetCurrentContext() == context_) gd_fxaa_shutdown();
+            wglMakeCurrent(nullptr, nullptr);
+            wglDeleteContext(context_);
+            context_ = nullptr;
+        }
         if (device_ && window_) { ReleaseDC(window_, device_); device_ = nullptr; }
         if (window_) { DestroyWindow(window_); window_ = nullptr; }
         if (opengl_) { FreeLibrary(opengl_); opengl_ = nullptr; }
@@ -3361,7 +3375,10 @@ public:
             ReapplyGuestRects();
             resize_pending_ = false;
         }
-        if (device_) SwapBuffers(device_);
+        if (device_) {
+            if (gd_settings_fxaa()) (void)gd_fxaa_apply(window_);
+            SwapBuffers(device_);
+        }
         gd_frame_pacer_wait(&frame_pacer_);
     }
     void BeginGpuFrame(u64 frame) {
@@ -12544,7 +12561,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-newera3-fix1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-newera4-fix1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -13183,7 +13200,7 @@ int main(int argc,char** argv) {
              " surface="+std::to_string(width)+"x"+
              std::to_string(height)+
              " texture-filtering="+
-             (gd_settings_linear_texture_filtering() ? "linear" : "game")+
+             gd_settings_texture_filtering_name()+
              " practice-zx="+
              ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
                 runtime.v22_practice_mode_offset)

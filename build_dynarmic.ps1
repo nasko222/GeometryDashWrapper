@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder111-0.9.7-newera3-fix1"
+$BuilderRevision = "dynarmic-x64-builder113-0.9.7-newera4-fix1"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -463,7 +463,8 @@ cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
 set "RESOLUTION=1140x640"
-set "TEXTURE_FILTERING=LINEAR"
+set "TEXTURE_FILTERING=GAME"
+set "ANTIALIASING=NONE"
 set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
@@ -480,7 +481,8 @@ cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
 set "RESOLUTION=1140x640"
-set "TEXTURE_FILTERING=LINEAR"
+set "TEXTURE_FILTERING=GAME"
+set "ANTIALIASING=NONE"
 set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
@@ -497,7 +499,8 @@ cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
 set "RESOLUTION=1140x640"
-set "TEXTURE_FILTERING=LINEAR"
+set "TEXTURE_FILTERING=GAME"
+set "ANTIALIASING=NONE"
 set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
@@ -514,7 +517,8 @@ cd /d "%~dp0.."
 set "I_LOST_THE_GAME=true"
 set "EDITOR_CONTROLLS=true"
 set "RESOLUTION=1140x640"
-set "TEXTURE_FILTERING=LINEAR"
+set "TEXTURE_FILTERING=GAME"
+set "ANTIALIASING=NONE"
 set "OLD_VER_PLAYTEST=false"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk

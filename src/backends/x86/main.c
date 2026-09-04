@@ -15,6 +15,7 @@
 #include "build_info.h"
 #include "runtime_settings.h"
 #include "frame_pacing_win.h"
+#include "antialias_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "win_dpi.h"
@@ -53,14 +54,24 @@ typedef void *(__cdecl *ButtonSpriteCreateFunction)(const char *text);
 typedef void (__cdecl *CcNodeAddChildFunction)(void *self, void *child);
 typedef void (__cdecl *CcNodeAddChildZFunction)(void *self, void *child, int z);
 typedef void (__cdecl *CcNodeSetPositionFunction)(void *self, float x, float y);
+typedef float (__cdecl *CcNodeGetPositionFunction)(void *self);
+typedef void (__cdecl *CcNodeSetScaleFunction)(void *self, float scale);
+typedef void (__cdecl *CcNodeSetFloatFunction)(void *self, float value);
+typedef void *(__cdecl *CcNodeCreateFunction)(void);
 typedef void (__cdecl *CcNodeRemoveFunction)(void *self, int cleanup);
 typedef void (__cdecl *CcNodeSetVisibleFunction)(void *self, int visible);
+typedef void (__cdecl *CcObjectRefFunction)(void *self);
 typedef void *(__cdecl *LevelEditorGetLevelFunction)(void *self);
+typedef void *(__cdecl *NodeGetterFunction)(void *self);
+typedef int (__cdecl *IntGetterFunction)(void *self);
 typedef void (__cdecl *GJGameLevelSetLevelStringFunction)(void *self,
                                                           void *string_object);
 typedef void *(__cdecl *PlayLayerCreateFunction)(void *level);
 typedef void (__cdecl *PlayLayerStartGameFunction)(void *self);
 typedef void *(__cdecl *CcSpriteCreateWithFrameFunction)(const char *name);
+typedef void *(__cdecl *CcSpriteCreateFileFunction)(const char *name);
+typedef struct { unsigned char r, g, b; } GdCcColor3B;
+typedef void (__cdecl *CcSpriteSetColorFunction)(void *self, const GdCcColor3B *color);
 typedef void *(__cdecl *CcMenuCreateFunction)(void);
 typedef void *(__cdecl *CcMenuItemSpriteExtraCreateFunction)(
     void *normal, void *selected, void *target, uintptr_t member_function,
@@ -129,15 +140,35 @@ typedef struct {
     CcNodeAddChildFunction ccnode_add_child;
     CcNodeAddChildZFunction ccnode_add_child_z;
     CcNodeSetPositionFunction ccnode_set_position;
+    CcNodeGetPositionFunction ccnode_get_position_x;
+    CcNodeGetPositionFunction ccnode_get_position_y;
+    CcNodeGetPositionFunction ccnode_get_rotation;
+    CcNodeGetPositionFunction ccnode_get_scale_x;
+    CcNodeGetPositionFunction ccnode_get_scale_y;
+    CcNodeSetScaleFunction ccnode_set_scale;
+    CcNodeSetFloatFunction ccnode_set_rotation;
+    CcNodeSetFloatFunction ccnode_set_scale_x;
+    CcNodeSetFloatFunction ccnode_set_scale_y;
+    CcNodeCreateFunction ccnode_create;
     CcNodeRemoveFunction ccnode_remove;
     CcNodeSetVisibleFunction ccnode_set_visible;
+    CcObjectRefFunction ccobject_retain;
+    CcObjectRefFunction ccobject_release;
     LevelEditorGetLevelFunction level_editor_get_level;
+    NodeGetterFunction level_editor_get_game_layer;
     void *level_editor_get_level_string;
     GJGameLevelSetLevelStringFunction gj_game_level_set_level_string;
     PlayLayerCreateFunction play_layer_create;
     PlayLayerStartGameFunction play_layer_start_game;
     void *play_layer_get_test_mode;
+    NodeGetterFunction play_layer_get_player;
+    NodeGetterFunction play_layer_get_game_layer;
+    IntGetterFunction play_layer_get_attempts;
+    IntGetterFunction player_get_is_dead;
+    IntGetterFunction game_manager_get_player_frame;
     CcSpriteCreateWithFrameFunction sprite_create_with_frame;
+    CcSpriteCreateFileFunction sprite_create_file;
+    CcSpriteSetColorFunction sprite_set_color;
     CcMenuCreateFunction cc_menu_create;
     CcMenuItemSpriteExtraCreateFunction menu_item_sprite_extra_create;
     CcLayerColorCreateFunction cclayer_color_create;
@@ -160,6 +191,19 @@ typedef struct {
     void *old_playtest_play_button;
     void *old_playtest_layer;
     void *old_playtest_stop_menu;
+    void *old_playtest_player;
+    void *old_playtest_play_game_layer;
+    void *old_playtest_editor_game_layer;
+    void *old_playtest_proxy_primary;
+    void *old_playtest_proxy_secondary;
+    int old_playtest_initial_attempts;
+    float old_playtest_editor_game_x;
+    float old_playtest_editor_game_y;
+    void *old_playtest_trail;
+    float old_playtest_trail_last_x;
+    float old_playtest_trail_last_y;
+    int old_playtest_trail_has_last;
+    unsigned int old_playtest_trail_segments;
     uint32_t old_playtest_test_mode_offset;
     int old_playtest_unavailable_logged;
     unsigned int editor_hotkey_miss_logs;
@@ -1088,7 +1132,16 @@ static int old_playtest_symbols_ready(void) {
            g_host.play_layer_start_game && g_host.play_layer_get_test_mode &&
            g_host.sprite_create_with_frame && g_host.cc_menu_create &&
            g_host.menu_item_sprite_extra_create && g_host.ccnode_set_visible &&
-           g_host.ccnode_set_position && g_host.ccnode_remove &&
+           g_host.ccnode_set_position && g_host.ccnode_get_position_x &&
+           g_host.ccnode_get_position_y && g_host.ccnode_get_rotation &&
+           g_host.ccnode_get_scale_x && g_host.ccnode_get_scale_y &&
+           g_host.ccnode_set_scale && g_host.ccnode_set_rotation &&
+           g_host.ccnode_set_scale_x && g_host.ccnode_set_scale_y &&
+           g_host.ccnode_create && g_host.ccnode_remove &&
+           g_host.level_editor_get_game_layer && g_host.play_layer_get_player &&
+           g_host.play_layer_get_game_layer && g_host.play_layer_get_attempts &&
+           g_host.player_get_is_dead && g_host.sprite_create_file &&
+           g_host.sprite_set_color &&
            (g_host.ccnode_add_child_z || g_host.ccnode_add_child);
 }
 
@@ -1132,8 +1185,16 @@ static int ensure_old_playtest_button(void) {
             g_host.old_playtest_layer = NULL;
             g_host.old_playtest_stop_menu = NULL;
             g_host.old_playtest_ui = NULL;
+            g_host.old_playtest_player = NULL;
+            g_host.old_playtest_play_game_layer = NULL;
+            g_host.old_playtest_editor_game_layer = NULL;
+            g_host.old_playtest_proxy_primary = NULL;
+            g_host.old_playtest_proxy_secondary = NULL;
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
+        /* The old scene owns any retained trail node and destroys it. Never
+           dereference that pointer after a scene transition. */
+        g_host.old_playtest_trail = NULL;
     }
     if (!editor_ui || g_host.old_playtest_layer ||
         g_host.old_playtest_play_button) return 1;
@@ -1142,15 +1203,83 @@ static int ensure_old_playtest_button(void) {
         return 1;
     }
     menu = g_host.cc_menu_create();
-    button = create_old_playtest_item(editor_ui, "GJ_playBtn_001.png");
+    button = create_old_playtest_item(editor_ui, "GJ_playBtn2_001.png");
     if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
     g_host.ccnode_set_position(menu, 0.0f, 0.0f);
     g_host.ccnode_set_position(button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
+    g_host.ccnode_set_scale(button, 0.65f);
     if (!add_extras_child(editor_ui, menu, 10000)) return 0;
     g_host.old_playtest_play_menu = menu;
     g_host.old_playtest_play_button = button;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-overlay");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-bridge-safe sprite=GJ_playBtn2_001.png");
     return 1;
+}
+
+static void clear_old_playtest_trail(void) {
+    if (g_host.old_playtest_trail &&
+        memory_range_is_readable(g_host.old_playtest_trail, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_trail, 1);
+    g_host.old_playtest_trail = NULL;
+    g_host.old_playtest_trail_has_last = 0;
+    g_host.old_playtest_trail_segments = 0;
+}
+
+static int append_old_playtest_trail_segment(float x, float y) {
+    float dx, dy, distance_squared;
+    void *crumb;
+    GdCcColor3B green = {0u, 255u, 0u};
+    if (!g_host.old_playtest_trail) return 1;
+    if (!g_host.old_playtest_trail_has_last) {
+        g_host.old_playtest_trail_last_x = x;
+        g_host.old_playtest_trail_last_y = y;
+        g_host.old_playtest_trail_has_last = 1;
+        return 1;
+    }
+    dx = x - g_host.old_playtest_trail_last_x;
+    dy = y - g_host.old_playtest_trail_last_y;
+    distance_squared = dx * dx + dy * dy;
+    if (distance_squared < 9.0f) return 1;
+    /* A portal/respawn jump should start a new trail span, not bridge space. */
+    if (dx > 192.0f || dx < -192.0f || dy > 192.0f || dy < -192.0f ||
+        g_host.old_playtest_trail_segments >= 4096u) {
+        g_host.old_playtest_trail_last_x = x;
+        g_host.old_playtest_trail_last_y = y;
+        return 1;
+    }
+    crumb = g_host.sprite_create_file("streak.png");
+    if (!crumb) return 0;
+    g_host.sprite_set_color(crumb, &green);
+    g_host.ccnode_set_position(crumb, x, y);
+    /* streak.png is 64x64. About 5 px gives a close-spaced breadcrumb path. */
+    g_host.ccnode_set_scale(crumb, 0.08f);
+    if (!add_extras_child(g_host.old_playtest_trail, crumb,
+                          (int)g_host.old_playtest_trail_segments)) return 0;
+    ++g_host.old_playtest_trail_segments;
+    g_host.old_playtest_trail_last_x = x;
+    g_host.old_playtest_trail_last_y = y;
+    return 1;
+}
+
+static int update_old_playtest_proxy_transform(void) {
+    float x, y, rotation, scale_x, scale_y;
+    if (!g_host.old_playtest_player || !g_host.old_playtest_proxy_primary)
+        return 1;
+    x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
+    y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
+    rotation = g_host.ccnode_get_rotation(g_host.old_playtest_player);
+    scale_x = g_host.ccnode_get_scale_x(g_host.old_playtest_player);
+    scale_y = g_host.ccnode_get_scale_y(g_host.old_playtest_player);
+    g_host.ccnode_set_position(g_host.old_playtest_proxy_primary, x, y);
+    g_host.ccnode_set_rotation(g_host.old_playtest_proxy_primary, rotation);
+    g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_primary, scale_x);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_primary, scale_y);
+    if (g_host.old_playtest_proxy_secondary) {
+        g_host.ccnode_set_position(g_host.old_playtest_proxy_secondary, x, y);
+        g_host.ccnode_set_rotation(g_host.old_playtest_proxy_secondary, rotation);
+        g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_secondary, scale_x);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_secondary, scale_y);
+    }
+    return append_old_playtest_trail_segment(x, y);
 }
 
 static int start_inline_old_playtest(void) {
@@ -1160,6 +1289,9 @@ static int start_inline_old_playtest(void) {
     void *play_layer;
     void *stop_menu;
     void *stop_button;
+    void *player;
+    void *play_game_layer;
+    void *editor_game_layer;
     unsigned char *test_mode;
     if (g_host.old_playtest_layer) return 1;
     editor_ui = find_active_editor_ui();
@@ -1173,6 +1305,7 @@ static int start_inline_old_playtest(void) {
         log_old_playtest_unavailable("unknown-PlayLayer-test-mode-layout");
         return 1;
     }
+    clear_old_playtest_trail();
     level = g_host.level_editor_get_level(g_host.active_editor_layer);
     if (!level) return 0;
     gd_call_sret_string_x86(g_host.level_editor_get_level_string,
@@ -1188,26 +1321,95 @@ static int start_inline_old_playtest(void) {
         return 1;
     }
     *test_mode = 1u;
+
+    if (!add_extras_child(g_host.active_editor_layer, play_layer, -10000))
+        return 0;
+    g_host.play_layer_start_game(play_layer);
+    player = g_host.play_layer_get_player(play_layer);
+    play_game_layer = g_host.play_layer_get_game_layer(play_layer);
+    editor_game_layer = g_host.level_editor_get_game_layer(g_host.active_editor_layer);
+    if (!player || !play_game_layer || !editor_game_layer) {
+        g_host.ccnode_remove(play_layer, 1);
+        return 0;
+    }
+
+    g_host.old_playtest_trail = g_host.ccnode_create();
+    if (!g_host.old_playtest_trail ||
+        !add_extras_child(editor_game_layer, g_host.old_playtest_trail, 9998)) {
+        g_host.old_playtest_trail = NULL;
+        g_host.ccnode_remove(play_layer, 1);
+        return 0;
+    }
+
+    {
+        int frame_id = 1;
+        char primary_name[64];
+        char secondary_name[64];
+        void *manager = g_host.game_manager_shared_state
+                            ? g_host.game_manager_shared_state() : NULL;
+        if (manager && g_host.game_manager_get_player_frame)
+            frame_id = g_host.game_manager_get_player_frame(manager);
+        if (frame_id < 0 || frame_id > 99) frame_id = 1;
+        snprintf(primary_name, sizeof(primary_name), "player_%02d_001.png", frame_id);
+        snprintf(secondary_name, sizeof(secondary_name), "player_%02d_2_001.png", frame_id);
+        g_host.old_playtest_proxy_secondary =
+            g_host.sprite_create_with_frame(secondary_name);
+        g_host.old_playtest_proxy_primary =
+            g_host.sprite_create_with_frame(primary_name);
+        if (!g_host.old_playtest_proxy_primary) {
+            g_host.old_playtest_proxy_primary =
+                g_host.sprite_create_with_frame("player_01_001.png");
+            g_host.old_playtest_proxy_secondary =
+                g_host.sprite_create_with_frame("player_01_2_001.png");
+        }
+        if (!g_host.old_playtest_proxy_primary ||
+            (g_host.old_playtest_proxy_secondary &&
+             !add_extras_child(editor_game_layer,
+                               g_host.old_playtest_proxy_secondary, 9999)) ||
+            !add_extras_child(editor_game_layer,
+                              g_host.old_playtest_proxy_primary, 10000)) {
+            g_host.ccnode_remove(play_layer, 1);
+            return 0;
+        }
+    }
+
+    g_host.old_playtest_editor_game_x = g_host.ccnode_get_position_x(editor_game_layer);
+    g_host.old_playtest_editor_game_y = g_host.ccnode_get_position_y(editor_game_layer);
+    /* Keep the real PlayerObject in its authentic PlayLayer hierarchy. Reparenting
+       it corrupts assumptions made by PlayLayer::update in 1.5-1.7. The hidden
+       PlayLayer remains the physics authority; only lightweight sprite proxies
+       are rendered inside the editor. */
+    g_host.ccnode_set_visible(play_layer, 0);
+    g_host.ccnode_set_position(editor_game_layer,
+        g_host.ccnode_get_position_x(play_game_layer),
+        g_host.ccnode_get_position_y(play_game_layer));
+    g_host.old_playtest_player = player;
+    if (!update_old_playtest_proxy_transform()) {
+        g_host.old_playtest_player = NULL;
+        g_host.ccnode_remove(play_layer, 1);
+        return 0;
+    }
+
     stop_menu = g_host.cc_menu_create();
     stop_button = create_old_playtest_item(editor_ui, "GJ_pauseBtn_001.png");
     if (!stop_menu || !stop_button ||
         !add_extras_child(stop_menu, stop_button, 0)) return 0;
     g_host.ccnode_set_position(stop_menu, 0.0f, 0.0f);
     g_host.ccnode_set_position(stop_button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
+    if (!add_extras_child(editor_ui, stop_menu, 10001)) return 0;
 
     g_host.old_playtest_scene = g_host.active_scene_root;
     g_host.old_playtest_editor = g_host.active_editor_layer;
     g_host.old_playtest_ui = editor_ui;
     g_host.old_playtest_layer = play_layer;
     g_host.old_playtest_stop_menu = stop_menu;
-    if (!add_extras_child(g_host.active_editor_layer, play_layer, 0) ||
-        !add_extras_child(editor_ui, stop_menu, 10001)) {
-        g_host.old_playtest_layer = NULL;
-        g_host.old_playtest_stop_menu = NULL;
-        return 0;
-    }
-    g_host.play_layer_start_game(play_layer);
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-overlay unsaved-level=live");
+    g_host.old_playtest_player = player;
+    g_host.old_playtest_play_game_layer = play_game_layer;
+    g_host.old_playtest_editor_game_layer = editor_game_layer;
+    g_host.old_playtest_initial_attempts = g_host.play_layer_get_attempts(play_layer);
+    if (g_host.old_playtest_play_menu)
+        g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 0);
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden");
     return 1;
 }
 
@@ -1216,15 +1418,57 @@ static int stop_inline_old_playtest(void) {
     if (g_host.old_playtest_stop_menu &&
         memory_range_is_readable(g_host.old_playtest_stop_menu, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_stop_menu, 1);
+    if (g_host.old_playtest_proxy_primary &&
+        memory_range_is_readable(g_host.old_playtest_proxy_primary, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_primary, 1);
+    if (g_host.old_playtest_proxy_secondary &&
+        memory_range_is_readable(g_host.old_playtest_proxy_secondary, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_secondary, 1);
+    if (g_host.old_playtest_editor_game_layer &&
+        memory_range_is_readable(g_host.old_playtest_editor_game_layer, sizeof(void *)))
+        g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
+                                   g_host.old_playtest_editor_game_x,
+                                   g_host.old_playtest_editor_game_y);
     if (memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_layer, 1);
+    if (g_host.old_playtest_play_menu &&
+        memory_range_is_readable(g_host.old_playtest_play_menu, sizeof(void *)))
+        g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 1);
     g_host.old_playtest_layer = NULL;
     g_host.old_playtest_stop_menu = NULL;
     g_host.old_playtest_editor = NULL;
     g_host.old_playtest_ui = NULL;
+    g_host.old_playtest_player = NULL;
+    g_host.old_playtest_play_game_layer = NULL;
+    g_host.old_playtest_editor_game_layer = NULL;
+    g_host.old_playtest_proxy_primary = NULL;
+    g_host.old_playtest_proxy_secondary = NULL;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-overlay editor=preserved");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained");
     return 1;
+}
+
+static int update_inline_old_playtest(void) {
+    float camera_x, camera_y;
+    void *current_player;
+    if (!g_host.old_playtest_layer) return 1;
+    if (!g_host.old_playtest_player || !g_host.old_playtest_play_game_layer ||
+        !g_host.old_playtest_editor_game_layer) return 0;
+    current_player = g_host.play_layer_get_player(g_host.old_playtest_layer);
+    if (!current_player || current_player != g_host.old_playtest_player ||
+        g_host.player_get_is_dead(g_host.old_playtest_player) ||
+        g_host.play_layer_get_attempts(g_host.old_playtest_layer) !=
+            g_host.old_playtest_initial_attempts) {
+        /* Do not allow PlayLayer's normal death/retry flow to become a visible
+           Attempt 2 inside the editor. Tear the backing layer down before the
+           next frame is rendered. */
+        return stop_inline_old_playtest();
+    }
+    camera_x = g_host.ccnode_get_position_x(g_host.old_playtest_play_game_layer);
+    camera_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
+    g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
+                               camera_x, camera_y);
+    return update_old_playtest_proxy_transform();
 }
 
 static int process_old_playtest_request(void) {
@@ -1761,11 +2005,23 @@ static int create_opengl_window(int client_width, int client_height) {
     descriptor.cDepthBits = 24;
     descriptor.cStencilBits = 8;
     descriptor.iLayerType = PFD_MAIN_PLANE;
-    pixel_format = ChoosePixelFormat(g_host.device, &descriptor);
-    if (!pixel_format || !SetPixelFormat(g_host.device, pixel_format, &descriptor)) {
-        runtime_log("ERROR: OpenGL pixel format setup failed: %lu",
-                    (unsigned long)GetLastError());
-        return 0;
+    {
+        int actual_msaa = 0;
+        const int requested_msaa = gd_settings_msaa_samples();
+        pixel_format = gd_gl_choose_pixel_format(g_host.device, &descriptor,
+                                                 requested_msaa, &actual_msaa);
+        if (pixel_format)
+            DescribePixelFormat(g_host.device, pixel_format, sizeof(descriptor),
+                                &descriptor);
+        if (!pixel_format || !SetPixelFormat(g_host.device, pixel_format, &descriptor)) {
+            runtime_log("ERROR: OpenGL pixel format setup failed: %lu",
+                        (unsigned long)GetLastError());
+            return 0;
+        }
+        runtime_log("Antialiasing: requested=%s MSAA=%dx%s FXAA=%s",
+                    gd_settings_antialiasing_name(), actual_msaa,
+                    requested_msaa && !actual_msaa ? " (fallback=off)" : "",
+                    gd_settings_fxaa() ? "on" : "off");
     }
     g_host.context = wglCreateContext(g_host.device);
     if (!g_host.context || !wglMakeCurrent(g_host.device, g_host.context)) {
@@ -1802,6 +2058,7 @@ static void destroy_opengl_window(void) {
     gd_frame_pacer_destroy(&g_host.frame_pacer);
     gd_extras_menu_destroy(&g_host.extras_menu);
     if (g_host.context) {
+        if (wglGetCurrentContext() == g_host.context) gd_fxaa_shutdown();
         wglMakeCurrent(NULL, NULL);
         wglDeleteContext(g_host.context);
         g_host.context = NULL;
@@ -1871,8 +2128,28 @@ static int run_message_loop(void) {
         if (!ensure_old_playtest_button()) {
             runtime_log("ERROR: inline old-version playtest button creation failed");
         }
+        if (!update_inline_old_playtest()) {
+            runtime_log("ERROR: inline old-version playtest bridge update failed");
+            InterlockedExchange(&g_host.old_playtest_request, 2);
+        }
         if (g_host.render && g_host.window_active) {
+            const int old_playtest_active_before_render =
+                g_host.old_playtest_layer != NULL;
             g_host.render(jni_shim_env(), NULL);
+            if (old_playtest_active_before_render && g_host.old_playtest_layer) {
+                if (!update_inline_old_playtest()) {
+                    runtime_log("ERROR: inline old-version playtest post-render check failed");
+                    (void)stop_inline_old_playtest();
+                }
+                if (!g_host.old_playtest_layer) {
+                    /* nativeRender advances scheduled gameplay before drawing.
+                       A death/retry can therefore be discovered only after that
+                       call. Re-render the now-restored editor before presenting
+                       so an Attempt 2/end-wall frame never reaches the screen. */
+                    g_host.render(jni_shim_env(), NULL);
+                }
+            }
+            if (gd_settings_fxaa()) (void)gd_fxaa_apply(g_host.window);
             SwapBuffers(g_host.device);
             /*
              * The game explicitly requests its animation interval through JNI.
@@ -2032,13 +2309,39 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode8addChildEPS0_i");
     g_host.ccnode_set_position = (CcNodeSetPositionFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode11setPositionEff");
+    g_host.ccnode_get_position_x = (CcNodeGetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode12getPositionXEv");
+    g_host.ccnode_get_position_y = (CcNodeGetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode12getPositionYEv");
+    g_host.ccnode_get_rotation = (CcNodeGetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode11getRotationEv");
+    g_host.ccnode_get_scale_x = (CcNodeGetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9getScaleXEv");
+    g_host.ccnode_get_scale_y = (CcNodeGetPositionFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9getScaleYEv");
+    g_host.ccnode_set_scale = (CcNodeSetScaleFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode8setScaleEf");
+    g_host.ccnode_set_rotation = (CcNodeSetFloatFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode11setRotationEf");
+    g_host.ccnode_set_scale_x = (CcNodeSetFloatFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9setScaleXEf");
+    g_host.ccnode_set_scale_y = (CcNodeSetFloatFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9setScaleYEf");
+    g_host.ccnode_create = (CcNodeCreateFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode6createEv");
     g_host.ccnode_remove = (CcNodeRemoveFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb");
     g_host.ccnode_set_visible = (CcNodeSetVisibleFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode10setVisibleEb");
+    g_host.ccobject_retain = (CcObjectRefFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d8CCObject6retainEv");
+    g_host.ccobject_release = (CcObjectRefFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d8CCObject7releaseEv");
     g_host.level_editor_get_level =
         (LevelEditorGetLevelFunction)elf_image_find_export(
             &image, "_ZNK16LevelEditorLayer8getLevelEv");
+    g_host.level_editor_get_game_layer = (NodeGetterFunction)elf_image_find_export(
+        &image, "_ZNK16LevelEditorLayer12getGameLayerEv");
     g_host.level_editor_get_level_string = elf_image_find_export(
         &image, "_ZN16LevelEditorLayer14getLevelStringEv");
     g_host.gj_game_level_set_level_string =
@@ -2051,9 +2354,23 @@ int main(int argc, char **argv) {
             &image, "_ZN9PlayLayer9startGameEv");
     g_host.play_layer_get_test_mode = elf_image_find_export(
         &image, "_ZNK9PlayLayer11getTestModeEv");
+    g_host.play_layer_get_player = (NodeGetterFunction)elf_image_find_export(
+        &image, "_ZNK9PlayLayer9getPlayerEv");
+    g_host.play_layer_get_game_layer = (NodeGetterFunction)elf_image_find_export(
+        &image, "_ZNK9PlayLayer12getGameLayerEv");
+    g_host.play_layer_get_attempts = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK9PlayLayer11getAttemptsEv");
+    g_host.player_get_is_dead = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject9getIsDeadEv");
+    g_host.game_manager_get_player_frame = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager14getPlayerFrameEv");
     g_host.sprite_create_with_frame =
         (CcSpriteCreateWithFrameFunction)elf_image_find_export(
             &image, "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc");
+    g_host.sprite_create_file = (CcSpriteCreateFileFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d8CCSprite6createEPKc");
+    g_host.sprite_set_color = (CcSpriteSetColorFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d8CCSprite8setColorERKNS_10_ccColor3BE");
     g_host.cc_menu_create = (CcMenuCreateFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCMenu6createEv");
     g_host.menu_item_sprite_extra_create =

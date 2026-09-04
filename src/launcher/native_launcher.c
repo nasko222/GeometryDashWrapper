@@ -20,7 +20,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-newera3-fix1"
+#define LAUNCHER_VERSION "0.9.7-newera4-fix1"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -715,6 +715,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t extras_menu[64];
     wchar_t resolution[64];
     wchar_t texture_filtering[64];
+    wchar_t antialiasing[64];
     wchar_t show_command_prompt[64];
     wchar_t old_ver_playtest[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
@@ -763,8 +764,11 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     fwprintf(file, L"resolution=%ls\n",
              GetSetting(L"RESOLUTION", L"1140x640", resolution, ARRAY_COUNT(resolution)));
     fwprintf(file, L"texture_filtering=%ls\n",
-             GetSetting(L"TEXTURE_FILTERING", L"LINEAR", texture_filtering,
+             GetSetting(L"TEXTURE_FILTERING", L"GAME", texture_filtering,
                         ARRAY_COUNT(texture_filtering)));
+    fwprintf(file, L"antialiasing=%ls\n",
+             GetSetting(L"ANTIALIASING", L"NONE", antialiasing,
+                        ARRAY_COUNT(antialiasing)));
     fwprintf(file, L"show_command_prompt=%ls\n",
              GetSetting(L"SHOW_COMMAND_PROMPT", L"false", show_command_prompt,
                         ARRAY_COUNT(show_command_prompt)));
