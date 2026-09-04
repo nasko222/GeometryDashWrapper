@@ -1008,8 +1008,17 @@ struct ElfRuntime {
     u32 editor_move_edit_command = 0;
     u32 editor_transform_object_call = 0;
     u32 editor_transform_edit_command = 0;
-    u32 editor_pause_layer_create = 0;
-    u32 editor_pause_layer_save_and_test = 0;
+    u32 old_playtest_callback = 0;
+    u32 level_editor_get_level = 0;
+    u32 level_editor_get_level_string = 0;
+    u32 gj_game_level_set_level_string = 0;
+    u32 play_layer_create = 0;
+    u32 play_layer_start_game = 0;
+    u32 play_layer_get_test_mode = 0;
+    u32 sprite_create_with_frame = 0;
+    u32 menu_item_sprite_extra_create = 0;
+    u32 cc_menu_create = 0;
+    u32 ccnode_set_visible = 0;
     u32 level_tools_get_level = 0;
     u32 gj_game_level_create = 0;
     u32 play_layer_scene = 0;
@@ -1549,10 +1558,26 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.editor_transform_object_call = address;
             else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand")
                 runtime.editor_transform_edit_command = address;
-            else if (name == "_ZN16EditorPauseLayer6createEP16LevelEditorLayer")
-                runtime.editor_pause_layer_create = address;
-            else if (name == "_ZN16EditorPauseLayer13onSaveAndTestEv")
-                runtime.editor_pause_layer_save_and_test = address;
+            else if (name == "_ZNK16LevelEditorLayer8getLevelEv")
+                runtime.level_editor_get_level = address;
+            else if (name == "_ZN16LevelEditorLayer14getLevelStringEv")
+                runtime.level_editor_get_level_string = address;
+            else if (name == "_ZN11GJGameLevel14setLevelStringESs")
+                runtime.gj_game_level_set_level_string = address;
+            else if (name == "_ZN9PlayLayer6createEP11GJGameLevel")
+                runtime.play_layer_create = address;
+            else if (name == "_ZN9PlayLayer9startGameEv")
+                runtime.play_layer_start_game = address;
+            else if (name == "_ZNK9PlayLayer11getTestModeEv")
+                runtime.play_layer_get_test_mode = address;
+            else if (name == "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc")
+                runtime.sprite_create_with_frame = address;
+            else if (name == "_ZN21CCMenuItemSpriteExtra6createEPN7cocos2d6CCNodeES2_PNS0_8CCObjectEMS3_FvS4_E")
+                runtime.menu_item_sprite_extra_create = address;
+            else if (name == "_ZN7cocos2d6CCMenu6createEv")
+                runtime.cc_menu_create = address;
+            else if (name == "_ZN7cocos2d6CCNode10setVisibleEb")
+                runtime.ccnode_set_visible = address;
             else if (name == "_ZN10LevelTools8getLevelEi")
                 runtime.level_tools_get_level = address;
             else if (name == "_ZN11GJGameLevel6createEv")
@@ -1787,7 +1812,6 @@ enum class HostEventType {
     DeleteBackward,
     PracticeCheckpoint,
     EditorCommand,
-    OldVersionPlaytest,
     ExtrasAction,
     Pause,
     Resume
@@ -2357,11 +2381,6 @@ private:
                 event.type = HostEventType::TextInput;
                 event.text = ClipboardTextUtf8(window);
                 if (!event.text.empty()) self->Queue(std::move(event));
-                return 0;
-            }
-            if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
-                wparam == VK_F5 && gd_settings_old_ver_playtest()) {
-                self->Queue(HostEvent{HostEventType::OldVersionPlaytest});
                 return 0;
             }
             if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
@@ -3162,36 +3181,223 @@ public:
         return ok;
     }
 
-    bool StartOldVersionPlaytest() {
-        if (!gd_settings_old_ver_playtest()) return true;
-        gameplay_check_at_ = {};
-        RefreshDesktopGameplayState();
-        if (!active_editor_layer_) return true;
-        if (!runtime_.editor_pause_layer_create ||
-            !runtime_.editor_pause_layer_save_and_test) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_UNAVAILABLE reason=missing-game-symbol\n";
-            log_.flush();
+    bool OldVersionPlaytestSymbolsReady() const {
+        return runtime_.old_playtest_callback && runtime_.level_editor_get_level &&
+               runtime_.level_editor_get_level_string &&
+               runtime_.gj_game_level_set_level_string &&
+               runtime_.play_layer_create && runtime_.play_layer_start_game &&
+               runtime_.play_layer_get_test_mode &&
+               runtime_.sprite_create_with_frame &&
+               runtime_.menu_item_sprite_extra_create && runtime_.cc_menu_create &&
+               runtime_.ccnode_set_visible && runtime_.ccnode_set_position_ff &&
+               runtime_.ccnode_remove_from_parent_cleanup &&
+               (runtime_.ccnode_add_child_z || runtime_.ccnode_add_child);
+    }
+
+    void LogOldVersionPlaytestUnavailable(const char* reason) {
+        if (old_playtest_unavailable_logged_) return;
+        old_playtest_unavailable_logged_ = true;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_UNAVAILABLE reason="
+             << (reason ? reason : "unknown") << "\n";
+        log_.flush();
+    }
+
+    u32 DeriveOldVersionPlaytestModeOffset() {
+        if (old_playtest_test_mode_offset_) return old_playtest_test_mode_offset_;
+        const u32 function = runtime_.play_layer_get_test_mode & ~1u;
+        if (!function || !env_.IsMapped(function, 12u)) return 0u;
+        for (u32 offset = 0u; offset + 6u <= 32u; offset += 2u) {
+            const u16 first = env_.MemoryRead16(function + offset);
+            const u16 second = env_.MemoryRead16(function + offset + 2u);
+            const u16 third = env_.MemoryRead16(function + offset + 4u);
+            if ((first & 0xff00u) == 0x2300u && second == 0x009bu &&
+                (third & 0xfe00u) == 0x5c00u) {
+                old_playtest_test_mode_offset_ = (first & 0xffu) * 4u;
+                break;
+            }
+            if (first == 0xf890u) {
+                old_playtest_test_mode_offset_ = second & 0x0fffu;
+                break;
+            }
+        }
+        return old_playtest_test_mode_offset_;
+    }
+
+    bool CreateOldVersionPlaytestItem(u32 target, const char* frame,
+                                      u32* item_out) {
+        if (item_out) *item_out = 0u;
+        const u32 frame_name = AllocateString(frame);
+        u32 normal = 0u, selected = 0u, item = 0u;
+        if (!frame_name ||
+            !RunFunction(runtime_.sprite_create_with_frame, {frame_name}, &normal,
+                         "CCSprite::createWithSpriteFrameName playtest", 0u,
+                         std::chrono::milliseconds(1500)) || !normal ||
+            !RunFunction(runtime_.sprite_create_with_frame, {frame_name}, &selected,
+                         "CCSprite::createWithSpriteFrameName playtest selected", 0u,
+                         std::chrono::milliseconds(1500)) || !selected ||
+            !RunFunction(runtime_.menu_item_sprite_extra_create,
+                         {normal, selected, target,
+                          runtime_.old_playtest_callback, 0u}, &item,
+                         "CCMenuItemSpriteExtra::create playtest", 0u,
+                         std::chrono::milliseconds(2000)) || !item) return false;
+        if (item_out) *item_out = item;
+        return true;
+    }
+
+    bool StartInlineOldVersionPlaytest() {
+        if (old_playtest_layer_) return true;
+        const u32 editor_ui = FindActiveEditorUi();
+        if (!editor_ui || !active_editor_layer_ || !active_scene_root_) return true;
+        if (!OldVersionPlaytestSymbolsReady()) {
+            LogOldVersionPlaytestUnavailable("missing-game-symbol");
             return true;
         }
-        u32 pause_layer = 0u;
-        if (!RunFunction(runtime_.editor_pause_layer_create,
-                         {active_editor_layer_}, &pause_layer,
-                         "EditorPauseLayer::create old-version playtest", 0u,
-                         std::chrono::milliseconds(3000)) || !pause_layer) {
-            return false;
+        const u32 test_mode_offset = DeriveOldVersionPlaytestModeOffset();
+        if (!test_mode_offset) {
+            LogOldVersionPlaytestUnavailable("unknown-PlayLayer-test-mode-layout");
+            return true;
         }
-        LogHostDispatch("oldVersionPlaytest",
-                        runtime_.editor_pause_layer_save_and_test,
-                        "action=EditorPauseLayer::onSaveAndTest");
-        if (!RunFunction(runtime_.editor_pause_layer_save_and_test,
-                         {pause_layer}, nullptr,
-                         "EditorPauseLayer::onSaveAndTest", 0u,
-                         std::chrono::milliseconds(10000))) {
-            return false;
+
+        u32 level = 0u;
+        if (!RunFunction(runtime_.level_editor_get_level,
+                         {active_editor_layer_}, &level,
+                         "LevelEditorLayer::getLevel inline playtest", 0u,
+                         std::chrono::milliseconds(1500)) || !level) return false;
+        const u32 level_string = Allocate(4u);
+        if (!level_string) return false;
+        env_.MemoryWrite32(level_string, 0u);
+        if (!RunFunction(runtime_.level_editor_get_level_string,
+                         {level_string, active_editor_layer_}, nullptr,
+                         "LevelEditorLayer::getLevelString inline playtest", 0u,
+                         std::chrono::milliseconds(4000)) ||
+            !RunFunction(runtime_.gj_game_level_set_level_string,
+                         {level, level_string}, nullptr,
+                         "GJGameLevel::setLevelString inline playtest", 0u,
+                         std::chrono::milliseconds(4000))) return false;
+
+        u32 play_layer = 0u;
+        if (!RunFunction(runtime_.play_layer_create, {level}, &play_layer,
+                         "PlayLayer::create inline playtest", 0u,
+                         std::chrono::milliseconds(10000)) || !play_layer) return false;
+        if (!env_.IsMapped(play_layer + test_mode_offset, 1u)) {
+            LogOldVersionPlaytestUnavailable("invalid-PlayLayer-test-mode-layout");
+            return true;
         }
-        InvalidateDesktopGameplayState();
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED key=F5\n";
+        env_.MemoryWrite8(play_layer + test_mode_offset, 1u);
+
+        u32 stop_menu = 0u, stop_button = 0u;
+        if (!RunFunction(runtime_.cc_menu_create, {}, &stop_menu,
+                         "CCMenu::create playtest stop", 0u,
+                         std::chrono::milliseconds(1500)) || !stop_menu ||
+            !CreateOldVersionPlaytestItem(editor_ui, "GJ_pauseBtn_001.png",
+                                          &stop_button) ||
+            !AddExtrasChild(stop_menu, stop_button, 0) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {stop_menu, FloatToWord(0.0f), FloatToWord(0.0f)},
+                         nullptr, "CCNode::setPosition playtest stop menu", 0u,
+                         std::chrono::milliseconds(1000)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {stop_button, FloatToWord(30.0f), FloatToWord(186.0f)},
+                         nullptr, "CCNode::setPosition playtest stop", 0u,
+                         std::chrono::milliseconds(1000))) return false;
+
+        old_playtest_scene_ = active_scene_root_;
+        old_playtest_editor_ = active_editor_layer_;
+        old_playtest_ui_ = editor_ui;
+        old_playtest_layer_ = play_layer;
+        old_playtest_stop_menu_ = stop_menu;
+        if (!AddExtrasChild(active_editor_layer_, play_layer, 0) ||
+            !AddExtrasChild(editor_ui, stop_menu, 10001) ||
+            !RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
+                         "PlayLayer::startGame inline playtest", 0u,
+                         std::chrono::milliseconds(10000))) return false;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-overlay unsaved-level=live\n";
         log_.flush();
+        return true;
+    }
+
+    bool StopInlineOldVersionPlaytest() {
+        if (!old_playtest_layer_) return true;
+        bool ok = true;
+        if (old_playtest_stop_menu_)
+            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {old_playtest_stop_menu_, 1u}, nullptr,
+                             "remove inline playtest stop menu", 0u,
+                             std::chrono::milliseconds(3000));
+        if (ok && old_playtest_layer_)
+            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {old_playtest_layer_, 1u}, nullptr,
+                             "remove inline PlayLayer", 0u,
+                             std::chrono::milliseconds(5000));
+        old_playtest_layer_ = 0u;
+        old_playtest_stop_menu_ = 0u;
+        old_playtest_editor_ = 0u;
+        old_playtest_ui_ = 0u;
+        InvalidateDesktopGameplayState();
+        if (ok) {
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-overlay editor=preserved\n";
+            log_.flush();
+        }
+        return ok;
+    }
+
+    bool EnsureOldVersionPlaytestButton() {
+        if (!gd_settings_old_ver_playtest() ||
+            !gd_settings_old_ver_playtest_supported_version()) return true;
+        const u32 editor_ui = FindActiveEditorUi();
+        if (old_playtest_scene_ != active_scene_root_) {
+            old_playtest_play_menu_ = 0u;
+            old_playtest_play_button_ = 0u;
+            old_playtest_editor_ = 0u;
+            old_playtest_ui_ = 0u;
+            old_playtest_layer_ = 0u;
+            old_playtest_stop_menu_ = 0u;
+            old_playtest_request_ = 0u;
+            old_playtest_scene_ = active_scene_root_;
+        }
+        if (!editor_ui || old_playtest_layer_) return true;
+        if (old_playtest_play_button_) return true;
+        if (!OldVersionPlaytestSymbolsReady()) {
+            LogOldVersionPlaytestUnavailable("missing-game-symbol");
+            return true;
+        }
+        u32 menu = 0u;
+        if (!RunFunction(runtime_.cc_menu_create, {}, &menu,
+                         "CCMenu::create editor playtest", 0u,
+                         std::chrono::milliseconds(1500)) || !menu) return false;
+        u32 button = 0u;
+        if (!CreateOldVersionPlaytestItem(editor_ui, "GJ_playBtn_001.png",
+                                          &button)) return false;
+        if (!AddExtrasChild(menu, button, 0) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {menu, FloatToWord(0.0f), FloatToWord(0.0f)}, nullptr,
+                         "CCNode::setPosition editor playtest menu", 0u,
+                         std::chrono::milliseconds(1000)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {button, FloatToWord(30.0f), FloatToWord(186.0f)}, nullptr,
+                         "CCNode::setPosition editor playtest", 0u,
+                         std::chrono::milliseconds(1000)) ||
+            !AddExtrasChild(editor_ui, menu, 10000)) return false;
+        old_playtest_play_menu_ = menu;
+        old_playtest_play_button_ = button;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-overlay\n";
+        log_.flush();
+        return true;
+    }
+
+    bool HandleOldVersionPlaytestBack(bool& handled) {
+        handled = false;
+        if (!old_playtest_layer_) return true;
+        handled = true;
+        old_playtest_request_ = 0u;
+        return StopInlineOldVersionPlaytest();
+    }
+
+    bool ProcessOldVersionPlaytestRequest() {
+        const u32 request = old_playtest_request_;
+        old_playtest_request_ = 0u;
+        if (request == 1u) return StartInlineOldVersionPlaytest();
+        if (request == 2u) return StopInlineOldVersionPlaytest();
         return true;
     }
 
@@ -5494,7 +5700,14 @@ private:
             using Fn = void (APIENTRY*)(GLenum, GLenum, GLint);
             const GLenum target = static_cast<GLenum>(arguments[0]);
             const GLenum pname = static_cast<GLenum>(arguments[1]);
-            const GLint param = static_cast<GLint>(arguments[2]);
+            GLint param = static_cast<GLint>(arguments[2]);
+            if (pname == 0x2800u) {
+                const int filtering = gd_settings_texture_filtering_mode();
+                if (filtering == GD_TEXTURE_FILTERING_LINEAR && param == 0x2600)
+                    param = 0x2601;
+                else if (filtering == GD_TEXTURE_FILTERING_NEAREST && param == 0x2601)
+                    param = 0x2600;
+            }
             reinterpret_cast<Fn>(function)(target, pname, param);
         } else if (name == "glUniform1f") {
             reinterpret_cast<void (APIENTRY*)(GLint,GLfloat)>(function)(static_cast<GLint>(arguments[0]), WordToFloat(static_cast<u32>(arguments[1])));
@@ -6752,6 +6965,13 @@ private:
         u32 result = 0;
         bool result_set = true;
 
+        if (name == "__gd_wrapper_old_playtest_callback") {
+            old_playtest_request_ = old_playtest_layer_ ? 2u : 1u;
+            cpu_.Regs()[0] = 0u;
+            ResumeAfterStub(import.address);
+            return true;
+        }
+
         if (import.name.rfind("__dynarmic_unz", 0) == 0)
             return DispatchHostMinizip(import);
         if (import.is_gl) return DispatchGl(import);
@@ -7388,6 +7608,16 @@ private:
     u32 extras_time_button_ = 0u;
     u32 extras_close_button_ = 0u;
     u32 extras_empty_button_ = 0u;
+    u32 old_playtest_request_ = 0u;
+    u32 old_playtest_scene_ = 0u;
+    u32 old_playtest_editor_ = 0u;
+    u32 old_playtest_ui_ = 0u;
+    u32 old_playtest_play_menu_ = 0u;
+    u32 old_playtest_play_button_ = 0u;
+    u32 old_playtest_layer_ = 0u;
+    u32 old_playtest_stop_menu_ = 0u;
+    u32 old_playtest_test_mode_offset_ = 0u;
+    bool old_playtest_unavailable_logged_ = false;
     u64 scene_scan_logs_ = 0u;
     u64 editor_hotkey_miss_logs_ = 0u;
     int native_width_ = 1140;
@@ -7723,7 +7953,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash Wrapper 0.9.7-newera1 legacy ARM debug profile\n";
+        file << "Geometry Dash Wrapper 0.9.7-newera3-fix1 legacy ARM debug profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -7927,7 +8157,7 @@ int main(int argc,char** argv) {
 
         std::string apk_path="game.apk";
         bool probe_only=false;
-        int width=0,height=0,max_frames=0;
+        int width = 1140, height = 640, max_frames = 0;
         gd_settings_resolution(&width, &height);
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
@@ -7972,6 +8202,11 @@ int main(int argc,char** argv) {
         }
         ProbeEnvironment env;
         ElfRuntime runtime=MapAndRelocateElf(libgame,env);
+        if (gd_settings_old_ver_playtest() &&
+            gd_settings_old_ver_playtest_supported_version()) {
+            runtime.old_playtest_callback = EnsureImport(
+                runtime, env, "__gd_wrapper_old_playtest_callback");
+        }
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         MinizipHookCounts minizip_hooks{};
         if (legacy_gd_100) {
@@ -8046,8 +8281,8 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory) +
              " music-pulse-max=" +
              std::to_string(gd_settings_music_pulse_max()) +
-             " resolution=" + std::to_string(width) + "x" +
-             std::to_string(height) +
+             " texture-filtering=" +
+             (gd_settings_linear_texture_filtering() ? "linear" : "game") +
              " old-ver-playtest=" +
              (gd_settings_old_ver_playtest() ? "true" : "false") +
              " practice-zx=" +
@@ -8178,6 +8413,8 @@ int main(int argc,char** argv) {
                     if(!native_paused){
                         bool handled=false;
                         if(event.value==4u)
+                            ok=executor.HandleOldVersionPlaytestBack(handled);
+                        if(ok && !handled && event.value==4u)
                             ok=executor.TryHandleEarlyEndLevelEscape(handled);
                         if(ok && !handled)
                             ok=executor.SendKey(
@@ -8203,9 +8440,6 @@ int main(int argc,char** argv) {
                 case HostEventType::EditorCommand:
                     if(!native_paused) ok=executor.SendEditorCommand(event.value);
                     break;
-                case HostEventType::OldVersionPlaytest:
-                    if(!native_paused) ok=executor.StartOldVersionPlaytest();
-                    break;
                 case HostEventType::ExtrasAction:
                     if(!native_paused) ok=executor.HandleExtrasAction(event.value);
                     break;
@@ -8230,6 +8464,8 @@ int main(int argc,char** argv) {
                     break;
                 }
             }
+            if (!native_paused && !executor.ProcessOldVersionPlaytestRequest())
+                throw std::runtime_error(executor.LastError());
             const auto events_done=std::chrono::steady_clock::now();
             if(executor.TerminationRequested()){
                 running=false;
@@ -8245,8 +8481,9 @@ int main(int argc,char** argv) {
             }
 
             const auto render_start=std::chrono::steady_clock::now();
-            // Reassert desktop pause suppression before the guest draws.
             executor.RefreshDesktopGameplayState();
+            if (!executor.EnsureOldVersionPlaytestButton())
+                throw std::runtime_error(executor.LastError());
             if(profile_enabled) executor.BeginGpuFrame(frame_count+1u);
             if(!executor.RunFunction(
                     runtime.native_render,{kEnvObject,0u},&result,

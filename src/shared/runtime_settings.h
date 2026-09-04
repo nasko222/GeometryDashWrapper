@@ -17,7 +17,17 @@ int gd_settings_i_lost_the_game(void);
 int gd_settings_editor_controls(void);
 int gd_settings_extras_menu(void);
 int gd_settings_old_ver_playtest(void);
-void gd_settings_resolution(int *width, int *height);
+int gd_settings_old_ver_playtest_supported_version(void);
+
+enum {
+    GD_TEXTURE_FILTERING_GAME = 0,
+    GD_TEXTURE_FILTERING_LINEAR = 1,
+    GD_TEXTURE_FILTERING_NEAREST = 2
+};
+
+int gd_settings_texture_filtering_mode(void);
+int gd_settings_linear_texture_filtering(void);
+int gd_settings_resolution(int *width, int *height);
 /* Uses the beta companion's complete editor visibility pass. */
 int gd_settings_v22_exact_editor_visibility(void);
 float gd_settings_music_pulse_max(void);

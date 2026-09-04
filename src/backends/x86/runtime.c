@@ -3548,6 +3548,13 @@ static void shim_glClearDepthf(float depth) {
 static void shim_glTexParameteri(unsigned int target, unsigned int pname, int param) {
     typedef void (APIENTRY *Function)(unsigned int, unsigned int, int);
     Function function = (Function)GetProcAddress(g_opengl, "glTexParameteri");
+    if (pname == 0x2800u) {
+        const int filtering = gd_settings_texture_filtering_mode();
+        if (filtering == GD_TEXTURE_FILTERING_LINEAR && param == 0x2600)
+            param = 0x2601;
+        else if (filtering == GD_TEXTURE_FILTERING_NEAREST && param == 0x2601)
+            param = 0x2600;
+    }
     if (function) function(target, pname, param);
 }
 

@@ -1,15 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera1
+# Geometry Dash Wrapper 0.9.7-newera3-fix1
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system. The launcher reads an APK, selects a backend from the packaged native ABI, loads the original game library, and supplies the Android, JNI, Cocos2d-x, OpenGL, audio, network, input, and storage behavior that library expects.
 
 No Geometry Dash APK, proprietary game library, save data, or compiled wrapper binary is included in this source package. You must supply a legally obtained compatible APK.
 
-## What newera1 changes
+## What newera3-fix1 changes
 
 - `Ctrl+V` pastes the complete Unicode clipboard into active game text fields. This covers level names, level descriptions/comments, search fields, account fields, and other fields that use the game's normal text-input path. Geometry Dash still applies its own character and length limits.
 - The command prompt is hidden by default when launched through the supplied `.cmd` files. Set `SHOW_COMMAND_PROMPT=TRUE` while diagnosing startup or runtime problems.
-- The guest render surface is configurable with `RESOLUTION=WIDTHxHEIGHT`. The new default is `1140x640`, exactly twice Geometry Dash's original 570x320 logical surface. The old fixed 1280x720 surface caused fractional scaling in early versions and could expose text-offset errors.
-- `OLD_VER_PLAYTEST=TRUE` enables F5 in the legacy ARM editor. It calls the old game's own exported `EditorPauseLayer::onSaveAndTest` routine when that routine is present. It is off by default and does not fabricate game objects or use fixed function addresses.
+- `RESOLUTION=1140x640` remains the default logical/native surface and can be changed independently. `TEXTURE_FILTERING` controls only texture sampling: `LINEAR` smooths enlarged textures, `NEAREST` forces crisp pixels, and `GAME` preserves the original build's requested filter.
+- `OLD_VER_PLAYTEST=TRUE` adds an inline play/stop button to editors before 1.8. It uses the current unsaved editor state and keeps the editor scene alive underneath the test. It is off by default.
 - The retired comments-hotkey experiment remains removed. Pressing C has no wrapper-owned comments behavior.
 
 ## Architecture
@@ -48,9 +48,10 @@ Edit the `set "NAME=value"` lines near the top of the two `RUN_AUTO_*.cmd` files
 | `FORCE_HIGHEST_GRAPHICS` | `true` | Requests the highest packaged graphics tier. It is suppressed for the verified 1.0 legacy binary because that build crashes on the forced path. |
 | `MUSIC_PULSE_MAX` | `0.30` | Clamps the music-derived pulse level from `0.0` to `1.0`. |
 | `FPS` | `VSYNC` | `VSYNC` requests swap interval 1. A numeric value from `1` through `10000` disables VSync and uses the shared high-resolution host frame cap. Invalid values fall back to VSync. |
-| `RESOLUTION` | `1140x640` | Guest render-surface width and height. Valid range: 320-7680 wide and 240-4320 high. Invalid values fall back to `1140x640`. |
+| `RESOLUTION` | `1140x640` | Logical/native render size passed to the game window. Keep the default for the historical layout, or override it with values such as `1280x720`. |
+| `TEXTURE_FILTERING` | `LINEAR` | Texture magnification filter override. `LINEAR` smooths enlarged textures, `NEAREST` forces crisp pixels, and `GAME` preserves the guest's original requests. |
 | `SHOW_COMMAND_PROMPT` | `FALSE` | Hides the launcher console. Set `TRUE` to keep it visible for diagnostics. Boolean settings also accept yes/no, on/off, and 1/0. |
-| `OLD_VER_PLAYTEST` | `FALSE` | On the legacy ARM backend, enables F5 in an active editor when the game's `EditorPauseLayer::create` and `onSaveAndTest` exports exist. |
+| `OLD_VER_PLAYTEST` | `FALSE` | Adds the inline editor play/stop control to Geometry Dash 1.0-1.7 on the legacy ARM and x86 backends. |
 | `VERSION_ISOLATED_SAVES` | `true` | Gives each package/version/backend combination its own save directory. Set `false` to use the shared `save` directory. |
 | `EDITOR_CONTROLLS` | `true` | Enables legacy/x86 editor movement and rotation shortcuts. The historical misspelling is part of the public setting name. |
 | `I_LOST_THE_GAME` | `true` | Launch guard set by the scripts. Direct backend execution without it shows the wrapper's launch message and exits. |
@@ -61,22 +62,21 @@ Advanced/internal settings:
 - `GD_X86_API_CONNECT_MODE` is selected automatically for the x86 2.11 protocol path. It normally should not be overridden.
 - `EXTRAS_MENU` is deliberately disabled in this branch even if an environment value is supplied.
 
-### Resolution behavior
+### Texture filtering
 
-`RESOLUTION` controls the dimensions passed to the game's authentic `nativeInit`, not only the outer Windows window size. `1140x640` gives early 570x320 layouts an integer 2x render target and then lets the wrapper scale that image to the current client area. Other aspect ratios are allowed for compatibility testing, but they can change layout decisions made by the original game.
-
-Command-line `--width=` and `--height=` arguments still override `RESOLUTION` when a Dynarmic backend is launched directly.
+The wrapper now restores an explicit `RESOLUTION` setting (default `1140x640`) and keeps texture filtering separate. `TEXTURE_FILTERING` affects only magnification sampling: `LINEAR` upgrades `GL_TEXTURE_MAG_FILTER=GL_NEAREST` to `GL_LINEAR`, `NEAREST` forces `GL_LINEAR` requests back to crisp pixels, and `GAME` leaves the guest untouched. This is texture smoothing/sharpening rather than AI upscaling, and it cannot add detail absent from the APK artwork.
 
 ### Old-version playtest
 
-With `OLD_VER_PLAYTEST=TRUE`, press F5 while the legacy ARM editor is active. The backend resolves these mangled exports from the loaded game at runtime:
+With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a play icon made from the old build's own `GJ_playBtn_001.png`. Selecting it performs this runtime path:
 
-```text
-EditorPauseLayer::create(LevelEditorLayer*)
-EditorPauseLayer::onSaveAndTest()
-```
+1. Read `LevelEditorLayer::getLevelString()` from the live editor, including unsaved edits.
+2. Update the editor's in-memory `GJGameLevel` without invoking a save routine.
+3. Create a `PlayLayer`, derive and set that build's test-mode byte from its exported getter, and attach it above the existing editor scene.
+4. Keep `EditorUI` visible, place the play/stop control on the left toolbar area, and attach the stop control to the editor UI.
+5. On stop, remove the temporary play layer and restore the same editor UI and scene.
 
-The verified Geometry Dash 1.0 ARM library contains both exports even though it has no modern inline editor-playtest implementation. F5 therefore uses the game's native save-and-test transition. If either symbol is absent, the wrapper logs `DYNARMIC_OLD_VER_PLAYTEST_UNAVAILABLE` and does nothing. This option currently targets the legacy ARM editor only and remains experimental until exercised in a Windows build.
+The implementation covers ARM Geometry Dash 1.0-1.4 and x86 Geometry Dash 1.5-1.7. It resolves the required game and Cocos2d-x exports at runtime and derives the per-build `PlayLayer` test-mode field from machine code instead of using a fixed object offset. Missing or unrecognized capabilities fail closed and are recorded in the backend log. The option remains experimental until the generated Windows builds have been exercised across each target release.
 
 ## Keyboard and text input
 
@@ -94,7 +94,7 @@ ARMv7 editor shortcuts remain game/companion-owned so A/D can continue to work a
 
 ## Graphics and windowing
 
-The wrapper creates a Win32 OpenGL window, forwards the guest's fixed-function rendering calls, tracks guest viewport/scissor rectangles, and rescales them into the letterboxed client area. DPI awareness is enabled so Windows display scaling does not introduce a second blurry stretch. Texture filtering is left to the game; an earlier forced-linear experiment was reverted.
+The wrapper creates a Win32 OpenGL window, forwards the guest's fixed-function rendering calls, tracks guest viewport/scissor rectangles, and rescales them into the letterboxed client area. DPI awareness is enabled so Windows display scaling does not introduce a second blurry stretch. `RESOLUTION` controls the native surface size, while `TEXTURE_FILTERING` independently selects `LINEAR`, `NEAREST`, or `GAME`.
 
 The ARMv7 compatibility path retains the audited late-2023 ground/background bounds clamps and editor visibility/song-position behavior used by the supported companion build. It does not restore the retired host-built stock-beta editor.
 
@@ -168,7 +168,7 @@ The abandoned 1.02 comments hotkey and the progressively reconstructed stock 2.2
 
 - The wrapper is Windows-only.
 - It does not emulate a complete Android device or guarantee arbitrary APK/mod compatibility.
-- The old-version F5 playtest is a native save-and-test transition, not a reconstructed modern inline playtest UI.
+- The old-version inline playtest is experimental and currently limited to Geometry Dash 1.0-1.7 builds exposing the audited editor, play-layer, menu, and sprite interfaces.
 - Cursor hiding is intentionally not included; previous attempts were unreliable and the feature remains postponed.
 - Stock/reduced 2019, 2022, and 2023 2.2-beta APKs without the compatible companion initializer do not gain a wrapper-built editor.
 - A Linux source audit cannot replace runtime testing of the generated Windows binaries.

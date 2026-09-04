@@ -52,3 +52,13 @@ _shim_bionic_longjmp:
     movl %ecx, 0(%esp)
     ret
 
+    .globl _gd_call_sret_string_x86
+_gd_call_sret_string_x86:
+    pushl %ebp
+    movl %esp, %ebp
+    pushl 16(%ebp)
+    pushl 12(%ebp)
+    call *8(%ebp)
+    addl $4, %esp
+    popl %ebp
+    ret

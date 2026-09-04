@@ -9306,7 +9306,14 @@ private:
             using Fn = void (APIENTRY*)(GLenum, GLenum, GLint);
             const GLenum target = static_cast<GLenum>(arguments[0]);
             const GLenum pname = static_cast<GLenum>(arguments[1]);
-            const GLint param = static_cast<GLint>(arguments[2]);
+            GLint param = static_cast<GLint>(arguments[2]);
+            if (pname == 0x2800u) {
+                const int filtering = gd_settings_texture_filtering_mode();
+                if (filtering == GD_TEXTURE_FILTERING_LINEAR && param == 0x2600)
+                    param = 0x2601;
+                else if (filtering == GD_TEXTURE_FILTERING_NEAREST && param == 0x2601)
+                    param = 0x2600;
+            }
             reinterpret_cast<Fn>(function)(target, pname, param);
         } else if (name == "glUniform1f") {
             reinterpret_cast<void (APIENTRY*)(GLint,GLfloat)>(function)(static_cast<GLint>(arguments[0]), WordToFloat(static_cast<u32>(arguments[1])));
@@ -12537,7 +12544,7 @@ private:
             allocations += sample.allocation_calls;
             frees += sample.free_calls;
         }
-        file << "Geometry Dash ARM wrapper 0.9.7-newera1 debug-everything profile\n";
+        file << "Geometry Dash ARM wrapper 0.9.7-newera3-fix1 debug-everything profile\n";
         file << "frames=" << samples_.size() << '\n';
         file << "slow_threshold_ms=" << slow_threshold_ms_ << '\n';
         file << "slow_frames=" << slow_frame_count_ << '\n';
@@ -12841,7 +12848,7 @@ int main(int argc,char** argv) {
         V22CompanionHookMode companion_hook_mode = V22CompanionHookMode::Off;
         bool probe_only=false;
         bool probe_only_explicit=false;
-        int width=0,height=0,max_frames=0;
+        int width = 1140, height = 640, max_frames = 0;
         gd_settings_resolution(&width, &height);
         for(int i=1;i<argc;++i){
             const std::string_view argument(argv[i]);
@@ -13173,8 +13180,10 @@ int main(int argc,char** argv) {
              std::to_string(graphics_patches.low_memory)+
              " music-pulse-max="+
              std::to_string(gd_settings_music_pulse_max())+
-             " resolution="+std::to_string(width)+"x"+
+             " surface="+std::to_string(width)+"x"+
              std::to_string(height)+
+             " texture-filtering="+
+             (gd_settings_linear_texture_filtering() ? "linear" : "game")+
              " practice-zx="+
              ((runtime.v22_ui_on_check && runtime.v22_ui_on_delete_check &&
                 runtime.v22_practice_mode_offset)

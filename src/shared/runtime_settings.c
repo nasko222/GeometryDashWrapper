@@ -154,28 +154,51 @@ int gd_settings_old_ver_playtest(void) {
     return gd_setting_bool("OLD_VER_PLAYTEST", 0);
 }
 
-void gd_settings_resolution(int *width, int *height) {
+int gd_settings_old_ver_playtest_supported_version(void) {
+    const char *value = getenv("GD_GAME_VERSION");
+    char *end = NULL;
+    double version;
+    if (!value || !*value) return 0;
+    version = strtod(value, &end);
+    if (end == value || version != version) return 0;
+    return version >= 1.0 && version < 1.8;
+}
+
+int gd_settings_texture_filtering_mode(void) {
+    const char *value = getenv("TEXTURE_FILTERING");
+    if (!value || !*value) return GD_TEXTURE_FILTERING_LINEAR;
+    if (ascii_equal_ci(value, "game") || ascii_equal_ci(value, "default") ||
+        ascii_equal_ci(value, "original") || ascii_equal_ci(value, "off") ||
+        strcmp(value, "0") == 0) return GD_TEXTURE_FILTERING_GAME;
+    if (ascii_equal_ci(value, "nearest") || ascii_equal_ci(value, "point") ||
+        ascii_equal_ci(value, "pixel") || ascii_equal_ci(value, "pixels") ||
+        ascii_equal_ci(value, "false") || strcmp(value, "2") == 0)
+        return GD_TEXTURE_FILTERING_NEAREST;
+    return GD_TEXTURE_FILTERING_LINEAR;
+}
+
+int gd_settings_linear_texture_filtering(void) {
+    return gd_settings_texture_filtering_mode() == GD_TEXTURE_FILTERING_LINEAR;
+}
+
+int gd_settings_resolution(int *width, int *height) {
     const char *value = getenv("RESOLUTION");
-    long parsed_width = 1140;
-    long parsed_height = 640;
-    if (value && *value) {
-        char *separator = NULL;
-        char *end = NULL;
-        parsed_width = strtol(value, &separator, 10);
-        if (separator && (*separator == 'x' || *separator == 'X')) {
-            parsed_height = strtol(separator + 1, &end, 10);
-            if (!end || *end || parsed_width < 320 || parsed_width > 7680 ||
-                parsed_height < 240 || parsed_height > 4320) {
-                parsed_width = 1140;
-                parsed_height = 640;
-            }
-        } else {
-            parsed_width = 1140;
-            parsed_height = 640;
-        }
-    }
+    char *end = NULL;
+    long parsed_width;
+    long parsed_height;
+    if (width) *width = 1140;
+    if (height) *height = 640;
+    if (!value || !*value) return 0;
+    parsed_width = strtol(value, &end, 10);
+    if (end == value || !end || (*end != 'x' && *end != 'X')) return 0;
+    value = end + 1;
+    parsed_height = strtol(value, &end, 10);
+    if (end == value || (end && *end != 0)) return 0;
+    if (parsed_width < 320 || parsed_width > 8192 ||
+        parsed_height < 240 || parsed_height > 8192) return 0;
     if (width) *width = (int)parsed_width;
     if (height) *height = (int)parsed_height;
+    return 1;
 }
 
 int gd_settings_v22_exact_editor_visibility(void) {
