@@ -1,0 +1,21 @@
+Geometry Dash Wrapper 0.9.7-newera4-fix2 verification notes
+===============================================================
+
+Targeted fixes from newera4-fix1:
+- Removed PlayLayer::getAttempts / attempt-count mismatch as an automatic stop condition.
+- Editor camera X follows the real hidden PlayerObject with a stable 120-unit screen anchor.
+- Editor camera Y follows the hidden PlayLayer's authentic game-layer camera.
+- Removed the artificial LevelEditorLayer::getLevelDistance editor-end stop.
+- Inline playtest now searches the hidden PlayLayer tree for EndPortalObject and keeps that portal 100000 units ahead of the real player every bridge update.
+- When exported, EndPortalObject::setPosition(CCPoint const&) is used so portal-specific position/cache logic is updated, with CCNode::setPosition(float,float) as fallback.
+- Manual pause button and Escape remain valid stop paths.
+- Player death/replacement remains an intentional auto-stop to prevent the hidden PlayLayer from presenting its normal retry/Attempt 2 path.
+
+Capability audit used for the bridge:
+- The checked legacy ARM 1.0 library exports EndPortalObject RTTI/create/trigger/setPosition, CCNode child traversal, PlayLayer::getPlayer, and LevelEditorLayer::getGameLayer.
+- The checked x86 old-version library exports the same EndPortalObject RTTI/setPosition and child traversal interfaces.
+- Builder revision is dynarmic-x64-builder114-0.9.7-newera4-fix2 to invalidate stale Dynarmic backend output.
+
+Packaging checks:
+- No APK, proprietary libgame/libcocos2dcpp binary, save data, or built game binary is included.
+- Source was checked for stale attempt-count, old_playtest_end_x, LevelEditorLayer::getLevelDistance, and editor-end playtest logic; none remain in the active x86/legacy-ARM bridge.

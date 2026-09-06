@@ -16,6 +16,7 @@
 #include "runtime_settings.h"
 #include "frame_pacing_win.h"
 #include "antialias_win.h"
+#include "audio_win.h"
 #include "extras_menu_win.h"
 #include "window_icon_win.h"
 #include "win_dpi.h"
@@ -54,6 +55,8 @@ typedef void *(__cdecl *ButtonSpriteCreateFunction)(const char *text);
 typedef void (__cdecl *CcNodeAddChildFunction)(void *self, void *child);
 typedef void (__cdecl *CcNodeAddChildZFunction)(void *self, void *child, int z);
 typedef void (__cdecl *CcNodeSetPositionFunction)(void *self, float x, float y);
+typedef struct { float x, y; } GdCcPoint;
+typedef void (__cdecl *EndPortalSetPositionFunction)(void *self, const GdCcPoint *point);
 typedef float (__cdecl *CcNodeGetPositionFunction)(void *self);
 typedef void (__cdecl *CcNodeSetScaleFunction)(void *self, float scale);
 typedef void (__cdecl *CcNodeSetFloatFunction)(void *self, float value);
@@ -140,6 +143,8 @@ typedef struct {
     CcNodeAddChildFunction ccnode_add_child;
     CcNodeAddChildZFunction ccnode_add_child_z;
     CcNodeSetPositionFunction ccnode_set_position;
+    EndPortalSetPositionFunction end_portal_set_position;
+    void *end_portal_trigger_object;
     CcNodeGetPositionFunction ccnode_get_position_x;
     CcNodeGetPositionFunction ccnode_get_position_y;
     CcNodeGetPositionFunction ccnode_get_rotation;
@@ -163,7 +168,6 @@ typedef struct {
     void *play_layer_get_test_mode;
     NodeGetterFunction play_layer_get_player;
     NodeGetterFunction play_layer_get_game_layer;
-    IntGetterFunction play_layer_get_attempts;
     IntGetterFunction player_get_is_dead;
     IntGetterFunction game_manager_get_player_frame;
     CcSpriteCreateWithFrameFunction sprite_create_with_frame;
@@ -196,9 +200,9 @@ typedef struct {
     void *old_playtest_editor_game_layer;
     void *old_playtest_proxy_primary;
     void *old_playtest_proxy_secondary;
-    int old_playtest_initial_attempts;
-    float old_playtest_editor_game_x;
-    float old_playtest_editor_game_y;
+    void *old_playtest_end_portal;
+    unsigned char old_playtest_end_trigger_original;
+    int old_playtest_end_trigger_suppressed;
     void *old_playtest_trail;
     float old_playtest_trail_last_x;
     float old_playtest_trail_last_y;
@@ -218,6 +222,8 @@ static GameHost g_host;
 
 #define OLD_PLAYTEST_BUTTON_X 30.0f
 #define OLD_PLAYTEST_BUTTON_Y 186.0f
+#define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
+#define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 
 typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
     void *self, const char *filename, const char *mode,
@@ -1118,6 +1124,79 @@ static void refresh_extras_visuals(void) {
     runtime_log("RESULT: X86_EXTRAS_GD_OVERLAY_READY");
 }
 
+static void *find_old_playtest_descendant_by_type(void *node,
+                                                     const char *type_name,
+                                                     unsigned int depth,
+                                                     unsigned int *visited) {
+    unsigned int count, index;
+    void *children;
+    if (!node || !type_name || !visited || depth > 16u ||
+        *visited >= 8192u || !object_type_contains(node, "")) return NULL;
+    ++*visited;
+    if (object_type_contains(node, type_name)) return node;
+    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
+        !g_host.ccarray_object_at_index) return NULL;
+    count = g_host.ccnode_get_children_count(node);
+    if (!count) return NULL;
+    if (count > 1024u) count = 1024u;
+    children = g_host.ccnode_get_children(node);
+    if (!children) return NULL;
+    for (index = 0u; index < count && *visited < 8192u; ++index) {
+        void *child = g_host.ccarray_object_at_index(children, index);
+        void *match = child ? find_old_playtest_descendant_by_type(
+                                  child, type_name, depth + 1u, visited)
+                            : NULL;
+        if (match) return match;
+    }
+    return NULL;
+}
+
+static int set_old_playtest_end_trigger_suppressed(int suppress) {
+    unsigned char replacement;
+    if (!g_host.end_portal_trigger_object) return 0;
+    if (suppress) {
+        if (g_host.old_playtest_end_trigger_suppressed) return 1;
+        if (!memory_range_is_readable(g_host.end_portal_trigger_object, 1u)) return 0;
+        g_host.old_playtest_end_trigger_original =
+            *(const unsigned char *)g_host.end_portal_trigger_object;
+        replacement = 0xc3u; /* ret: inline editor playtest has no level end. */
+        if (!patch_x86_code(g_host.end_portal_trigger_object, &replacement, 1u))
+            return 0;
+        g_host.old_playtest_end_trigger_suppressed = 1;
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_END_DISABLED triggerObject=ret");
+        return 1;
+    }
+    if (!g_host.old_playtest_end_trigger_suppressed) return 1;
+    replacement = g_host.old_playtest_end_trigger_original;
+    if (!patch_x86_code(g_host.end_portal_trigger_object, &replacement, 1u))
+        return 0;
+    g_host.old_playtest_end_trigger_suppressed = 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_END_RESTORED");
+    return 1;
+}
+
+static void suppress_old_playtest_end_portal(void *play_layer, float player_x) {
+    if (!play_layer || !g_host.ccnode_set_position ||
+        !g_host.ccnode_get_position_y) return;
+    if (!g_host.old_playtest_end_portal) {
+        unsigned int visited = 0u;
+        g_host.old_playtest_end_portal = find_old_playtest_descendant_by_type(
+            play_layer, "EndPortalObject", 0u, &visited);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_END_PORTAL %s nodes=%u",
+                    g_host.old_playtest_end_portal ? "found" : "not-found",
+                    visited);
+    }
+    if (g_host.old_playtest_end_portal &&
+        memory_range_is_readable(g_host.old_playtest_end_portal, sizeof(void *))) {
+        const float y = g_host.ccnode_get_position_y(g_host.old_playtest_end_portal);
+        const GdCcPoint point = {player_x + OLD_PLAYTEST_END_PORTAL_AHEAD_X, y};
+        if (g_host.end_portal_set_position)
+            g_host.end_portal_set_position(g_host.old_playtest_end_portal, &point);
+        else
+            g_host.ccnode_set_position(g_host.old_playtest_end_portal, point.x, point.y);
+    }
+}
+
 static void log_old_playtest_unavailable(const char *reason) {
     if (g_host.old_playtest_unavailable_logged) return;
     g_host.old_playtest_unavailable_logged = 1;
@@ -1139,8 +1218,9 @@ static int old_playtest_symbols_ready(void) {
            g_host.ccnode_set_scale_x && g_host.ccnode_set_scale_y &&
            g_host.ccnode_create && g_host.ccnode_remove &&
            g_host.level_editor_get_game_layer && g_host.play_layer_get_player &&
-           g_host.play_layer_get_game_layer && g_host.play_layer_get_attempts &&
-           g_host.player_get_is_dead && g_host.sprite_create_file &&
+           g_host.play_layer_get_game_layer && g_host.player_get_is_dead &&
+           g_host.end_portal_trigger_object &&
+           g_host.sprite_create_file &&
            g_host.sprite_set_color &&
            (g_host.ccnode_add_child_z || g_host.ccnode_add_child);
 }
@@ -1182,6 +1262,8 @@ static int ensure_old_playtest_button(void) {
         g_host.old_playtest_play_menu = NULL;
         g_host.old_playtest_play_button = NULL;
         if (g_host.old_playtest_layer) {
+            (void)set_old_playtest_end_trigger_suppressed(0);
+            audio_stop_background();
             g_host.old_playtest_layer = NULL;
             g_host.old_playtest_stop_menu = NULL;
             g_host.old_playtest_ui = NULL;
@@ -1190,6 +1272,7 @@ static int ensure_old_playtest_button(void) {
             g_host.old_playtest_editor_game_layer = NULL;
             g_host.old_playtest_proxy_primary = NULL;
             g_host.old_playtest_proxy_secondary = NULL;
+            g_host.old_playtest_end_portal = NULL;
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
         /* The old scene owns any retained trail node and destroys it. Never
@@ -1207,7 +1290,7 @@ static int ensure_old_playtest_button(void) {
     if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
     g_host.ccnode_set_position(menu, 0.0f, 0.0f);
     g_host.ccnode_set_position(button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
-    g_host.ccnode_set_scale(button, 0.65f);
+    g_host.ccnode_set_scale(button, 0.325f);
     if (!add_extras_child(editor_ui, menu, 10000)) return 0;
     g_host.old_playtest_play_menu = menu;
     g_host.old_playtest_play_button = button;
@@ -1282,6 +1365,8 @@ static int update_old_playtest_proxy_transform(void) {
     return append_old_playtest_trail_segment(x, y);
 }
 
+static int stop_inline_old_playtest(void);
+
 static int start_inline_old_playtest(void) {
     void *editor_ui;
     void *level;
@@ -1332,7 +1417,8 @@ static int start_inline_old_playtest(void) {
         g_host.ccnode_remove(play_layer, 1);
         return 0;
     }
-
+    suppress_old_playtest_end_portal(play_layer,
+                                      g_host.ccnode_get_position_x(player));
     g_host.old_playtest_trail = g_host.ccnode_create();
     if (!g_host.old_playtest_trail ||
         !add_extras_child(editor_game_layer, g_host.old_playtest_trail, 9998)) {
@@ -1373,16 +1459,18 @@ static int start_inline_old_playtest(void) {
         }
     }
 
-    g_host.old_playtest_editor_game_x = g_host.ccnode_get_position_x(editor_game_layer);
-    g_host.old_playtest_editor_game_y = g_host.ccnode_get_position_y(editor_game_layer);
     /* Keep the real PlayerObject in its authentic PlayLayer hierarchy. Reparenting
        it corrupts assumptions made by PlayLayer::update in 1.5-1.7. The hidden
        PlayLayer remains the physics authority; only lightweight sprite proxies
        are rendered inside the editor. */
     g_host.ccnode_set_visible(play_layer, 0);
-    g_host.ccnode_set_position(editor_game_layer,
-        g_host.ccnode_get_position_x(play_game_layer),
-        g_host.ccnode_get_position_y(play_game_layer));
+    {
+        const float player_x = g_host.ccnode_get_position_x(player);
+        float camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
+        if (camera_x > 0.0f) camera_x = 0.0f;
+        g_host.ccnode_set_position(editor_game_layer, camera_x,
+            g_host.ccnode_get_position_y(play_game_layer));
+    }
     g_host.old_playtest_player = player;
     if (!update_old_playtest_proxy_transform()) {
         g_host.old_playtest_player = NULL;
@@ -1406,15 +1494,28 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_player = player;
     g_host.old_playtest_play_game_layer = play_game_layer;
     g_host.old_playtest_editor_game_layer = editor_game_layer;
-    g_host.old_playtest_initial_attempts = g_host.play_layer_get_attempts(play_layer);
     if (g_host.old_playtest_play_menu)
         g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 0);
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden");
+    /* A real inline editor test must be endless. Moving the portal sprite is
+       insufficient because EndPortalObject::triggerObject owns the player-lock
+       and completion sequence. Temporarily replace that method with RET while
+       this hidden PlayLayer exists, then restore it on every exit path. */
+    if (!set_old_playtest_end_trigger_suppressed(1)) {
+        runtime_log("ERROR: could not disable EndPortalObject::triggerObject");
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden end=disabled");
     return 1;
 }
 
 static int stop_inline_old_playtest(void) {
-    if (!g_host.old_playtest_layer) return 1;
+    if (!g_host.old_playtest_layer) {
+        (void)set_old_playtest_end_trigger_suppressed(0);
+        return 1;
+    }
+    /* The wrapper-owned pause/stop control must stop the preview song too. */
+    audio_stop_background();
     if (g_host.old_playtest_stop_menu &&
         memory_range_is_readable(g_host.old_playtest_stop_menu, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_stop_menu, 1);
@@ -1424,13 +1525,10 @@ static int stop_inline_old_playtest(void) {
     if (g_host.old_playtest_proxy_secondary &&
         memory_range_is_readable(g_host.old_playtest_proxy_secondary, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_proxy_secondary, 1);
-    if (g_host.old_playtest_editor_game_layer &&
-        memory_range_is_readable(g_host.old_playtest_editor_game_layer, sizeof(void *)))
-        g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
-                                   g_host.old_playtest_editor_game_x,
-                                   g_host.old_playtest_editor_game_y);
     if (memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_layer, 1);
+    if (!set_old_playtest_end_trigger_suppressed(0))
+        runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
     if (g_host.old_playtest_play_menu &&
         memory_range_is_readable(g_host.old_playtest_play_menu, sizeof(void *)))
         g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 1);
@@ -1443,28 +1541,41 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_editor_game_layer = NULL;
     g_host.old_playtest_proxy_primary = NULL;
     g_host.old_playtest_proxy_secondary = NULL;
+    g_host.old_playtest_end_portal = NULL;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained music=stopped end=restored");
     return 1;
 }
 
 static int update_inline_old_playtest(void) {
-    float camera_x, camera_y;
+    float player_x, camera_x, camera_y;
     void *current_player;
     if (!g_host.old_playtest_layer) return 1;
     if (!g_host.old_playtest_player || !g_host.old_playtest_play_game_layer ||
         !g_host.old_playtest_editor_game_layer) return 0;
     current_player = g_host.play_layer_get_player(g_host.old_playtest_layer);
-    if (!current_player || current_player != g_host.old_playtest_player ||
-        g_host.player_get_is_dead(g_host.old_playtest_player) ||
-        g_host.play_layer_get_attempts(g_host.old_playtest_layer) !=
-            g_host.old_playtest_initial_attempts) {
-        /* Do not allow PlayLayer's normal death/retry flow to become a visible
-           Attempt 2 inside the editor. Tear the backing layer down before the
-           next frame is rendered. */
+    if (!current_player || current_player != g_host.old_playtest_player) {
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_AUTO_STOP reason=player-replaced");
         return stop_inline_old_playtest();
     }
-    camera_x = g_host.ccnode_get_position_x(g_host.old_playtest_play_game_layer);
+    if (g_host.player_get_is_dead(g_host.old_playtest_player)) {
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_AUTO_STOP reason=player-dead");
+        return stop_inline_old_playtest();
+    }
+
+    player_x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
+    /* Inline editor playtest has no gameplay end wall. Keep the hidden
+       PlayLayer's EndPortalObject far ahead so its normal completion target
+       can never catch the player while the editor test is running. */
+    suppress_old_playtest_end_portal(g_host.old_playtest_layer, player_x);
+
+    /* Do not trust the hidden PlayLayer's horizontal game-layer transform for
+       editor playtest camera ownership. Keep the cube at a stable screen-space
+       anchor and let the editor objects/trail move underneath it. This matches
+       the old inline editor-playtest feel and avoids the one-frame/parent-space
+       mismatch that left the proxy drifting off screen. */
+    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
+    if (camera_x > 0.0f) camera_x = 0.0f;
     camera_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
                                camera_x, camera_y);
@@ -2309,6 +2420,10 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode8addChildEPS0_i");
     g_host.ccnode_set_position = (CcNodeSetPositionFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode11setPositionEff");
+    g_host.end_portal_set_position = (EndPortalSetPositionFunction)elf_image_find_export(
+        &image, "_ZN15EndPortalObject11setPositionERKN7cocos2d7CCPointE");
+    g_host.end_portal_trigger_object = elf_image_find_export(
+        &image, "_ZN15EndPortalObject13triggerObjectEv");
     g_host.ccnode_get_position_x = (CcNodeGetPositionFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode12getPositionXEv");
     g_host.ccnode_get_position_y = (CcNodeGetPositionFunction)elf_image_find_export(
@@ -2358,8 +2473,6 @@ int main(int argc, char **argv) {
         &image, "_ZNK9PlayLayer9getPlayerEv");
     g_host.play_layer_get_game_layer = (NodeGetterFunction)elf_image_find_export(
         &image, "_ZNK9PlayLayer12getGameLayerEv");
-    g_host.play_layer_get_attempts = (IntGetterFunction)elf_image_find_export(
-        &image, "_ZNK9PlayLayer11getAttemptsEv");
     g_host.player_get_is_dead = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK12PlayerObject9getIsDeadEv");
     g_host.game_manager_get_player_frame = (IntGetterFunction)elf_image_find_export(

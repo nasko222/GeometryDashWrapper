@@ -1,0 +1,29 @@
+Geometry Dash Wrapper 0.9.7-newera5 verification notes
+
+Changes from 0.9.7-newera4-fix2
+--------------------------------------
+1. Endless pre-1.8 inline editor playtest
+   - EndPortalObject::triggerObject is required by the OLD_VER_PLAYTEST capability check.
+   - x86: saves the original first byte, writes RET (C3), FlushInstructionCache is used by patch_x86_code, and restores the byte when playtest ends or the scene changes.
+   - legacy ARM: saves the original Thumb/ARM entry instruction, writes Thumb BX LR (4770) or ARM BX LR (E12FFF1E), calls Dynarmic A32 Jit::ClearCache(), and restores the original instruction on teardown/scene change.
+   - The existing far-ahead EndPortalObject movement is retained only as a secondary guard.
+
+2. Preview audio teardown
+   - StopInlineOldVersionPlaytest explicitly calls audio_stop_background on x86 and legacy ARM.
+   - Scene-loss cleanup also stops background music.
+
+3. Editor play button size
+   - GJ_playBtn2_001.png wrapper scale changed from 0.65 to 0.325 on x86 and legacy ARM.
+
+4. Intentional non-change
+   - The short first attempt followed by the stable second attempt is not modified in newera5.
+
+5. Build cache
+   - Dynarmic builder revision: dynarmic-x64-builder115-0.9.7-newera5
+
+Expected diagnostic markers
+---------------------------
+RESULT: X86_OLD_VER_PLAYTEST_END_DISABLED triggerObject=ret
+RESULT: X86_OLD_VER_PLAYTEST_END_RESTORED
+RESULT: DYNARMIC_OLD_VER_PLAYTEST_END_DISABLED triggerObject=return
+RESULT: DYNARMIC_OLD_VER_PLAYTEST_END_RESTORED

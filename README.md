@@ -1,8 +1,17 @@
-# Geometry Dash Wrapper 0.9.7-newera4-fix1
+# Geometry Dash Wrapper 0.9.7-newera5
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system. The launcher reads an APK, selects a backend from the packaged native ABI, loads the original game library, and supplies the Android, JNI, Cocos2d-x, OpenGL, audio, network, input, and storage behavior that library expects.
 
 No Geometry Dash APK, proprietary game library, save data, or compiled wrapper binary is included in this source package. You must supply a legally obtained compatible APK.
+
+## What newera5 changes
+
+- Pre-1.8 inline editor playtest is now **endless**. While the wrapper-owned hidden `PlayLayer` is active, `EndPortalObject::triggerObject()` is temporarily replaced with an immediate return. That prevents the old end portal from locking the cube, starting the end-wall animation, or entering `levelComplete()`. The original guest instruction is restored as soon as playtest stops or the editor scene changes.
+- x86 saves the original first opcode, installs `RET` (`0xC3`), flushes the Windows instruction cache, then restores the byte. Legacy ARM saves the original Thumb/ARM instruction, installs `BX LR`, clears Dynarmic's translated-code cache, and restores it afterward.
+- The existing far-ahead hidden portal movement remains as a secondary guard, but it is no longer what prevents completion; the trigger itself is disabled during inline testing.
+- Clicking the wrapper's pause/stop button now explicitly calls the shared audio bridge's `audio_stop_background()`, so the preview music stops together with the editor playtest. Escape uses the same teardown path.
+- The editor play button still uses the smaller `GJ_playBtn2_001.png`, but its wrapper scale is reduced from `0.65` to `0.325` — exactly half the previous size — to better match the pause/stop button.
+- The known short first attempt followed by the stable second attempt is intentionally left unchanged in newera5.
 
 ## What newera4-fix1 changes
 
@@ -15,7 +24,7 @@ No Geometry Dash APK, proprietary game library, save data, or compiled wrapper b
 - The command prompt is hidden by default when launched through the supplied `.cmd` files. Set `SHOW_COMMAND_PROMPT=TRUE` while diagnosing startup or runtime problems.
 - `RESOLUTION=1140x640` remains independent from texture sampling. `TEXTURE_FILTERING=GAME` is now the default, so the wrapper leaves each game build's original filtering requests alone. `LINEAR` and `NEAREST` remain optional overrides.
 - `ANTIALIASING=NONE` is the default. Optional `FXAA`, `MSAA2`, `MSAA4`, and `MSAA8` modes add host-side edge antialiasing without changing Geometry Dash's logical resolution.
-- `OLD_VER_PLAYTEST=TRUE` uses the smaller `GJ_playBtn2_001.png` control and a hidden PlayLayer only as the old build's physics engine. The real PlayerObject stays owned by that hidden PlayLayer; lightweight editor-side icon sprites mirror its transform. The editor camera follows the hidden gameplay camera, green breadcrumb sprites remain in the editor, and the visible PlayLayer attempt/end-wall UI is suppressed. Death/retry is stopped before a second attempt is rendered. The pause button or Escape stops the test.
+- `OLD_VER_PLAYTEST=TRUE` uses the smaller `GJ_playBtn2_001.png` control and a hidden PlayLayer only as the old build's physics engine. The real PlayerObject stays owned by that hidden PlayLayer; lightweight editor-side icon sprites mirror its transform. The editor camera follows the simulated player with a stable horizontal anchor, green breadcrumb sprites remain in the editor, and the visible PlayLayer attempt/end-wall UI is suppressed. Death stops the test before a retry frame is presented. The pause button or Escape stops the test.
 - The retired comments-hotkey experiment remains removed. Pressing C has no wrapper-owned comments behavior.
 
 ## Architecture
