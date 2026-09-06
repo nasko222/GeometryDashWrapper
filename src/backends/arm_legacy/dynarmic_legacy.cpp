@@ -999,6 +999,8 @@ struct ElfRuntime {
     u32 native_pause = 0;
     u32 native_resume = 0;
     u32 game_manager_shared_state = 0;
+    u32 game_manager_get_play_layer = 0;
+    u32 game_manager_set_play_layer = 0;
     u32 play_layer_get_practice_mode = 0;
     u32 play_layer_get_ui_layer = 0;
     u32 ui_on_check = 0;
@@ -1014,13 +1016,24 @@ struct ElfRuntime {
     u32 level_editor_get_game_layer = 0;
     u32 level_editor_get_level_string = 0;
     u32 gj_game_level_set_level_string = 0;
+    u32 gj_game_level_get_audio_track = 0;
+    u32 gj_game_level_set_audio_track = 0;
+    u32 gj_game_level_get_level_type = 0;
+    u32 gj_game_level_set_level_type = 0;
     u32 play_layer_create = 0;
     u32 play_layer_start_game = 0;
+    u32 play_layer_reset_level = 0;
     u32 play_layer_get_test_mode = 0;
     u32 play_layer_get_player = 0;
     u32 play_layer_get_game_layer = 0;
     u32 player_get_is_dead = 0;
+    u32 player_get_fly_mode = 0;
+    u32 player_get_roll_mode = 0;
+    u32 player_get_bird_mode = 0;
     u32 game_manager_get_player_frame = 0;
+    u32 game_manager_get_player_ship = 0;
+    u32 game_manager_get_player_ball = 0;
+    u32 game_manager_get_player_bird = 0;
     u32 sprite_create_with_frame = 0;
     u32 sprite_create_file = 0;
     u32 sprite_set_color = 0;
@@ -1559,6 +1572,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
             else if (name == "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume") runtime.native_resume = address;
             else if (name == "_ZN11GameManager11sharedStateEv")
                 runtime.game_manager_shared_state = address;
+            else if (name == "_ZNK11GameManager12getPlayLayerEv")
+                runtime.game_manager_get_play_layer = address;
+            else if (name == "_ZN11GameManager12setPlayLayerEP9PlayLayer")
+                runtime.game_manager_set_play_layer = address;
             else if (name == "_ZNK9PlayLayer15getPracticeModeEv")
                 runtime.play_layer_get_practice_mode = address;
             else if (name == "_ZNK9PlayLayer10getUILayerEv")
@@ -1588,10 +1605,20 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.level_editor_get_level_string = address;
             else if (name == "_ZN11GJGameLevel14setLevelStringESs")
                 runtime.gj_game_level_set_level_string = address;
+            else if (name == "_ZNK11GJGameLevel13getAudioTrackEv")
+                runtime.gj_game_level_get_audio_track = address;
+            else if (name == "_ZN11GJGameLevel13setAudioTrackEi")
+                runtime.gj_game_level_set_audio_track = address;
+            else if (name == "_ZNK11GJGameLevel12getLevelTypeEv")
+                runtime.gj_game_level_get_level_type = address;
+            else if (name == "_ZN11GJGameLevel12setLevelTypeE11GJLevelType")
+                runtime.gj_game_level_set_level_type = address;
             else if (name == "_ZN9PlayLayer6createEP11GJGameLevel")
                 runtime.play_layer_create = address;
             else if (name == "_ZN9PlayLayer9startGameEv")
                 runtime.play_layer_start_game = address;
+            else if (name == "_ZN9PlayLayer10resetLevelEv")
+                runtime.play_layer_reset_level = address;
             else if (name == "_ZNK9PlayLayer11getTestModeEv")
                 runtime.play_layer_get_test_mode = address;
             else if (name == "_ZNK9PlayLayer9getPlayerEv")
@@ -1600,8 +1627,20 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.play_layer_get_game_layer = address;
             else if (name == "_ZNK12PlayerObject9getIsDeadEv")
                 runtime.player_get_is_dead = address;
+            else if (name == "_ZNK12PlayerObject10getFlyModeEv")
+                runtime.player_get_fly_mode = address;
+            else if (name == "_ZNK12PlayerObject11getRollModeEv")
+                runtime.player_get_roll_mode = address;
+            else if (name == "_ZNK12PlayerObject11getBirdModeEv")
+                runtime.player_get_bird_mode = address;
             else if (name == "_ZNK11GameManager14getPlayerFrameEv")
                 runtime.game_manager_get_player_frame = address;
+            else if (name == "_ZNK11GameManager13getPlayerShipEv")
+                runtime.game_manager_get_player_ship = address;
+            else if (name == "_ZNK11GameManager13getPlayerBallEv")
+                runtime.game_manager_get_player_ball = address;
+            else if (name == "_ZNK11GameManager13getPlayerBirdEv")
+                runtime.game_manager_get_player_bird = address;
             else if (name == "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc")
                 runtime.sprite_create_with_frame = address;
             else if (name == "_ZN7cocos2d8CCSprite6createEPKc")
@@ -3266,8 +3305,9 @@ public:
         return runtime_.old_playtest_callback && runtime_.level_editor_get_level &&
                runtime_.level_editor_get_game_layer &&
                runtime_.level_editor_get_level_string &&
-               runtime_.gj_game_level_set_level_string &&
+               runtime_.gj_game_level_set_level_string && runtime_.gj_game_level_create &&
                runtime_.play_layer_create && runtime_.play_layer_start_game &&
+               runtime_.play_layer_reset_level &&
                runtime_.play_layer_get_test_mode && runtime_.play_layer_get_player &&
                runtime_.play_layer_get_game_layer && runtime_.player_get_is_dead &&
                runtime_.end_portal_trigger_object &&
@@ -3327,13 +3367,48 @@ public:
         return true;
     }
 
+    bool StartOldVersionPlaytestPreservingFirstAttempt(u32 play_layer) {
+        if (!play_layer || !runtime_.play_layer_start_game ||
+            !runtime_.play_layer_reset_level) return false;
+        const u32 symbol = runtime_.play_layer_reset_level;
+        const u32 address = symbol & ~1u;
+        const bool thumb = (symbol & 1u) != 0u;
+        u16 original16 = 0u;
+        u32 original32 = 0u;
+        if (thumb) {
+            if (!env_.IsMapped(address, 2u)) return false;
+            original16 = env_.MemoryRead16(address);
+            env_.MemoryWrite16(address, 0x4770u); /* bx lr */
+        } else {
+            if (!env_.IsMapped(address, 4u)) return false;
+            original32 = env_.MemoryRead32(address);
+            env_.MemoryWrite32(address, 0xE12FFF1Eu); /* bx lr */
+        }
+        cpu_.ClearCache();
+        /* init() has already built Attempt 1. startGame() normally calls
+           resetLevel() once more, producing the visible Attempt 1 -> 2 jump
+           when PlayLayer is instantiated directly from these old editors. */
+        const bool ok = RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
+                                    "PlayLayer::startGame preserve first attempt", 0u,
+                                    std::chrono::milliseconds(10000));
+        if (thumb) env_.MemoryWrite16(address, original16);
+        else env_.MemoryWrite32(address, original32);
+        cpu_.ClearCache();
+        if (ok) {
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED startGame-reset=suppressed-once\n";
+            log_.flush();
+        }
+        return ok;
+    }
+
     bool SuppressOldVersionPlaytestEndPortal(u32 play_layer, float player_x) {
         if (!play_layer || !runtime_.ccnode_set_position_ff ||
             !runtime_.ccnode_get_position_y)
             return true;
-        if (!old_playtest_end_portal_) {
+        if (!old_playtest_end_portal_ && !old_playtest_end_portal_scanned_) {
             unsigned visited = 0u;
             u32 portal = 0u;
+            old_playtest_end_portal_scanned_ = true;
             if (!FindSceneNodeByType(play_layer, "EndPortalObject", portal,
                                      0u, visited)) {
                 log_ << "WARNING: DYNARMIC_OLD_VER_PLAYTEST_END_PORTAL scan-failed\n";
@@ -3395,7 +3470,7 @@ public:
     }
 
     bool CreateOldVersionPlaytestItem(u32 target, const char* frame,
-                                      u32* item_out) {
+                                      float sprite_scale, u32* item_out) {
         if (item_out) *item_out = 0u;
         const u32 frame_name = AllocateString(frame);
         u32 normal = 0u, selected = 0u, item = 0u;
@@ -3405,13 +3480,162 @@ public:
                          std::chrono::milliseconds(1500)) || !normal ||
             !RunFunction(runtime_.sprite_create_with_frame, {frame_name}, &selected,
                          "CCSprite::createWithSpriteFrameName playtest selected", 0u,
-                         std::chrono::milliseconds(1500)) || !selected ||
-            !RunFunction(runtime_.menu_item_sprite_extra_create,
+                         std::chrono::milliseconds(1500)) || !selected) return false;
+        /* Scale the normal and selected sprites, not CCMenuItemSpriteExtra.
+           Old CCMenuItemSpriteExtra restores its own pressed scale to 1.0,
+           which is what made the play icon suddenly jump back to full size. */
+        if (sprite_scale > 0.0f && sprite_scale != 1.0f &&
+            (!RunFunction(runtime_.ccnode_set_scale,
+                          {normal, FloatToWord(sprite_scale)}, nullptr,
+                          "scale playtest normal sprite", 0u,
+                          std::chrono::milliseconds(500)) ||
+             !RunFunction(runtime_.ccnode_set_scale,
+                          {selected, FloatToWord(sprite_scale)}, nullptr,
+                          "scale playtest selected sprite", 0u,
+                          std::chrono::milliseconds(500)))) return false;
+        if (!RunFunction(runtime_.menu_item_sprite_extra_create,
                          {normal, selected, target,
                           runtime_.old_playtest_callback, 0u}, &item,
                          "CCMenuItemSpriteExtra::create playtest", 0u,
                          std::chrono::milliseconds(2000)) || !item) return false;
         if (item_out) *item_out = item;
+        return true;
+    }
+
+    int DetectOldVersionPlaytestMode() {
+        if (!old_playtest_player_) return 0;
+        u32 value = 0u;
+        /* Bird/UFO can also report flying in some releases, so test the
+           specific modes before the generic fly/ship flag. */
+        if (runtime_.player_get_bird_mode &&
+            RunFunction(runtime_.player_get_bird_mode, {old_playtest_player_},
+                        &value, "PlayerObject::getBirdMode playtest", 0u,
+                        std::chrono::milliseconds(300)) && value)
+            return 3;
+        value = 0u;
+        if (runtime_.player_get_roll_mode &&
+            RunFunction(runtime_.player_get_roll_mode, {old_playtest_player_},
+                        &value, "PlayerObject::getRollMode playtest", 0u,
+                        std::chrono::milliseconds(300)) && value)
+            return 2;
+        value = 0u;
+        if (runtime_.player_get_fly_mode &&
+            RunFunction(runtime_.player_get_fly_mode, {old_playtest_player_},
+                        &value, "PlayerObject::getFlyMode playtest", 0u,
+                        std::chrono::milliseconds(300)) && value)
+            return 1;
+        return 0;
+    }
+
+    int OldVersionPlaytestIconForMode(int mode) {
+        if (!runtime_.game_manager_shared_state) return 1;
+        u32 manager = 0u;
+        if (!RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                         "GameManager::sharedState playtest mode icon", 0u,
+                         std::chrono::milliseconds(300)) || !manager) return 1;
+        u32 getter = runtime_.game_manager_get_player_frame;
+        if (mode == 1 && runtime_.game_manager_get_player_ship)
+            getter = runtime_.game_manager_get_player_ship;
+        else if (mode == 2 && runtime_.game_manager_get_player_ball)
+            getter = runtime_.game_manager_get_player_ball;
+        else if (mode == 3 && runtime_.game_manager_get_player_bird)
+            getter = runtime_.game_manager_get_player_bird;
+        u32 value = 1u;
+        if (getter)
+            (void)RunFunction(getter, {manager}, &value,
+                              "GameManager mode icon playtest", 0u,
+                              std::chrono::milliseconds(300));
+        if (value > 99u) value = 1u;
+        if ((mode == 1 || mode == 3) && value == 0u) value = 1u;
+        return static_cast<int>(value);
+    }
+
+    bool RemoveOldVersionPlaytestProxyVisuals() {
+        bool ok = true;
+        const std::array<u32,3> sprites = {
+            old_playtest_proxy_primary_, old_playtest_proxy_secondary_,
+            old_playtest_proxy_tertiary_};
+        for (u32 sprite : sprites) {
+            if (!sprite || !env_.IsMapped(sprite, 4u)) continue;
+            if (!RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {sprite, 1u}, nullptr,
+                             "remove playtest mode proxy", 0u,
+                             std::chrono::milliseconds(500))) ok = false;
+        }
+        old_playtest_proxy_primary_ = 0u;
+        old_playtest_proxy_secondary_ = 0u;
+        old_playtest_proxy_tertiary_ = 0u;
+        return ok;
+    }
+
+    bool RebuildOldVersionPlaytestProxyVisuals(bool force) {
+        if (!old_playtest_player_ || !old_playtest_trail_) return true;
+        int mode = DetectOldVersionPlaytestMode();
+        int icon = OldVersionPlaytestIconForMode(mode);
+        if (!force && old_playtest_proxy_primary_ &&
+            mode == old_playtest_proxy_mode_ && icon == old_playtest_proxy_icon_)
+            return true;
+        if (!RemoveOldVersionPlaytestProxyVisuals()) return false;
+
+        const char* prefix = mode == 1 ? "ship" :
+                             mode == 2 ? "player_ball" :
+                             mode == 3 ? "bird" : "player";
+        char primary_name[64]{};
+        char secondary_name[64]{};
+        char tertiary_name[64]{};
+        std::snprintf(primary_name, sizeof(primary_name),
+                      "%s_%02d_001.png", prefix, icon);
+        std::snprintf(secondary_name, sizeof(secondary_name),
+                      "%s_%02d_2_001.png", prefix, icon);
+        std::snprintf(tertiary_name, sizeof(tertiary_name),
+                      "%s_%02d_3_001.png", prefix, icon);
+
+        auto create_frame = [&](const char* name, u32& output) -> bool {
+            output = 0u;
+            const u32 guest_name = AllocateString(name);
+            return guest_name &&
+                   RunFunction(runtime_.sprite_create_with_frame, {guest_name},
+                               &output, "create mode-aware playtest proxy", 0u,
+                               std::chrono::milliseconds(700));
+        };
+        if (!create_frame(primary_name, old_playtest_proxy_primary_) ||
+            !old_playtest_proxy_primary_) {
+            icon = mode == 2 ? 0 : 1;
+            std::snprintf(primary_name, sizeof(primary_name),
+                          "%s_%02d_001.png", prefix, icon);
+            if (!create_frame(primary_name, old_playtest_proxy_primary_) ||
+                !old_playtest_proxy_primary_) {
+                mode = 0;
+                icon = 1;
+                if (!create_frame("player_01_001.png",
+                                  old_playtest_proxy_primary_) ||
+                    !old_playtest_proxy_primary_) return false;
+            }
+        }
+
+        /* 1.0/1.1 only ship a single ship layer. Avoid looking up non-existent
+           ship overlay frames on those builds; newer builds expose the ship
+           icon getter and have the layered frames. */
+        if (!(mode == 1 && !runtime_.game_manager_get_player_ship)) {
+            (void)create_frame(secondary_name, old_playtest_proxy_secondary_);
+            if (mode == 3)
+                (void)create_frame(tertiary_name, old_playtest_proxy_tertiary_);
+        }
+        if (old_playtest_proxy_tertiary_ &&
+            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_tertiary_, 9998))
+            return false;
+        if (old_playtest_proxy_secondary_ &&
+            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_secondary_, 9999))
+            return false;
+        if (!AddExtrasChild(old_playtest_trail_, old_playtest_proxy_primary_, 10000))
+            return false;
+        old_playtest_proxy_mode_ = mode;
+        old_playtest_proxy_icon_ = icon;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_PROXY_MODE mode="
+             << (mode == 1 ? "ship" : mode == 2 ? "ball" :
+                 mode == 3 ? "bird" : "cube")
+             << " icon=" << icon << "\n";
+        log_.flush();
         return true;
     }
 
@@ -3489,7 +3713,9 @@ public:
     }
 
     bool UpdateOldVersionPlaytestProxyTransform() {
-        if (!old_playtest_player_ || !old_playtest_proxy_primary_) return true;
+        if (!old_playtest_player_) return true;
+        if (!RebuildOldVersionPlaytestProxyVisuals(false)) return false;
+        if (!old_playtest_proxy_primary_) return true;
         float x = 0.0f, y = 0.0f, rotation = 0.0f;
         float scale_x = 1.0f, scale_y = 1.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, old_playtest_player_,
@@ -3521,7 +3747,8 @@ public:
                                "CCNode::setScaleY playtest proxy", 0u,
                                std::chrono::milliseconds(500));
         };
-        if (!update_sprite(old_playtest_proxy_secondary_) ||
+        if (!update_sprite(old_playtest_proxy_tertiary_) ||
+            !update_sprite(old_playtest_proxy_secondary_) ||
             !update_sprite(old_playtest_proxy_primary_)) return false;
         return AppendOldVersionPlaytestTrailSegment(x, y);
     }
@@ -3541,25 +3768,74 @@ public:
         }
         if (!ClearOldVersionPlaytestTrail()) return false;
 
-        u32 level = 0u;
+        u32 editor_level = 0u;
         if (!RunFunction(runtime_.level_editor_get_level,
-                         {active_editor_layer_}, &level,
+                         {active_editor_layer_}, &editor_level,
                          "LevelEditorLayer::getLevel inline playtest", 0u,
-                         std::chrono::milliseconds(1500)) || !level) return false;
+                         std::chrono::milliseconds(1500)) || !editor_level) return false;
         const u32 level_string = Allocate(4u);
         if (!level_string) return false;
         env_.MemoryWrite32(level_string, 0u);
         if (!RunFunction(runtime_.level_editor_get_level_string,
                          {level_string, active_editor_layer_}, nullptr,
                          "LevelEditorLayer::getLevelString inline playtest", 0u,
-                         std::chrono::milliseconds(4000)) ||
+                         std::chrono::milliseconds(4000))) return false;
+
+        /* PlayLayer::init registers itself in GameManager. Capture the editor's
+           previous play-layer pointer (normally zero) so manual teardown can
+           restore it even if the hidden PlayLayer remains autoreleased. */
+        old_playtest_previous_play_layer_ = 0u;
+        if (runtime_.game_manager_shared_state &&
+            runtime_.game_manager_get_play_layer) {
+            u32 manager = 0u;
+            if (RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                            "GameManager::sharedState playtest save", 0u,
+                            std::chrono::milliseconds(500)) && manager)
+                (void)RunFunction(runtime_.game_manager_get_play_layer, {manager},
+                                  &old_playtest_previous_play_layer_,
+                                  "GameManager::getPlayLayer playtest save", 0u,
+                                  std::chrono::milliseconds(500));
+        }
+
+        /* PlayLayer mutates its GJGameLevel bookkeeping. Never share the
+           editor's live level object with it: that was leaving LevelEditorLayer
+           corrupted and explains the post-playtest crash when placing portals
+           or other objects. Build a private temporary level from the unsaved
+           editor string instead. */
+        u32 level_clone = 0u;
+        if (!RunFunction(runtime_.gj_game_level_create, {}, &level_clone,
+                         "GJGameLevel::create inline playtest clone", 0u,
+                         std::chrono::milliseconds(1000)) || !level_clone) return false;
+        if (runtime_.ccobject_retain &&
+            !RunFunction(runtime_.ccobject_retain, {level_clone}, nullptr,
+                         "retain playtest level clone", 0u,
+                         std::chrono::milliseconds(500))) return false;
+        auto copy_int_property = [&](u32 getter, u32 setter,
+                                     const char* getter_label,
+                                     const char* setter_label) -> bool {
+            if (!getter || !setter) return true;
+            u32 value = 0u;
+            return RunFunction(getter, {editor_level}, &value, getter_label, 0u,
+                               std::chrono::milliseconds(500)) &&
+                   RunFunction(setter, {level_clone, value}, nullptr,
+                               setter_label, 0u,
+                               std::chrono::milliseconds(500));
+        };
+        if (!copy_int_property(runtime_.gj_game_level_get_audio_track,
+                               runtime_.gj_game_level_set_audio_track,
+                               "GJGameLevel::getAudioTrack editor",
+                               "GJGameLevel::setAudioTrack clone") ||
+            !copy_int_property(runtime_.gj_game_level_get_level_type,
+                               runtime_.gj_game_level_set_level_type,
+                               "GJGameLevel::getLevelType editor",
+                               "GJGameLevel::setLevelType clone") ||
             !RunFunction(runtime_.gj_game_level_set_level_string,
-                         {level, level_string}, nullptr,
-                         "GJGameLevel::setLevelString inline playtest", 0u,
+                         {level_clone, level_string}, nullptr,
+                         "GJGameLevel::setLevelString playtest clone", 0u,
                          std::chrono::milliseconds(4000))) return false;
 
         u32 play_layer = 0u;
-        if (!RunFunction(runtime_.play_layer_create, {level}, &play_layer,
+        if (!RunFunction(runtime_.play_layer_create, {level_clone}, &play_layer,
                          "PlayLayer::create inline playtest", 0u,
                          std::chrono::milliseconds(10000)) || !play_layer) return false;
         if (!env_.IsMapped(play_layer + test_mode_offset, 1u)) {
@@ -3568,9 +3844,7 @@ public:
         }
         env_.MemoryWrite8(play_layer + test_mode_offset, 1u);
         if (!AddExtrasChild(active_editor_layer_, play_layer, -10000) ||
-            !RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
-                         "PlayLayer::startGame inline playtest", 0u,
-                         std::chrono::milliseconds(10000))) return false;
+            !StartOldVersionPlaytestPreservingFirstAttempt(play_layer)) return false;
 
         u32 player = 0u, play_game_layer = 0u, editor_game_layer = 0u;
         if (!RunFunction(runtime_.play_layer_get_player, {play_layer}, &player,
@@ -3585,6 +3859,19 @@ public:
                          std::chrono::milliseconds(1000)) || !editor_game_layer)
             return false;
 
+        old_playtest_scene_ = active_scene_root_;
+        old_playtest_editor_ = active_editor_layer_;
+        old_playtest_ui_ = editor_ui;
+        old_playtest_layer_ = play_layer;
+        old_playtest_player_ = player;
+        old_playtest_play_game_layer_ = play_game_layer;
+        old_playtest_editor_game_layer_ = editor_game_layer;
+        old_playtest_level_clone_ = level_clone;
+        old_playtest_proxy_mode_ = -1;
+        old_playtest_proxy_icon_ = -1;
+        old_playtest_end_portal_ = 0u;
+        old_playtest_end_portal_scanned_ = false;
+
         float start_player_x = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, player, start_player_x,
                               "CCNode::getPositionX playtest player start"))
@@ -3592,86 +3879,42 @@ public:
         if (!SuppressOldVersionPlaytestEndPortal(play_layer, start_player_x))
             return false;
 
+        /* Wrapper visuals are a sibling overlay under LevelEditorLayer, never
+           children of the editor game layer. Old editor object placement code
+           assumes game-layer children are GameObjects. */
         u32 trail = 0u;
         if (!RunFunction(runtime_.ccnode_create, {}, &trail,
-                         "CCNode::create playtest trail root", 0u,
+                         "CCNode::create playtest overlay root", 0u,
                          std::chrono::milliseconds(1000)) || !trail ||
-            !AddExtrasChild(editor_game_layer, trail, 9998)) return false;
+            !AddExtrasChild(active_editor_layer_, trail, 9998)) return false;
         old_playtest_trail_ = trail;
+        if (!RebuildOldVersionPlaytestProxyVisuals(true)) return false;
 
-        u32 frame_id = 1u;
-        if (runtime_.game_manager_shared_state && runtime_.game_manager_get_player_frame) {
-            u32 manager = 0u;
-            if (RunFunction(runtime_.game_manager_shared_state, {}, &manager,
-                            "GameManager::sharedState playtest icon", 0u,
-                            std::chrono::milliseconds(500)) && manager) {
-                u32 value = 1u;
-                if (RunFunction(runtime_.game_manager_get_player_frame, {manager}, &value,
-                                "GameManager::getPlayerFrame playtest icon", 0u,
-                                std::chrono::milliseconds(500)))
-                    frame_id = value;
-            }
-        }
-        if (frame_id > 99u) frame_id = 1u;
-        char primary_name[64];
-        char secondary_name[64];
-        std::snprintf(primary_name, sizeof(primary_name),
-                      "player_%02u_001.png", frame_id);
-        std::snprintf(secondary_name, sizeof(secondary_name),
-                      "player_%02u_2_001.png", frame_id);
-        u32 primary_name_guest = AllocateString(primary_name);
-        u32 secondary_name_guest = AllocateString(secondary_name);
-        u32 proxy_primary = 0u, proxy_secondary = 0u;
-        if (!primary_name_guest ||
-            !RunFunction(runtime_.sprite_create_with_frame, {primary_name_guest},
-                         &proxy_primary, "create playtest proxy primary", 0u,
-                         std::chrono::milliseconds(1000)) || !proxy_primary) {
-            primary_name_guest = AllocateString("player_01_001.png");
-            secondary_name_guest = AllocateString("player_01_2_001.png");
-            if (!primary_name_guest ||
-                !RunFunction(runtime_.sprite_create_with_frame, {primary_name_guest},
-                             &proxy_primary, "create fallback playtest proxy", 0u,
-                             std::chrono::milliseconds(1000)) || !proxy_primary)
-                return false;
-        }
-        if (secondary_name_guest)
-            (void)RunFunction(runtime_.sprite_create_with_frame, {secondary_name_guest},
-                              &proxy_secondary, "create playtest proxy secondary", 0u,
-                              std::chrono::milliseconds(1000));
-        if ((proxy_secondary &&
-             !AddExtrasChild(editor_game_layer, proxy_secondary, 9999)) ||
-            !AddExtrasChild(editor_game_layer, proxy_primary, 10000)) return false;
-
-        float camera_x = 0.0f, camera_y = 0.0f;
+        float camera_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y, play_game_layer,
                               camera_y, "CCNode::getPositionY play")) return false;
-
-        /* Keep the real PlayerObject inside PlayLayer. Both ARM and x86 game
-           code assume that hierarchy during update; reparenting it is unsafe. */
-        float player_x_for_camera = 0.0f;
-        if (!GuestFloatGetter(runtime_.ccnode_get_position_x, player,
-                              player_x_for_camera, "CCNode::getPositionX player camera"))
-            return false;
-        camera_x = 120.0f - player_x_for_camera;
+        float camera_x = 120.0f - start_player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
+        camera_y += 20.0f;
         if (!RunFunction(runtime_.ccnode_set_visible, {play_layer, 0u}, nullptr,
                          "hide backing PlayLayer", 0u,
                          std::chrono::milliseconds(500)) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {editor_game_layer, FloatToWord(camera_x), FloatToWord(camera_y)},
                          nullptr, "follow player with editor camera", 0u,
-                         std::chrono::milliseconds(500))) return false;
-        old_playtest_player_ = player;
-        old_playtest_proxy_primary_ = proxy_primary;
-        old_playtest_proxy_secondary_ = proxy_secondary;
-        if (!UpdateOldVersionPlaytestProxyTransform()) return false;
+                         std::chrono::milliseconds(500)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {trail, FloatToWord(camera_x), FloatToWord(camera_y)},
+                         nullptr, "mirror editor camera on playtest overlay", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !UpdateOldVersionPlaytestProxyTransform()) return false;
 
         u32 stop_menu = 0u, stop_button = 0u;
         if (!RunFunction(runtime_.cc_menu_create, {}, &stop_menu,
                          "CCMenu::create playtest stop", 0u,
                          std::chrono::milliseconds(1500)) || !stop_menu ||
             !CreateOldVersionPlaytestItem(editor_ui, "GJ_pauseBtn_001.png",
-                                          &stop_button) ||
+                                          1.0f, &stop_button) ||
             !AddExtrasChild(stop_menu, stop_button, 0) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {stop_menu, FloatToWord(0.0f), FloatToWord(0.0f)},
@@ -3682,18 +3925,8 @@ public:
                          nullptr, "CCNode::setPosition playtest stop", 0u,
                          std::chrono::milliseconds(1000)) ||
             !AddExtrasChild(editor_ui, stop_menu, 10001)) return false;
-
-        old_playtest_scene_ = active_scene_root_;
-        old_playtest_editor_ = active_editor_layer_;
-        old_playtest_ui_ = editor_ui;
-        old_playtest_layer_ = play_layer;
         old_playtest_stop_menu_ = stop_menu;
-        old_playtest_player_ = player;
-        old_playtest_play_game_layer_ = play_game_layer;
-        old_playtest_editor_game_layer_ = editor_game_layer;
-        /* Inline editor testing has no level end. EndPortalObject::triggerObject
-           owns the old player-lock and level-complete sequence, so disable that
-           method only for the lifetime of this hidden PlayLayer. */
+
         if (!SetOldVersionPlaytestEndTriggerSuppressed(true)) {
             log_ << "ERROR: could not disable EndPortalObject::triggerObject\n";
             log_.flush();
@@ -3707,61 +3940,101 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden end=disabled\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=20\n";
         log_.flush();
         return true;
     }
 
     bool StopInlineOldVersionPlaytest() {
-        if (!old_playtest_layer_) return SetOldVersionPlaytestEndTriggerSuppressed(false);
+        if (!old_playtest_layer_)
+            return SetOldVersionPlaytestEndTriggerSuppressed(false);
         audio_stop_background();
         bool ok = true;
-        if (ok && old_playtest_stop_menu_)
+        if (old_playtest_stop_menu_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_stop_menu_, 1u}, nullptr,
                              "remove inline playtest stop menu", 0u,
-                             std::chrono::milliseconds(1000));
-        if (ok && old_playtest_proxy_primary_)
-            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {old_playtest_proxy_primary_, 1u}, nullptr,
-                             "remove playtest proxy primary", 0u,
-                             std::chrono::milliseconds(1000));
-        if (ok && old_playtest_proxy_secondary_)
-            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {old_playtest_proxy_secondary_, 1u}, nullptr,
-                             "remove playtest proxy secondary", 0u,
-                             std::chrono::milliseconds(1000));
-        if (ok && old_playtest_layer_)
+                             std::chrono::milliseconds(1000)) && ok;
+        if (!RemoveOldVersionPlaytestProxyVisuals()) ok = false;
+        if (old_playtest_layer_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_layer_, 1u}, nullptr,
                              "remove hidden inline PlayLayer", 0u,
-                             std::chrono::milliseconds(3000));
+                             std::chrono::milliseconds(3000)) && ok;
+        /* A detached autoreleased PlayLayer may not destruct immediately.
+           Explicitly restore GameManager::m_playLayer before the next editor
+           touch so portal/object placement cannot find a stale test layer. */
+        if (runtime_.game_manager_shared_state &&
+            runtime_.game_manager_set_play_layer) {
+            u32 manager = 0u;
+            if (RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                            "GameManager::sharedState playtest restore", 0u,
+                            std::chrono::milliseconds(500)) && manager)
+                ok = RunFunction(runtime_.game_manager_set_play_layer,
+                                 {manager, old_playtest_previous_play_layer_},
+                                 nullptr, "GameManager::setPlayLayer restore editor",
+                                 0u, std::chrono::milliseconds(500)) && ok;
+        }
+        old_playtest_previous_play_layer_ = 0u;
+        /* The clone is explicitly retained before PlayLayer::create so that
+           the editor and the temporary gameplay session never share a live
+           GJGameLevel. Release our retain only after the PlayLayer is gone. */
+        if (old_playtest_level_clone_ && runtime_.ccobject_release)
+            ok = RunFunction(runtime_.ccobject_release,
+                             {old_playtest_level_clone_}, nullptr,
+                             "release playtest level clone", 0u,
+                             std::chrono::milliseconds(1000)) && ok;
+        old_playtest_level_clone_ = 0u;
         if (!SetOldVersionPlaytestEndTriggerSuppressed(false)) ok = false;
-        if (ok && old_playtest_play_menu_)
+        if (old_playtest_play_menu_)
             ok = RunFunction(runtime_.ccnode_set_visible,
                              {old_playtest_play_menu_, 1u}, nullptr,
                              "restore playtest play button", 0u,
-                             std::chrono::milliseconds(500));
+                             std::chrono::milliseconds(500)) && ok;
         old_playtest_layer_ = 0u;
         old_playtest_stop_menu_ = 0u;
-        old_playtest_editor_ = 0u;
-        old_playtest_ui_ = 0u;
+        /* Keep editor/game-layer pointers while the retained breadcrumb
+           overlay belongs to this scene. It is a sibling of the game layer,
+           so it has to mirror later manual editor panning after playtest. */
         old_playtest_player_ = 0u;
         old_playtest_play_game_layer_ = 0u;
-        old_playtest_editor_game_layer_ = 0u;
-        old_playtest_proxy_primary_ = 0u;
-        old_playtest_proxy_secondary_ = 0u;
+        old_playtest_proxy_mode_ = -1;
+        old_playtest_proxy_icon_ = -1;
         old_playtest_end_portal_ = 0u;
+        old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained music=stopped end=restored\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained-outside-game-layer music=stopped end=restored editor-level=untouched\n";
             log_.flush();
         }
         return ok;
     }
 
     bool UpdateInlineOldVersionPlaytest() {
-        if (!old_playtest_layer_) return true;
+        if (!old_playtest_layer_) {
+            /* Breadcrumbs live outside LevelEditorLayer::getGameLayer so the
+               old object-placement code never sees wrapper CCNodes as game
+               objects. Mirror the editor camera after stopping so the retained
+               path stays locked to the level while the user pans/zooms. */
+            if (old_playtest_trail_ && old_playtest_editor_game_layer_ &&
+                env_.IsMapped(old_playtest_trail_, 4u) &&
+                env_.IsMapped(old_playtest_editor_game_layer_, 4u)) {
+                float x = 0.0f, y = 0.0f;
+                if (GuestFloatGetter(runtime_.ccnode_get_position_x,
+                                     old_playtest_editor_game_layer_, x,
+                                     "CCNode::getPositionX retained trail camera") &&
+                    GuestFloatGetter(runtime_.ccnode_get_position_y,
+                                     old_playtest_editor_game_layer_, y,
+                                     "CCNode::getPositionY retained trail camera")) {
+                    (void)RunFunction(runtime_.ccnode_set_position_ff,
+                                      {old_playtest_trail_, FloatToWord(x),
+                                       FloatToWord(y)}, nullptr,
+                                      "mirror retained playtest trail camera", 0u,
+                                      std::chrono::milliseconds(300));
+                }
+            }
+            return true;
+        }
         if (!old_playtest_player_ || !old_playtest_play_game_layer_ ||
             !old_playtest_editor_game_layer_) return false;
         u32 current_player = 0u, dead = 0u;
@@ -3786,9 +4059,9 @@ public:
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x,
                               old_playtest_player_, player_x,
                               "CCNode::getPositionX playtest player")) return false;
-        /* Inline editor playtest intentionally has no gameplay end wall.
-           Keep the hidden PlayLayer's EndPortalObject far ahead of the cube
-           instead of stopping at an artificial editor-distance threshold. */
+        /* triggerObject is suppressed while inline playtest is active, and
+           the physical EndPortalObject is also kept far ahead as a secondary
+           guard for old builds that use position checks outside triggerObject. */
         if (!SuppressOldVersionPlaytestEndPortal(old_playtest_layer_, player_x))
             return false;
 
@@ -3798,11 +4071,18 @@ public:
                               "CCNode::getPositionY playtest camera")) return false;
         float camera_x = 120.0f - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
+        camera_y += 20.0f;
         if (!RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_, FloatToWord(camera_x),
                           FloatToWord(camera_y)}, nullptr,
                          "follow player with editor playtest camera", 0u,
                          std::chrono::milliseconds(500)) ||
+            (old_playtest_trail_ &&
+             !RunFunction(runtime_.ccnode_set_position_ff,
+                          {old_playtest_trail_, FloatToWord(camera_x),
+                           FloatToWord(camera_y)}, nullptr,
+                          "mirror editor camera on playtest overlay", 0u,
+                          std::chrono::milliseconds(500))) ||
             !UpdateOldVersionPlaytestProxyTransform()) return false;
         return true;
     }
@@ -3827,7 +4107,16 @@ public:
             old_playtest_editor_game_layer_ = 0u;
             old_playtest_proxy_primary_ = 0u;
             old_playtest_proxy_secondary_ = 0u;
+            old_playtest_proxy_tertiary_ = 0u;
+            old_playtest_proxy_mode_ = -1;
+            old_playtest_proxy_icon_ = -1;
+            /* Scene teardown owns the PlayLayer; do not dereference guest
+               objects here. The clone is process-local and the normal stop
+               path releases it before any ordinary editor transition. */
+            old_playtest_level_clone_ = 0u;
+            old_playtest_previous_play_layer_ = 0u;
             old_playtest_end_portal_ = 0u;
+            old_playtest_end_portal_scanned_ = false;
             old_playtest_request_ = 0u;
             /* The outgoing scene owns the retained trail node. */
             old_playtest_trail_ = 0u;
@@ -3845,7 +4134,7 @@ public:
                          std::chrono::milliseconds(1500)) || !menu) return false;
         u32 button = 0u;
         if (!CreateOldVersionPlaytestItem(editor_ui, "GJ_playBtn2_001.png",
-                                          &button)) return false;
+                                          0.49f, &button)) return false;
         if (!AddExtrasChild(menu, button, 0) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {menu, FloatToWord(0.0f), FloatToWord(0.0f)}, nullptr,
@@ -3854,10 +4143,6 @@ public:
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {button, FloatToWord(30.0f), FloatToWord(186.0f)}, nullptr,
                          "CCNode::setPosition editor playtest", 0u,
-                         std::chrono::milliseconds(1000)) ||
-            !RunFunction(runtime_.ccnode_set_scale,
-                         {button, FloatToWord(0.325f)}, nullptr,
-                         "CCNode::setScale editor playtest", 0u,
                          std::chrono::milliseconds(1000)) ||
             !AddExtrasChild(editor_ui, menu, 10000)) return false;
         old_playtest_play_menu_ = menu;
@@ -8107,7 +8392,13 @@ private:
     u32 old_playtest_editor_game_layer_ = 0u;
     u32 old_playtest_proxy_primary_ = 0u;
     u32 old_playtest_proxy_secondary_ = 0u;
+    u32 old_playtest_proxy_tertiary_ = 0u;
+    int old_playtest_proxy_mode_ = -1;
+    int old_playtest_proxy_icon_ = -1;
+    u32 old_playtest_level_clone_ = 0u;
+    u32 old_playtest_previous_play_layer_ = 0u;
     u32 old_playtest_end_portal_ = 0u;
+    bool old_playtest_end_portal_scanned_ = false;
     u32 old_playtest_end_portal_point_ = 0u;
     bool old_playtest_end_trigger_suppressed_ = false;
     bool old_playtest_end_trigger_thumb_ = false;

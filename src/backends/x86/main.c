@@ -37,6 +37,8 @@ typedef void (*NativeInsertTextFunction)(void *environment, void *object,
 typedef void (*NativeDeleteBackwardFunction)(void *environment, void *object);
 typedef void (*NativeLifecycleFunction)(void *environment, void *object);
 typedef void *(__cdecl *GameManagerSharedStateFunction)(void);
+typedef void *(__cdecl *GameManagerGetPlayLayerFunction)(void *self);
+typedef void (__cdecl *GameManagerSetPlayLayerFunction)(void *self, void *play_layer);
 typedef void (__cdecl *UiCheckpointFunction)(void *self, void *sender);
 typedef void (__cdecl *UiCheckpointNoSenderFunction)(void *self);
 typedef int (__cdecl *CcNodeGetTagFunction)(void *self);
@@ -67,6 +69,8 @@ typedef void (__cdecl *CcObjectRefFunction)(void *self);
 typedef void *(__cdecl *LevelEditorGetLevelFunction)(void *self);
 typedef void *(__cdecl *NodeGetterFunction)(void *self);
 typedef int (__cdecl *IntGetterFunction)(void *self);
+typedef void (__cdecl *IntSetterFunction)(void *self, int value);
+typedef void *(__cdecl *NoArgCreateFunction)(void);
 typedef void (__cdecl *GJGameLevelSetLevelStringFunction)(void *self,
                                                           void *string_object);
 typedef void *(__cdecl *PlayLayerCreateFunction)(void *level);
@@ -122,6 +126,8 @@ typedef struct {
     void *active_editor_layer;
     void *active_pause_layer;
     GameManagerSharedStateFunction game_manager_shared_state;
+    GameManagerGetPlayLayerFunction game_manager_get_play_layer;
+    GameManagerSetPlayLayerFunction game_manager_set_play_layer;
     UiCheckpointFunction ui_on_check;
     UiCheckpointFunction ui_on_delete_check;
     UiCheckpointNoSenderFunction ui_on_check_no_sender;
@@ -163,13 +169,25 @@ typedef struct {
     NodeGetterFunction level_editor_get_game_layer;
     void *level_editor_get_level_string;
     GJGameLevelSetLevelStringFunction gj_game_level_set_level_string;
+    NoArgCreateFunction gj_game_level_create;
+    IntGetterFunction gj_game_level_get_audio_track;
+    IntSetterFunction gj_game_level_set_audio_track;
+    IntGetterFunction gj_game_level_get_level_type;
+    IntSetterFunction gj_game_level_set_level_type;
     PlayLayerCreateFunction play_layer_create;
     PlayLayerStartGameFunction play_layer_start_game;
+    void *play_layer_reset_level;
     void *play_layer_get_test_mode;
     NodeGetterFunction play_layer_get_player;
     NodeGetterFunction play_layer_get_game_layer;
     IntGetterFunction player_get_is_dead;
+    IntGetterFunction player_get_fly_mode;
+    IntGetterFunction player_get_roll_mode;
+    IntGetterFunction player_get_bird_mode;
     IntGetterFunction game_manager_get_player_frame;
+    IntGetterFunction game_manager_get_player_ship;
+    IntGetterFunction game_manager_get_player_ball;
+    IntGetterFunction game_manager_get_player_bird;
     CcSpriteCreateWithFrameFunction sprite_create_with_frame;
     CcSpriteCreateFileFunction sprite_create_file;
     CcSpriteSetColorFunction sprite_set_color;
@@ -200,7 +218,13 @@ typedef struct {
     void *old_playtest_editor_game_layer;
     void *old_playtest_proxy_primary;
     void *old_playtest_proxy_secondary;
+    void *old_playtest_proxy_tertiary;
+    int old_playtest_proxy_mode;
+    int old_playtest_proxy_icon;
+    void *old_playtest_level_clone;
+    void *old_playtest_previous_play_layer;
     void *old_playtest_end_portal;
+    int old_playtest_end_portal_scanned;
     unsigned char old_playtest_end_trigger_original;
     int old_playtest_end_trigger_suppressed;
     void *old_playtest_trail;
@@ -222,8 +246,20 @@ static GameHost g_host;
 
 #define OLD_PLAYTEST_BUTTON_X 30.0f
 #define OLD_PLAYTEST_BUTTON_Y 186.0f
+/* GJ_playBtn2 is about 82 px high; the pause icon is about 40 px. Scale the
+   play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
+   cannot restore the item to an oversized scale. */
+#define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
+#define OLD_PLAYTEST_CAMERA_Y_OFFSET 20.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
+
+enum {
+    OLD_PLAYTEST_MODE_CUBE = 0,
+    OLD_PLAYTEST_MODE_SHIP = 1,
+    OLD_PLAYTEST_MODE_BALL = 2,
+    OLD_PLAYTEST_MODE_BIRD = 3
+};
 
 typedef unsigned char *(__cdecl *AndroidFileDataFunction)(
     void *self, const char *filename, const char *mode,
@@ -1178,8 +1214,10 @@ static int set_old_playtest_end_trigger_suppressed(int suppress) {
 static void suppress_old_playtest_end_portal(void *play_layer, float player_x) {
     if (!play_layer || !g_host.ccnode_set_position ||
         !g_host.ccnode_get_position_y) return;
-    if (!g_host.old_playtest_end_portal) {
+    if (!g_host.old_playtest_end_portal &&
+        !g_host.old_playtest_end_portal_scanned) {
         unsigned int visited = 0u;
+        g_host.old_playtest_end_portal_scanned = 1;
         g_host.old_playtest_end_portal = find_old_playtest_descendant_by_type(
             play_layer, "EndPortalObject", 0u, &visited);
         runtime_log("RESULT: X86_OLD_VER_PLAYTEST_END_PORTAL %s nodes=%u",
@@ -1207,8 +1245,9 @@ static void log_old_playtest_unavailable(const char *reason) {
 static int old_playtest_symbols_ready(void) {
     return g_host.level_editor_get_level &&
            g_host.level_editor_get_level_string &&
-           g_host.gj_game_level_set_level_string && g_host.play_layer_create &&
-           g_host.play_layer_start_game && g_host.play_layer_get_test_mode &&
+           g_host.gj_game_level_set_level_string && g_host.gj_game_level_create &&
+           g_host.play_layer_create && g_host.play_layer_start_game &&
+           g_host.play_layer_reset_level && g_host.play_layer_get_test_mode &&
            g_host.sprite_create_with_frame && g_host.cc_menu_create &&
            g_host.menu_item_sprite_extra_create && g_host.ccnode_set_visible &&
            g_host.ccnode_set_position && g_host.ccnode_get_position_x &&
@@ -1232,7 +1271,8 @@ static void __cdecl old_playtest_button_callback(void *self, void *sender) {
                         g_host.old_playtest_layer ? 2 : 1);
 }
 
-static void *create_old_playtest_item(void *target, const char *frame) {
+static void *create_old_playtest_item(void *target, const char *frame,
+                                      float sprite_scale) {
     void *normal;
     void *selected;
     if (!g_host.sprite_create_with_frame ||
@@ -1240,10 +1280,152 @@ static void *create_old_playtest_item(void *target, const char *frame) {
     normal = g_host.sprite_create_with_frame(frame);
     selected = g_host.sprite_create_with_frame(frame);
     if (!normal || !selected) return NULL;
+    /* Scale the actual normal/selected sprites before CCMenuItemSpriteExtra is
+       created. Its pressed-state animation is then free to scale the menu item
+       around 1.0 without ever snapping the icon back to the old huge size. */
+    if (sprite_scale > 0.0f && sprite_scale != 1.0f) {
+        g_host.ccnode_set_scale(normal, sprite_scale);
+        g_host.ccnode_set_scale(selected, sprite_scale);
+    }
     return g_host.menu_item_sprite_extra_create(
         normal, selected, target,
         (uintptr_t)(void (__cdecl *)(void *, void *))old_playtest_button_callback,
         0);
+}
+
+static int start_old_playtest_preserving_first_attempt(void *play_layer) {
+    unsigned char original;
+    unsigned char replacement = 0xc3u; /* RET */
+    if (!play_layer || !g_host.play_layer_start_game ||
+        !g_host.play_layer_reset_level ||
+        !memory_range_is_readable(g_host.play_layer_reset_level, 1u)) return 0;
+    original = *(const unsigned char *)g_host.play_layer_reset_level;
+    /* PlayLayer::init has already constructed Attempt 1. The historical
+       startGame() unconditionally calls resetLevel() again, producing the
+       annoying one-second Attempt 1 -> Attempt 2 restart when we instantiate
+       PlayLayer directly inside an old editor. Suppress only that one nested
+       reset while startGame schedules update and marks gameplay active. */
+    if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
+        return 0;
+    g_host.play_layer_start_game(play_layer);
+    if (!patch_x86_code(g_host.play_layer_reset_level, &original, 1u))
+        return 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED startGame-reset=suppressed-once");
+    return 1;
+}
+
+static int old_playtest_detect_mode(void) {
+    if (!g_host.old_playtest_player) return OLD_PLAYTEST_MODE_CUBE;
+    /* UFO/bird may also be considered a flying mode by old builds, so test
+       the more specific modes before the generic ship/fly flag. */
+    if (g_host.player_get_bird_mode &&
+        g_host.player_get_bird_mode(g_host.old_playtest_player))
+        return OLD_PLAYTEST_MODE_BIRD;
+    if (g_host.player_get_roll_mode &&
+        g_host.player_get_roll_mode(g_host.old_playtest_player))
+        return OLD_PLAYTEST_MODE_BALL;
+    if (g_host.player_get_fly_mode &&
+        g_host.player_get_fly_mode(g_host.old_playtest_player))
+        return OLD_PLAYTEST_MODE_SHIP;
+    return OLD_PLAYTEST_MODE_CUBE;
+}
+
+static int old_playtest_icon_for_mode(int mode) {
+    void *manager = g_host.game_manager_shared_state
+                        ? g_host.game_manager_shared_state() : NULL;
+    int icon = 1;
+    if (!manager) return icon;
+    if (mode == OLD_PLAYTEST_MODE_SHIP && g_host.game_manager_get_player_ship)
+        icon = g_host.game_manager_get_player_ship(manager);
+    else if (mode == OLD_PLAYTEST_MODE_BALL && g_host.game_manager_get_player_ball)
+        icon = g_host.game_manager_get_player_ball(manager);
+    else if (mode == OLD_PLAYTEST_MODE_BIRD && g_host.game_manager_get_player_bird)
+        icon = g_host.game_manager_get_player_bird(manager);
+    else if (g_host.game_manager_get_player_frame)
+        icon = g_host.game_manager_get_player_frame(manager);
+    if (icon < 0 || icon > 99) icon = 1;
+    if ((mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) &&
+        icon == 0) icon = 1;
+    return icon;
+}
+
+static void remove_old_playtest_proxy_visuals(void) {
+    if (g_host.old_playtest_proxy_primary &&
+        memory_range_is_readable(g_host.old_playtest_proxy_primary, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_primary, 1);
+    if (g_host.old_playtest_proxy_secondary &&
+        memory_range_is_readable(g_host.old_playtest_proxy_secondary, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_secondary, 1);
+    if (g_host.old_playtest_proxy_tertiary &&
+        memory_range_is_readable(g_host.old_playtest_proxy_tertiary, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_tertiary, 1);
+    g_host.old_playtest_proxy_primary = NULL;
+    g_host.old_playtest_proxy_secondary = NULL;
+    g_host.old_playtest_proxy_tertiary = NULL;
+}
+
+static int rebuild_old_playtest_proxy_visuals(int force) {
+    int mode, icon;
+    char primary_name[64];
+    char secondary_name[64];
+    char tertiary_name[64];
+    const char *prefix;
+    if (!g_host.old_playtest_player || !g_host.old_playtest_trail) return 1;
+    mode = old_playtest_detect_mode();
+    icon = old_playtest_icon_for_mode(mode);
+    if (!force && g_host.old_playtest_proxy_primary &&
+        mode == g_host.old_playtest_proxy_mode &&
+        icon == g_host.old_playtest_proxy_icon) return 1;
+
+    remove_old_playtest_proxy_visuals();
+    if (mode == OLD_PLAYTEST_MODE_SHIP) prefix = "ship";
+    else if (mode == OLD_PLAYTEST_MODE_BALL) prefix = "player_ball";
+    else if (mode == OLD_PLAYTEST_MODE_BIRD) prefix = "bird";
+    else prefix = "player";
+    snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
+    snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
+    snprintf(tertiary_name, sizeof(tertiary_name), "%s_%02d_3_001.png", prefix, icon);
+    g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(primary_name);
+    g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(secondary_name);
+    if (mode == OLD_PLAYTEST_MODE_BIRD)
+        g_host.old_playtest_proxy_tertiary = g_host.sprite_create_with_frame(tertiary_name);
+
+    /* Not every historical build ships every icon index/layer. Fall back to
+       that mode's first stock icon before falling all the way back to cube. */
+    if (!g_host.old_playtest_proxy_primary) {
+        icon = (mode == OLD_PLAYTEST_MODE_BALL) ? 0 : 1;
+        snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
+        snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
+        snprintf(tertiary_name, sizeof(tertiary_name), "%s_%02d_3_001.png", prefix, icon);
+        g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(primary_name);
+        g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(secondary_name);
+        if (mode == OLD_PLAYTEST_MODE_BIRD)
+            g_host.old_playtest_proxy_tertiary = g_host.sprite_create_with_frame(tertiary_name);
+    }
+    if (!g_host.old_playtest_proxy_primary && mode != OLD_PLAYTEST_MODE_CUBE) {
+        mode = OLD_PLAYTEST_MODE_CUBE;
+        icon = 1;
+        g_host.old_playtest_proxy_primary =
+            g_host.sprite_create_with_frame("player_01_001.png");
+        g_host.old_playtest_proxy_secondary =
+            g_host.sprite_create_with_frame("player_01_2_001.png");
+    }
+    if (!g_host.old_playtest_proxy_primary) return 0;
+    if (g_host.old_playtest_proxy_tertiary &&
+        !add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_tertiary, 9998)) return 0;
+    if (g_host.old_playtest_proxy_secondary &&
+        !add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_secondary, 9999)) return 0;
+    if (!add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_primary, 10000)) return 0;
+    g_host.old_playtest_proxy_mode = mode;
+    g_host.old_playtest_proxy_icon = icon;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d",
+                mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
+                mode == OLD_PLAYTEST_MODE_BALL ? "ball" :
+                mode == OLD_PLAYTEST_MODE_BIRD ? "bird" : "cube", icon);
+    return 1;
 }
 
 static int ensure_old_playtest_button(void) {
@@ -1272,7 +1454,17 @@ static int ensure_old_playtest_button(void) {
             g_host.old_playtest_editor_game_layer = NULL;
             g_host.old_playtest_proxy_primary = NULL;
             g_host.old_playtest_proxy_secondary = NULL;
+            g_host.old_playtest_proxy_tertiary = NULL;
+            g_host.old_playtest_proxy_mode = -1;
+            g_host.old_playtest_proxy_icon = -1;
+            /* Scene teardown owns the PlayLayer; avoid dereferencing stale
+               guest objects here. The temporary clone is process-local and
+               will be reclaimed at shutdown if a scene transition bypasses
+               the normal stop path. */
+            g_host.old_playtest_level_clone = NULL;
+            g_host.old_playtest_previous_play_layer = NULL;
             g_host.old_playtest_end_portal = NULL;
+            g_host.old_playtest_end_portal_scanned = 0;
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
         /* The old scene owns any retained trail node and destroys it. Never
@@ -1286,11 +1478,11 @@ static int ensure_old_playtest_button(void) {
         return 1;
     }
     menu = g_host.cc_menu_create();
-    button = create_old_playtest_item(editor_ui, "GJ_playBtn2_001.png");
+    button = create_old_playtest_item(editor_ui, "GJ_playBtn2_001.png",
+                                      OLD_PLAYTEST_PLAY_SPRITE_SCALE);
     if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
     g_host.ccnode_set_position(menu, 0.0f, 0.0f);
     g_host.ccnode_set_position(button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
-    g_host.ccnode_set_scale(button, 0.325f);
     if (!add_extras_child(editor_ui, menu, 10000)) return 0;
     g_host.old_playtest_play_menu = menu;
     g_host.old_playtest_play_button = button;
@@ -1345,22 +1537,25 @@ static int append_old_playtest_trail_segment(float x, float y) {
 
 static int update_old_playtest_proxy_transform(void) {
     float x, y, rotation, scale_x, scale_y;
-    if (!g_host.old_playtest_player || !g_host.old_playtest_proxy_primary)
-        return 1;
+    void *sprites[3];
+    int index;
+    if (!g_host.old_playtest_player) return 1;
+    if (!rebuild_old_playtest_proxy_visuals(0)) return 0;
+    if (!g_host.old_playtest_proxy_primary) return 1;
     x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
     y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
     rotation = g_host.ccnode_get_rotation(g_host.old_playtest_player);
     scale_x = g_host.ccnode_get_scale_x(g_host.old_playtest_player);
     scale_y = g_host.ccnode_get_scale_y(g_host.old_playtest_player);
-    g_host.ccnode_set_position(g_host.old_playtest_proxy_primary, x, y);
-    g_host.ccnode_set_rotation(g_host.old_playtest_proxy_primary, rotation);
-    g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_primary, scale_x);
-    g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_primary, scale_y);
-    if (g_host.old_playtest_proxy_secondary) {
-        g_host.ccnode_set_position(g_host.old_playtest_proxy_secondary, x, y);
-        g_host.ccnode_set_rotation(g_host.old_playtest_proxy_secondary, rotation);
-        g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_secondary, scale_x);
-        g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_secondary, scale_y);
+    sprites[0] = g_host.old_playtest_proxy_primary;
+    sprites[1] = g_host.old_playtest_proxy_secondary;
+    sprites[2] = g_host.old_playtest_proxy_tertiary;
+    for (index = 0; index < 3; ++index) {
+        if (!sprites[index]) continue;
+        g_host.ccnode_set_position(sprites[index], x, y);
+        g_host.ccnode_set_rotation(sprites[index], rotation);
+        g_host.ccnode_set_scale_x(sprites[index], scale_x);
+        g_host.ccnode_set_scale_y(sprites[index], scale_y);
     }
     return append_old_playtest_trail_segment(x, y);
 }
@@ -1369,7 +1564,9 @@ static int stop_inline_old_playtest(void);
 
 static int start_inline_old_playtest(void) {
     void *editor_ui;
-    void *level;
+    void *editor_level;
+    void *level_clone;
+    void *game_manager = NULL;
     void *level_string = NULL;
     void *play_layer;
     void *stop_menu;
@@ -1378,6 +1575,7 @@ static int start_inline_old_playtest(void) {
     void *play_game_layer;
     void *editor_game_layer;
     unsigned char *test_mode;
+    float player_x, camera_x, camera_y;
     if (g_host.old_playtest_layer) return 1;
     editor_ui = find_active_editor_ui();
     if (!editor_ui || !g_host.active_editor_layer ||
@@ -1391,121 +1589,146 @@ static int start_inline_old_playtest(void) {
         return 1;
     }
     clear_old_playtest_trail();
-    level = g_host.level_editor_get_level(g_host.active_editor_layer);
-    if (!level) return 0;
+    editor_level = g_host.level_editor_get_level(g_host.active_editor_layer);
+    if (!editor_level) return 0;
     gd_call_sret_string_x86(g_host.level_editor_get_level_string,
                             &level_string, g_host.active_editor_layer);
     if (!level_string) return 0;
-    g_host.gj_game_level_set_level_string(level, &level_string);
-    play_layer = g_host.play_layer_create(level);
-    if (!play_layer) return 0;
+
+    /* PlayLayer::init registers itself in GameManager. Capture the editor's
+       previous value (normally NULL) so manual PlayLayer teardown cannot leave
+       GameManager pointing at a dead hidden test layer. */
+    g_host.old_playtest_previous_play_layer = NULL;
+    if (g_host.game_manager_shared_state && g_host.game_manager_get_play_layer) {
+        game_manager = g_host.game_manager_shared_state();
+        if (game_manager)
+            g_host.old_playtest_previous_play_layer =
+                g_host.game_manager_get_play_layer(game_manager);
+    }
+
+    /* Never hand the editor's live GJGameLevel to PlayLayer. Old PlayLayer
+       mutates bookkeeping/state on the level object; sharing it with
+       LevelEditorLayer left the editor corrupted after a test and made later
+       object/portal placement crash. A private temporary level owns only the
+       unsaved level string and the small metadata needed for playback. */
+    level_clone = g_host.gj_game_level_create();
+    if (!level_clone) return 0;
+    if (g_host.ccobject_retain) g_host.ccobject_retain(level_clone);
+    if (g_host.gj_game_level_get_audio_track &&
+        g_host.gj_game_level_set_audio_track)
+        g_host.gj_game_level_set_audio_track(
+            level_clone, g_host.gj_game_level_get_audio_track(editor_level));
+    if (g_host.gj_game_level_get_level_type &&
+        g_host.gj_game_level_set_level_type)
+        g_host.gj_game_level_set_level_type(
+            level_clone, g_host.gj_game_level_get_level_type(editor_level));
+    g_host.gj_game_level_set_level_string(level_clone, &level_string);
+
+    play_layer = g_host.play_layer_create(level_clone);
+    if (!play_layer) {
+        if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        return 0;
+    }
     test_mode = (unsigned char *)play_layer +
                 g_host.old_playtest_test_mode_offset;
     if (!memory_range_is_readable(test_mode, 1u)) {
+        if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         log_old_playtest_unavailable("invalid-PlayLayer-test-mode-layout");
         return 1;
     }
     *test_mode = 1u;
 
-    if (!add_extras_child(g_host.active_editor_layer, play_layer, -10000))
+    if (!add_extras_child(g_host.active_editor_layer, play_layer, -10000)) {
+        if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         return 0;
-    g_host.play_layer_start_game(play_layer);
+    }
+    if (!start_old_playtest_preserving_first_attempt(play_layer)) {
+        g_host.ccnode_remove(play_layer, 1);
+        if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        return 0;
+    }
     player = g_host.play_layer_get_player(play_layer);
     play_game_layer = g_host.play_layer_get_game_layer(play_layer);
     editor_game_layer = g_host.level_editor_get_game_layer(g_host.active_editor_layer);
     if (!player || !play_game_layer || !editor_game_layer) {
         g_host.ccnode_remove(play_layer, 1);
+        if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         return 0;
     }
-    suppress_old_playtest_end_portal(play_layer,
-                                      g_host.ccnode_get_position_x(player));
-    g_host.old_playtest_trail = g_host.ccnode_create();
-    if (!g_host.old_playtest_trail ||
-        !add_extras_child(editor_game_layer, g_host.old_playtest_trail, 9998)) {
-        g_host.old_playtest_trail = NULL;
-        g_host.ccnode_remove(play_layer, 1);
-        return 0;
-    }
-
-    {
-        int frame_id = 1;
-        char primary_name[64];
-        char secondary_name[64];
-        void *manager = g_host.game_manager_shared_state
-                            ? g_host.game_manager_shared_state() : NULL;
-        if (manager && g_host.game_manager_get_player_frame)
-            frame_id = g_host.game_manager_get_player_frame(manager);
-        if (frame_id < 0 || frame_id > 99) frame_id = 1;
-        snprintf(primary_name, sizeof(primary_name), "player_%02d_001.png", frame_id);
-        snprintf(secondary_name, sizeof(secondary_name), "player_%02d_2_001.png", frame_id);
-        g_host.old_playtest_proxy_secondary =
-            g_host.sprite_create_with_frame(secondary_name);
-        g_host.old_playtest_proxy_primary =
-            g_host.sprite_create_with_frame(primary_name);
-        if (!g_host.old_playtest_proxy_primary) {
-            g_host.old_playtest_proxy_primary =
-                g_host.sprite_create_with_frame("player_01_001.png");
-            g_host.old_playtest_proxy_secondary =
-                g_host.sprite_create_with_frame("player_01_2_001.png");
-        }
-        if (!g_host.old_playtest_proxy_primary ||
-            (g_host.old_playtest_proxy_secondary &&
-             !add_extras_child(editor_game_layer,
-                               g_host.old_playtest_proxy_secondary, 9999)) ||
-            !add_extras_child(editor_game_layer,
-                              g_host.old_playtest_proxy_primary, 10000)) {
-            g_host.ccnode_remove(play_layer, 1);
-            return 0;
-        }
-    }
-
-    /* Keep the real PlayerObject in its authentic PlayLayer hierarchy. Reparenting
-       it corrupts assumptions made by PlayLayer::update in 1.5-1.7. The hidden
-       PlayLayer remains the physics authority; only lightweight sprite proxies
-       are rendered inside the editor. */
-    g_host.ccnode_set_visible(play_layer, 0);
-    {
-        const float player_x = g_host.ccnode_get_position_x(player);
-        float camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
-        if (camera_x > 0.0f) camera_x = 0.0f;
-        g_host.ccnode_set_position(editor_game_layer, camera_x,
-            g_host.ccnode_get_position_y(play_game_layer));
-    }
-    g_host.old_playtest_player = player;
-    if (!update_old_playtest_proxy_transform()) {
-        g_host.old_playtest_player = NULL;
-        g_host.ccnode_remove(play_layer, 1);
-        return 0;
-    }
-
-    stop_menu = g_host.cc_menu_create();
-    stop_button = create_old_playtest_item(editor_ui, "GJ_pauseBtn_001.png");
-    if (!stop_menu || !stop_button ||
-        !add_extras_child(stop_menu, stop_button, 0)) return 0;
-    g_host.ccnode_set_position(stop_menu, 0.0f, 0.0f);
-    g_host.ccnode_set_position(stop_button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
-    if (!add_extras_child(editor_ui, stop_menu, 10001)) return 0;
 
     g_host.old_playtest_scene = g_host.active_scene_root;
     g_host.old_playtest_editor = g_host.active_editor_layer;
     g_host.old_playtest_ui = editor_ui;
     g_host.old_playtest_layer = play_layer;
-    g_host.old_playtest_stop_menu = stop_menu;
     g_host.old_playtest_player = player;
     g_host.old_playtest_play_game_layer = play_game_layer;
     g_host.old_playtest_editor_game_layer = editor_game_layer;
+    g_host.old_playtest_level_clone = level_clone;
+    g_host.old_playtest_proxy_mode = -1;
+    g_host.old_playtest_proxy_icon = -1;
+    g_host.old_playtest_end_portal = NULL;
+    g_host.old_playtest_end_portal_scanned = 0;
+
+    player_x = g_host.ccnode_get_position_x(player);
+    suppress_old_playtest_end_portal(play_layer, player_x);
+
+    /* Wrapper visuals must not become children of LevelEditorLayer's game
+       layer. Some old editors iterate that layer assuming its gameplay
+       children are GameObjects, which is why placing a portal after a test
+       could walk into our retained CCNode/sprites and crash. Keep a sibling
+       overlay under LevelEditorLayer and mirror the editor camera transform. */
+    g_host.old_playtest_trail = g_host.ccnode_create();
+    if (!g_host.old_playtest_trail ||
+        !add_extras_child(g_host.active_editor_layer,
+                          g_host.old_playtest_trail, 9998)) {
+        g_host.old_playtest_trail = NULL;
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+    if (!rebuild_old_playtest_proxy_visuals(1)) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+
+    /* Keep the real PlayerObject in its authentic hidden PlayLayer hierarchy.
+       The editor camera is 20 world units lower than the gameplay camera to
+       match the old inline editor framing requested by the desktop UI. */
+    g_host.ccnode_set_visible(play_layer, 0);
+    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
+    if (camera_x > 0.0f) camera_x = 0.0f;
+    camera_y = g_host.ccnode_get_position_y(play_game_layer) +
+               OLD_PLAYTEST_CAMERA_Y_OFFSET;
+    g_host.ccnode_set_position(editor_game_layer, camera_x, camera_y);
+    g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
+    if (!update_old_playtest_proxy_transform()) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+
+    stop_menu = g_host.cc_menu_create();
+    stop_button = create_old_playtest_item(editor_ui, "GJ_pauseBtn_001.png", 1.0f);
+    if (!stop_menu || !stop_button ||
+        !add_extras_child(stop_menu, stop_button, 0)) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+    g_host.ccnode_set_position(stop_menu, 0.0f, 0.0f);
+    g_host.ccnode_set_position(stop_button, OLD_PLAYTEST_BUTTON_X,
+                               OLD_PLAYTEST_BUTTON_Y);
+    if (!add_extras_child(editor_ui, stop_menu, 10001)) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+    g_host.old_playtest_stop_menu = stop_menu;
     if (g_host.old_playtest_play_menu)
         g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 0);
-    /* A real inline editor test must be endless. Moving the portal sprite is
-       insufficient because EndPortalObject::triggerObject owns the player-lock
-       and completion sequence. Temporarily replace that method with RET while
-       this hidden PlayLayer exists, then restore it on every exit path. */
+
     if (!set_old_playtest_end_trigger_suppressed(1)) {
         runtime_log("ERROR: could not disable EndPortalObject::triggerObject");
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=live player=proxy playlayer=hidden end=disabled");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=20");
     return 1;
 }
 
@@ -1514,19 +1737,27 @@ static int stop_inline_old_playtest(void) {
         (void)set_old_playtest_end_trigger_suppressed(0);
         return 1;
     }
-    /* The wrapper-owned pause/stop control must stop the preview song too. */
     audio_stop_background();
     if (g_host.old_playtest_stop_menu &&
         memory_range_is_readable(g_host.old_playtest_stop_menu, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_stop_menu, 1);
-    if (g_host.old_playtest_proxy_primary &&
-        memory_range_is_readable(g_host.old_playtest_proxy_primary, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_proxy_primary, 1);
-    if (g_host.old_playtest_proxy_secondary &&
-        memory_range_is_readable(g_host.old_playtest_proxy_secondary, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_proxy_secondary, 1);
+    remove_old_playtest_proxy_visuals();
     if (memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_layer, 1);
+    /* A manually detached PlayLayer is not guaranteed to reach its destructor
+       immediately. Restore GameManager::m_playLayer explicitly so subsequent
+       editor actions (notably portal placement) cannot dereference the hidden
+       test layer after it has been cleaned up. */
+    if (g_host.game_manager_shared_state && g_host.game_manager_set_play_layer) {
+        void *manager = g_host.game_manager_shared_state();
+        if (manager)
+            g_host.game_manager_set_play_layer(
+                manager, g_host.old_playtest_previous_play_layer);
+    }
+    g_host.old_playtest_previous_play_layer = NULL;
+    if (g_host.old_playtest_level_clone && g_host.ccobject_release)
+        g_host.ccobject_release(g_host.old_playtest_level_clone);
+    g_host.old_playtest_level_clone = NULL;
     if (!set_old_playtest_end_trigger_suppressed(0))
         runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
     if (g_host.old_playtest_play_menu &&
@@ -1534,23 +1765,38 @@ static int stop_inline_old_playtest(void) {
         g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 1);
     g_host.old_playtest_layer = NULL;
     g_host.old_playtest_stop_menu = NULL;
-    g_host.old_playtest_editor = NULL;
-    g_host.old_playtest_ui = NULL;
+    /* Keep the editor/game-layer pointers while the retained breadcrumb overlay
+       belongs to this scene so it can continue mirroring manual editor panning
+       without ever becoming a child of the editor game layer. */
     g_host.old_playtest_player = NULL;
     g_host.old_playtest_play_game_layer = NULL;
-    g_host.old_playtest_editor_game_layer = NULL;
-    g_host.old_playtest_proxy_primary = NULL;
-    g_host.old_playtest_proxy_secondary = NULL;
+    g_host.old_playtest_proxy_mode = -1;
+    g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_end_portal = NULL;
+    g_host.old_playtest_end_portal_scanned = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained music=stopped end=restored");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained-outside-game-layer music=stopped end=restored editor-level=untouched");
     return 1;
 }
 
 static int update_inline_old_playtest(void) {
     float player_x, camera_x, camera_y;
     void *current_player;
-    if (!g_host.old_playtest_layer) return 1;
+    if (!g_host.old_playtest_layer) {
+        /* Retained breadcrumbs are a sibling overlay, not editor game-layer
+           children. Follow later editor panning so the path remains locked to
+           the level after playtest has stopped. */
+        if (g_host.old_playtest_trail && g_host.old_playtest_editor_game_layer &&
+            memory_range_is_readable(g_host.old_playtest_trail, sizeof(void *)) &&
+            memory_range_is_readable(g_host.old_playtest_editor_game_layer,
+                                     sizeof(void *))) {
+            g_host.ccnode_set_position(
+                g_host.old_playtest_trail,
+                g_host.ccnode_get_position_x(g_host.old_playtest_editor_game_layer),
+                g_host.ccnode_get_position_y(g_host.old_playtest_editor_game_layer));
+        }
+        return 1;
+    }
     if (!g_host.old_playtest_player || !g_host.old_playtest_play_game_layer ||
         !g_host.old_playtest_editor_game_layer) return 0;
     current_player = g_host.play_layer_get_player(g_host.old_playtest_layer);
@@ -1564,21 +1810,15 @@ static int update_inline_old_playtest(void) {
     }
 
     player_x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
-    /* Inline editor playtest has no gameplay end wall. Keep the hidden
-       PlayLayer's EndPortalObject far ahead so its normal completion target
-       can never catch the player while the editor test is running. */
     suppress_old_playtest_end_portal(g_host.old_playtest_layer, player_x);
-
-    /* Do not trust the hidden PlayLayer's horizontal game-layer transform for
-       editor playtest camera ownership. Keep the cube at a stable screen-space
-       anchor and let the editor objects/trail move underneath it. This matches
-       the old inline editor-playtest feel and avoids the one-frame/parent-space
-       mismatch that left the proxy drifting off screen. */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
-    camera_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
+    camera_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer) +
+               OLD_PLAYTEST_CAMERA_Y_OFFSET;
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
                                camera_x, camera_y);
+    if (g_host.old_playtest_trail)
+        g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
     return update_old_playtest_proxy_transform();
 }
 
@@ -2364,6 +2604,12 @@ int main(int argc, char **argv) {
     g_host.game_manager_shared_state =
         (GameManagerSharedStateFunction)elf_image_find_export(
             &image, "_ZN11GameManager11sharedStateEv");
+    g_host.game_manager_get_play_layer =
+        (GameManagerGetPlayLayerFunction)elf_image_find_export(
+            &image, "_ZNK11GameManager12getPlayLayerEv");
+    g_host.game_manager_set_play_layer =
+        (GameManagerSetPlayLayerFunction)elf_image_find_export(
+            &image, "_ZN11GameManager12setPlayLayerEP9PlayLayer");
     g_host.ccnode_get_tag = (CcNodeGetTagFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode6getTagEv");
     if (!g_host.ccnode_get_tag)
@@ -2462,11 +2708,23 @@ int main(int argc, char **argv) {
     g_host.gj_game_level_set_level_string =
         (GJGameLevelSetLevelStringFunction)elf_image_find_export(
             &image, "_ZN11GJGameLevel14setLevelStringESs");
+    g_host.gj_game_level_create = (NoArgCreateFunction)elf_image_find_export(
+        &image, "_ZN11GJGameLevel6createEv");
+    g_host.gj_game_level_get_audio_track = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GJGameLevel13getAudioTrackEv");
+    g_host.gj_game_level_set_audio_track = (IntSetterFunction)elf_image_find_export(
+        &image, "_ZN11GJGameLevel13setAudioTrackEi");
+    g_host.gj_game_level_get_level_type = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GJGameLevel12getLevelTypeEv");
+    g_host.gj_game_level_set_level_type = (IntSetterFunction)elf_image_find_export(
+        &image, "_ZN11GJGameLevel12setLevelTypeE11GJLevelType");
     g_host.play_layer_create = (PlayLayerCreateFunction)elf_image_find_export(
         &image, "_ZN9PlayLayer6createEP11GJGameLevel");
     g_host.play_layer_start_game =
         (PlayLayerStartGameFunction)elf_image_find_export(
             &image, "_ZN9PlayLayer9startGameEv");
+    g_host.play_layer_reset_level = elf_image_find_export(
+        &image, "_ZN9PlayLayer10resetLevelEv");
     g_host.play_layer_get_test_mode = elf_image_find_export(
         &image, "_ZNK9PlayLayer11getTestModeEv");
     g_host.play_layer_get_player = (NodeGetterFunction)elf_image_find_export(
@@ -2475,8 +2733,20 @@ int main(int argc, char **argv) {
         &image, "_ZNK9PlayLayer12getGameLayerEv");
     g_host.player_get_is_dead = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK12PlayerObject9getIsDeadEv");
+    g_host.player_get_fly_mode = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject10getFlyModeEv");
+    g_host.player_get_roll_mode = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject11getRollModeEv");
+    g_host.player_get_bird_mode = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject11getBirdModeEv");
     g_host.game_manager_get_player_frame = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK11GameManager14getPlayerFrameEv");
+    g_host.game_manager_get_player_ship = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager13getPlayerShipEv");
+    g_host.game_manager_get_player_ball = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager13getPlayerBallEv");
+    g_host.game_manager_get_player_bird = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager13getPlayerBirdEv");
     g_host.sprite_create_with_frame =
         (CcSpriteCreateWithFrameFunction)elf_image_find_export(
             &image, "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc");

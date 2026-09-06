@@ -1,0 +1,65 @@
+Geometry Dash Wrapper 0.9.7-newera6 verification notes
+
+Scope
+-----
+This source update targets the pre-1.8 inline editor playtest bridge on both
+legacy ARM (1.0-1.4) and x86 (1.5-1.7). No APK or proprietary game library is
+included.
+
+Source checks performed
+-----------------------
+1. `git diff --check` passes with no whitespace/conflict errors.
+2. Version identifiers are 0.9.7-newera6 and the Dynarmic builder revision is:
+   dynarmic-x64-builder116-0.9.7-newera6
+3. The tested x86 1.5 library exports the interfaces used by newera6:
+   - PlayLayer::resetLevel()
+   - PlayLayer::getPlayer() / getGameLayer()
+   - PlayerObject::getFlyMode() / getRollMode() / getBirdMode()
+   - GameManager::getPlayerFrame()/getPlayerShip()/getPlayerBall()/getPlayerBird()
+   - GameManager::getPlayLayer()/setPlayLayer()
+   - GJGameLevel::create(), get/setAudioTrack(), get/setLevelType()
+4. The tested ARM 1.1 library exports the interfaces required by its historical
+   capabilities, including PlayLayer::resetLevel(), getPlayer()/getGameLayer(),
+   PlayerObject::getFlyMode(), GameManager::getPlayLayer()/setPlayLayer(), and
+   GJGameLevel::create()/audio-track/level-type accessors. That early build does
+   not export the later ball/bird mode getters, so newera6 only displays modes
+   actually present in that binary.
+5. Disassembly confirms the redundant reset responsible for the wrapper's
+   Attempt 1 -> Attempt 2 restart:
+   - x86 PlayLayer::startGame at ELF 0x179320 directly calls resetLevel at
+     ELF 0x1789f0 near the end of startGame.
+   - ARM Thumb PlayLayer::startGame at ELF 0x195660 directly branches to
+     resetLevel at ELF 0x19ac68 near the end of startGame.
+   newera6 suppresses only this synchronous reset call and restores the original
+   guest instruction immediately afterward.
+6. GJ_GameSheet.plist in both inspected old APKs reports:
+   - GJ_playBtn2_001.png sourceSize = 79x82
+   - GJ_pauseBtn_001.png sourceSize = 38x40
+   A 0.49 scale on the play sprite therefore gives approximately the pause
+   button's natural visual size. Both normal and selected play sprites are
+   scaled before CCMenuItemSpriteExtra is created, so its pressed-state scale
+   animation no longer restores the play graphic to full size.
+7. The x86 1.5 game sheet contains cube, ship, ball and bird/UFO sprite families.
+   The early ARM game sheet contains the cube family and its historical ship
+   sprite. Proxy mode selection is therefore capability/asset driven.
+
+Behavioral changes implemented
+-------------------------------
+- Preserve Attempt 1 by suppressing only startGame's redundant resetLevel call.
+- Move the editor playtest camera approximately 20 world units downward.
+- Use a private temporary GJGameLevel clone instead of the editor's live level.
+- Keep wrapper breadcrumb/player-proxy nodes outside LevelEditorLayer::getGameLayer().
+- Restore GameManager::m_playLayer to its pre-test value on teardown so editor
+  actions cannot observe a stale hidden PlayLayer pointer.
+- Switch the visible proxy between cube/ship/ball/bird sprite families when the
+  real hidden PlayerObject changes mode and the loaded build exposes that mode.
+- Keep newera5 endless-end suppression and explicit music-stop behavior.
+- Avoid repeated EndPortalObject tree scans/log spam when a historical build
+  does not expose a separate EndPortalObject node in the hidden PlayLayer tree.
+
+Runtime note
+------------
+The source was structurally/audit checked in this environment, but the Windows
+x86/Dynarmic binaries cannot be executed here against the user's APKs. The final
+proof for these ABI-sensitive historical builds is the user's Windows BUILD_ALL
+plus runtime test. If a failure remains, send the newest dated log directory.
