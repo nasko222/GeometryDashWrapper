@@ -222,8 +222,8 @@ typedef struct {
     void *old_playtest_ui;
     void *old_playtest_play_menu;
     void *old_playtest_play_button;
+    void *old_playtest_stop_button;
     void *old_playtest_layer;
-    void *old_playtest_stop_menu;
     void *old_playtest_player;
     void *old_playtest_play_game_layer;
     void *old_playtest_editor_game_layer;
@@ -248,7 +248,7 @@ typedef struct {
     float old_playtest_trail_last_y;
     int old_playtest_trail_has_last;
     unsigned int old_playtest_trail_segments;
-    void *old_playtest_trajectory[10];
+    void *old_playtest_trajectory[18];
     int old_playtest_trajectory_initialized;
     float old_playtest_motion_last_x;
     float old_playtest_motion_last_y;
@@ -278,10 +278,11 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_Y_OFFSET 20.0f
+#define OLD_PLAYTEST_CAMERA_Y_OFFSET 0.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
-#define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 10
+#define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 18
+#define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 32.0f
 #define OLD_PLAYTEST_RAD_TO_DEG 57.29577951308232f
 
 enum {
@@ -1326,6 +1327,7 @@ static int old_playtest_symbols_ready(void) {
     return g_host.level_editor_get_level &&
            g_host.level_editor_get_level_string &&
            g_host.gj_game_level_set_level_string && g_host.gj_game_level_create &&
+           g_host.ccobject_retain &&
            g_host.play_layer_create && g_host.play_layer_start_game &&
            g_host.play_layer_reset_level && g_host.play_layer_get_test_mode &&
            g_host.sprite_create_with_frame && g_host.cc_menu_create &&
@@ -1582,6 +1584,7 @@ static int ensure_old_playtest_button(void) {
     void *editor_ui;
     void *menu;
     void *button;
+    void *stop_button;
     ULONGLONG now;
     if (!gd_settings_old_ver_playtest() ||
         !gd_settings_old_ver_playtest_supported_version()) return 1;
@@ -1593,13 +1596,13 @@ static int ensure_old_playtest_button(void) {
         g_host.old_playtest_scene = g_host.active_scene_root;
         g_host.old_playtest_play_menu = NULL;
         g_host.old_playtest_play_button = NULL;
+        g_host.old_playtest_stop_button = NULL;
         if (g_host.old_playtest_layer) {
             (void)set_old_playtest_reset_level_suppressed(0);
             (void)set_old_playtest_destroy_player_suppressed(0);
             (void)set_old_playtest_end_trigger_suppressed(0);
             audio_stop_background();
             g_host.old_playtest_layer = NULL;
-            g_host.old_playtest_stop_menu = NULL;
             g_host.old_playtest_ui = NULL;
             g_host.old_playtest_player = NULL;
             g_host.old_playtest_play_game_layer = NULL;
@@ -1609,18 +1612,12 @@ static int ensure_old_playtest_button(void) {
             g_host.old_playtest_proxy_tertiary = NULL;
             g_host.old_playtest_proxy_mode = -1;
             g_host.old_playtest_proxy_icon = -1;
-            /* Scene teardown owns the PlayLayer; avoid dereferencing stale
-               guest objects here. The temporary clone is process-local and
-               will be reclaimed at shutdown if a scene transition bypasses
-               the normal stop path. */
             g_host.old_playtest_level_clone = NULL;
             g_host.old_playtest_previous_play_layer = NULL;
             g_host.old_playtest_end_portal = NULL;
             g_host.old_playtest_end_portal_scanned = 0;
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
-        /* The old scene owns any retained trail node and destroys it. Never
-           dereference that pointer after a scene transition. */
         g_host.old_playtest_trail = NULL;
     }
     if (!editor_ui || g_host.old_playtest_layer ||
@@ -1632,13 +1629,23 @@ static int ensure_old_playtest_button(void) {
     menu = g_host.cc_menu_create();
     button = create_old_playtest_item(editor_ui, "GJ_playBtn2_001.png",
                                       OLD_PLAYTEST_PLAY_SPRITE_SCALE);
-    if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
+    stop_button = create_old_playtest_item(editor_ui, "GJ_pauseBtn_001.png", 1.0f);
+    if (!menu || !button || !stop_button ||
+        !add_extras_child(menu, button, 0) ||
+        !add_extras_child(menu, stop_button, 1)) return 0;
     g_host.ccnode_set_position(menu, 0.0f, 0.0f);
     g_host.ccnode_set_position(button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
-    if (!add_extras_child(editor_ui, menu, 10000)) return 0;
+    g_host.ccnode_set_position(stop_button, OLD_PLAYTEST_BUTTON_X, OLD_PLAYTEST_BUTTON_Y);
+    g_host.ccnode_set_visible(stop_button, 0);
+    /* Keep wrapper controls completely outside LevelEditorLayer/EditorUI.
+       Older editors assume their own child arrays contain only game-owned UI
+       nodes; transient wrapper children were the last common mutation before
+       the reproducible post-play object-placement crash. */
+    if (!add_extras_child(g_host.active_scene_root, menu, 30000)) return 0;
     g_host.old_playtest_play_menu = menu;
     g_host.old_playtest_play_button = button;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-bridge-safe sprite=GJ_playBtn2_001.png");
+    g_host.old_playtest_stop_button = stop_button;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_BUTTON_READY mode=scene-overlay sprite=GJ_playBtn2_001.png pause=persistent");
     return 1;
 }
 
@@ -1672,8 +1679,8 @@ static void position_old_playtest_line_sprite(void *sprite,
     g_host.ccnode_set_visible(sprite, 1);
     g_host.ccnode_set_position(sprite, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f);
     g_host.ccnode_set_rotation(sprite, atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
-    /* streak.png is 64 px wide. Slight X overlap removes sampling gaps. */
-    g_host.ccnode_set_scale_x(sprite, (length / 64.0f) * 1.12f);
+    /* square.png is a solid 32x32 texture. A tiny X overlap hides rotated-joint seams without the dotted alpha pattern from streak.png. */
+    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.04f);
     g_host.ccnode_set_scale_y(sprite, thickness);
 }
 
@@ -1698,7 +1705,7 @@ static int append_old_playtest_trail_segment(float x, float y) {
         g_host.old_playtest_trail_last_y = y;
         return 1;
     }
-    segment = g_host.sprite_create_file("streak.png");
+    segment = g_host.sprite_create_file("square.png");
     if (!segment) return 0;
     g_host.sprite_set_color(segment, &green);
     position_old_playtest_line_sprite(segment,
@@ -1715,8 +1722,8 @@ static int append_old_playtest_trail_segment(float x, float y) {
 
 static int update_old_playtest_trajectory(float x, float y) {
     int i;
-    float vx, vy, ax, ay, px, py;
-    GdCcColor3B orange = {255u, 72u, 0u};
+    float vx, vy, ay, px, py;
+    GdCcColor3B orange = {255u, 84u, 0u};
     if (!g_host.old_playtest_trail) return 1;
     if (!g_host.old_playtest_motion_has_last) {
         g_host.old_playtest_motion_last_x = x;
@@ -1732,6 +1739,10 @@ static int update_old_playtest_trajectory(float x, float y) {
         g_host.old_playtest_motion_last_y = y;
         return 1;
     }
+    /* Old GD levels only scroll forward. Portal/camera transitions can make a
+       single sampled X delta look negative; never let that flip the prediction
+       behind the player. */
+    if (vx < 0.0f) vx = -vx;
     if (!g_host.old_playtest_motion_has_velocity) {
         g_host.old_playtest_motion_vx = vx;
         g_host.old_playtest_motion_vy = vy;
@@ -1740,19 +1751,22 @@ static int update_old_playtest_trajectory(float x, float y) {
         g_host.old_playtest_motion_last_y = y;
         return 1;
     }
-    ax = vx - g_host.old_playtest_motion_vx;
+    /* Low-pass the sampled velocity so the guide is a continuous arc instead
+       of ten twitchy dashes. Only predict vertical acceleration; horizontal
+       acceleration made the old guide fold back on itself near portals. */
+    vx = g_host.old_playtest_motion_vx * 0.65f + vx * 0.35f;
+    vy = g_host.old_playtest_motion_vy * 0.65f + vy * 0.35f;
     ay = vy - g_host.old_playtest_motion_vy;
-    if (ax > 1.5f) ax = 1.5f; else if (ax < -1.5f) ax = -1.5f;
-    if (ay > 2.0f) ay = 2.0f; else if (ay < -2.0f) ay = -2.0f;
+    if (ay > 0.35f) ay = 0.35f; else if (ay < -0.35f) ay = -0.35f;
     px = x;
     py = y;
     for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
-        float t = (float)(i + 1) * 3.0f;
-        float nx = x + vx * t + 0.5f * ax * t * t;
-        float ny = y + vy * t + 0.5f * ay * t * t;
+        const float t = (float)(i + 1) * 2.0f;
+        const float nx = x + vx * t;
+        const float ny = y + vy * t + 0.5f * ay * t * t;
         if (!g_host.old_playtest_trajectory[i]) {
             g_host.old_playtest_trajectory[i] =
-                g_host.sprite_create_file("streak.png");
+                g_host.sprite_create_file("square.png");
             if (!g_host.old_playtest_trajectory[i]) return 0;
             g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
             if (!add_extras_child(g_host.old_playtest_trail,
@@ -1760,7 +1774,7 @@ static int update_old_playtest_trajectory(float x, float y) {
                                   5000 + i)) return 0;
         }
         position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
-                                          px, py, nx, ny, 0.042f);
+                                          px, py, nx, ny, 0.055f);
         px = nx;
         py = ny;
     }
@@ -1810,8 +1824,6 @@ static int start_inline_old_playtest(void) {
     void *game_manager = NULL;
     void *level_string = NULL;
     void *play_layer;
-    void *stop_menu;
-    void *stop_button;
     void *player;
     void *play_game_layer;
     void *editor_game_layer;
@@ -1870,6 +1882,11 @@ static int start_inline_old_playtest(void) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         return 0;
     }
+    /* Hold an explicit retain on the hidden PlayLayer. On stop we detach it
+       from the scene but intentionally do not destroy it while the old editor
+       is still alive; its delayed destructor was a prime remaining UAF source
+       in the post-play object-placement crash. */
+    if (g_host.ccobject_retain) g_host.ccobject_retain(play_layer);
     test_mode = (unsigned char *)play_layer +
                 g_host.old_playtest_test_mode_offset;
     if (!memory_range_is_readable(test_mode, 1u)) {
@@ -1879,7 +1896,7 @@ static int start_inline_old_playtest(void) {
     }
     *test_mode = 1u;
 
-    if (!add_extras_child(g_host.active_editor_layer, play_layer, -10000)) {
+    if (!add_extras_child(g_host.active_scene_root, play_layer, -10000)) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         return 0;
     }
@@ -1924,15 +1941,14 @@ static int start_inline_old_playtest(void) {
     player_x = g_host.ccnode_get_position_x(player);
     suppress_old_playtest_end_portal(play_layer, player_x);
 
-    /* Wrapper visuals must not become children of LevelEditorLayer's game
-       layer. Some old editors iterate that layer assuming its gameplay
-       children are GameObjects, which is why placing a portal after a test
-       could walk into our retained CCNode/sprites and crash. Keep a sibling
-       overlay under LevelEditorLayer and mirror the editor camera transform. */
+    /* The hidden PlayLayer and every wrapper visual live directly under the
+       scene root. Do not mutate LevelEditorLayer's child array at all: the 1.1
+       crash is reproducible only after playtest teardown, and its next editor
+       placement later walks a bogus low string pointer (0x210). */
     g_host.old_playtest_trail = g_host.ccnode_create();
     if (!g_host.old_playtest_trail ||
-        !add_extras_child(g_host.active_editor_layer,
-                          g_host.old_playtest_trail, 9998)) {
+        !add_extras_child(g_host.active_scene_root,
+                          g_host.old_playtest_trail, 20000)) {
         g_host.old_playtest_trail = NULL;
         (void)stop_inline_old_playtest();
         return 0;
@@ -1943,8 +1959,8 @@ static int start_inline_old_playtest(void) {
     }
 
     /* Keep the real PlayerObject in its authentic hidden PlayLayer hierarchy.
-       The editor camera is 20 world units lower than the gameplay camera to
-       match the old inline editor framing requested by the desktop UI. */
+       Match the gameplay camera vertically with no extra +20 offset; that
+       extra offset pushed screen-limited ship/ball movement off the top. */
     g_host.ccnode_set_visible(play_layer, 0);
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
@@ -1957,48 +1973,41 @@ static int start_inline_old_playtest(void) {
         return 0;
     }
 
-    stop_menu = g_host.cc_menu_create();
-    stop_button = create_old_playtest_item(editor_ui, "GJ_pauseBtn_001.png", 1.0f);
-    if (!stop_menu || !stop_button ||
-        !add_extras_child(stop_menu, stop_button, 0)) {
-        (void)stop_inline_old_playtest();
-        return 0;
-    }
-    g_host.ccnode_set_position(stop_menu, 0.0f, 0.0f);
-    g_host.ccnode_set_position(stop_button, OLD_PLAYTEST_BUTTON_X,
-                               OLD_PLAYTEST_BUTTON_Y);
-    if (!add_extras_child(editor_ui, stop_menu, 10001)) {
-        (void)stop_inline_old_playtest();
-        return 0;
-    }
-    g_host.old_playtest_stop_menu = stop_menu;
-    if (g_host.old_playtest_play_menu)
-        g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 0);
+    /* Play/pause controls are persistent scene-root siblings. Starting and
+       stopping only flips visibility; no EditorUI child insertion/removal is
+       allowed during a playtest. */
+    if (g_host.old_playtest_play_button)
+        g_host.ccnode_set_visible(g_host.old_playtest_play_button, 0);
+    if (g_host.old_playtest_stop_button)
+        g_host.ccnode_set_visible(g_host.old_playtest_stop_button, 1);
 
     if (!set_old_playtest_end_trigger_suppressed(1)) {
         runtime_log("ERROR: could not disable EndPortalObject::triggerObject");
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=20");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=0 scene-isolated=1");
     return 1;
 }
 
 static int stop_inline_old_playtest(void) {
+    void *retired_layer;
     if (!g_host.old_playtest_layer) {
         (void)set_old_playtest_reset_level_suppressed(0);
         (void)set_old_playtest_destroy_player_suppressed(0);
         (void)set_old_playtest_end_trigger_suppressed(0);
+        if (g_host.old_playtest_play_button)
+            g_host.ccnode_set_visible(g_host.old_playtest_play_button, 1);
+        if (g_host.old_playtest_stop_button)
+            g_host.ccnode_set_visible(g_host.old_playtest_stop_button, 0);
         return 1;
     }
+    retired_layer = g_host.old_playtest_layer;
     audio_stop_background();
     (void)set_old_playtest_reset_level_suppressed(0);
     (void)set_old_playtest_destroy_player_suppressed(0);
-    if (g_host.old_playtest_stop_menu &&
-        memory_range_is_readable(g_host.old_playtest_stop_menu, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_stop_menu, 1);
     remove_old_playtest_proxy_visuals();
-    /* Restore the editor camera before removing any test-owned nodes. */
+
     if (g_host.old_playtest_editor_camera_original_valid &&
         g_host.old_playtest_editor_game_layer &&
         memory_range_is_readable(g_host.old_playtest_editor_game_layer,
@@ -2008,9 +2017,9 @@ static int stop_inline_old_playtest(void) {
             g_host.old_playtest_editor_camera_original_y);
     }
     g_host.old_playtest_editor_camera_original_valid = 0;
-    /* Remove every wrapper-only visual node before the editor can accept
-       another touch. Retaining breadcrumbs after stop was correlated with the
-       post-play portal/object-placement crash on the real 1.1 ARM build. */
+
+    /* The overlay is scene-owned rather than editor-owned in newera8, so its
+       destruction cannot mutate LevelEditorLayer/EditorUI child arrays. */
     clear_old_playtest_trail();
     if (g_host.old_playtest_player &&
         memory_range_is_readable(g_host.old_playtest_player, sizeof(void *))) {
@@ -2019,17 +2028,20 @@ static int stop_inline_old_playtest(void) {
         if (g_host.ccnode_unschedule_all_selectors)
             g_host.ccnode_unschedule_all_selectors(g_host.old_playtest_player);
     }
-    if (g_host.old_playtest_layer &&
-        memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *))) {
+    if (retired_layer && memory_range_is_readable(retired_layer, sizeof(void *))) {
         if (g_host.ccnode_stop_all_actions)
-            g_host.ccnode_stop_all_actions(g_host.old_playtest_layer);
+            g_host.ccnode_stop_all_actions(retired_layer);
         if (g_host.ccnode_unschedule_all_selectors)
-            g_host.ccnode_unschedule_all_selectors(g_host.old_playtest_layer);
+            g_host.ccnode_unschedule_all_selectors(retired_layer);
         if (g_host.ccnode_unschedule_update)
-            g_host.ccnode_unschedule_update(g_host.old_playtest_layer);
+            g_host.ccnode_unschedule_update(retired_layer);
+        /* removeFromParentAndCleanup(false) still performs the normal onExit/touch
+           unregister path, but deliberately skips recursive cleanup of the old
+           PlayLayer subtree. Newera7's stop frame freed thousands of PlayLayer
+           allocations immediately before the reproducible editor strlen(0x210)
+           crash; the explicit retain keeps the detached tree alive as well. */
+        g_host.ccnode_remove(retired_layer, 0);
     }
-    if (memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_layer, 1);
     if (g_host.game_manager_shared_state && g_host.game_manager_set_play_layer) {
         void *manager = g_host.game_manager_shared_state();
         if (manager)
@@ -2037,18 +2049,19 @@ static int stop_inline_old_playtest(void) {
                 manager, g_host.old_playtest_previous_play_layer);
     }
     g_host.old_playtest_previous_play_layer = NULL;
-    /* Deliberately keep our retain on the temporary level clone. Old
-       autorelease pools can destroy the detached PlayLayer later; releasing
-       this clone immediately can leave that delayed destructor with a stale
-       level pointer. It is a tiny per-playtest stability leak. */
+    /* Both the detached PlayLayer and its private level retain are deliberately
+       parked until process/scene teardown. A small leak is preferable to the
+       reproducible 0x210 strlen UAF seen immediately after old PlayLayer
+       destruction when placing an editor object. */
     g_host.old_playtest_level_clone = NULL;
     if (!set_old_playtest_end_trigger_suppressed(0))
         runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
-    if (g_host.old_playtest_play_menu &&
-        memory_range_is_readable(g_host.old_playtest_play_menu, sizeof(void *)))
-        g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 1);
+
+    if (g_host.old_playtest_play_button)
+        g_host.ccnode_set_visible(g_host.old_playtest_play_button, 1);
+    if (g_host.old_playtest_stop_button)
+        g_host.ccnode_set_visible(g_host.old_playtest_stop_button, 0);
     g_host.old_playtest_layer = NULL;
-    g_host.old_playtest_stop_menu = NULL;
     g_host.old_playtest_player = NULL;
     g_host.old_playtest_play_game_layer = NULL;
     g_host.old_playtest_editor_game_layer = NULL;
@@ -2058,7 +2071,7 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe visuals=removed music=stopped end=restored camera=restored clone=retained-for-safety");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=removed music=stopped end=restored camera=restored playlayer=detached-retained-cleanup0");
     return 1;
 }
 

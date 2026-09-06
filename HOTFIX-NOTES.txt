@@ -1,0 +1,5 @@
+GeometryDashWrapper 0.9.7-newera7 -> newera8 hotfix source
+
+Copy these files over a clean newera7 source tree.
+Optional cleanup: delete NEWERA7-VERIFICATION.txt after copying.
+Then rebuild; Dynarmic builder revision is 119.

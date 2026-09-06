@@ -3330,6 +3330,7 @@ public:
                runtime_.level_editor_get_game_layer &&
                runtime_.level_editor_get_level_string &&
                runtime_.gj_game_level_set_level_string && runtime_.gj_game_level_create &&
+               runtime_.ccobject_retain &&
                runtime_.play_layer_create && runtime_.play_layer_start_game &&
                runtime_.play_layer_reset_level &&
                runtime_.play_layer_get_test_mode && runtime_.play_layer_get_player &&
@@ -3866,7 +3867,7 @@ public:
                            nullptr, "rotate playtest line", 0u,
                            std::chrono::milliseconds(300)) &&
                RunFunction(runtime_.ccnode_set_scale_x,
-                           {sprite, FloatToWord((length / 64.0f) * 1.12f)},
+                           {sprite, FloatToWord((length / 32.0f) * 1.04f)},
                            nullptr, "stretch playtest line", 0u,
                            std::chrono::milliseconds(300)) &&
                RunFunction(runtime_.ccnode_set_scale_y,
@@ -3893,7 +3894,7 @@ public:
             return true;
         }
         if (!old_playtest_streak_name_) {
-            old_playtest_streak_name_ = AllocateString("streak.png");
+            old_playtest_streak_name_ = AllocateString("square.png");
             if (!old_playtest_streak_name_) return false;
         }
         if (!old_playtest_green_color_) {
@@ -3937,6 +3938,10 @@ public:
             old_playtest_motion_last_y_ = y;
             return true;
         }
+        /* Early Geometry Dash scrolls only forward. A portal/camera transition
+           can make one sampled X delta look negative; don't let the guide arc
+           flip behind the player. */
+        if (vx < 0.0f) vx = -vx;
         if (!old_playtest_motion_has_velocity_) {
             old_playtest_motion_vx_ = vx;
             old_playtest_motion_vy_ = vy;
@@ -3945,22 +3950,23 @@ public:
             old_playtest_motion_last_y_ = y;
             return true;
         }
-        float ax = std::clamp(vx - old_playtest_motion_vx_, -1.5f, 1.5f);
-        float ay = std::clamp(vy - old_playtest_motion_vy_, -2.0f, 2.0f);
+        vx = old_playtest_motion_vx_ * 0.65f + vx * 0.35f;
+        vy = old_playtest_motion_vy_ * 0.65f + vy * 0.35f;
+        const float ay = std::clamp(vy - old_playtest_motion_vy_, -0.35f, 0.35f);
         if (!old_playtest_orange_color_) {
             old_playtest_orange_color_ = Allocate(4u);
             if (!old_playtest_orange_color_) return false;
-            /* ccColor3B bytes in guest memory: R=255, G=72, B=0. */
-            env_.MemoryWrite32(old_playtest_orange_color_, 0x000048ffu);
+            /* ccColor3B bytes in guest memory: R=255, G=84, B=0. */
+            env_.MemoryWrite32(old_playtest_orange_color_, 0x000054ffu);
         }
         float px = x, py = y;
         for (std::size_t i = 0; i < old_playtest_trajectory_.size(); ++i) {
-            const float t = static_cast<float>(i + 1u) * 3.0f;
-            const float nx = x + vx * t + 0.5f * ax * t * t;
+            const float t = static_cast<float>(i + 1u) * 2.0f;
+            const float nx = x + vx * t;
             const float ny = y + vy * t + 0.5f * ay * t * t;
             if (!old_playtest_trajectory_[i]) {
                 if (!old_playtest_streak_name_)
-                    old_playtest_streak_name_ = AllocateString("streak.png");
+                    old_playtest_streak_name_ = AllocateString("square.png");
                 if (!old_playtest_streak_name_ ||
                     !RunFunction(runtime_.sprite_create_file,
                                  {old_playtest_streak_name_},
@@ -3976,7 +3982,7 @@ public:
                                     5000 + static_cast<int>(i))) return false;
             }
             if (!PositionOldVersionPlaytestLineSprite(old_playtest_trajectory_[i],
-                                                       px, py, nx, ny, 0.042f))
+                                                       px, py, nx, ny, 0.055f))
                 return false;
             px = nx;
             py = ny;
@@ -4116,12 +4122,20 @@ public:
         if (!RunFunction(runtime_.play_layer_create, {level_clone}, &play_layer,
                          "PlayLayer::create inline playtest", 0u,
                          std::chrono::milliseconds(10000)) || !play_layer) return false;
+        /* Keep an explicit retain on PlayLayer. newera8 detaches it on stop so
+           onExit/touch cleanup runs, but defers its destructor until the old
+           editor is gone; that destructor timing is the strongest remaining
+           suspect for the reproducible post-play strlen(0x210) crash. */
+        if (runtime_.ccobject_retain &&
+            !RunFunction(runtime_.ccobject_retain, {play_layer}, nullptr,
+                         "retain hidden playtest layer", 0u,
+                         std::chrono::milliseconds(500))) return false;
         if (!env_.IsMapped(play_layer + test_mode_offset, 1u)) {
             LogOldVersionPlaytestUnavailable("invalid-PlayLayer-test-mode-layout");
             return true;
         }
         env_.MemoryWrite8(play_layer + test_mode_offset, 1u);
-        if (!AddExtrasChild(active_editor_layer_, play_layer, -10000) ||
+        if (!AddExtrasChild(active_scene_root_, play_layer, -10000) ||
             !StartOldVersionPlaytestPreservingFirstAttempt(play_layer)) return false;
 
         u32 player = 0u, play_game_layer = 0u, editor_game_layer = 0u;
@@ -4166,14 +4180,14 @@ public:
         if (!SuppressOldVersionPlaytestEndPortal(play_layer, start_player_x))
             return false;
 
-        /* Wrapper visuals are a sibling overlay under LevelEditorLayer, never
-           children of the editor game layer. Old editor object placement code
-           assumes game-layer children are GameObjects. */
+        /* Put every transient gameplay/visual node on the scene root. Do not
+           touch LevelEditorLayer's child array: the ARM 1.1 logs crash on the
+           very next placement with strlen(0x210) after old playtest teardown. */
         u32 trail = 0u;
         if (!RunFunction(runtime_.ccnode_create, {}, &trail,
                          "CCNode::create playtest overlay root", 0u,
                          std::chrono::milliseconds(1000)) || !trail ||
-            !AddExtrasChild(active_editor_layer_, trail, 9998)) return false;
+            !AddExtrasChild(active_scene_root_, trail, 20000)) return false;
         old_playtest_trail_ = trail;
         if (!RebuildOldVersionPlaytestProxyVisuals(true)) return false;
 
@@ -4182,7 +4196,8 @@ public:
                               camera_y, "CCNode::getPositionY play")) return false;
         float camera_x = 120.0f - start_player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
-        camera_y += 20.0f;
+        /* No extra vertical offset. The +20 framing used by newera7 pushed
+           ship/ball at their screen ceiling beyond the visible editor area. */
         if (!RunFunction(runtime_.ccnode_set_visible, {play_layer, 0u}, nullptr,
                          "hide backing PlayLayer", 0u,
                          std::chrono::milliseconds(500)) ||
@@ -4196,23 +4211,19 @@ public:
                          std::chrono::milliseconds(500)) ||
             !UpdateOldVersionPlaytestProxyTransform()) return false;
 
-        u32 stop_menu = 0u, stop_button = 0u;
-        if (!RunFunction(runtime_.cc_menu_create, {}, &stop_menu,
-                         "CCMenu::create playtest stop", 0u,
-                         std::chrono::milliseconds(1500)) || !stop_menu ||
-            !CreateOldVersionPlaytestItem(editor_ui, "GJ_pauseBtn_001.png",
-                                          1.0f, &stop_button) ||
-            !AddExtrasChild(stop_menu, stop_button, 0) ||
-            !RunFunction(runtime_.ccnode_set_position_ff,
-                         {stop_menu, FloatToWord(0.0f), FloatToWord(0.0f)},
-                         nullptr, "CCNode::setPosition playtest stop menu", 0u,
-                         std::chrono::milliseconds(1000)) ||
-            !RunFunction(runtime_.ccnode_set_position_ff,
-                         {stop_button, FloatToWord(30.0f), FloatToWord(186.0f)},
-                         nullptr, "CCNode::setPosition playtest stop", 0u,
-                         std::chrono::milliseconds(1000)) ||
-            !AddExtrasChild(editor_ui, stop_menu, 10001)) return false;
-        old_playtest_stop_menu_ = stop_menu;
+        /* The play/pause buttons are persistent scene-root siblings. Starting
+           and stopping only flips visibility, so EditorUI's child list never
+           changes during playtest. */
+        if (old_playtest_play_button_ &&
+            !RunFunction(runtime_.ccnode_set_visible,
+                         {old_playtest_play_button_, 0u}, nullptr,
+                         "hide persistent playtest play", 0u,
+                         std::chrono::milliseconds(500))) return false;
+        if (old_playtest_stop_button_ &&
+            !RunFunction(runtime_.ccnode_set_visible,
+                         {old_playtest_stop_button_, 1u}, nullptr,
+                         "show persistent playtest pause", 0u,
+                         std::chrono::milliseconds(500))) return false;
 
         if (!SetOldVersionPlaytestEndTriggerSuppressed(true)) {
             log_ << "ERROR: could not disable EndPortalObject::triggerObject\n";
@@ -4220,14 +4231,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        if (old_playtest_play_menu_ &&
-            !RunFunction(runtime_.ccnode_set_visible, {old_playtest_play_menu_, 0u},
-                         nullptr, "hide playtest play button", 0u,
-                         std::chrono::milliseconds(500))) {
-            (void)StopInlineOldVersionPlaytest();
-            return false;
-        }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=20\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=0 scene-isolated=1\n";
         log_.flush();
         return true;
     }
@@ -4236,16 +4240,24 @@ public:
         if (!old_playtest_layer_) {
             (void)SetOldVersionPlaytestResetLevelSuppressed(false);
             (void)SetOldVersionPlaytestDestroyPlayerSuppressed(false);
-            return SetOldVersionPlaytestEndTriggerSuppressed(false);
+            const bool end_ok = SetOldVersionPlaytestEndTriggerSuppressed(false);
+            bool buttons_ok = true;
+            if (old_playtest_play_button_)
+                buttons_ok = RunFunction(runtime_.ccnode_set_visible,
+                                         {old_playtest_play_button_, 1u}, nullptr,
+                                         "show persistent playtest play", 0u,
+                                         std::chrono::milliseconds(500)) && buttons_ok;
+            if (old_playtest_stop_button_)
+                buttons_ok = RunFunction(runtime_.ccnode_set_visible,
+                                         {old_playtest_stop_button_, 0u}, nullptr,
+                                         "hide persistent playtest pause", 0u,
+                                         std::chrono::milliseconds(500)) && buttons_ok;
+            return end_ok && buttons_ok;
         }
+        const u32 retired_layer = old_playtest_layer_;
         audio_stop_background();
         bool ok = SetOldVersionPlaytestResetLevelSuppressed(false);
         ok = SetOldVersionPlaytestDestroyPlayerSuppressed(false) && ok;
-        if (old_playtest_stop_menu_)
-            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {old_playtest_stop_menu_, 1u}, nullptr,
-                             "remove inline playtest stop menu", 0u,
-                             std::chrono::milliseconds(1000)) && ok;
         if (!RemoveOldVersionPlaytestProxyVisuals()) ok = false;
         if (old_playtest_editor_camera_original_valid_ &&
             old_playtest_editor_game_layer_)
@@ -4256,9 +4268,9 @@ public:
                              nullptr, "restore editor camera after playtest", 0u,
                              std::chrono::milliseconds(500)) && ok;
         old_playtest_editor_camera_original_valid_ = false;
-        /* Remove all wrapper-only visual nodes before another editor touch.
-           Keeping the breadcrumb overlay alive after stop correlated exactly
-           with the 1.1 portal/object-placement crash in the user's logs. */
+
+        /* newera8's visual root is a scene sibling, not an editor child, so
+           clearing it cannot disturb LevelEditorLayer's child array. */
         if (!ClearOldVersionPlaytestTrail()) ok = false;
         auto quiet_node = [&](u32 node, const char* label) {
             if (!node || !env_.IsMapped(node, 4u)) return;
@@ -4271,17 +4283,23 @@ public:
                                  std::chrono::milliseconds(500)) && ok;
         };
         quiet_node(old_playtest_player_, "CCNode::stopAllActions playtest player");
-        quiet_node(old_playtest_layer_, "CCNode::stopAllActions hidden PlayLayer");
-        if (old_playtest_layer_ && runtime_.ccnode_unschedule_update)
+        quiet_node(retired_layer, "CCNode::stopAllActions hidden PlayLayer");
+        if (retired_layer && runtime_.ccnode_unschedule_update)
             ok = RunFunction(runtime_.ccnode_unschedule_update,
-                             {old_playtest_layer_}, nullptr,
+                             {retired_layer}, nullptr,
                              "CCNode::unscheduleUpdate hidden PlayLayer", 0u,
                              std::chrono::milliseconds(500)) && ok;
-        if (old_playtest_layer_)
+        if (retired_layer) {
+            /* removeFromParentAndCleanup(false) still runs the onExit/touch-unregister
+               path but skips recursive cleanup of the old PlayLayer subtree.
+               Newera7 freed thousands of allocations in the stop frame right
+               before the repeatable editor strlen(0x210) placement crash. The
+               explicit retain keeps the detached tree alive for this test. */
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {old_playtest_layer_, 1u}, nullptr,
-                             "remove hidden inline PlayLayer", 0u,
+                             {retired_layer, 0u}, nullptr,
+                             "detach retained hidden PlayLayer without cleanup", 0u,
                              std::chrono::milliseconds(3000)) && ok;
+        }
         if (runtime_.game_manager_shared_state &&
             runtime_.game_manager_set_play_layer) {
             u32 manager = 0u;
@@ -4294,19 +4312,22 @@ public:
                                  0u, std::chrono::milliseconds(500)) && ok;
         }
         old_playtest_previous_play_layer_ = 0u;
-        /* Intentionally do not release our clone retain here. The detached
-           PlayLayer is autoreleased and may destruct later; a delayed
-           destructor touching an already released clone is a worse failure
-           than this tiny per-playtest leak. */
+        /* Keep both explicit retains parked. The ARM 1.1 logs consistently
+           crash after PlayLayer teardown with strlen(0x210), so destruction is
+           deferred instead of gambling with another editor-side UAF. */
         old_playtest_level_clone_ = 0u;
         if (!SetOldVersionPlaytestEndTriggerSuppressed(false)) ok = false;
-        if (old_playtest_play_menu_)
+        if (old_playtest_play_button_)
             ok = RunFunction(runtime_.ccnode_set_visible,
-                             {old_playtest_play_menu_, 1u}, nullptr,
-                             "restore playtest play button", 0u,
+                             {old_playtest_play_button_, 1u}, nullptr,
+                             "show persistent playtest play", 0u,
+                             std::chrono::milliseconds(500)) && ok;
+        if (old_playtest_stop_button_)
+            ok = RunFunction(runtime_.ccnode_set_visible,
+                             {old_playtest_stop_button_, 0u}, nullptr,
+                             "hide persistent playtest pause", 0u,
                              std::chrono::milliseconds(500)) && ok;
         old_playtest_layer_ = 0u;
-        old_playtest_stop_menu_ = 0u;
         old_playtest_player_ = 0u;
         old_playtest_play_game_layer_ = 0u;
         old_playtest_editor_game_layer_ = 0u;
@@ -4316,7 +4337,7 @@ public:
         old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe visuals=removed music=stopped end=restored camera=restored clone=retained-for-safety\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=removed music=stopped end=restored camera=restored playlayer=detached-retained-cleanup0\n";
             log_.flush();
         }
         return ok;
@@ -4367,7 +4388,6 @@ public:
                               "CCNode::getPositionY playtest camera")) return false;
         float camera_x = 120.0f - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
-        camera_y += 20.0f;
         if (!RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_, FloatToWord(camera_x),
                           FloatToWord(camera_y)}, nullptr,
@@ -4396,10 +4416,10 @@ public:
             }
             old_playtest_play_menu_ = 0u;
             old_playtest_play_button_ = 0u;
+            old_playtest_stop_button_ = 0u;
             old_playtest_editor_ = 0u;
             old_playtest_ui_ = 0u;
             old_playtest_layer_ = 0u;
-            old_playtest_stop_menu_ = 0u;
             old_playtest_player_ = 0u;
             old_playtest_play_game_layer_ = 0u;
             old_playtest_editor_game_layer_ = 0u;
@@ -4408,15 +4428,11 @@ public:
             old_playtest_proxy_tertiary_ = 0u;
             old_playtest_proxy_mode_ = -1;
             old_playtest_proxy_icon_ = -1;
-            /* Scene teardown owns the PlayLayer; do not dereference guest
-               objects here. The clone is process-local and the normal stop
-               path releases it before any ordinary editor transition. */
             old_playtest_level_clone_ = 0u;
             old_playtest_previous_play_layer_ = 0u;
             old_playtest_end_portal_ = 0u;
             old_playtest_end_portal_scanned_ = false;
             old_playtest_request_ = 0u;
-            /* The outgoing scene owns the retained trail node. */
             old_playtest_trail_ = 0u;
             old_playtest_scene_ = active_scene_root_;
         }
@@ -4430,10 +4446,13 @@ public:
         if (!RunFunction(runtime_.cc_menu_create, {}, &menu,
                          "CCMenu::create editor playtest", 0u,
                          std::chrono::milliseconds(1500)) || !menu) return false;
-        u32 button = 0u;
+        u32 button = 0u, stop_button = 0u;
         if (!CreateOldVersionPlaytestItem(editor_ui, "GJ_playBtn2_001.png",
-                                          0.49f, &button)) return false;
+                                          0.49f, &button) ||
+            !CreateOldVersionPlaytestItem(editor_ui, "GJ_pauseBtn_001.png",
+                                          1.0f, &stop_button)) return false;
         if (!AddExtrasChild(menu, button, 0) ||
+            !AddExtrasChild(menu, stop_button, 1) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
                          {menu, FloatToWord(0.0f), FloatToWord(0.0f)}, nullptr,
                          "CCNode::setPosition editor playtest menu", 0u,
@@ -4442,10 +4461,18 @@ public:
                          {button, FloatToWord(30.0f), FloatToWord(186.0f)}, nullptr,
                          "CCNode::setPosition editor playtest", 0u,
                          std::chrono::milliseconds(1000)) ||
-            !AddExtrasChild(editor_ui, menu, 10000)) return false;
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {stop_button, FloatToWord(30.0f), FloatToWord(186.0f)}, nullptr,
+                         "CCNode::setPosition editor playtest pause", 0u,
+                         std::chrono::milliseconds(1000)) ||
+            !RunFunction(runtime_.ccnode_set_visible, {stop_button, 0u}, nullptr,
+                         "hide persistent playtest pause", 0u,
+                         std::chrono::milliseconds(500)) ||
+            !AddExtrasChild(active_scene_root_, menu, 30000)) return false;
         old_playtest_play_menu_ = menu;
         old_playtest_play_button_ = button;
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_BUTTON_READY mode=editor-bridge-safe sprite=GJ_playBtn2_001.png\n";
+        old_playtest_stop_button_ = stop_button;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_BUTTON_READY mode=scene-overlay sprite=GJ_playBtn2_001.png pause=persistent\n";
         log_.flush();
         return true;
     }
@@ -8683,8 +8710,8 @@ private:
     u32 old_playtest_ui_ = 0u;
     u32 old_playtest_play_menu_ = 0u;
     u32 old_playtest_play_button_ = 0u;
+    u32 old_playtest_stop_button_ = 0u;
     u32 old_playtest_layer_ = 0u;
-    u32 old_playtest_stop_menu_ = 0u;
     u32 old_playtest_player_ = 0u;
     u32 old_playtest_play_game_layer_ = 0u;
     u32 old_playtest_editor_game_layer_ = 0u;
@@ -8721,7 +8748,7 @@ private:
     u32 old_playtest_primary_color_ = 0u;
     u32 old_playtest_secondary_color_ = 0u;
     u32 old_playtest_orange_color_ = 0u;
-    std::array<u32,10> old_playtest_trajectory_{};
+    std::array<u32,18> old_playtest_trajectory_{};
     bool old_playtest_motion_has_last_ = false;
     bool old_playtest_motion_has_velocity_ = false;
     float old_playtest_motion_last_x_ = 0.0f;

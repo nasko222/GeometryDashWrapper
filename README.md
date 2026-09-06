@@ -1,16 +1,17 @@
-# Geometry Dash Wrapper 0.9.7-newera7
+# Geometry Dash Wrapper 0.9.7-newera8
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
-## What newera7 changes
+## What newera8 changes
 
-- Pre-1.8 inline editor playtest startup now has a short 1.5 second `destroyPlayer()` + `resetLevel()` guard applied only after the required synchronous startup reset has already completed. The real 1.1 logs showed the unwanted restart roughly one second after `startGame()`, accompanied by a music rewind, which matches the old death/reset action path. The guard is restored automatically after startup and always restored on stop.
-- Playtest teardown is hardened for the post-test object-placement crash: wrapper trail/proxy/trajectory nodes are removed on stop, the editor camera is restored, the hidden PlayLayer is unscheduled before removal, `GameManager::m_playLayer` is restored, and the temporary cloned level is intentionally retained instead of being released immediately while the detached autoreleased PlayLayer may still destruct later.
-- Green breadcrumbs are now continuous stretched `streak.png` segments instead of dotted 5-pixel crumbs.
-- Player proxy sprites now use the selected Geometry Dash primary/secondary colors through `GameManager::getPlayerColor*` + `colorForIdx`.
-- Ship mode now includes the selected cube inside the ship instead of showing only the white vehicle sprite.
-- Added a red-orange trajectory preview. It extrapolates the real player's recent velocity/acceleration into 20 short line segments. It is a visual prediction, not a collision solver, so portals/gravity changes naturally cause it to recompute.
-- Existing newera6-fix1 behavior remains: hidden authentic PlayLayer physics, editor camera follow, no end trigger, small stable play button, pause/Escape stop, separate resolution/filtering/AA controls.
+- The first-attempt restart fix from newera7 is retained. The user confirmed that the unwanted Attempt 1 -> Attempt 2 interruption is finally gone.
+- The remaining ARM 1.1 post-play editor crash is isolated more aggressively. The supplied newera7 log dies on the first placement touch after stopping with `strlen(0x210)`, after a stop frame that frees thousands of old PlayLayer allocations. Newera8 keeps the hidden PlayLayer completely outside `LevelEditorLayer`/`EditorUI`, detaches it with `removeFromParentAndCleanup(false)`, and intentionally keeps the detached PlayLayer plus its private level clone retained while the editor remains alive. This is a temporary stability tradeoff and leaks memory per playtest until a later safe retirement point is implemented.
+- The play/pause controls are persistent scene-root siblings. Starting/stopping only toggles their visibility; the old editor UI child arrays are no longer modified by the wrapper during playtest.
+- The proxy, breadcrumb, and trajectory overlay is also a scene-root sibling. It is removed independently of the editor object hierarchy.
+- The extra `+20` vertical camera offset from newera7 is removed. The editor now mirrors the hidden gameplay camera vertically, which keeps ship/ball and other screen-limited modes inside the same top/bottom framing as normal gameplay.
+- Green breadcrumbs now use stretched solid `square.png` segments with overlap instead of the alpha-patterned `streak.png`, so the trail should render as a continuous green line rather than dots/dashes.
+- The red-orange trajectory preview is rebuilt as 18 connected solid segments. Sampled velocity is low-pass filtered and only vertical acceleration is extrapolated, avoiding the disconnected short dashes and backward folds seen in newera7.
+- Player colors, ship-with-cube proxy, gamemode switching, endless editor playtest, music stop, and the stable play-button sizing from newera7 remain in place.
 
 ## Architecture
 
@@ -78,10 +79,10 @@ With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a small play co
 1. Read the live editor's unsaved level string, create a private temporary `GJGameLevel`, copy the playback metadata available in that build, and give only the clone to `PlayLayer`. The editor's own level object is not mutated.
 2. Create the authentic old `PlayLayer`. Run the complete `startGame()` / `resetLevel()` initialization, while temporarily suppressing only `updateAttempts()` for that one reset. This initializes the spawn queues correctly without advancing the visible attempt counter.
 3. Keep the real `PlayerObject` in its original hidden PlayLayer hierarchy for physics. A separate editor overlay mirrors its transform. The proxy changes sprite family when the real player enters ship, ball, or bird/UFO mode on builds that expose those modes.
-4. Follow the real player's horizontal movement with the editor game layer, mirror the hidden gameplay camera vertically, and apply the extra 20-unit downward editor framing offset.
-5. Breadcrumb sprites and proxy sprites live in a sibling overlay under `LevelEditorLayer`, never in `LevelEditorLayer::getGameLayer()`. This avoids contaminating the game-object child list used by old editor placement code. The retained breadcrumb overlay follows later editor panning after the test stops.
+4. Follow the real player's horizontal movement with the editor game layer and mirror the hidden gameplay camera vertically with no additional Y offset.
+5. Breadcrumb, trajectory, and proxy sprites live in a scene-root sibling overlay, not under `LevelEditorLayer` or `EditorUI`. The green trail uses solid stretched squares; the orange trajectory uses 18 connected prediction segments.
 6. Suppress `EndPortalObject::triggerObject()` while testing and keep the hidden portal far ahead as a secondary guard, so inline testing has no normal level-complete endpoint.
-7. Hide the play control while testing and show the pause control in the same toolbar slot. Clicking it or pressing Escape stops music, removes the hidden PlayLayer/private level clone/player proxy, restores end-trigger code, and returns control to the same editor.
+7. Hide the play control while testing and show the pause control in the same toolbar slot. Clicking it or pressing Escape stops music, restores end-trigger code/camera state, removes the scene-root visual overlay, and detaches the hidden PlayLayer without recursive cleanup. The detached PlayLayer and private level clone are intentionally retained in newera8 while the editor is alive to avoid the repeatable old-engine teardown crash.
 8. If the backing player genuinely dies or is replaced, the bridge tears down the test rather than allowing the historical PlayLayer retry/scene lifecycle to leak into the editor.
 
 The bridge covers ARM Geometry Dash 1.0-1.4 and x86 Geometry Dash 1.5-1.7 when the required exported game/Cocos2d-x interfaces are present. Missing capabilities fail closed and are logged. Runtime testing on the individual historical APKs is still required because their internal layouts differ by release.

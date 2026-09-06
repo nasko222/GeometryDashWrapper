@@ -1,0 +1,28 @@
+Geometry Dash Wrapper 0.9.7-newera8 verification notes
+=======================================================
+
+Basis for this iteration
+------------------------
+- The user's newera7 ARM 1.1 log reproduces the post-play editor crash after a normal playtest stop.
+- The next editor placement touch reaches nativeTouchesEnd and faults through strlen with guest pointer 0x210.
+- The newera7 stop frame immediately before that placement performs a very large free/cleanup burst. The first-attempt restart is reported fixed by the user.
+- The latest x86 run in the supplied log set had OLD_VER_PLAYTEST disabled, so this particular crash signature is proven on ARM 1.1 only. The x86 playtest path mirrors the same isolation/retirement changes proactively.
+
+newera8 changes checked statically
+----------------------------------
+- Version: 0.9.7-newera8; Dynarmic builder revision 119.
+- Hidden PlayLayer is added only under the active scene root, never under LevelEditorLayer or EditorUI.
+- Play/pause menu is a persistent scene-root sibling; start/stop only toggles button visibility.
+- Breadcrumb/proxy/trajectory overlay is a scene-root sibling.
+- Normal stop detaches the retained hidden PlayLayer with removeFromParentAndCleanup(false), avoiding recursive PlayLayer cleanup while the editor remains active.
+- The detached PlayLayer and private GJGameLevel are intentionally retained/leaked per test for this stability experiment.
+- GameManager::m_playLayer is restored to its pre-test value.
+- Extra +20 camera Y offset is removed on ARM and x86.
+- Breadcrumbs and trajectory use solid square.png line segments rather than streak.png.
+- Trajectory has 18 connected segments with filtered velocity and vertical-only acceleration extrapolation.
+- First-attempt suppression logic from newera7 is unchanged.
+- git diff --check reports no whitespace errors.
+
+Runtime status
+--------------
+No Windows runtime execution was possible in this Linux packaging environment. The post-play crash fix is therefore a targeted hypothesis based on the exact user log, not a claimed verified runtime fix. Please test ARM 1.1 first: play -> pause -> immediately place a normal block and a portal. If it still faults, attach that run because the new STOPPED log identifies the cleanup=0 retirement path.
