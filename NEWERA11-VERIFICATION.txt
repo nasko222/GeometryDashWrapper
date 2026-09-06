@@ -1,0 +1,83 @@
+GeometryDashWrapper 0.9.7-newera11 verification notes
+=====================================================
+
+Scope
+-----
+newera11 continues the pre-1.8 inline editor playtest bridge on legacy ARM
+(1.0-1.4) and x86 (1.5-1.7).  No game APKs are included in the source ZIP.
+
+Post-play special-object crash
+------------------------------
+The supplied ARM 1.1 newera10 log shows that editor input state was restored
+successfully on Stop, yet a later special-object placement still reached the
+same invalid strlen pointer 0x210.  That rules out the earlier theory that the
+crash was caused only by leaving EditorUI/LevelEditorLayer touch disabled or by
+PlayLayer teardown.
+
+Binary inspection of the historical libraries exposed GameManager::getEditMode
+and GameManager::setEditMode in the tested early ARM and x86 builds.  PlayLayer
+uses the global gameplay/editor mode while LevelEditorLayer depends on editor
+mode.  newera11 therefore saves the pre-test edit-mode value before PlayLayer
+creation and restores it on Stop, early failure, and scene replacement, in
+addition to restoring GameManager::m_playLayer.
+
+Verified exports used by this change
+------------------------------------
+- early ARM sample:
+    GameManager::getEditMode
+    GameManager::setEditMode
+    CCMenu::isEnabled
+    CCMenu::setEnabled
+    EditorUI::updateSlider
+- ARM 1.1 sample:
+    all of the above plus PlayLayer::toggleFlipped(bool,bool)
+- x86 sample:
+    all of the above plus PlayLayer::toggleFlipped(bool,bool)
+
+Mirror suppression is optional: the oldest build can omit toggleFlipped and the
+bridge leaves mirror suppression as a no-op rather than failing playtest.
+
+Camera/UI
+---------
+- The editor game layer and wrapper visual overlay use 0.92x of the editor's
+  original X/Y scale during playtest.
+- Horizontal follow remains player-relative; the vertical transform is derived
+  from the hidden gameplay camera and scaled around logical Y=160.
+- Original editor camera position and scale are restored on Stop.
+- EditorUI/LevelEditorLayer touch state is saved and suspended.
+- Descendant CCMenu enabled states and Slider touch states are separately saved,
+  disabled, and restored.
+- EditorUI::updateSlider() is called after camera restore so the top X-position
+  mover resynchronizes with the editor camera.
+
+Trajectory/breadcrumbs
+----------------------
+- Green breadcrumb segments retain the corrected old-Cocos rotation sign and
+  overlap behavior.
+- Orange trajectory segments are world-anchored, not re-anchored to the player
+  every frame.
+- A new jump/impulse can anchor from observed vertical movement even if an old
+  getOnGround implementation remains asserted for the launch frame.
+- Existing trajectory sprites are explicitly made visible after re-anchoring;
+  newera10 could hide a reused trajectory and never show it again.
+- An immediate +/-0.35 fallback acceleration makes the guide appear on the
+  first airborne sample; subsequent observed physics deltas refine it.
+- Ship/UFO trajectory remains intentionally hidden because their future motion
+  depends on held input.
+
+Static checks performed
+-----------------------
+- Version strings: 0.9.7-newera11.
+- Dynarmic builder revision: dynarmic-x64-builder122-0.9.7-newera11.
+- Balanced (), [], and {} delimiters after stripping strings/comments in the
+  modified x86 C and legacy ARM C++ sources.
+- Required new symbol names were checked against the historical ELF exports.
+- Patch round-trip and source-tree comparison are performed during packaging.
+
+Runtime status
+--------------
+This environment cannot execute the generated Windows wrapper, so the
+GameManager edit-mode fix, 0.92 camera framing, menu/slider suspension, mirror
+portal suppression, and trajectory re-show must still be validated on the
+user's historical APKs.  The first-attempt preservation path is intentionally
+left unchanged because it was already confirmed working by runtime testing.

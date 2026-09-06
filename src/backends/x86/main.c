@@ -132,6 +132,8 @@ typedef struct {
     GameManagerSharedStateFunction game_manager_shared_state;
     GameManagerGetPlayLayerFunction game_manager_get_play_layer;
     GameManagerSetPlayLayerFunction game_manager_set_play_layer;
+    IntGetterFunction game_manager_get_edit_mode;
+    IntSetterFunction game_manager_set_edit_mode;
     UiCheckpointFunction ui_on_check;
     UiCheckpointFunction ui_on_delete_check;
     UiCheckpointNoSenderFunction ui_on_check_no_sender;
@@ -211,6 +213,10 @@ typedef struct {
     CcSpriteSetColorFunction sprite_set_color;
     CcMenuCreateFunction cc_menu_create;
     CcMenuItemSpriteExtraCreateFunction menu_item_sprite_extra_create;
+    IntGetterFunction ccmenu_is_enabled;
+    IntSetterFunction ccmenu_set_enabled;
+    CcNodeNoArgFunction editor_ui_update_slider;
+    void *play_layer_toggle_flipped;
     CcLayerColorCreateFunction cclayer_color_create;
     void *active_editor_ui;
     void *active_menu_layer;
@@ -241,6 +247,8 @@ typedef struct {
     int old_playtest_proxy_icon;
     void *old_playtest_level_clone;
     void *old_playtest_previous_play_layer;
+    int old_playtest_previous_edit_mode;
+    int old_playtest_previous_edit_mode_valid;
     int old_playtest_editor_input_suspended;
     int old_playtest_editor_ui_touch_was_enabled;
     int old_playtest_editor_layer_touch_was_enabled;
@@ -248,6 +256,8 @@ typedef struct {
     int old_playtest_end_portal_scanned;
     unsigned char old_playtest_end_trigger_original;
     int old_playtest_end_trigger_suppressed;
+    unsigned char old_playtest_mirror_original;
+    int old_playtest_mirror_suppressed;
     unsigned char old_playtest_destroy_player_original;
     int old_playtest_destroy_player_suppressed;
     unsigned char old_playtest_reset_level_original;
@@ -266,6 +276,9 @@ typedef struct {
     float old_playtest_motion_vy;
     int old_playtest_motion_has_last;
     int old_playtest_motion_has_velocity;
+    int old_playtest_motion_prev_on_ground;
+    int old_playtest_motion_prev_on_ground_valid;
+    int old_playtest_trajectory_sample_count;
     int old_playtest_trajectory_anchor_valid;
     int old_playtest_trajectory_anchor_mode;
     int old_playtest_trajectory_anchor_gravity;
@@ -276,7 +289,15 @@ typedef struct {
     float old_playtest_trajectory_anchor_ay;
     float old_playtest_editor_camera_original_x;
     float old_playtest_editor_camera_original_y;
+    float old_playtest_editor_camera_original_scale_x;
+    float old_playtest_editor_camera_original_scale_y;
     int old_playtest_editor_camera_original_valid;
+    void *old_playtest_editor_menus[128];
+    unsigned char old_playtest_editor_menu_enabled[128];
+    unsigned int old_playtest_editor_menu_count;
+    void *old_playtest_editor_sliders[32];
+    unsigned char old_playtest_editor_slider_touch_enabled[32];
+    unsigned int old_playtest_editor_slider_count;
     uint32_t old_playtest_test_mode_offset;
     int old_playtest_unavailable_logged;
     unsigned int editor_hotkey_miss_logs;
@@ -296,7 +317,8 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_Y_OFFSET 0.0f
+#define OLD_PLAYTEST_CAMERA_ZOOM 0.92f
+#define OLD_PLAYTEST_VIEW_CENTER_Y 160.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 18
@@ -1260,6 +1282,30 @@ static int set_old_playtest_end_trigger_suppressed(int suppress) {
     return 1;
 }
 
+static int set_old_playtest_mirror_suppressed(int suppress) {
+    unsigned char replacement;
+    if (!g_host.play_layer_toggle_flipped) return 1;
+    if (suppress) {
+        if (g_host.old_playtest_mirror_suppressed) return 1;
+        if (!memory_range_is_readable(g_host.play_layer_toggle_flipped, 1u)) return 0;
+        g_host.old_playtest_mirror_original =
+            *(const unsigned char *)g_host.play_layer_toggle_flipped;
+        replacement = 0xc3u; /* RET: mirror portals are inert in editor playtest. */
+        if (!patch_x86_code(g_host.play_layer_toggle_flipped, &replacement, 1u))
+            return 0;
+        g_host.old_playtest_mirror_suppressed = 1;
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_MIRROR_DISABLED toggleFlipped=ret");
+        return 1;
+    }
+    if (!g_host.old_playtest_mirror_suppressed) return 1;
+    replacement = g_host.old_playtest_mirror_original;
+    if (!patch_x86_code(g_host.play_layer_toggle_flipped, &replacement, 1u))
+        return 0;
+    g_host.old_playtest_mirror_suppressed = 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_MIRROR_RESTORED");
+    return 1;
+}
+
 static int set_old_playtest_reset_level_suppressed(int suppress) {
     unsigned char replacement;
     if (!g_host.play_layer_reset_level) return 1;
@@ -1346,10 +1392,12 @@ static int old_playtest_symbols_ready(void) {
            g_host.level_editor_get_level_string &&
            g_host.gj_game_level_set_level_string && g_host.gj_game_level_create &&
            g_host.ccobject_retain &&
+           g_host.game_manager_get_edit_mode && g_host.game_manager_set_edit_mode &&
            g_host.play_layer_create && g_host.play_layer_start_game &&
            g_host.play_layer_reset_level && g_host.play_layer_get_test_mode &&
            g_host.sprite_create_with_frame && g_host.cc_menu_create &&
-           g_host.menu_item_sprite_extra_create && g_host.ccnode_set_visible &&
+           g_host.menu_item_sprite_extra_create && g_host.ccmenu_set_enabled &&
+           g_host.editor_ui_update_slider && g_host.ccnode_set_visible &&
            g_host.ccnode_set_position && g_host.ccnode_get_position_x &&
            g_host.ccnode_get_position_y && g_host.ccnode_get_rotation &&
            g_host.ccnode_get_scale_x && g_host.ccnode_get_scale_y &&
@@ -1620,6 +1668,8 @@ static int ensure_old_playtest_button(void) {
             (void)set_old_playtest_reset_level_suppressed(0);
             (void)set_old_playtest_destroy_player_suppressed(0);
             (void)set_old_playtest_end_trigger_suppressed(0);
+            (void)set_old_playtest_mirror_suppressed(0);
+            restore_old_playtest_edit_mode();
             audio_stop_background();
             g_host.old_playtest_layer = NULL;
             g_host.old_playtest_ui = NULL;
@@ -1638,6 +1688,8 @@ static int ensure_old_playtest_button(void) {
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
         g_host.old_playtest_trail = NULL;
+        g_host.old_playtest_editor_menu_count = 0u;
+        g_host.old_playtest_editor_slider_count = 0u;
     }
     if (!editor_ui || g_host.old_playtest_layer ||
         g_host.old_playtest_play_button) return 1;
@@ -1680,6 +1732,9 @@ static void clear_old_playtest_trail(void) {
     g_host.old_playtest_trajectory_initialized = 0;
     g_host.old_playtest_motion_has_last = 0;
     g_host.old_playtest_motion_has_velocity = 0;
+    g_host.old_playtest_motion_prev_on_ground = 0;
+    g_host.old_playtest_motion_prev_on_ground_valid = 0;
+    g_host.old_playtest_trajectory_sample_count = 0;
     g_host.old_playtest_trajectory_anchor_valid = 0;
 }
 
@@ -1720,6 +1775,117 @@ static void set_old_playtest_editor_input_enabled(int enabled) {
         runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_INPUT_SUSPENDED ui-prev=%d layer-prev=%d",
                     g_host.old_playtest_editor_ui_touch_was_enabled,
                     g_host.old_playtest_editor_layer_touch_was_enabled);
+}
+
+static void restore_old_playtest_edit_mode(void) {
+    if (g_host.old_playtest_previous_edit_mode_valid &&
+        g_host.game_manager_shared_state && g_host.game_manager_set_edit_mode) {
+        void *manager = g_host.game_manager_shared_state();
+        if (manager) {
+            g_host.game_manager_set_edit_mode(
+                manager, g_host.old_playtest_previous_edit_mode);
+            runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDIT_MODE_RESTORED value=%d",
+                        g_host.old_playtest_previous_edit_mode);
+        }
+    }
+    g_host.old_playtest_previous_edit_mode_valid = 0;
+}
+
+static void collect_old_playtest_editor_controls(void *node,
+                                                 unsigned int depth,
+                                                 unsigned int *visited) {
+    unsigned int i, count;
+    void *children;
+    if (!node || !visited || depth > 16u || *visited >= 4096u ||
+        !memory_range_is_readable(node, sizeof(void *))) return;
+    ++*visited;
+
+    if (g_host.ccmenu_set_enabled && object_type_contains(node, "CCMenu") &&
+        g_host.old_playtest_editor_menu_count < 128u) {
+        unsigned int slot = g_host.old_playtest_editor_menu_count++;
+        g_host.old_playtest_editor_menus[slot] = node;
+        g_host.old_playtest_editor_menu_enabled[slot] =
+            g_host.ccmenu_is_enabled ? (unsigned char)(g_host.ccmenu_is_enabled(node) != 0) : 1u;
+        g_host.ccmenu_set_enabled(node, 0);
+    }
+    if (g_host.cclayer_set_touch_enabled && object_type_contains(node, "Slider") &&
+        g_host.old_playtest_editor_slider_count < 32u) {
+        unsigned int slot = g_host.old_playtest_editor_slider_count++;
+        g_host.old_playtest_editor_sliders[slot] = node;
+        g_host.old_playtest_editor_slider_touch_enabled[slot] =
+            g_host.cclayer_is_touch_enabled
+                ? (unsigned char)(g_host.cclayer_is_touch_enabled(node) != 0) : 1u;
+        g_host.cclayer_set_touch_enabled(node, 0);
+    }
+
+    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
+        !g_host.ccarray_object_at_index) return;
+    count = g_host.ccnode_get_children_count(node);
+    if (!count || count > 1024u) return;
+    children = g_host.ccnode_get_children(node);
+    if (!children) return;
+    for (i = 0u; i < count && *visited < 4096u; ++i) {
+        void *child = g_host.ccarray_object_at_index(children, i);
+        if (child) collect_old_playtest_editor_controls(child, depth + 1u, visited);
+    }
+}
+
+static void set_old_playtest_editor_controls_enabled(int enabled) {
+    unsigned int i;
+    if (!enabled) {
+        unsigned int visited = 0u;
+        g_host.old_playtest_editor_menu_count = 0u;
+        g_host.old_playtest_editor_slider_count = 0u;
+        memset(g_host.old_playtest_editor_menus, 0, sizeof(g_host.old_playtest_editor_menus));
+        memset(g_host.old_playtest_editor_sliders, 0, sizeof(g_host.old_playtest_editor_sliders));
+        if (g_host.old_playtest_editor)
+            collect_old_playtest_editor_controls(g_host.old_playtest_editor, 0u, &visited);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_SUSPENDED menus=%u sliders=%u",
+                    g_host.old_playtest_editor_menu_count,
+                    g_host.old_playtest_editor_slider_count);
+        return;
+    }
+    for (i = 0u; i < g_host.old_playtest_editor_menu_count; ++i) {
+        void *menu = g_host.old_playtest_editor_menus[i];
+        if (menu && g_host.ccmenu_set_enabled &&
+            memory_range_is_readable(menu, sizeof(void *)))
+            g_host.ccmenu_set_enabled(menu, g_host.old_playtest_editor_menu_enabled[i] != 0);
+    }
+    for (i = 0u; i < g_host.old_playtest_editor_slider_count; ++i) {
+        void *slider = g_host.old_playtest_editor_sliders[i];
+        if (slider && g_host.cclayer_set_touch_enabled &&
+            memory_range_is_readable(slider, sizeof(void *)))
+            g_host.cclayer_set_touch_enabled(
+                slider, g_host.old_playtest_editor_slider_touch_enabled[i] != 0);
+    }
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus=%u sliders=%u",
+                g_host.old_playtest_editor_menu_count,
+                g_host.old_playtest_editor_slider_count);
+    g_host.old_playtest_editor_menu_count = 0u;
+    g_host.old_playtest_editor_slider_count = 0u;
+}
+
+static int apply_old_playtest_camera(float player_x) {
+    float base_y, camera_x, camera_y;
+    float scale_x, scale_y;
+    if (!g_host.old_playtest_editor_game_layer || !g_host.old_playtest_play_game_layer)
+        return 0;
+    base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
+    scale_x = g_host.old_playtest_editor_camera_original_scale_x * OLD_PLAYTEST_CAMERA_ZOOM;
+    scale_y = g_host.old_playtest_editor_camera_original_scale_y * OLD_PLAYTEST_CAMERA_ZOOM;
+    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x * scale_x;
+    if (camera_x > 0.0f) camera_x = 0.0f;
+    camera_y = (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_Y +
+               OLD_PLAYTEST_CAMERA_ZOOM * base_y;
+    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, scale_x);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, scale_y);
+    g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer, camera_x, camera_y);
+    if (g_host.old_playtest_trail) {
+        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, scale_x);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, scale_y);
+        g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
+    }
+    return 1;
 }
 
 static int read_old_playtest_player_velocity(double *vx, double *vy) {
@@ -1814,10 +1980,8 @@ static void hide_old_playtest_trajectory(void) {
 
 static int update_old_playtest_trajectory(float x, float y) {
     int i, on_ground = 0, gravity = 0, mode;
-    double raw_vx = 0.0, raw_vy = 0.0;
-    float dx, dy;
-    double dt_game = 0.0, raw_ay = 0.0, previous_raw_vy = 0.0;
-    int acceleration_sample_valid = 0, vertical_impulse = 0;
+    float dx, dy, previous_vy, acceleration;
+    int moving_sample, jump_started, gravity_changed, impulse;
     float px, py;
     GdCcColor3B orange = {255u, 84u, 0u};
     if (!g_host.old_playtest_trail) return 1;
@@ -1828,17 +1992,13 @@ static int update_old_playtest_trajectory(float x, float y) {
     if (g_host.player_get_gravity_flipped)
         gravity = g_host.player_get_gravity_flipped(g_host.old_playtest_player) != 0;
 
-    /* A ballistic line is meaningful for cube/ball. Ship/UFO depends on held
-       input every frame, so don't draw a fake parabola for those modes. */
+    /* Cube and ball have ballistic arcs. Ship/UFO are continuously controlled,
+       so a static parabola would lie about where the player is going. */
     if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
         g_host.old_playtest_trajectory_anchor_valid = 0;
         g_host.old_playtest_motion_has_last = 0;
         g_host.old_playtest_motion_has_velocity = 0;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-    if (!read_old_playtest_player_velocity(&raw_vx, &raw_vy)) {
-        g_host.old_playtest_trajectory_anchor_valid = 0;
+        g_host.old_playtest_motion_prev_on_ground_valid = 0;
         hide_old_playtest_trajectory();
         return 1;
     }
@@ -1846,119 +2006,96 @@ static int update_old_playtest_trajectory(float x, float y) {
     if (!g_host.old_playtest_motion_has_last) {
         g_host.old_playtest_motion_last_x = x;
         g_host.old_playtest_motion_last_y = y;
-        g_host.old_playtest_motion_vx = (float)raw_vx;
-        g_host.old_playtest_motion_vy = (float)raw_vy;
         g_host.old_playtest_motion_has_last = 1;
-        g_host.old_playtest_motion_has_velocity = 1;
+        g_host.old_playtest_motion_prev_on_ground = on_ground;
+        g_host.old_playtest_motion_prev_on_ground_valid = 1;
         hide_old_playtest_trajectory();
         return 1;
     }
 
     dx = x - g_host.old_playtest_motion_last_x;
     dy = y - g_host.old_playtest_motion_last_y;
-    /* The bridge runs once before and once after nativeRender. Only the latter
-       advances PlayerObject, so ignore the duplicate zero-motion sample. */
-    if (dx * dx + dy * dy < 0.0001f) return 1;
+    moving_sample = dx * dx + dy * dy >= 0.0001f;
+    if (!moving_sample) return 1; /* pre/post-render duplicate sample */
 
-    previous_raw_vy = (double)g_host.old_playtest_motion_vy;
-    if (g_host.old_playtest_motion_has_velocity &&
-        fabs(g_host.old_playtest_motion_vx) > 1.0f) {
-        dt_game = (double)dx / (double)g_host.old_playtest_motion_vx;
-        if (dt_game > 0.001 && dt_game < 0.100) {
-            raw_ay = (raw_vy - (double)g_host.old_playtest_motion_vy) / dt_game;
-            if (isfinite(raw_ay) && fabs(raw_ay) > 1.0 && fabs(raw_ay) < 20000.0)
-                acceleration_sample_valid = 1;
+    previous_vy = g_host.old_playtest_motion_vy;
+    jump_started = g_host.old_playtest_motion_prev_on_ground_valid &&
+                   g_host.old_playtest_motion_prev_on_ground && !on_ground;
+    gravity_changed = g_host.old_playtest_trajectory_anchor_valid &&
+                      g_host.old_playtest_trajectory_anchor_gravity != gravity;
+    acceleration = g_host.old_playtest_motion_has_velocity ? dy - previous_vy : 0.0f;
+    impulse = g_host.old_playtest_motion_has_velocity && fabsf(acceleration) > 1.75f;
+
+    /* Position deltas are the most version-stable motion signal we have. The
+       old ARM/x86 PlayerObject layouts move around between releases, while
+       CCNode position is already the exact world-space result of physics. */
+    if (on_ground && fabsf(dy) < 0.08f) {
+        g_host.old_playtest_trajectory_anchor_valid = 0;
+        g_host.old_playtest_trajectory_sample_count = 0;
+        hide_old_playtest_trajectory();
+    } else if (jump_started || gravity_changed || impulse ||
+               (!g_host.old_playtest_trajectory_anchor_valid && fabsf(dy) >= 0.08f)) {
+        g_host.old_playtest_trajectory_anchor_valid = 1;
+        g_host.old_playtest_trajectory_anchor_mode = mode;
+        g_host.old_playtest_trajectory_anchor_gravity = gravity;
+        g_host.old_playtest_trajectory_anchor_x = x;
+        g_host.old_playtest_trajectory_anchor_y = y;
+        g_host.old_playtest_trajectory_anchor_vx = dx;
+        g_host.old_playtest_trajectory_anchor_vy = dy;
+        /* Draw immediately instead of waiting for a later gravity sample.
+           The measured acceleration below quickly replaces this fallback. */
+        g_host.old_playtest_trajectory_anchor_ay = gravity ? 0.35f : -0.35f;
+        g_host.old_playtest_trajectory_sample_count = 1;
+        hide_old_playtest_trajectory();
+    } else {
+        /* Calibrate gravity from the next few real physics steps after the
+           launch. This avoids hard-coded PlayerObject offsets and also adapts
+           to speed/gravity changes in old versions. */
+        if (fabsf(acceleration) > 0.01f && fabsf(acceleration) < 2.0f) {
+            if (g_host.old_playtest_trajectory_sample_count == 0)
+                g_host.old_playtest_trajectory_anchor_ay = acceleration;
+            else
+                g_host.old_playtest_trajectory_anchor_ay =
+                    g_host.old_playtest_trajectory_anchor_ay * 0.65f +
+                    acceleration * 0.35f;
+            ++g_host.old_playtest_trajectory_sample_count;
+        }
+
+        if (g_host.old_playtest_trajectory_sample_count >= 1) {
+            px = g_host.old_playtest_trajectory_anchor_x;
+            py = g_host.old_playtest_trajectory_anchor_y;
+            for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
+                const float t = (float)(i + 1) * 2.5f; /* physics frames */
+                const float nx = g_host.old_playtest_trajectory_anchor_x +
+                                 g_host.old_playtest_trajectory_anchor_vx * t;
+                const float ny = g_host.old_playtest_trajectory_anchor_y +
+                                 g_host.old_playtest_trajectory_anchor_vy * t +
+                                 0.5f * g_host.old_playtest_trajectory_anchor_ay * t * t;
+                if (!g_host.old_playtest_trajectory[i]) {
+                    g_host.old_playtest_trajectory[i] = g_host.sprite_create_file("square.png");
+                    if (!g_host.old_playtest_trajectory[i]) return 0;
+                    g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
+                    if (!add_extras_child(g_host.old_playtest_trail,
+                                          g_host.old_playtest_trajectory[i],
+                                          5000 + i)) return 0;
+                }
+                g_host.ccnode_set_visible(g_host.old_playtest_trajectory[i], 1);
+                position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
+                                                  px, py, nx, ny, 0.080f);
+                px = nx;
+                py = ny;
+            }
+            g_host.old_playtest_trajectory_initialized = 1;
         }
     }
-    vertical_impulse = fabs(raw_vy - previous_raw_vy) > 80.0;
+
     g_host.old_playtest_motion_last_x = x;
     g_host.old_playtest_motion_last_y = y;
-    g_host.old_playtest_motion_vx = (float)raw_vx;
-    g_host.old_playtest_motion_vy = (float)raw_vy;
+    g_host.old_playtest_motion_vx = dx;
+    g_host.old_playtest_motion_vy = dy;
     g_host.old_playtest_motion_has_velocity = 1;
-
-    if (on_ground) {
-        g_host.old_playtest_trajectory_anchor_valid = 0;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-    if (vertical_impulse) {
-        g_host.old_playtest_trajectory_anchor_valid = 1;
-        g_host.old_playtest_trajectory_anchor_mode = mode;
-        g_host.old_playtest_trajectory_anchor_gravity = gravity;
-        g_host.old_playtest_trajectory_anchor_x = x;
-        g_host.old_playtest_trajectory_anchor_y = y;
-        g_host.old_playtest_trajectory_anchor_vx = (float)raw_vx;
-        g_host.old_playtest_trajectory_anchor_vy = (float)raw_vy;
-        g_host.old_playtest_trajectory_anchor_ay = 0.0f;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-
-    /* Snapshot the real launch state in world space. We wait for one more
-       physics tick before drawing so gravity is measured from the game's own
-       vertical-velocity field instead of guessing a made-up acceleration. */
-    if (!g_host.old_playtest_trajectory_anchor_valid ||
-        g_host.old_playtest_trajectory_anchor_mode != mode ||
-        g_host.old_playtest_trajectory_anchor_gravity != gravity) {
-        g_host.old_playtest_trajectory_anchor_valid = 1;
-        g_host.old_playtest_trajectory_anchor_mode = mode;
-        g_host.old_playtest_trajectory_anchor_gravity = gravity;
-        g_host.old_playtest_trajectory_anchor_x = x;
-        g_host.old_playtest_trajectory_anchor_y = y;
-        g_host.old_playtest_trajectory_anchor_vx = (float)raw_vx;
-        g_host.old_playtest_trajectory_anchor_vy = (float)raw_vy;
-        g_host.old_playtest_trajectory_anchor_ay = 0.0f;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-    if (fabsf(g_host.old_playtest_trajectory_anchor_ay) < 1.0f &&
-        acceleration_sample_valid) {
-        g_host.old_playtest_trajectory_anchor_ay = (float)raw_ay;
-        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_TRAJECTORY_CALIBRATED vx=%.3f vy=%.3f ay=%.3f",
-                    g_host.old_playtest_trajectory_anchor_vx,
-                    g_host.old_playtest_trajectory_anchor_vy,
-                    g_host.old_playtest_trajectory_anchor_ay);
-    }
-    if (fabsf(g_host.old_playtest_trajectory_anchor_ay) < 1.0f) {
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-
-    px = g_host.old_playtest_trajectory_anchor_x;
-    py = g_host.old_playtest_trajectory_anchor_y;
-    for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
-        /* update() multiplies the velocity fields by the game's scaled dt.
-           0.045 is ~50 ms of real time at the old 0.9 time scale. */
-        const float t = (float)(i + 1) * 0.045f;
-        const float nx = g_host.old_playtest_trajectory_anchor_x +
-                         g_host.old_playtest_trajectory_anchor_vx * t;
-        const float ny = g_host.old_playtest_trajectory_anchor_y +
-                         g_host.old_playtest_trajectory_anchor_vy * t +
-                         0.5f * g_host.old_playtest_trajectory_anchor_ay * t * t;
-        const float camera_y = g_host.old_playtest_play_game_layer
-            ? g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer) : 0.0f;
-        if (ny + camera_y < 82.0f) {
-            int j;
-            for (j = i; j < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++j)
-                if (g_host.old_playtest_trajectory[j])
-                    g_host.ccnode_set_visible(g_host.old_playtest_trajectory[j], 0);
-            break;
-        }
-        if (!g_host.old_playtest_trajectory[i]) {
-            g_host.old_playtest_trajectory[i] = g_host.sprite_create_file("square.png");
-            if (!g_host.old_playtest_trajectory[i]) return 0;
-            g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
-            if (!add_extras_child(g_host.old_playtest_trail,
-                                  g_host.old_playtest_trajectory[i],
-                                  5000 + i)) return 0;
-        }
-        position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
-                                          px, py, nx, ny, 0.080f);
-        px = nx;
-        py = ny;
-    }
-    g_host.old_playtest_trajectory_initialized = 1;
+    g_host.old_playtest_motion_prev_on_ground = on_ground;
+    g_host.old_playtest_motion_prev_on_ground_valid = 1;
     return 1;
 }
 
@@ -2004,7 +2141,7 @@ static int start_inline_old_playtest(void) {
     void *play_game_layer;
     void *editor_game_layer;
     unsigned char *test_mode;
-    float player_x, camera_x, camera_y;
+    float player_x;
     if (g_host.old_playtest_layer) return 1;
     editor_ui = find_active_editor_ui();
     if (!editor_ui || !g_host.active_editor_layer ||
@@ -2028,11 +2165,20 @@ static int start_inline_old_playtest(void) {
        previous value (normally NULL) so manual PlayLayer teardown cannot leave
        GameManager pointing at a dead hidden test layer. */
     g_host.old_playtest_previous_play_layer = NULL;
-    if (g_host.game_manager_shared_state && g_host.game_manager_get_play_layer) {
+    g_host.old_playtest_previous_edit_mode_valid = 0;
+    if (g_host.game_manager_shared_state) {
         game_manager = g_host.game_manager_shared_state();
-        if (game_manager)
+        if (game_manager && g_host.game_manager_get_play_layer)
             g_host.old_playtest_previous_play_layer =
                 g_host.game_manager_get_play_layer(game_manager);
+        if (game_manager && g_host.game_manager_get_edit_mode &&
+            g_host.game_manager_set_edit_mode) {
+            g_host.old_playtest_previous_edit_mode =
+                g_host.game_manager_get_edit_mode(game_manager);
+            g_host.old_playtest_previous_edit_mode_valid = 1;
+            runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDIT_MODE_SAVED value=%d",
+                        g_host.old_playtest_previous_edit_mode);
+        }
     }
 
     /* Never hand the editor's live GJGameLevel to PlayLayer. Old PlayLayer
@@ -2056,6 +2202,7 @@ static int start_inline_old_playtest(void) {
     play_layer = g_host.play_layer_create(level_clone);
     if (!play_layer) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        restore_old_playtest_edit_mode();
         return 0;
     }
     /* Hold an explicit retain on the hidden PlayLayer. Stop parks it in the
@@ -2065,6 +2212,7 @@ static int start_inline_old_playtest(void) {
                 g_host.old_playtest_test_mode_offset;
     if (!memory_range_is_readable(test_mode, 1u)) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        restore_old_playtest_edit_mode();
         log_old_playtest_unavailable("invalid-PlayLayer-test-mode-layout");
         return 1;
     }
@@ -2072,11 +2220,13 @@ static int start_inline_old_playtest(void) {
 
     if (!add_extras_child(g_host.active_scene_root, play_layer, -10000)) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        restore_old_playtest_edit_mode();
         return 0;
     }
     if (!start_old_playtest_preserving_first_attempt(play_layer)) {
         g_host.ccnode_remove(play_layer, 1);
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        restore_old_playtest_edit_mode();
         return 0;
     }
     player = g_host.play_layer_get_player(play_layer);
@@ -2085,6 +2235,7 @@ static int start_inline_old_playtest(void) {
     if (!player || !play_game_layer || !editor_game_layer) {
         g_host.ccnode_remove(play_layer, 1);
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
+        restore_old_playtest_edit_mode();
         return 0;
     }
 
@@ -2104,11 +2255,16 @@ static int start_inline_old_playtest(void) {
         g_host.ccnode_get_position_x(editor_game_layer);
     g_host.old_playtest_editor_camera_original_y =
         g_host.ccnode_get_position_y(editor_game_layer);
+    g_host.old_playtest_editor_camera_original_scale_x =
+        g_host.ccnode_get_scale_x(editor_game_layer);
+    g_host.old_playtest_editor_camera_original_scale_y =
+        g_host.ccnode_get_scale_y(editor_game_layer);
     g_host.old_playtest_editor_camera_original_valid = 1;
     /* Gameplay touches must never fall through to EditorUI/LevelEditorLayer.
        newera9 proved teardown was not the placement-crash source; the editor
        was still consuming every jump touch behind the hidden PlayLayer. */
     set_old_playtest_editor_input_enabled(0);
+    set_old_playtest_editor_controls_enabled(0);
     g_host.old_playtest_death_grace_until = GetTickCount64() + OLD_PLAYTEST_DEATH_GRACE_MS;
     if (!set_old_playtest_destroy_player_suppressed(1) ||
         !set_old_playtest_reset_level_suppressed(1)) {
@@ -2140,12 +2296,10 @@ static int start_inline_old_playtest(void) {
        Match the gameplay camera vertically with no extra +20 offset; that
        extra offset pushed screen-limited ship/ball movement off the top. */
     g_host.ccnode_set_visible(play_layer, 0);
-    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
-    if (camera_x > 0.0f) camera_x = 0.0f;
-    camera_y = g_host.ccnode_get_position_y(play_game_layer) +
-               OLD_PLAYTEST_CAMERA_Y_OFFSET;
-    g_host.ccnode_set_position(editor_game_layer, camera_x, camera_y);
-    g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
+    if (!apply_old_playtest_camera(player_x)) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
     if (!update_old_playtest_proxy_transform()) {
         (void)stop_inline_old_playtest();
         return 0;
@@ -2164,7 +2318,12 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=0 scene-isolated=1 editor-input=suspended");
+    if (!set_old_playtest_mirror_suppressed(1)) {
+        runtime_log("ERROR: could not disable PlayLayer::toggleFlipped");
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.92 scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2174,9 +2333,12 @@ static int stop_inline_old_playtest(void) {
     if (!g_host.old_playtest_layer) {
         if (g_host.old_playtest_editor_input_suspended)
             set_old_playtest_editor_input_enabled(1);
+        set_old_playtest_editor_controls_enabled(1);
         (void)set_old_playtest_reset_level_suppressed(0);
         (void)set_old_playtest_destroy_player_suppressed(0);
         (void)set_old_playtest_end_trigger_suppressed(0);
+        (void)set_old_playtest_mirror_suppressed(0);
+        restore_old_playtest_edit_mode();
         if (g_host.old_playtest_play_button)
             g_host.ccnode_set_visible(g_host.old_playtest_play_button, 1);
         if (g_host.old_playtest_stop_button)
@@ -2194,6 +2356,10 @@ static int stop_inline_old_playtest(void) {
         g_host.old_playtest_editor_game_layer &&
         memory_range_is_readable(g_host.old_playtest_editor_game_layer,
                                  sizeof(void *))) {
+        g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer,
+            g_host.old_playtest_editor_camera_original_scale_x);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer,
+            g_host.old_playtest_editor_camera_original_scale_y);
         g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
             g_host.old_playtest_editor_camera_original_x,
             g_host.old_playtest_editor_camera_original_y);
@@ -2201,6 +2367,7 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_editor_camera_original_valid = 0;
     if (g_host.old_playtest_editor_input_suspended)
         set_old_playtest_editor_input_enabled(1);
+    set_old_playtest_editor_controls_enabled(1);
 
     /* Do not remove ANY playtest node while the old editor scene is alive.
        newera8 still reproduced strlen(0x210) after remove(..., false), proving
@@ -2247,12 +2414,20 @@ static int stop_inline_old_playtest(void) {
                 manager, g_host.old_playtest_previous_play_layer);
     }
     g_host.old_playtest_previous_play_layer = NULL;
+    restore_old_playtest_edit_mode();
+    if (g_host.editor_ui_update_slider && g_host.old_playtest_ui &&
+        memory_range_is_readable(g_host.old_playtest_ui, sizeof(void *))) {
+        g_host.editor_ui_update_slider(g_host.old_playtest_ui);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_SLIDER_RESYNCED");
+    }
     /* The scene parent + explicit retain intentionally keep the retired
        PlayLayer and private level alive. This is diagnostic/stability-first:
        zero teardown is much safer than a repeatable post-play editor UAF. */
     g_host.old_playtest_level_clone = NULL;
     if (!set_old_playtest_end_trigger_suppressed(0))
         runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
+    if (!set_old_playtest_mirror_suppressed(0))
+        runtime_log("ERROR: failed to restore PlayLayer::toggleFlipped");
 
     if (g_host.old_playtest_play_button)
         g_host.ccnode_set_visible(g_host.old_playtest_play_button, 1);
@@ -2275,17 +2450,20 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_trajectory_initialized = 0;
     g_host.old_playtest_motion_has_last = 0;
     g_host.old_playtest_motion_has_velocity = 0;
+    g_host.old_playtest_motion_prev_on_ground = 0;
+    g_host.old_playtest_motion_prev_on_ground_valid = 0;
+    g_host.old_playtest_trajectory_sample_count = 0;
     g_host.old_playtest_trajectory_anchor_valid = 0;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=restored edit-mode=restored slider=resynced");
     return 1;
 }
 
 static int update_inline_old_playtest(void) {
-    float player_x, camera_x, camera_y;
+    float player_x;
     void *current_player;
     if (!g_host.old_playtest_layer) return 1;
     if ((g_host.old_playtest_destroy_player_suppressed ||
@@ -2308,14 +2486,7 @@ static int update_inline_old_playtest(void) {
 
     player_x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
     suppress_old_playtest_end_portal(g_host.old_playtest_layer, player_x);
-    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
-    if (camera_x > 0.0f) camera_x = 0.0f;
-    camera_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer) +
-               OLD_PLAYTEST_CAMERA_Y_OFFSET;
-    g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
-                               camera_x, camera_y);
-    if (g_host.old_playtest_trail)
-        g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
+    if (!apply_old_playtest_camera(player_x)) return 0;
     return update_old_playtest_proxy_transform();
 }
 
@@ -3107,6 +3278,12 @@ int main(int argc, char **argv) {
     g_host.game_manager_set_play_layer =
         (GameManagerSetPlayLayerFunction)elf_image_find_export(
             &image, "_ZN11GameManager12setPlayLayerEP9PlayLayer");
+    g_host.game_manager_get_edit_mode =
+        (IntGetterFunction)elf_image_find_export(
+            &image, "_ZNK11GameManager11getEditModeEv");
+    g_host.game_manager_set_edit_mode =
+        (IntSetterFunction)elf_image_find_export(
+            &image, "_ZN11GameManager11setEditModeEb");
     g_host.ccnode_get_tag = (CcNodeGetTagFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode6getTagEv");
     if (!g_host.ccnode_get_tag)
@@ -3281,6 +3458,14 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d8CCSprite8setColorERKNS_10_ccColor3BE");
     g_host.cc_menu_create = (CcMenuCreateFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCMenu6createEv");
+    g_host.ccmenu_is_enabled = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCMenu9isEnabledEv");
+    g_host.ccmenu_set_enabled = (IntSetterFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCMenu10setEnabledEb");
+    g_host.editor_ui_update_slider = (CcNodeNoArgFunction)elf_image_find_export(
+        &image, "_ZN8EditorUI12updateSliderEv");
+    g_host.play_layer_toggle_flipped = elf_image_find_export(
+        &image, "_ZN9PlayLayer13toggleFlippedEbb");
     g_host.menu_item_sprite_extra_create =
         (CcMenuItemSpriteExtraCreateFunction)elf_image_find_export(
             &image,
