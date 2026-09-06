@@ -62,3 +62,19 @@ _gd_call_sret_string_x86:
     addl $4, %esp
     popl %ebp
     ret
+
+
+    /* Call an old i386 C++ method returning ccColor3B by hidden sret pointer.
+       colorForIdx(int) uses: hidden output, this, int; callee ret $4 cleans the
+       hidden pointer, so the bridge removes only the two ordinary arguments. */
+    .globl _gd_call_sret_color3b_x86
+_gd_call_sret_color3b_x86:
+    pushl %ebp
+    movl %esp, %ebp
+    pushl 20(%ebp)
+    pushl 16(%ebp)
+    pushl 12(%ebp)
+    call *8(%ebp)
+    addl $8, %esp
+    popl %ebp
+    ret

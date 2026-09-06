@@ -5,6 +5,7 @@
 #include <GL/gl.h>
 
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,7 @@ typedef void (__cdecl *CcNodeSetFloatFunction)(void *self, float value);
 typedef void *(__cdecl *CcNodeCreateFunction)(void);
 typedef void (__cdecl *CcNodeRemoveFunction)(void *self, int cleanup);
 typedef void (__cdecl *CcNodeSetVisibleFunction)(void *self, int visible);
+typedef void (__cdecl *CcNodeNoArgFunction)(void *self);
 typedef void (__cdecl *CcObjectRefFunction)(void *self);
 typedef void *(__cdecl *LevelEditorGetLevelFunction)(void *self);
 typedef void *(__cdecl *NodeGetterFunction)(void *self);
@@ -87,6 +89,7 @@ typedef struct { unsigned char r, g, b, a; } GdCcColor4B;
 typedef void *(__cdecl *CcLayerColorCreateFunction)(const GdCcColor4B *color);
 
 extern void gd_call_sret_string_x86(void *function, void *output, void *self);
+extern void gd_call_sret_color3b_x86(void *function, void *output, void *self, int index);
 
 typedef struct {
     HWND window;
@@ -163,6 +166,9 @@ typedef struct {
     CcNodeCreateFunction ccnode_create;
     CcNodeRemoveFunction ccnode_remove;
     CcNodeSetVisibleFunction ccnode_set_visible;
+    CcNodeNoArgFunction ccnode_unschedule_update;
+    CcNodeNoArgFunction ccnode_unschedule_all_selectors;
+    CcNodeNoArgFunction ccnode_stop_all_actions;
     CcObjectRefFunction ccobject_retain;
     CcObjectRefFunction ccobject_release;
     LevelEditorGetLevelFunction level_editor_get_level;
@@ -177,6 +183,8 @@ typedef struct {
     PlayLayerCreateFunction play_layer_create;
     PlayLayerStartGameFunction play_layer_start_game;
     void *play_layer_reset_level;
+    void *play_layer_update_attempts;
+    void *play_layer_destroy_player;
     void *play_layer_get_test_mode;
     NodeGetterFunction play_layer_get_player;
     NodeGetterFunction play_layer_get_game_layer;
@@ -188,6 +196,9 @@ typedef struct {
     IntGetterFunction game_manager_get_player_ship;
     IntGetterFunction game_manager_get_player_ball;
     IntGetterFunction game_manager_get_player_bird;
+    IntGetterFunction game_manager_get_player_color;
+    IntGetterFunction game_manager_get_player_color2;
+    void *game_manager_color_for_idx;
     CcSpriteCreateWithFrameFunction sprite_create_with_frame;
     CcSpriteCreateFileFunction sprite_create_file;
     CcSpriteSetColorFunction sprite_set_color;
@@ -227,11 +238,27 @@ typedef struct {
     int old_playtest_end_portal_scanned;
     unsigned char old_playtest_end_trigger_original;
     int old_playtest_end_trigger_suppressed;
+    unsigned char old_playtest_destroy_player_original;
+    int old_playtest_destroy_player_suppressed;
+    unsigned char old_playtest_reset_level_original;
+    int old_playtest_reset_level_suppressed;
+    ULONGLONG old_playtest_death_grace_until;
     void *old_playtest_trail;
     float old_playtest_trail_last_x;
     float old_playtest_trail_last_y;
     int old_playtest_trail_has_last;
     unsigned int old_playtest_trail_segments;
+    void *old_playtest_trajectory[10];
+    int old_playtest_trajectory_initialized;
+    float old_playtest_motion_last_x;
+    float old_playtest_motion_last_y;
+    float old_playtest_motion_vx;
+    float old_playtest_motion_vy;
+    int old_playtest_motion_has_last;
+    int old_playtest_motion_has_velocity;
+    float old_playtest_editor_camera_original_x;
+    float old_playtest_editor_camera_original_y;
+    int old_playtest_editor_camera_original_valid;
     uint32_t old_playtest_test_mode_offset;
     int old_playtest_unavailable_logged;
     unsigned int editor_hotkey_miss_logs;
@@ -253,6 +280,9 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
 #define OLD_PLAYTEST_CAMERA_Y_OFFSET 20.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
+#define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
+#define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 10
+#define OLD_PLAYTEST_RAD_TO_DEG 57.29577951308232f
 
 enum {
     OLD_PLAYTEST_MODE_CUBE = 0,
@@ -1211,6 +1241,56 @@ static int set_old_playtest_end_trigger_suppressed(int suppress) {
     return 1;
 }
 
+static int set_old_playtest_reset_level_suppressed(int suppress) {
+    unsigned char replacement;
+    if (!g_host.play_layer_reset_level) return 1;
+    if (suppress) {
+        if (g_host.old_playtest_reset_level_suppressed) return 1;
+        if (!memory_range_is_readable(g_host.play_layer_reset_level, 1u)) return 0;
+        g_host.old_playtest_reset_level_original =
+            *(const unsigned char *)g_host.play_layer_reset_level;
+        replacement = 0xc3u;
+        if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
+            return 0;
+        g_host.old_playtest_reset_level_suppressed = 1;
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD enabled=%ums",
+                    (unsigned)OLD_PLAYTEST_DEATH_GRACE_MS);
+        return 1;
+    }
+    if (!g_host.old_playtest_reset_level_suppressed) return 1;
+    replacement = g_host.old_playtest_reset_level_original;
+    if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
+        return 0;
+    g_host.old_playtest_reset_level_suppressed = 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD restored");
+    return 1;
+}
+
+static int set_old_playtest_destroy_player_suppressed(int suppress) {
+    unsigned char replacement;
+    if (!g_host.play_layer_destroy_player) return 1;
+    if (suppress) {
+        if (g_host.old_playtest_destroy_player_suppressed) return 1;
+        if (!memory_range_is_readable(g_host.play_layer_destroy_player, 1u)) return 0;
+        g_host.old_playtest_destroy_player_original =
+            *(const unsigned char *)g_host.play_layer_destroy_player;
+        replacement = 0xc3u; /* startup grace: ignore destroyPlayer briefly */
+        if (!patch_x86_code(g_host.play_layer_destroy_player, &replacement, 1u))
+            return 0;
+        g_host.old_playtest_destroy_player_suppressed = 1;
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_DEATH_GUARD enabled=%ums",
+                    (unsigned)OLD_PLAYTEST_DEATH_GRACE_MS);
+        return 1;
+    }
+    if (!g_host.old_playtest_destroy_player_suppressed) return 1;
+    replacement = g_host.old_playtest_destroy_player_original;
+    if (!patch_x86_code(g_host.play_layer_destroy_player, &replacement, 1u))
+        return 0;
+    g_host.old_playtest_destroy_player_suppressed = 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_DEATH_GUARD restored");
+    return 1;
+}
+
 static void suppress_old_playtest_end_portal(void *play_layer, float player_x) {
     if (!play_layer || !g_host.ccnode_set_position ||
         !g_host.ccnode_get_position_y) return;
@@ -1296,21 +1376,26 @@ static void *create_old_playtest_item(void *target, const char *frame,
 static int start_old_playtest_preserving_first_attempt(void *play_layer) {
     unsigned char original;
     unsigned char replacement = 0xc3u; /* RET */
-    if (!play_layer || !g_host.play_layer_start_game ||
-        !g_host.play_layer_reset_level ||
-        !memory_range_is_readable(g_host.play_layer_reset_level, 1u)) return 0;
-    original = *(const unsigned char *)g_host.play_layer_reset_level;
-    /* PlayLayer::init has already constructed Attempt 1. The historical
-       startGame() unconditionally calls resetLevel() again, producing the
-       annoying one-second Attempt 1 -> Attempt 2 restart when we instantiate
-       PlayLayer directly inside an old editor. Suppress only that one nested
-       reset while startGame schedules update and marks gameplay active. */
-    if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
+    if (!play_layer || !g_host.play_layer_start_game) return 0;
+
+    /* resetLevel() must run: besides resetting the player it initializes the
+       spawn queues consumed by checkSpawnObjects().  newera6 skipped the whole
+       reset, which produced a null CCArray crash on the first frame.  Suppress
+       only updateAttempts() for this one startGame() so the full gameplay reset
+       happens without advancing the visible Attempt counter. */
+    if (!g_host.play_layer_update_attempts ||
+        !memory_range_is_readable(g_host.play_layer_update_attempts, 1u)) {
+        g_host.play_layer_start_game(play_layer);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_FIRST_ATTEMPT_FALLBACK updateAttempts=missing resetLevel=full");
+        return 1;
+    }
+    original = *(const unsigned char *)g_host.play_layer_update_attempts;
+    if (!patch_x86_code(g_host.play_layer_update_attempts, &replacement, 1u))
         return 0;
     g_host.play_layer_start_game(play_layer);
-    if (!patch_x86_code(g_host.play_layer_reset_level, &original, 1u))
+    if (!patch_x86_code(g_host.play_layer_update_attempts, &original, 1u))
         return 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED startGame-reset=suppressed-once");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED updateAttempts=suppressed-once resetLevel=full");
     return 1;
 }
 
@@ -1364,12 +1449,37 @@ static void remove_old_playtest_proxy_visuals(void) {
     g_host.old_playtest_proxy_tertiary = NULL;
 }
 
+static int old_playtest_get_player_colors(GdCcColor3B *primary,
+                                           GdCcColor3B *secondary) {
+    void *manager;
+    int primary_idx, secondary_idx;
+    if (!primary || !secondary) return 0;
+    *primary = (GdCcColor3B){255u, 255u, 255u};
+    *secondary = (GdCcColor3B){255u, 255u, 255u};
+    if (!g_host.game_manager_shared_state ||
+        !g_host.game_manager_get_player_color ||
+        !g_host.game_manager_get_player_color2 ||
+        !g_host.game_manager_color_for_idx) return 0;
+    manager = g_host.game_manager_shared_state();
+    if (!manager) return 0;
+    primary_idx = g_host.game_manager_get_player_color(manager);
+    secondary_idx = g_host.game_manager_get_player_color2(manager);
+    gd_call_sret_color3b_x86(g_host.game_manager_color_for_idx,
+                             primary, manager, primary_idx);
+    gd_call_sret_color3b_x86(g_host.game_manager_color_for_idx,
+                             secondary, manager, secondary_idx);
+    return 1;
+}
+
 static int rebuild_old_playtest_proxy_visuals(int force) {
-    int mode, icon;
+    int mode, icon, cube_icon;
     char primary_name[64];
     char secondary_name[64];
     char tertiary_name[64];
     const char *prefix;
+    GdCcColor3B primary_color = {255u, 255u, 255u};
+    GdCcColor3B secondary_color = {255u, 255u, 255u};
+    void *manager;
     if (!g_host.old_playtest_player || !g_host.old_playtest_trail) return 1;
     mode = old_playtest_detect_mode();
     icon = old_playtest_icon_for_mode(mode);
@@ -1378,37 +1488,76 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
         icon == g_host.old_playtest_proxy_icon) return 1;
 
     remove_old_playtest_proxy_visuals();
-    if (mode == OLD_PLAYTEST_MODE_SHIP) prefix = "ship";
-    else if (mode == OLD_PLAYTEST_MODE_BALL) prefix = "player_ball";
-    else if (mode == OLD_PLAYTEST_MODE_BIRD) prefix = "bird";
-    else prefix = "player";
-    snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
-    snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
-    snprintf(tertiary_name, sizeof(tertiary_name), "%s_%02d_3_001.png", prefix, icon);
-    g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(primary_name);
-    g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(secondary_name);
-    if (mode == OLD_PLAYTEST_MODE_BIRD)
-        g_host.old_playtest_proxy_tertiary = g_host.sprite_create_with_frame(tertiary_name);
+    (void)old_playtest_get_player_colors(&primary_color, &secondary_color);
 
-    /* Not every historical build ships every icon index/layer. Fall back to
-       that mode's first stock icon before falling all the way back to cube. */
-    if (!g_host.old_playtest_proxy_primary) {
-        icon = (mode == OLD_PLAYTEST_MODE_BALL) ? 0 : 1;
+    if (mode == OLD_PLAYTEST_MODE_SHIP) {
+        /* Ship is one vehicle sprite plus the selected cube sitting inside it.
+           Use the player's real palette on both parts. */
+        snprintf(primary_name, sizeof(primary_name), "ship_%02d_001.png", icon);
+        g_host.old_playtest_proxy_primary =
+            g_host.sprite_create_with_frame(primary_name);
+        manager = g_host.game_manager_shared_state
+                      ? g_host.game_manager_shared_state() : NULL;
+        cube_icon = (manager && g_host.game_manager_get_player_frame)
+                        ? g_host.game_manager_get_player_frame(manager) : 1;
+        if (cube_icon < 1 || cube_icon > 99) cube_icon = 1;
+        snprintf(secondary_name, sizeof(secondary_name),
+                 "player_%02d_001.png", cube_icon);
+        snprintf(tertiary_name, sizeof(tertiary_name),
+                 "player_%02d_2_001.png", cube_icon);
+        g_host.old_playtest_proxy_secondary =
+            g_host.sprite_create_with_frame(secondary_name);
+        g_host.old_playtest_proxy_tertiary =
+            g_host.sprite_create_with_frame(tertiary_name);
+        if (g_host.old_playtest_proxy_primary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_primary,
+                                    &primary_color);
+        if (g_host.old_playtest_proxy_secondary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary,
+                                    &primary_color);
+        if (g_host.old_playtest_proxy_tertiary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary,
+                                    &secondary_color);
+    } else {
+        if (mode == OLD_PLAYTEST_MODE_BALL) prefix = "player_ball";
+        else if (mode == OLD_PLAYTEST_MODE_BIRD) prefix = "bird";
+        else prefix = "player";
         snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
         snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
         snprintf(tertiary_name, sizeof(tertiary_name), "%s_%02d_3_001.png", prefix, icon);
-        g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(primary_name);
-        g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(secondary_name);
-        if (mode == OLD_PLAYTEST_MODE_BIRD)
-            g_host.old_playtest_proxy_tertiary = g_host.sprite_create_with_frame(tertiary_name);
-    }
-    if (!g_host.old_playtest_proxy_primary && mode != OLD_PLAYTEST_MODE_CUBE) {
-        mode = OLD_PLAYTEST_MODE_CUBE;
-        icon = 1;
         g_host.old_playtest_proxy_primary =
-            g_host.sprite_create_with_frame("player_01_001.png");
+            g_host.sprite_create_with_frame(primary_name);
         g_host.old_playtest_proxy_secondary =
-            g_host.sprite_create_with_frame("player_01_2_001.png");
+            g_host.sprite_create_with_frame(secondary_name);
+        if (mode == OLD_PLAYTEST_MODE_BIRD)
+            g_host.old_playtest_proxy_tertiary =
+                g_host.sprite_create_with_frame(tertiary_name);
+        if (!g_host.old_playtest_proxy_primary) {
+            icon = (mode == OLD_PLAYTEST_MODE_BALL) ? 0 : 1;
+            snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
+            snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
+            g_host.old_playtest_proxy_primary =
+                g_host.sprite_create_with_frame(primary_name);
+            g_host.old_playtest_proxy_secondary =
+                g_host.sprite_create_with_frame(secondary_name);
+        }
+        if (!g_host.old_playtest_proxy_primary && mode != OLD_PLAYTEST_MODE_CUBE) {
+            mode = OLD_PLAYTEST_MODE_CUBE;
+            icon = 1;
+            g_host.old_playtest_proxy_primary =
+                g_host.sprite_create_with_frame("player_01_001.png");
+            g_host.old_playtest_proxy_secondary =
+                g_host.sprite_create_with_frame("player_01_2_001.png");
+        }
+        if (g_host.old_playtest_proxy_primary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_primary,
+                                    &primary_color);
+        if (g_host.old_playtest_proxy_secondary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary,
+                                    &secondary_color);
+        if (g_host.old_playtest_proxy_tertiary)
+            g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary,
+                                    &secondary_color);
     }
     if (!g_host.old_playtest_proxy_primary) return 0;
     if (g_host.old_playtest_proxy_tertiary &&
@@ -1421,7 +1570,8 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
                           g_host.old_playtest_proxy_primary, 10000)) return 0;
     g_host.old_playtest_proxy_mode = mode;
     g_host.old_playtest_proxy_icon = icon;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d",
+    g_host.old_playtest_motion_has_velocity = 0;
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d colors=player",
                 mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
                 mode == OLD_PLAYTEST_MODE_BALL ? "ball" :
                 mode == OLD_PLAYTEST_MODE_BIRD ? "bird" : "cube", icon);
@@ -1444,6 +1594,8 @@ static int ensure_old_playtest_button(void) {
         g_host.old_playtest_play_menu = NULL;
         g_host.old_playtest_play_button = NULL;
         if (g_host.old_playtest_layer) {
+            (void)set_old_playtest_reset_level_suppressed(0);
+            (void)set_old_playtest_destroy_player_suppressed(0);
             (void)set_old_playtest_end_trigger_suppressed(0);
             audio_stop_background();
             g_host.old_playtest_layer = NULL;
@@ -1497,11 +1649,37 @@ static void clear_old_playtest_trail(void) {
     g_host.old_playtest_trail = NULL;
     g_host.old_playtest_trail_has_last = 0;
     g_host.old_playtest_trail_segments = 0;
+    memset(g_host.old_playtest_trajectory, 0,
+           sizeof(g_host.old_playtest_trajectory));
+    g_host.old_playtest_trajectory_initialized = 0;
+    g_host.old_playtest_motion_has_last = 0;
+    g_host.old_playtest_motion_has_velocity = 0;
+}
+
+static void position_old_playtest_line_sprite(void *sprite,
+                                               float x1, float y1,
+                                               float x2, float y2,
+                                               float thickness) {
+    float dx, dy, length;
+    if (!sprite) return;
+    dx = x2 - x1;
+    dy = y2 - y1;
+    length = sqrtf(dx * dx + dy * dy);
+    if (length < 0.05f) {
+        g_host.ccnode_set_visible(sprite, 0);
+        return;
+    }
+    g_host.ccnode_set_visible(sprite, 1);
+    g_host.ccnode_set_position(sprite, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f);
+    g_host.ccnode_set_rotation(sprite, atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
+    /* streak.png is 64 px wide. Slight X overlap removes sampling gaps. */
+    g_host.ccnode_set_scale_x(sprite, (length / 64.0f) * 1.12f);
+    g_host.ccnode_set_scale_y(sprite, thickness);
 }
 
 static int append_old_playtest_trail_segment(float x, float y) {
     float dx, dy, distance_squared;
-    void *crumb;
+    void *segment;
     GdCcColor3B green = {0u, 255u, 0u};
     if (!g_host.old_playtest_trail) return 1;
     if (!g_host.old_playtest_trail_has_last) {
@@ -1513,25 +1691,84 @@ static int append_old_playtest_trail_segment(float x, float y) {
     dx = x - g_host.old_playtest_trail_last_x;
     dy = y - g_host.old_playtest_trail_last_y;
     distance_squared = dx * dx + dy * dy;
-    if (distance_squared < 9.0f) return 1;
-    /* A portal/respawn jump should start a new trail span, not bridge space. */
+    if (distance_squared < 0.25f) return 1;
     if (dx > 192.0f || dx < -192.0f || dy > 192.0f || dy < -192.0f ||
         g_host.old_playtest_trail_segments >= 4096u) {
         g_host.old_playtest_trail_last_x = x;
         g_host.old_playtest_trail_last_y = y;
         return 1;
     }
-    crumb = g_host.sprite_create_file("streak.png");
-    if (!crumb) return 0;
-    g_host.sprite_set_color(crumb, &green);
-    g_host.ccnode_set_position(crumb, x, y);
-    /* streak.png is 64x64. About 5 px gives a close-spaced breadcrumb path. */
-    g_host.ccnode_set_scale(crumb, 0.08f);
-    if (!add_extras_child(g_host.old_playtest_trail, crumb,
+    segment = g_host.sprite_create_file("streak.png");
+    if (!segment) return 0;
+    g_host.sprite_set_color(segment, &green);
+    position_old_playtest_line_sprite(segment,
+                                      g_host.old_playtest_trail_last_x,
+                                      g_host.old_playtest_trail_last_y,
+                                      x, y, 0.060f);
+    if (!add_extras_child(g_host.old_playtest_trail, segment,
                           (int)g_host.old_playtest_trail_segments)) return 0;
     ++g_host.old_playtest_trail_segments;
     g_host.old_playtest_trail_last_x = x;
     g_host.old_playtest_trail_last_y = y;
+    return 1;
+}
+
+static int update_old_playtest_trajectory(float x, float y) {
+    int i;
+    float vx, vy, ax, ay, px, py;
+    GdCcColor3B orange = {255u, 72u, 0u};
+    if (!g_host.old_playtest_trail) return 1;
+    if (!g_host.old_playtest_motion_has_last) {
+        g_host.old_playtest_motion_last_x = x;
+        g_host.old_playtest_motion_last_y = y;
+        g_host.old_playtest_motion_has_last = 1;
+        return 1;
+    }
+    vx = x - g_host.old_playtest_motion_last_x;
+    vy = y - g_host.old_playtest_motion_last_y;
+    if (vx > 64.0f || vx < -64.0f || vy > 64.0f || vy < -64.0f) {
+        g_host.old_playtest_motion_has_velocity = 0;
+        g_host.old_playtest_motion_last_x = x;
+        g_host.old_playtest_motion_last_y = y;
+        return 1;
+    }
+    if (!g_host.old_playtest_motion_has_velocity) {
+        g_host.old_playtest_motion_vx = vx;
+        g_host.old_playtest_motion_vy = vy;
+        g_host.old_playtest_motion_has_velocity = 1;
+        g_host.old_playtest_motion_last_x = x;
+        g_host.old_playtest_motion_last_y = y;
+        return 1;
+    }
+    ax = vx - g_host.old_playtest_motion_vx;
+    ay = vy - g_host.old_playtest_motion_vy;
+    if (ax > 1.5f) ax = 1.5f; else if (ax < -1.5f) ax = -1.5f;
+    if (ay > 2.0f) ay = 2.0f; else if (ay < -2.0f) ay = -2.0f;
+    px = x;
+    py = y;
+    for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
+        float t = (float)(i + 1) * 3.0f;
+        float nx = x + vx * t + 0.5f * ax * t * t;
+        float ny = y + vy * t + 0.5f * ay * t * t;
+        if (!g_host.old_playtest_trajectory[i]) {
+            g_host.old_playtest_trajectory[i] =
+                g_host.sprite_create_file("streak.png");
+            if (!g_host.old_playtest_trajectory[i]) return 0;
+            g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
+            if (!add_extras_child(g_host.old_playtest_trail,
+                                  g_host.old_playtest_trajectory[i],
+                                  5000 + i)) return 0;
+        }
+        position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
+                                          px, py, nx, ny, 0.042f);
+        px = nx;
+        py = ny;
+    }
+    g_host.old_playtest_trajectory_initialized = 1;
+    g_host.old_playtest_motion_vx = vx;
+    g_host.old_playtest_motion_vy = vy;
+    g_host.old_playtest_motion_last_x = x;
+    g_host.old_playtest_motion_last_y = y;
     return 1;
 }
 
@@ -1551,13 +1788,17 @@ static int update_old_playtest_proxy_transform(void) {
     sprites[1] = g_host.old_playtest_proxy_secondary;
     sprites[2] = g_host.old_playtest_proxy_tertiary;
     for (index = 0; index < 3; ++index) {
+        float factor = 1.0f;
         if (!sprites[index]) continue;
+        if (g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP &&
+            index > 0) factor = 0.55f;
         g_host.ccnode_set_position(sprites[index], x, y);
         g_host.ccnode_set_rotation(sprites[index], rotation);
-        g_host.ccnode_set_scale_x(sprites[index], scale_x);
-        g_host.ccnode_set_scale_y(sprites[index], scale_y);
+        g_host.ccnode_set_scale_x(sprites[index], scale_x * factor);
+        g_host.ccnode_set_scale_y(sprites[index], scale_y * factor);
     }
-    return append_old_playtest_trail_segment(x, y);
+    if (!append_old_playtest_trail_segment(x, y)) return 0;
+    return update_old_playtest_trajectory(x, y);
 }
 
 static int stop_inline_old_playtest(void);
@@ -1668,6 +1909,17 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
+    g_host.old_playtest_editor_camera_original_x =
+        g_host.ccnode_get_position_x(editor_game_layer);
+    g_host.old_playtest_editor_camera_original_y =
+        g_host.ccnode_get_position_y(editor_game_layer);
+    g_host.old_playtest_editor_camera_original_valid = 1;
+    g_host.old_playtest_death_grace_until = GetTickCount64() + OLD_PLAYTEST_DEATH_GRACE_MS;
+    if (!set_old_playtest_destroy_player_suppressed(1) ||
+        !set_old_playtest_reset_level_suppressed(1)) {
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
 
     player_x = g_host.ccnode_get_position_x(player);
     suppress_old_playtest_end_portal(play_layer, player_x);
@@ -1734,20 +1986,50 @@ static int start_inline_old_playtest(void) {
 
 static int stop_inline_old_playtest(void) {
     if (!g_host.old_playtest_layer) {
+        (void)set_old_playtest_reset_level_suppressed(0);
+        (void)set_old_playtest_destroy_player_suppressed(0);
         (void)set_old_playtest_end_trigger_suppressed(0);
         return 1;
     }
     audio_stop_background();
+    (void)set_old_playtest_reset_level_suppressed(0);
+    (void)set_old_playtest_destroy_player_suppressed(0);
     if (g_host.old_playtest_stop_menu &&
         memory_range_is_readable(g_host.old_playtest_stop_menu, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_stop_menu, 1);
     remove_old_playtest_proxy_visuals();
+    /* Restore the editor camera before removing any test-owned nodes. */
+    if (g_host.old_playtest_editor_camera_original_valid &&
+        g_host.old_playtest_editor_game_layer &&
+        memory_range_is_readable(g_host.old_playtest_editor_game_layer,
+                                 sizeof(void *))) {
+        g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
+            g_host.old_playtest_editor_camera_original_x,
+            g_host.old_playtest_editor_camera_original_y);
+    }
+    g_host.old_playtest_editor_camera_original_valid = 0;
+    /* Remove every wrapper-only visual node before the editor can accept
+       another touch. Retaining breadcrumbs after stop was correlated with the
+       post-play portal/object-placement crash on the real 1.1 ARM build. */
+    clear_old_playtest_trail();
+    if (g_host.old_playtest_player &&
+        memory_range_is_readable(g_host.old_playtest_player, sizeof(void *))) {
+        if (g_host.ccnode_stop_all_actions)
+            g_host.ccnode_stop_all_actions(g_host.old_playtest_player);
+        if (g_host.ccnode_unschedule_all_selectors)
+            g_host.ccnode_unschedule_all_selectors(g_host.old_playtest_player);
+    }
+    if (g_host.old_playtest_layer &&
+        memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *))) {
+        if (g_host.ccnode_stop_all_actions)
+            g_host.ccnode_stop_all_actions(g_host.old_playtest_layer);
+        if (g_host.ccnode_unschedule_all_selectors)
+            g_host.ccnode_unschedule_all_selectors(g_host.old_playtest_layer);
+        if (g_host.ccnode_unschedule_update)
+            g_host.ccnode_unschedule_update(g_host.old_playtest_layer);
+    }
     if (memory_range_is_readable(g_host.old_playtest_layer, sizeof(void *)))
         g_host.ccnode_remove(g_host.old_playtest_layer, 1);
-    /* A manually detached PlayLayer is not guaranteed to reach its destructor
-       immediately. Restore GameManager::m_playLayer explicitly so subsequent
-       editor actions (notably portal placement) cannot dereference the hidden
-       test layer after it has been cleaned up. */
     if (g_host.game_manager_shared_state && g_host.game_manager_set_play_layer) {
         void *manager = g_host.game_manager_shared_state();
         if (manager)
@@ -1755,8 +2037,10 @@ static int stop_inline_old_playtest(void) {
                 manager, g_host.old_playtest_previous_play_layer);
     }
     g_host.old_playtest_previous_play_layer = NULL;
-    if (g_host.old_playtest_level_clone && g_host.ccobject_release)
-        g_host.ccobject_release(g_host.old_playtest_level_clone);
+    /* Deliberately keep our retain on the temporary level clone. Old
+       autorelease pools can destroy the detached PlayLayer later; releasing
+       this clone immediately can leave that delayed destructor with a stale
+       level pointer. It is a tiny per-playtest stability leak. */
     g_host.old_playtest_level_clone = NULL;
     if (!set_old_playtest_end_trigger_suppressed(0))
         runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
@@ -1765,37 +2049,28 @@ static int stop_inline_old_playtest(void) {
         g_host.ccnode_set_visible(g_host.old_playtest_play_menu, 1);
     g_host.old_playtest_layer = NULL;
     g_host.old_playtest_stop_menu = NULL;
-    /* Keep the editor/game-layer pointers while the retained breadcrumb overlay
-       belongs to this scene so it can continue mirroring manual editor panning
-       without ever becoming a child of the editor game layer. */
     g_host.old_playtest_player = NULL;
     g_host.old_playtest_play_game_layer = NULL;
+    g_host.old_playtest_editor_game_layer = NULL;
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
+    g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained-outside-game-layer music=stopped end=restored editor-level=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe visuals=removed music=stopped end=restored camera=restored clone=retained-for-safety");
     return 1;
 }
 
 static int update_inline_old_playtest(void) {
     float player_x, camera_x, camera_y;
     void *current_player;
-    if (!g_host.old_playtest_layer) {
-        /* Retained breadcrumbs are a sibling overlay, not editor game-layer
-           children. Follow later editor panning so the path remains locked to
-           the level after playtest has stopped. */
-        if (g_host.old_playtest_trail && g_host.old_playtest_editor_game_layer &&
-            memory_range_is_readable(g_host.old_playtest_trail, sizeof(void *)) &&
-            memory_range_is_readable(g_host.old_playtest_editor_game_layer,
-                                     sizeof(void *))) {
-            g_host.ccnode_set_position(
-                g_host.old_playtest_trail,
-                g_host.ccnode_get_position_x(g_host.old_playtest_editor_game_layer),
-                g_host.ccnode_get_position_y(g_host.old_playtest_editor_game_layer));
-        }
-        return 1;
+    if (!g_host.old_playtest_layer) return 1;
+    if ((g_host.old_playtest_destroy_player_suppressed ||
+         g_host.old_playtest_reset_level_suppressed) &&
+        GetTickCount64() >= g_host.old_playtest_death_grace_until) {
+        if (!set_old_playtest_reset_level_suppressed(0) ||
+            !set_old_playtest_destroy_player_suppressed(0)) return 0;
     }
     if (!g_host.old_playtest_player || !g_host.old_playtest_play_game_layer ||
         !g_host.old_playtest_editor_game_layer) return 0;
@@ -2694,6 +2969,12 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb");
     g_host.ccnode_set_visible = (CcNodeSetVisibleFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode10setVisibleEb");
+    g_host.ccnode_unschedule_update = (CcNodeNoArgFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode16unscheduleUpdateEv");
+    g_host.ccnode_unschedule_all_selectors = (CcNodeNoArgFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode22unscheduleAllSelectorsEv");
+    g_host.ccnode_stop_all_actions = (CcNodeNoArgFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode14stopAllActionsEv");
     g_host.ccobject_retain = (CcObjectRefFunction)elf_image_find_export(
         &image, "_ZN7cocos2d8CCObject6retainEv");
     g_host.ccobject_release = (CcObjectRefFunction)elf_image_find_export(
@@ -2725,6 +3006,10 @@ int main(int argc, char **argv) {
             &image, "_ZN9PlayLayer9startGameEv");
     g_host.play_layer_reset_level = elf_image_find_export(
         &image, "_ZN9PlayLayer10resetLevelEv");
+    g_host.play_layer_update_attempts = elf_image_find_export(
+        &image, "_ZN9PlayLayer14updateAttemptsEv");
+    g_host.play_layer_destroy_player = elf_image_find_export(
+        &image, "_ZN9PlayLayer13destroyPlayerEv");
     g_host.play_layer_get_test_mode = elf_image_find_export(
         &image, "_ZNK9PlayLayer11getTestModeEv");
     g_host.play_layer_get_player = (NodeGetterFunction)elf_image_find_export(
@@ -2747,6 +3032,12 @@ int main(int argc, char **argv) {
         &image, "_ZNK11GameManager13getPlayerBallEv");
     g_host.game_manager_get_player_bird = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK11GameManager13getPlayerBirdEv");
+    g_host.game_manager_get_player_color = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager14getPlayerColorEv");
+    g_host.game_manager_get_player_color2 = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK11GameManager15getPlayerColor2Ev");
+    g_host.game_manager_color_for_idx = elf_image_find_export(
+        &image, "_ZN11GameManager11colorForIdxEi");
     g_host.sprite_create_with_frame =
         (CcSpriteCreateWithFrameFunction)elf_image_find_export(
             &image, "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc");

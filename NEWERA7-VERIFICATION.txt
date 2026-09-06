@@ -1,0 +1,47 @@
+Geometry Dash Wrapper 0.9.7-newera7 verification notes
+=======================================================
+
+Input diagnosis from the 2026-09-06 user logs
+----------------------------------------------
+- ARM Geometry Dash 1.1 successfully entered the inline editor bridge.
+- The log recorded FIRST_ATTEMPT_PRESERVED, then about one second later the
+  guest called rewindBackgroundMusic again. Old PlayLayer::destroyPlayer()
+  schedules the death/reset action path, so newera7 adds a 1500 ms startup
+  destroyPlayer + resetLevel guard after the required initial reset and restores
+  both original guest instructions afterward.
+- After stopping playtest and returning to editor object placement, the ARM log
+  failed in nativeTouchesEnd with an invalid guest strlen pointer (0x210). The
+  failure occurred after wrapper teardown, so newera7 makes teardown stricter:
+  wrapper visuals are deleted, camera restored, player/PlayLayer actions and
+  selectors stopped, PlayLayer update unscheduled, GameManager::m_playLayer
+  restored, and the retained private GJGameLevel clone is deliberately not
+  released immediately.
+
+QOL implementation
+------------------
+- Breadcrumbs use stretched streak.png sprites from the previous player point
+  to the current point, producing a continuous green line instead of dots.
+- Primary and secondary player colors come from GameManager::getPlayerColor(),
+  getPlayerColor2(), and colorForIdx(). ARM returns the 3-byte color packed in
+  r0; x86 uses a dedicated hidden-sret ABI bridge.
+- Ship proxy consists of the selected ship plus the selected cube primary and
+  secondary layers inside it.
+- Red-orange trajectory consists of ten reusable streak.png line segments. It
+  extrapolates recent per-frame velocity/acceleration and recomputes as motion
+  changes. It is visual guidance rather than collision-aware prediction.
+
+Static/source checks performed
+------------------------------
+- Confirmed required symbols in the supplied/tested ARM and x86 game libraries:
+  PlayLayer::destroyPlayer, GameManager::getPlayerColor/getPlayerColor2,
+  GameManager::colorForIdx, CCNode::unscheduleUpdate, stopAllActions, and
+  unscheduleAllSelectors.
+- Verified x86 colorForIdx ABI from disassembly: hidden result pointer, this,
+  integer index; callee returns with ret $4. Added gd_call_sret_color3b_x86.
+- Verified ARM colorForIdx packs R/G/B into r0 before returning.
+- Source brace/parenthesis counts balance and all newly referenced GameHost /
+  ElfRuntime fields are declared and resolved.
+- Dynarmic builder revision bumped to 118 to prevent stale ARM binaries.
+
+A Windows runtime/build test is still required; this environment does not run
+this project's Windows binaries.

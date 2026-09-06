@@ -1023,6 +1023,8 @@ struct ElfRuntime {
     u32 play_layer_create = 0;
     u32 play_layer_start_game = 0;
     u32 play_layer_reset_level = 0;
+    u32 play_layer_update_attempts = 0;
+    u32 play_layer_destroy_player = 0;
     u32 play_layer_get_test_mode = 0;
     u32 play_layer_get_player = 0;
     u32 play_layer_get_game_layer = 0;
@@ -1034,12 +1036,18 @@ struct ElfRuntime {
     u32 game_manager_get_player_ship = 0;
     u32 game_manager_get_player_ball = 0;
     u32 game_manager_get_player_bird = 0;
+    u32 game_manager_get_player_color = 0;
+    u32 game_manager_get_player_color2 = 0;
+    u32 game_manager_color_for_idx = 0;
     u32 sprite_create_with_frame = 0;
     u32 sprite_create_file = 0;
     u32 sprite_set_color = 0;
     u32 menu_item_sprite_extra_create = 0;
     u32 cc_menu_create = 0;
     u32 ccnode_set_visible = 0;
+    u32 ccnode_unschedule_update = 0;
+    u32 ccnode_unschedule_all_selectors = 0;
+    u32 ccnode_stop_all_actions = 0;
     u32 ccnode_get_position_x = 0;
     u32 ccnode_get_position_y = 0;
     u32 ccnode_get_rotation = 0;
@@ -1619,6 +1627,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.play_layer_start_game = address;
             else if (name == "_ZN9PlayLayer10resetLevelEv")
                 runtime.play_layer_reset_level = address;
+            else if (name == "_ZN9PlayLayer14updateAttemptsEv")
+                runtime.play_layer_update_attempts = address;
+            else if (name == "_ZN9PlayLayer13destroyPlayerEv")
+                runtime.play_layer_destroy_player = address;
             else if (name == "_ZNK9PlayLayer11getTestModeEv")
                 runtime.play_layer_get_test_mode = address;
             else if (name == "_ZNK9PlayLayer9getPlayerEv")
@@ -1641,6 +1653,12 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.game_manager_get_player_ball = address;
             else if (name == "_ZNK11GameManager13getPlayerBirdEv")
                 runtime.game_manager_get_player_bird = address;
+            else if (name == "_ZNK11GameManager14getPlayerColorEv")
+                runtime.game_manager_get_player_color = address;
+            else if (name == "_ZNK11GameManager15getPlayerColor2Ev")
+                runtime.game_manager_get_player_color2 = address;
+            else if (name == "_ZN11GameManager11colorForIdxEi")
+                runtime.game_manager_color_for_idx = address;
             else if (name == "_ZN7cocos2d8CCSprite25createWithSpriteFrameNameEPKc")
                 runtime.sprite_create_with_frame = address;
             else if (name == "_ZN7cocos2d8CCSprite6createEPKc")
@@ -1653,6 +1671,12 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.cc_menu_create = address;
             else if (name == "_ZN7cocos2d6CCNode10setVisibleEb")
                 runtime.ccnode_set_visible = address;
+            else if (name == "_ZN7cocos2d6CCNode16unscheduleUpdateEv")
+                runtime.ccnode_unschedule_update = address;
+            else if (name == "_ZN7cocos2d6CCNode22unscheduleAllSelectorsEv")
+                runtime.ccnode_unschedule_all_selectors = address;
+            else if (name == "_ZN7cocos2d6CCNode14stopAllActionsEv")
+                runtime.ccnode_stop_all_actions = address;
             else if (name == "_ZN10LevelTools8getLevelEi")
                 runtime.level_tools_get_level = address;
             else if (name == "_ZN11GJGameLevel6createEv")
@@ -3367,10 +3391,102 @@ public:
         return true;
     }
 
-    bool StartOldVersionPlaytestPreservingFirstAttempt(u32 play_layer) {
-        if (!play_layer || !runtime_.play_layer_start_game ||
-            !runtime_.play_layer_reset_level) return false;
+    bool SetOldVersionPlaytestResetLevelSuppressed(bool suppress) {
+        if (!runtime_.play_layer_reset_level) return true;
         const u32 symbol = runtime_.play_layer_reset_level;
+        const u32 address = symbol & ~1u;
+        const bool thumb = (symbol & 1u) != 0u;
+        if (suppress) {
+            if (old_playtest_reset_level_suppressed_) return true;
+            if (thumb) {
+                if (!env_.IsMapped(address, 2u)) return false;
+                old_playtest_reset_level_original16_ = env_.MemoryRead16(address);
+                env_.MemoryWrite16(address, 0x4770u);
+            } else {
+                if (!env_.IsMapped(address, 4u)) return false;
+                old_playtest_reset_level_original32_ = env_.MemoryRead32(address);
+                env_.MemoryWrite32(address, 0xE12FFF1Eu);
+            }
+            cpu_.ClearCache();
+            old_playtest_reset_level_thumb_ = thumb;
+            old_playtest_reset_level_suppressed_ = true;
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD enabled=1500ms\n";
+            log_.flush();
+            return true;
+        }
+        if (!old_playtest_reset_level_suppressed_) return true;
+        if (old_playtest_reset_level_thumb_)
+            env_.MemoryWrite16(address, old_playtest_reset_level_original16_);
+        else
+            env_.MemoryWrite32(address, old_playtest_reset_level_original32_);
+        cpu_.ClearCache();
+        old_playtest_reset_level_suppressed_ = false;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD restored\n";
+        log_.flush();
+        return true;
+    }
+
+    bool SetOldVersionPlaytestDestroyPlayerSuppressed(bool suppress) {
+        if (!runtime_.play_layer_destroy_player) return true;
+        const u32 symbol = runtime_.play_layer_destroy_player;
+        const u32 address = symbol & ~1u;
+        const bool thumb = (symbol & 1u) != 0u;
+        if (suppress) {
+            if (old_playtest_destroy_player_suppressed_) return true;
+            if (thumb) {
+                if (!env_.IsMapped(address, 2u)) return false;
+                old_playtest_destroy_player_original16_ = env_.MemoryRead16(address);
+                env_.MemoryWrite16(address, 0x4770u); /* bx lr */
+            } else {
+                if (!env_.IsMapped(address, 4u)) return false;
+                old_playtest_destroy_player_original32_ = env_.MemoryRead32(address);
+                env_.MemoryWrite32(address, 0xE12FFF1Eu); /* bx lr */
+            }
+            cpu_.ClearCache();
+            old_playtest_destroy_player_thumb_ = thumb;
+            old_playtest_destroy_player_suppressed_ = true;
+            old_playtest_death_grace_until_ = std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(1500);
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_DEATH_GUARD enabled=1500ms\n";
+            log_.flush();
+            return true;
+        }
+        if (!old_playtest_destroy_player_suppressed_) return true;
+        if (old_playtest_destroy_player_thumb_)
+            env_.MemoryWrite16(address, old_playtest_destroy_player_original16_);
+        else
+            env_.MemoryWrite32(address, old_playtest_destroy_player_original32_);
+        cpu_.ClearCache();
+        old_playtest_destroy_player_suppressed_ = false;
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_DEATH_GUARD restored\n";
+        log_.flush();
+        return true;
+    }
+
+    bool StartOldVersionPlaytestPreservingFirstAttempt(u32 play_layer) {
+        if (!play_layer || !runtime_.play_layer_start_game) return false;
+
+        /* newera6 incorrectly suppressed resetLevel() itself.  resetLevel() is
+           not just the Attempt counter: it also initializes PlayLayer's spawn
+           queues/CCArrays.  Skipping it leaves checkSpawnObjects() with a null
+           array and crashes on the first render.
+
+           Keep the full reset, but suppress only updateAttempts() for this one
+           startGame() call.  That keeps all gameplay initialization while
+           preventing the synthetic second-attempt bump. */
+        if (!runtime_.play_layer_update_attempts) {
+            const bool ok = RunFunction(runtime_.play_layer_start_game,
+                                        {play_layer}, nullptr,
+                                        "PlayLayer::startGame normal fallback", 0u,
+                                        std::chrono::milliseconds(10000));
+            if (ok) {
+                log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_FIRST_ATTEMPT_FALLBACK updateAttempts=missing resetLevel=full\n";
+                log_.flush();
+            }
+            return ok;
+        }
+
+        const u32 symbol = runtime_.play_layer_update_attempts;
         const u32 address = symbol & ~1u;
         const bool thumb = (symbol & 1u) != 0u;
         u16 original16 = 0u;
@@ -3385,9 +3501,6 @@ public:
             env_.MemoryWrite32(address, 0xE12FFF1Eu); /* bx lr */
         }
         cpu_.ClearCache();
-        /* init() has already built Attempt 1. startGame() normally calls
-           resetLevel() once more, producing the visible Attempt 1 -> 2 jump
-           when PlayLayer is instantiated directly from these old editors. */
         const bool ok = RunFunction(runtime_.play_layer_start_game, {play_layer}, nullptr,
                                     "PlayLayer::startGame preserve first attempt", 0u,
                                     std::chrono::milliseconds(10000));
@@ -3395,7 +3508,7 @@ public:
         else env_.MemoryWrite32(address, original32);
         cpu_.ClearCache();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED startGame-reset=suppressed-once\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_FIRST_ATTEMPT_PRESERVED updateAttempts=suppressed-once resetLevel=full\n";
             log_.flush();
         }
         return ok;
@@ -3568,6 +3681,45 @@ public:
         return ok;
     }
 
+    bool GetOldVersionPlaytestColors(u32& primary_color,
+                                         u32& secondary_color) {
+        primary_color = 0u;
+        secondary_color = 0u;
+        if (!runtime_.game_manager_shared_state ||
+            !runtime_.game_manager_get_player_color ||
+            !runtime_.game_manager_get_player_color2 ||
+            !runtime_.game_manager_color_for_idx) return true;
+        u32 manager = 0u, primary_idx = 0u, secondary_idx = 0u;
+        u32 primary_raw = 0x00ffffffu, secondary_raw = 0x00ffffffu;
+        if (!RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                         "GameManager::sharedState playtest colors", 0u,
+                         std::chrono::milliseconds(300)) || !manager)
+            return true;
+        if (!RunFunction(runtime_.game_manager_get_player_color, {manager},
+                         &primary_idx, "GameManager::getPlayerColor playtest", 0u,
+                         std::chrono::milliseconds(300)) ||
+            !RunFunction(runtime_.game_manager_get_player_color2, {manager},
+                         &secondary_idx, "GameManager::getPlayerColor2 playtest", 0u,
+                         std::chrono::milliseconds(300))) return true;
+        (void)RunFunction(runtime_.game_manager_color_for_idx,
+                          {manager, primary_idx}, &primary_raw,
+                          "GameManager::colorForIdx primary playtest", 0u,
+                          std::chrono::milliseconds(300));
+        (void)RunFunction(runtime_.game_manager_color_for_idx,
+                          {manager, secondary_idx}, &secondary_raw,
+                          "GameManager::colorForIdx secondary playtest", 0u,
+                          std::chrono::milliseconds(300));
+        if (!old_playtest_primary_color_) old_playtest_primary_color_ = Allocate(4u);
+        if (!old_playtest_secondary_color_) old_playtest_secondary_color_ = Allocate(4u);
+        if (!old_playtest_primary_color_ || !old_playtest_secondary_color_)
+            return false;
+        env_.MemoryWrite32(old_playtest_primary_color_, primary_raw);
+        env_.MemoryWrite32(old_playtest_secondary_color_, secondary_raw);
+        primary_color = old_playtest_primary_color_;
+        secondary_color = old_playtest_secondary_color_;
+        return true;
+    }
+
     bool RebuildOldVersionPlaytestProxyVisuals(bool force) {
         if (!old_playtest_player_ || !old_playtest_trail_) return true;
         int mode = DetectOldVersionPlaytestMode();
@@ -3577,19 +3729,8 @@ public:
             return true;
         if (!RemoveOldVersionPlaytestProxyVisuals()) return false;
 
-        const char* prefix = mode == 1 ? "ship" :
-                             mode == 2 ? "player_ball" :
-                             mode == 3 ? "bird" : "player";
-        char primary_name[64]{};
-        char secondary_name[64]{};
-        char tertiary_name[64]{};
-        std::snprintf(primary_name, sizeof(primary_name),
-                      "%s_%02d_001.png", prefix, icon);
-        std::snprintf(secondary_name, sizeof(secondary_name),
-                      "%s_%02d_2_001.png", prefix, icon);
-        std::snprintf(tertiary_name, sizeof(tertiary_name),
-                      "%s_%02d_3_001.png", prefix, icon);
-
+        u32 primary_color = 0u, secondary_color = 0u;
+        if (!GetOldVersionPlaytestColors(primary_color, secondary_color)) return false;
         auto create_frame = [&](const char* name, u32& output) -> bool {
             output = 0u;
             const u32 guest_name = AllocateString(name);
@@ -3598,29 +3739,64 @@ public:
                                &output, "create mode-aware playtest proxy", 0u,
                                std::chrono::milliseconds(700));
         };
-        if (!create_frame(primary_name, old_playtest_proxy_primary_) ||
-            !old_playtest_proxy_primary_) {
-            icon = mode == 2 ? 0 : 1;
-            std::snprintf(primary_name, sizeof(primary_name),
-                          "%s_%02d_001.png", prefix, icon);
-            if (!create_frame(primary_name, old_playtest_proxy_primary_) ||
-                !old_playtest_proxy_primary_) {
+        auto tint = [&](u32 sprite, u32 color, const char* label) -> bool {
+            return !sprite || !color ||
+                   RunFunction(runtime_.sprite_set_color, {sprite, color}, nullptr,
+                               label, 0u, std::chrono::milliseconds(300));
+        };
+
+        char name[64]{};
+        if (mode == 1) {
+            std::snprintf(name, sizeof(name), "ship_%02d_001.png", icon);
+            (void)create_frame(name, old_playtest_proxy_primary_);
+            u32 manager = 0u, cube_icon = 1u;
+            if (runtime_.game_manager_shared_state &&
+                RunFunction(runtime_.game_manager_shared_state, {}, &manager,
+                            "GameManager::sharedState ship cube", 0u,
+                            std::chrono::milliseconds(300)) && manager &&
+                runtime_.game_manager_get_player_frame)
+                (void)RunFunction(runtime_.game_manager_get_player_frame, {manager},
+                                  &cube_icon, "GameManager::getPlayerFrame ship cube", 0u,
+                                  std::chrono::milliseconds(300));
+            if (cube_icon < 1u || cube_icon > 99u) cube_icon = 1u;
+            std::snprintf(name, sizeof(name), "player_%02u_001.png", cube_icon);
+            (void)create_frame(name, old_playtest_proxy_secondary_);
+            std::snprintf(name, sizeof(name), "player_%02u_2_001.png", cube_icon);
+            (void)create_frame(name, old_playtest_proxy_tertiary_);
+            if (!tint(old_playtest_proxy_primary_, primary_color, "tint ship proxy") ||
+                !tint(old_playtest_proxy_secondary_, primary_color, "tint ship cube primary") ||
+                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint ship cube secondary"))
+                return false;
+        } else {
+            const char* prefix = mode == 2 ? "player_ball" :
+                                 mode == 3 ? "bird" : "player";
+            std::snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
+            (void)create_frame(name, old_playtest_proxy_primary_);
+            std::snprintf(name, sizeof(name), "%s_%02d_2_001.png", prefix, icon);
+            (void)create_frame(name, old_playtest_proxy_secondary_);
+            if (mode == 3) {
+                std::snprintf(name, sizeof(name), "%s_%02d_3_001.png", prefix, icon);
+                (void)create_frame(name, old_playtest_proxy_tertiary_);
+            }
+            if (!old_playtest_proxy_primary_) {
+                icon = mode == 2 ? 0 : 1;
+                std::snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
+                (void)create_frame(name, old_playtest_proxy_primary_);
+                std::snprintf(name, sizeof(name), "%s_%02d_2_001.png", prefix, icon);
+                (void)create_frame(name, old_playtest_proxy_secondary_);
+            }
+            if (!old_playtest_proxy_primary_ && mode != 0) {
                 mode = 0;
                 icon = 1;
-                if (!create_frame("player_01_001.png",
-                                  old_playtest_proxy_primary_) ||
-                    !old_playtest_proxy_primary_) return false;
+                (void)create_frame("player_01_001.png", old_playtest_proxy_primary_);
+                (void)create_frame("player_01_2_001.png", old_playtest_proxy_secondary_);
             }
+            if (!tint(old_playtest_proxy_primary_, primary_color, "tint player proxy primary") ||
+                !tint(old_playtest_proxy_secondary_, secondary_color, "tint player proxy secondary") ||
+                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint player proxy tertiary"))
+                return false;
         }
-
-        /* 1.0/1.1 only ship a single ship layer. Avoid looking up non-existent
-           ship overlay frames on those builds; newer builds expose the ship
-           icon getter and have the layered frames. */
-        if (!(mode == 1 && !runtime_.game_manager_get_player_ship)) {
-            (void)create_frame(secondary_name, old_playtest_proxy_secondary_);
-            if (mode == 3)
-                (void)create_frame(tertiary_name, old_playtest_proxy_tertiary_);
-        }
+        if (!old_playtest_proxy_primary_) return false;
         if (old_playtest_proxy_tertiary_ &&
             !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_tertiary_, 9998))
             return false;
@@ -3631,10 +3807,11 @@ public:
             return false;
         old_playtest_proxy_mode_ = mode;
         old_playtest_proxy_icon_ = icon;
+        old_playtest_motion_has_velocity_ = false;
         log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_PROXY_MODE mode="
              << (mode == 1 ? "ship" : mode == 2 ? "ball" :
                  mode == 3 ? "bird" : "cube")
-             << " icon=" << icon << "\n";
+             << " icon=" << icon << " colors=player\n";
         log_.flush();
         return true;
     }
@@ -3657,7 +3834,45 @@ public:
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
+        old_playtest_trajectory_.fill(0u);
+        old_playtest_motion_has_last_ = false;
+        old_playtest_motion_has_velocity_ = false;
         return true;
+    }
+
+    bool PositionOldVersionPlaytestLineSprite(u32 sprite,
+                                               float x1, float y1,
+                                               float x2, float y2,
+                                               float thickness) {
+        if (!sprite) return true;
+        const float dx = x2 - x1;
+        const float dy = y2 - y1;
+        const float length = std::sqrt(dx * dx + dy * dy);
+        if (length < 0.05f)
+            return RunFunction(runtime_.ccnode_set_visible, {sprite, 0u}, nullptr,
+                               "hide short playtest line", 0u,
+                               std::chrono::milliseconds(300));
+        constexpr float kRadToDeg = 57.29577951308232f;
+        return RunFunction(runtime_.ccnode_set_visible, {sprite, 1u}, nullptr,
+                           "show playtest line", 0u,
+                           std::chrono::milliseconds(300)) &&
+               RunFunction(runtime_.ccnode_set_position_ff,
+                           {sprite, FloatToWord((x1 + x2) * 0.5f),
+                            FloatToWord((y1 + y2) * 0.5f)}, nullptr,
+                           "position playtest line", 0u,
+                           std::chrono::milliseconds(300)) &&
+               RunFunction(runtime_.ccnode_set_rotation,
+                           {sprite, FloatToWord(std::atan2(dy, dx) * kRadToDeg)},
+                           nullptr, "rotate playtest line", 0u,
+                           std::chrono::milliseconds(300)) &&
+               RunFunction(runtime_.ccnode_set_scale_x,
+                           {sprite, FloatToWord((length / 64.0f) * 1.12f)},
+                           nullptr, "stretch playtest line", 0u,
+                           std::chrono::milliseconds(300)) &&
+               RunFunction(runtime_.ccnode_set_scale_y,
+                           {sprite, FloatToWord(thickness)}, nullptr,
+                           "thicken playtest line", 0u,
+                           std::chrono::milliseconds(300));
     }
 
     bool AppendOldVersionPlaytestTrailSegment(float x, float y) {
@@ -3670,9 +3885,8 @@ public:
         }
         const float dx = x - old_playtest_trail_last_x_;
         const float dy = y - old_playtest_trail_last_y_;
-        const float distance_squared = dx * dx + dy * dy;
-        if (distance_squared < 9.0f) return true;
-        if (dx > 192.0f || dx < -192.0f || dy > 192.0f || dy < -192.0f ||
+        if (dx * dx + dy * dy < 0.25f) return true;
+        if (std::fabs(dx) > 192.0f || std::fabs(dy) > 192.0f ||
             old_playtest_trail_segments_ >= 4096u) {
             old_playtest_trail_last_x_ = x;
             old_playtest_trail_last_y_ = y;
@@ -3687,28 +3901,90 @@ public:
             if (!old_playtest_green_color_) return false;
             env_.MemoryWrite32(old_playtest_green_color_, 0x0000ff00u);
         }
-        u32 crumb = 0u;
+        u32 segment = 0u;
         if (!RunFunction(runtime_.sprite_create_file, {old_playtest_streak_name_},
-                         &crumb, "CCSprite::create breadcrumb", 0u,
-                         std::chrono::milliseconds(1000)) || !crumb ||
+                         &segment, "CCSprite::create continuous breadcrumb", 0u,
+                         std::chrono::milliseconds(700)) || !segment ||
             !RunFunction(runtime_.sprite_set_color,
-                         {crumb, old_playtest_green_color_}, nullptr,
+                         {segment, old_playtest_green_color_}, nullptr,
                          "CCSprite::setColor breadcrumb green", 0u,
-                         std::chrono::milliseconds(500)) ||
-            !RunFunction(runtime_.ccnode_set_position_ff,
-                         {crumb, FloatToWord(x), FloatToWord(y)}, nullptr,
-                         "CCNode::setPosition breadcrumb", 0u,
-                         std::chrono::milliseconds(500)) ||
-            !RunFunction(runtime_.ccnode_set_scale,
-                         {crumb, FloatToWord(0.08f)}, nullptr,
-                         "CCNode::setScale breadcrumb", 0u,
-                         std::chrono::milliseconds(500)) ||
-            !AddExtrasChild(old_playtest_trail_, crumb,
+                         std::chrono::milliseconds(300)) ||
+            !PositionOldVersionPlaytestLineSprite(
+                segment, old_playtest_trail_last_x_, old_playtest_trail_last_y_,
+                x, y, 0.060f) ||
+            !AddExtrasChild(old_playtest_trail_, segment,
                             static_cast<int>(old_playtest_trail_segments_)))
             return false;
         ++old_playtest_trail_segments_;
         old_playtest_trail_last_x_ = x;
         old_playtest_trail_last_y_ = y;
+        return true;
+    }
+
+    bool UpdateOldVersionPlaytestTrajectory(float x, float y) {
+        if (!old_playtest_trail_) return true;
+        if (!old_playtest_motion_has_last_) {
+            old_playtest_motion_last_x_ = x;
+            old_playtest_motion_last_y_ = y;
+            old_playtest_motion_has_last_ = true;
+            return true;
+        }
+        float vx = x - old_playtest_motion_last_x_;
+        float vy = y - old_playtest_motion_last_y_;
+        if (std::fabs(vx) > 64.0f || std::fabs(vy) > 64.0f) {
+            old_playtest_motion_has_velocity_ = false;
+            old_playtest_motion_last_x_ = x;
+            old_playtest_motion_last_y_ = y;
+            return true;
+        }
+        if (!old_playtest_motion_has_velocity_) {
+            old_playtest_motion_vx_ = vx;
+            old_playtest_motion_vy_ = vy;
+            old_playtest_motion_has_velocity_ = true;
+            old_playtest_motion_last_x_ = x;
+            old_playtest_motion_last_y_ = y;
+            return true;
+        }
+        float ax = std::clamp(vx - old_playtest_motion_vx_, -1.5f, 1.5f);
+        float ay = std::clamp(vy - old_playtest_motion_vy_, -2.0f, 2.0f);
+        if (!old_playtest_orange_color_) {
+            old_playtest_orange_color_ = Allocate(4u);
+            if (!old_playtest_orange_color_) return false;
+            /* ccColor3B bytes in guest memory: R=255, G=72, B=0. */
+            env_.MemoryWrite32(old_playtest_orange_color_, 0x000048ffu);
+        }
+        float px = x, py = y;
+        for (std::size_t i = 0; i < old_playtest_trajectory_.size(); ++i) {
+            const float t = static_cast<float>(i + 1u) * 3.0f;
+            const float nx = x + vx * t + 0.5f * ax * t * t;
+            const float ny = y + vy * t + 0.5f * ay * t * t;
+            if (!old_playtest_trajectory_[i]) {
+                if (!old_playtest_streak_name_)
+                    old_playtest_streak_name_ = AllocateString("streak.png");
+                if (!old_playtest_streak_name_ ||
+                    !RunFunction(runtime_.sprite_create_file,
+                                 {old_playtest_streak_name_},
+                                 &old_playtest_trajectory_[i],
+                                 "CCSprite::create trajectory line", 0u,
+                                 std::chrono::milliseconds(700)) ||
+                    !old_playtest_trajectory_[i] ||
+                    !RunFunction(runtime_.sprite_set_color,
+                                 {old_playtest_trajectory_[i], old_playtest_orange_color_},
+                                 nullptr, "CCSprite::setColor trajectory orange", 0u,
+                                 std::chrono::milliseconds(300)) ||
+                    !AddExtrasChild(old_playtest_trail_, old_playtest_trajectory_[i],
+                                    5000 + static_cast<int>(i))) return false;
+            }
+            if (!PositionOldVersionPlaytestLineSprite(old_playtest_trajectory_[i],
+                                                       px, py, nx, ny, 0.042f))
+                return false;
+            px = nx;
+            py = ny;
+        }
+        old_playtest_motion_vx_ = vx;
+        old_playtest_motion_vy_ = vy;
+        old_playtest_motion_last_x_ = x;
+        old_playtest_motion_last_y_ = y;
         return true;
     }
 
@@ -3728,29 +4004,31 @@ public:
                               scale_x, "CCNode::getScaleX playtest player") ||
             !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
                               scale_y, "CCNode::getScaleY playtest player")) return false;
-        auto update_sprite = [&](u32 sprite) -> bool {
+        auto update_sprite = [&](u32 sprite, float factor) -> bool {
             if (!sprite) return true;
             return RunFunction(runtime_.ccnode_set_position_ff,
                                {sprite, FloatToWord(x), FloatToWord(y)}, nullptr,
                                "CCNode::setPosition playtest proxy", 0u,
-                               std::chrono::milliseconds(500)) &&
+                               std::chrono::milliseconds(300)) &&
                    RunFunction(runtime_.ccnode_set_rotation,
                                {sprite, FloatToWord(rotation)}, nullptr,
                                "CCNode::setRotation playtest proxy", 0u,
-                               std::chrono::milliseconds(500)) &&
+                               std::chrono::milliseconds(300)) &&
                    RunFunction(runtime_.ccnode_set_scale_x,
-                               {sprite, FloatToWord(scale_x)}, nullptr,
+                               {sprite, FloatToWord(scale_x * factor)}, nullptr,
                                "CCNode::setScaleX playtest proxy", 0u,
-                               std::chrono::milliseconds(500)) &&
+                               std::chrono::milliseconds(300)) &&
                    RunFunction(runtime_.ccnode_set_scale_y,
-                               {sprite, FloatToWord(scale_y)}, nullptr,
+                               {sprite, FloatToWord(scale_y * factor)}, nullptr,
                                "CCNode::setScaleY playtest proxy", 0u,
-                               std::chrono::milliseconds(500));
+                               std::chrono::milliseconds(300));
         };
-        if (!update_sprite(old_playtest_proxy_tertiary_) ||
-            !update_sprite(old_playtest_proxy_secondary_) ||
-            !update_sprite(old_playtest_proxy_primary_)) return false;
-        return AppendOldVersionPlaytestTrailSegment(x, y);
+        const float inner_factor = old_playtest_proxy_mode_ == 1 ? 0.55f : 1.0f;
+        if (!update_sprite(old_playtest_proxy_tertiary_, inner_factor) ||
+            !update_sprite(old_playtest_proxy_secondary_, inner_factor) ||
+            !update_sprite(old_playtest_proxy_primary_, 1.0f)) return false;
+        if (!AppendOldVersionPlaytestTrailSegment(x, y)) return false;
+        return UpdateOldVersionPlaytestTrajectory(x, y);
     }
 
     bool StartInlineOldVersionPlaytest() {
@@ -3871,6 +4149,15 @@ public:
         old_playtest_proxy_icon_ = -1;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
+                              old_playtest_editor_camera_original_x_,
+                              "CCNode::getPositionX save editor camera") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y, editor_game_layer,
+                              old_playtest_editor_camera_original_y_,
+                              "CCNode::getPositionY save editor camera")) return false;
+        old_playtest_editor_camera_original_valid_ = true;
+        if (!SetOldVersionPlaytestDestroyPlayerSuppressed(true) ||
+            !SetOldVersionPlaytestResetLevelSuppressed(true)) return false;
 
         float start_player_x = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, player, start_player_x,
@@ -3946,24 +4233,55 @@ public:
     }
 
     bool StopInlineOldVersionPlaytest() {
-        if (!old_playtest_layer_)
+        if (!old_playtest_layer_) {
+            (void)SetOldVersionPlaytestResetLevelSuppressed(false);
+            (void)SetOldVersionPlaytestDestroyPlayerSuppressed(false);
             return SetOldVersionPlaytestEndTriggerSuppressed(false);
+        }
         audio_stop_background();
-        bool ok = true;
+        bool ok = SetOldVersionPlaytestResetLevelSuppressed(false);
+        ok = SetOldVersionPlaytestDestroyPlayerSuppressed(false) && ok;
         if (old_playtest_stop_menu_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_stop_menu_, 1u}, nullptr,
                              "remove inline playtest stop menu", 0u,
                              std::chrono::milliseconds(1000)) && ok;
         if (!RemoveOldVersionPlaytestProxyVisuals()) ok = false;
+        if (old_playtest_editor_camera_original_valid_ &&
+            old_playtest_editor_game_layer_)
+            ok = RunFunction(runtime_.ccnode_set_position_ff,
+                             {old_playtest_editor_game_layer_,
+                              FloatToWord(old_playtest_editor_camera_original_x_),
+                              FloatToWord(old_playtest_editor_camera_original_y_)},
+                             nullptr, "restore editor camera after playtest", 0u,
+                             std::chrono::milliseconds(500)) && ok;
+        old_playtest_editor_camera_original_valid_ = false;
+        /* Remove all wrapper-only visual nodes before another editor touch.
+           Keeping the breadcrumb overlay alive after stop correlated exactly
+           with the 1.1 portal/object-placement crash in the user's logs. */
+        if (!ClearOldVersionPlaytestTrail()) ok = false;
+        auto quiet_node = [&](u32 node, const char* label) {
+            if (!node || !env_.IsMapped(node, 4u)) return;
+            if (runtime_.ccnode_stop_all_actions)
+                ok = RunFunction(runtime_.ccnode_stop_all_actions, {node}, nullptr,
+                                 label, 0u, std::chrono::milliseconds(500)) && ok;
+            if (runtime_.ccnode_unschedule_all_selectors)
+                ok = RunFunction(runtime_.ccnode_unschedule_all_selectors, {node}, nullptr,
+                                 "CCNode::unscheduleAllSelectors playtest teardown", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
+        };
+        quiet_node(old_playtest_player_, "CCNode::stopAllActions playtest player");
+        quiet_node(old_playtest_layer_, "CCNode::stopAllActions hidden PlayLayer");
+        if (old_playtest_layer_ && runtime_.ccnode_unschedule_update)
+            ok = RunFunction(runtime_.ccnode_unschedule_update,
+                             {old_playtest_layer_}, nullptr,
+                             "CCNode::unscheduleUpdate hidden PlayLayer", 0u,
+                             std::chrono::milliseconds(500)) && ok;
         if (old_playtest_layer_)
             ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
                              {old_playtest_layer_, 1u}, nullptr,
                              "remove hidden inline PlayLayer", 0u,
                              std::chrono::milliseconds(3000)) && ok;
-        /* A detached autoreleased PlayLayer may not destruct immediately.
-           Explicitly restore GameManager::m_playLayer before the next editor
-           touch so portal/object placement cannot find a stale test layer. */
         if (runtime_.game_manager_shared_state &&
             runtime_.game_manager_set_play_layer) {
             u32 manager = 0u;
@@ -3976,14 +4294,10 @@ public:
                                  0u, std::chrono::milliseconds(500)) && ok;
         }
         old_playtest_previous_play_layer_ = 0u;
-        /* The clone is explicitly retained before PlayLayer::create so that
-           the editor and the temporary gameplay session never share a live
-           GJGameLevel. Release our retain only after the PlayLayer is gone. */
-        if (old_playtest_level_clone_ && runtime_.ccobject_release)
-            ok = RunFunction(runtime_.ccobject_release,
-                             {old_playtest_level_clone_}, nullptr,
-                             "release playtest level clone", 0u,
-                             std::chrono::milliseconds(1000)) && ok;
+        /* Intentionally do not release our clone retain here. The detached
+           PlayLayer is autoreleased and may destruct later; a delayed
+           destructor touching an already released clone is a worse failure
+           than this tiny per-playtest leak. */
         old_playtest_level_clone_ = 0u;
         if (!SetOldVersionPlaytestEndTriggerSuppressed(false)) ok = false;
         if (old_playtest_play_menu_)
@@ -3993,47 +4307,29 @@ public:
                              std::chrono::milliseconds(500)) && ok;
         old_playtest_layer_ = 0u;
         old_playtest_stop_menu_ = 0u;
-        /* Keep editor/game-layer pointers while the retained breadcrumb
-           overlay belongs to this scene. It is a sibling of the game layer,
-           so it has to mirror later manual editor panning after playtest. */
         old_playtest_player_ = 0u;
         old_playtest_play_game_layer_ = 0u;
+        old_playtest_editor_game_layer_ = 0u;
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe trail=retained-outside-game-layer music=stopped end=restored editor-level=untouched\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=editor-bridge-safe visuals=removed music=stopped end=restored camera=restored clone=retained-for-safety\n";
             log_.flush();
         }
         return ok;
     }
 
     bool UpdateInlineOldVersionPlaytest() {
-        if (!old_playtest_layer_) {
-            /* Breadcrumbs live outside LevelEditorLayer::getGameLayer so the
-               old object-placement code never sees wrapper CCNodes as game
-               objects. Mirror the editor camera after stopping so the retained
-               path stays locked to the level while the user pans/zooms. */
-            if (old_playtest_trail_ && old_playtest_editor_game_layer_ &&
-                env_.IsMapped(old_playtest_trail_, 4u) &&
-                env_.IsMapped(old_playtest_editor_game_layer_, 4u)) {
-                float x = 0.0f, y = 0.0f;
-                if (GuestFloatGetter(runtime_.ccnode_get_position_x,
-                                     old_playtest_editor_game_layer_, x,
-                                     "CCNode::getPositionX retained trail camera") &&
-                    GuestFloatGetter(runtime_.ccnode_get_position_y,
-                                     old_playtest_editor_game_layer_, y,
-                                     "CCNode::getPositionY retained trail camera")) {
-                    (void)RunFunction(runtime_.ccnode_set_position_ff,
-                                      {old_playtest_trail_, FloatToWord(x),
-                                       FloatToWord(y)}, nullptr,
-                                      "mirror retained playtest trail camera", 0u,
-                                      std::chrono::milliseconds(300));
-                }
-            }
-            return true;
+        if (!old_playtest_layer_) return true;
+        if ((old_playtest_destroy_player_suppressed_ ||
+             old_playtest_reset_level_suppressed_) &&
+            std::chrono::steady_clock::now() >= old_playtest_death_grace_until_) {
+            if (!SetOldVersionPlaytestResetLevelSuppressed(false) ||
+                !SetOldVersionPlaytestDestroyPlayerSuppressed(false))
+                return false;
         }
         if (!old_playtest_player_ || !old_playtest_play_game_layer_ ||
             !old_playtest_editor_game_layer_) return false;
@@ -4093,6 +4389,8 @@ public:
         const u32 editor_ui = FindActiveEditorUi();
         if (old_playtest_scene_ != active_scene_root_) {
             if (old_playtest_layer_) {
+                (void)SetOldVersionPlaytestResetLevelSuppressed(false);
+                (void)SetOldVersionPlaytestDestroyPlayerSuppressed(false);
                 (void)SetOldVersionPlaytestEndTriggerSuppressed(false);
                 audio_stop_background();
             }
@@ -8404,6 +8702,15 @@ private:
     bool old_playtest_end_trigger_thumb_ = false;
     u16 old_playtest_end_trigger_original16_ = 0u;
     u32 old_playtest_end_trigger_original32_ = 0u;
+    bool old_playtest_destroy_player_suppressed_ = false;
+    bool old_playtest_destroy_player_thumb_ = false;
+    bool old_playtest_reset_level_suppressed_ = false;
+    bool old_playtest_reset_level_thumb_ = false;
+    u16 old_playtest_destroy_player_original16_ = 0u;
+    u32 old_playtest_destroy_player_original32_ = 0u;
+    u16 old_playtest_reset_level_original16_ = 0u;
+    u32 old_playtest_reset_level_original32_ = 0u;
+    std::chrono::steady_clock::time_point old_playtest_death_grace_until_{};
     u32 old_playtest_trail_ = 0u;
     float old_playtest_trail_last_x_ = 0.0f;
     float old_playtest_trail_last_y_ = 0.0f;
@@ -8411,6 +8718,19 @@ private:
     u32 old_playtest_trail_segments_ = 0u;
     u32 old_playtest_streak_name_ = 0u;
     u32 old_playtest_green_color_ = 0u;
+    u32 old_playtest_primary_color_ = 0u;
+    u32 old_playtest_secondary_color_ = 0u;
+    u32 old_playtest_orange_color_ = 0u;
+    std::array<u32,10> old_playtest_trajectory_{};
+    bool old_playtest_motion_has_last_ = false;
+    bool old_playtest_motion_has_velocity_ = false;
+    float old_playtest_motion_last_x_ = 0.0f;
+    float old_playtest_motion_last_y_ = 0.0f;
+    float old_playtest_motion_vx_ = 0.0f;
+    float old_playtest_motion_vy_ = 0.0f;
+    float old_playtest_editor_camera_original_x_ = 0.0f;
+    float old_playtest_editor_camera_original_y_ = 0.0f;
+    bool old_playtest_editor_camera_original_valid_ = false;
     u32 old_playtest_test_mode_offset_ = 0u;
     bool old_playtest_unavailable_logged_ = false;
     u64 scene_scan_logs_ = 0u;

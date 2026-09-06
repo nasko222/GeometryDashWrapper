@@ -1,0 +1,15 @@
+Geometry Dash Wrapper 0.9.7-newera6-fix1 verification notes
+
+Crash fixed:
+- The supplied 1.1 ARM log crashes at PlayLayer::checkSpawnObjects()+0x25 on a null guest address immediately after newera6 logs FIRST_ATTEMPT_PRESERVED.
+- newera6 achieved that by temporarily replacing PlayLayer::resetLevel() with an immediate return.
+- resetLevel() also initializes PlayLayer spawn-object arrays, so skipping it leaves checkSpawnObjects() dereferencing a null CCArray.
+
+Fix:
+- startGame() now executes the complete resetLevel().
+- Only PlayLayer::updateAttempts() is temporarily suppressed during that one startGame() call, preserving Attempt 1 without skipping gameplay initialization.
+- If updateAttempts() is unavailable on an unusual build, playtest falls back to an unmodified startGame() rather than risking a broken PlayLayer.
+- Applied to both ARM-legacy and x86.
+- Dynarmic builder revision: dynarmic-x64-builder117-0.9.7-newera6-fix1.
+
+No other newera6 playtest/camera/proxy/endless-level changes were intentionally altered in this hotfix.
