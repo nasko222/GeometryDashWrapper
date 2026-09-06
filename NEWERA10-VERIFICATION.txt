@@ -1,0 +1,76 @@
+GeometryDashWrapper 0.9.7-newera10 verification notes
+=======================================================
+
+User evidence used
+------------------
+Latest supplied ARM legacy run is 0.9.7-newera9 on Geometry Dash v1.1.
+The working first-attempt preservation is still present. A normal stop logs
+zero teardown / parked PlayLayer, yet a later editor object-placement touch
+still fails in strlen with guest pointer 0x210. This rules out PlayLayer onExit
+or destructor timing as the primary cause of that specific crash.
+
+The screenshot also shows an important breadcrumb clue: horizontal green
+segments join, but the airborne/diagonal pieces separate. The texture itself
+is not dotted: the supplied v1.1 square.png is a 32x32 fully opaque white
+image. Old cocos2d-x CCNode rotation applies the negative mathematical angle;
+newera9 used +atan2, so diagonal stretched squares were rotated away from the
+segment they were supposed to cover.
+
+Changes under test
+------------------
+1. Post-play placement crash:
+   - EditorUI touch state is sampled with CCLayer::isTouchEnabled().
+   - LevelEditorLayer touch state is sampled separately.
+   - both editor touch delegates are disabled only while inline PlayLayer owns
+     the gameplay taps/jumps
+   - the exact prior touch states are restored on stop
+   - the separate wrapper scene-root pause button remains usable
+   - newera9's zero-teardown parking path stays enabled while this is tested
+   - additional logs report EDITOR_INPUT_SUSPENDED / EDITOR_INPUT_RESTORED
+
+2. Green breadcrumb line:
+   - segment rotation changed from +atan2(dy,dx) to -atan2(dy,dx)
+   - joint overlap increased from 10% to 25%
+   - horizontal behavior is unchanged; the fix specifically targets diagonal
+     and curved jump paths
+
+3. Red-orange trajectory:
+   - removed the arbitrary per-frame dx/dy + t=2.0 predictor
+   - ARM v1.1 PlayerObject::update disassembly confirms:
+       +0x340 = horizontal velocity double used in position integration
+       +0x370 = vertical velocity double used in position integration
+   - historical x86 PlayerObject::update disassembly confirms:
+       +0x38c = horizontal velocity double
+       +0x3bc = vertical velocity double
+   - cube/ball prediction snapshots the real airborne velocity
+   - gravity is measured from consecutive real physics ticks
+   - jump/pad-sized vertical impulses re-anchor the prediction
+   - prediction uses game-time increments of 0.045 and is clipped before the
+     bottom editor toolbar
+   - ship/UFO guide remains hidden because held input changes their future path
+   - calibration logs report vx/vy/ay for diagnosing any remaining mismatch
+
+Static/binary checks
+--------------------
+- ARM v1.1 and the historical x86 library both export:
+    cocos2d::CCLayer::setTouchEnabled(bool)
+    cocos2d::CCLayer::isTouchEnabled()
+- ARM v1.1 PlayerObject::update integrates the two doubles at +0x340/+0x370.
+- x86 PlayerObject::update integrates the two doubles at +0x38c/+0x3bc.
+- square.png from the tested old asset set is 32x32 RGB and fully opaque.
+- first-attempt, endless-level, camera, proxy colors/modes, music stop and
+  button sizing code was intentionally left in place.
+- Dynarmic builder revision: 121.
+- Runtime Windows verification is still required.
+
+Critical test order
+-------------------
+1. Enter editor -> Play and make several jumps.
+2. Verify green trail is continuous through diagonal jump arcs.
+3. Verify orange cube trajectory follows the actual jump arc instead of a
+   detached/dotted curve. Send the TRAJECTORY_CALIBRATED log line if not.
+4. Pause/stop.
+5. Immediately place a normal block, then a portal.
+6. Repeat Play -> Pause -> placement once more.
+7. If placement still crashes, send the log; the new input-suspend lines will
+   tell us whether both editor delegates were actually disabled/restored.

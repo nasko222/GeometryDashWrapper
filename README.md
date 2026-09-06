@@ -1,15 +1,16 @@
-# Geometry Dash Wrapper 0.9.7-newera9
+# Geometry Dash Wrapper 0.9.7-newera10
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
-## What newera9 changes
+## What newera10 changes
 
-- The confirmed first-attempt fix is retained unchanged.
-- Fixes the still-dotted green/orange lines: `square.png` is 32 physical pixels in the HD asset set but 16 Cocos points at the active content scale. Newera8 stretched each segment as if it were 32 points wide, so it only covered about half the requested distance. Newera9 scales against 16 points and overlaps joins slightly.
-- Replaces the red-orange predictor that re-anchored itself to the player every frame. Cube/ball predictions now snapshot an airborne launch and remain fixed in world space until landing, gravity change, or mode change. Ship/UFO prediction is hidden for now because those modes are continuously input-driven and the old sampled ballistic approximation was visibly wrong.
-- Changes old-editor playtest stop to a zero-teardown parking path. The supplied ARM 1.1 log still crashes during the first post-play placement at `strlen(0x210)` even after `removeFromParentAndCleanup(false)`. Newera9 therefore does not detach the hidden PlayLayer and does not remove its proxy/trail nodes while the editor scene is alive. It makes the entire retired tree invisible, stops actions/schedulers, disables PlayLayer/UILayer touch and keypad handling, restores `GameManager::m_playLayer`, and leaves the inert tree scene-owned until scene destruction. This intentionally trades temporary memory for editor stability.
-- Camera framing, player colors, ship-with-cube proxy, gamemode switching, endless playtest, music stop, play-button sizing, and the working Attempt 1 preservation remain unchanged from newera8.
-- Dynarmic builder revision is bumped to 120 so the legacy ARM executable cannot be reused from the newera8 cache.
+- Keeps the confirmed first-attempt preservation unchanged.
+- Fixes the diagonal breadcrumb gaps at their actual source: old Cocos2d-x applies node rotation with the opposite sign from the mathematical `atan2` convention. Horizontal pieces therefore looked fine while jump arcs pointed each stretched square the wrong way. Newera10 negates the segment rotation and adds extra joint overlap.
+- Replaces the old frame-delta trajectory guess with a physics-backed cube/ball guide. The wrapper reads the real PlayerObject horizontal/vertical velocity fields used by `PlayerObject::update`, measures gravity from consecutive physics ticks, snapshots jump/pad impulses in world space, and predicts forward in the same time units. Ship/UFO still hide the trajectory because their future motion depends on held input.
+- Targets the persistent post-play object-placement crash with a different cause than teardown. Newera9 already performed zero PlayLayer teardown and the ARM 1.1 log still entered `strlen` with the invalid pointer `0x210` on the first later placement. During playtest, EditorUI and LevelEditorLayer were still registered for every jump/tap at the same time as the hidden PlayLayer. Newera10 records their previous touch-enabled states, suspends both editor touch delegates while gameplay owns input, and restores the exact states on stop.
+- The zero-teardown parking path remains in place while this is tested: the retired PlayLayer stays invisible, unscheduled, touch-disabled and scene-owned until the editor scene is destroyed.
+- Camera framing, player colors, ship-with-cube proxy, gamemode switching, endless playtest, music stop and play-button sizing remain unchanged.
+- Dynarmic builder revision is bumped to 121.
 
 ## Architecture
 
@@ -78,9 +79,9 @@ With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a small play co
 2. Create the authentic old `PlayLayer`. Run the complete `startGame()` / `resetLevel()` initialization, while temporarily suppressing only `updateAttempts()` for that one reset. This initializes the spawn queues correctly without advancing the visible attempt counter.
 3. Keep the real `PlayerObject` in its original hidden PlayLayer hierarchy for physics. A separate editor overlay mirrors its transform. The proxy changes sprite family when the real player enters ship, ball, or bird/UFO mode on builds that expose those modes.
 4. Follow the real player's horizontal movement with the editor game layer and mirror the hidden gameplay camera vertically with no additional Y offset.
-5. Breadcrumb, trajectory, and proxy sprites live in a scene-root sibling overlay, not under `LevelEditorLayer` or `EditorUI`. Green segments account for the HD content scale so adjacent solid squares overlap into one continuous line. Cube/ball trajectory is a fixed world-space launch prediction; ship/UFO trajectory is intentionally hidden until an input-aware predictor is implemented.
+5. Breadcrumb, trajectory, and proxy sprites live in a scene-root sibling overlay, not under `LevelEditorLayer` or `EditorUI`. Breadcrumb segments use the corrected Cocos rotation sign plus overlapping solid squares, so diagonal jumps connect instead of turning into dashes. Cube/ball trajectory uses the real PlayerObject velocity fields and measured gravity; ship/UFO trajectory remains hidden until an input-aware predictor is implemented.
 6. Suppress `EndPortalObject::triggerObject()` while testing and keep the hidden portal far ahead as a secondary guard, so inline testing has no normal level-complete endpoint.
-7. Hide the play control while testing and show the pause control in the same toolbar slot. Clicking it or pressing Escape stops music and restores end-trigger/camera/GameManager state, but performs no PlayLayer or overlay removal. The retired PlayLayer, UILayer, proxy, trail, and private level are parked invisible and unscheduled under the current scene until scene destruction. This avoids invoking the old engine's `onExit`/cleanup path before the editor is finished with its own state.
+7. As soon as playtest starts, preserve and disable `EditorUI` / `LevelEditorLayer` touch handling so jump taps cannot also execute editor placement logic behind the hidden gameplay layer. Hide the play control and show the pause control in the same toolbar slot. Clicking it or pressing Escape stops music, restores the exact editor touch states plus end-trigger/camera/GameManager state, and parks the retired PlayLayer/visual tree without invoking its old `onExit` path.
 8. If the backing player genuinely dies or is replaced, the bridge tears down the test rather than allowing the historical PlayLayer retry/scene lifecycle to leak into the editor.
 
 The bridge covers ARM Geometry Dash 1.0-1.4 and x86 Geometry Dash 1.5-1.7 when the required exported game/Cocos2d-x interfaces are present. Missing capabilities fail closed and are logged. Runtime testing on the individual historical APKs is still required because their internal layouts differ by release.

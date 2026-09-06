@@ -168,6 +168,7 @@ typedef struct {
     CcNodeRemoveFunction ccnode_remove;
     CcNodeSetVisibleFunction ccnode_set_visible;
     CcLayerSetBoolFunction cclayer_set_touch_enabled;
+    IntGetterFunction cclayer_is_touch_enabled;
     CcLayerSetBoolFunction cclayer_set_keypad_enabled;
     CcNodeNoArgFunction ccnode_unschedule_update;
     CcNodeNoArgFunction ccnode_unschedule_all_selectors;
@@ -240,6 +241,9 @@ typedef struct {
     int old_playtest_proxy_icon;
     void *old_playtest_level_clone;
     void *old_playtest_previous_play_layer;
+    int old_playtest_editor_input_suspended;
+    int old_playtest_editor_ui_touch_was_enabled;
+    int old_playtest_editor_layer_touch_was_enabled;
     void *old_playtest_end_portal;
     int old_playtest_end_portal_scanned;
     unsigned char old_playtest_end_trigger_original;
@@ -1352,6 +1356,7 @@ static int old_playtest_symbols_ready(void) {
            g_host.ccnode_set_scale && g_host.ccnode_set_rotation &&
            g_host.ccnode_set_scale_x && g_host.ccnode_set_scale_y &&
            g_host.ccnode_create && g_host.ccnode_remove &&
+           g_host.cclayer_set_touch_enabled &&
            g_host.level_editor_get_game_layer && g_host.play_layer_get_player &&
            g_host.play_layer_get_game_layer && g_host.player_get_is_dead &&
            g_host.end_portal_trigger_object &&
@@ -1678,6 +1683,66 @@ static void clear_old_playtest_trail(void) {
     g_host.old_playtest_trajectory_anchor_valid = 0;
 }
 
+static void set_old_playtest_editor_input_enabled(int enabled) {
+    if (!g_host.cclayer_set_touch_enabled) return;
+    if (!enabled) {
+        g_host.old_playtest_editor_ui_touch_was_enabled = 1;
+        g_host.old_playtest_editor_layer_touch_was_enabled = 1;
+        if (g_host.cclayer_is_touch_enabled) {
+            if (g_host.old_playtest_ui &&
+                memory_range_is_readable(g_host.old_playtest_ui, sizeof(void *)))
+                g_host.old_playtest_editor_ui_touch_was_enabled =
+                    g_host.cclayer_is_touch_enabled(g_host.old_playtest_ui) != 0;
+            if (g_host.old_playtest_editor &&
+                g_host.old_playtest_editor != g_host.old_playtest_ui &&
+                memory_range_is_readable(g_host.old_playtest_editor, sizeof(void *)))
+                g_host.old_playtest_editor_layer_touch_was_enabled =
+                    g_host.cclayer_is_touch_enabled(g_host.old_playtest_editor) != 0;
+        }
+    }
+    if (g_host.old_playtest_ui &&
+        memory_range_is_readable(g_host.old_playtest_ui, sizeof(void *)))
+        g_host.cclayer_set_touch_enabled(
+            g_host.old_playtest_ui,
+            enabled ? g_host.old_playtest_editor_ui_touch_was_enabled : 0);
+    if (g_host.old_playtest_editor &&
+        g_host.old_playtest_editor != g_host.old_playtest_ui &&
+        memory_range_is_readable(g_host.old_playtest_editor, sizeof(void *)))
+        g_host.cclayer_set_touch_enabled(
+            g_host.old_playtest_editor,
+            enabled ? g_host.old_playtest_editor_layer_touch_was_enabled : 0);
+    g_host.old_playtest_editor_input_suspended = enabled ? 0 : 1;
+    if (enabled)
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_INPUT_RESTORED ui=%d layer=%d",
+                    g_host.old_playtest_editor_ui_touch_was_enabled,
+                    g_host.old_playtest_editor_layer_touch_was_enabled);
+    else
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_INPUT_SUSPENDED ui-prev=%d layer-prev=%d",
+                    g_host.old_playtest_editor_ui_touch_was_enabled,
+                    g_host.old_playtest_editor_layer_touch_was_enabled);
+}
+
+static int read_old_playtest_player_velocity(double *vx, double *vy) {
+    const unsigned char *player = (const unsigned char *)g_host.old_playtest_player;
+    /* 1.5-era PlayerObject::update integrates position from these doubles:
+       +0x38c = horizontal velocity, +0x3bc = vertical velocity. If an older
+       x86 layout does not look sane, simply hide the guide rather than risk
+       using garbage as trajectory data. */
+    const size_t vx_offset = 0x38cu;
+    const size_t vy_offset = 0x3bcu;
+    double local_vx = 0.0, local_vy = 0.0;
+    if (!player ||
+        !memory_range_is_readable(player + vx_offset, sizeof(double)) ||
+        !memory_range_is_readable(player + vy_offset, sizeof(double))) return 0;
+    memcpy(&local_vx, player + vx_offset, sizeof(local_vx));
+    memcpy(&local_vy, player + vy_offset, sizeof(local_vy));
+    if (!isfinite(local_vx) || !isfinite(local_vy) ||
+        fabs(local_vx) > 100000.0 || fabs(local_vy) > 100000.0) return 0;
+    if (vx) *vx = local_vx;
+    if (vy) *vy = local_vy;
+    return 1;
+}
+
 static void position_old_playtest_line_sprite(void *sprite,
                                                float x1, float y1,
                                                float x2, float y2,
@@ -1693,12 +1758,12 @@ static void position_old_playtest_line_sprite(void *sprite,
     }
     g_host.ccnode_set_visible(sprite, 1);
     g_host.ccnode_set_position(sprite, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f);
-    g_host.ccnode_set_rotation(sprite, atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
+    g_host.ccnode_set_rotation(sprite, -atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
     /* With -hd assets active, square.png's 32 physical pixels are 16 Cocos
        points. Scaling against 32 only covered half of every requested segment,
        which is exactly why newera8 still looked dotted. Add a little overlap so
        rotated segment joints cannot expose one-pixel cracks. */
-    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.10f);
+    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.25f);
     g_host.ccnode_set_scale_y(sprite, thickness);
 }
 
@@ -1749,7 +1814,11 @@ static void hide_old_playtest_trajectory(void) {
 
 static int update_old_playtest_trajectory(float x, float y) {
     int i, on_ground = 0, gravity = 0, mode;
-    float sample_vx, sample_vy, vx, vy, ay, px, py;
+    double raw_vx = 0.0, raw_vy = 0.0;
+    float dx, dy;
+    double dt_game = 0.0, raw_ay = 0.0, previous_raw_vy = 0.0;
+    int acceleration_sample_valid = 0, vertical_impulse = 0;
+    float px, py;
     GdCcColor3B orange = {255u, 84u, 0u};
     if (!g_host.old_playtest_trail) return 1;
 
@@ -1759,60 +1828,76 @@ static int update_old_playtest_trajectory(float x, float y) {
     if (g_host.player_get_gravity_flipped)
         gravity = g_host.player_get_gravity_flipped(g_host.old_playtest_player) != 0;
 
-    if (!g_host.old_playtest_motion_has_last) {
-        g_host.old_playtest_motion_last_x = x;
-        g_host.old_playtest_motion_last_y = y;
-        g_host.old_playtest_motion_has_last = 1;
+    /* A ballistic line is meaningful for cube/ball. Ship/UFO depends on held
+       input every frame, so don't draw a fake parabola for those modes. */
+    if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
+        g_host.old_playtest_trajectory_anchor_valid = 0;
+        g_host.old_playtest_motion_has_last = 0;
+        g_host.old_playtest_motion_has_velocity = 0;
         hide_old_playtest_trajectory();
         return 1;
     }
-
-    sample_vx = x - g_host.old_playtest_motion_last_x;
-    sample_vy = y - g_host.old_playtest_motion_last_y;
-    g_host.old_playtest_motion_last_x = x;
-    g_host.old_playtest_motion_last_y = y;
-    if (sample_vx > 64.0f || sample_vx < -64.0f ||
-        sample_vy > 64.0f || sample_vy < -64.0f) {
-        g_host.old_playtest_motion_has_velocity = 0;
+    if (!read_old_playtest_player_velocity(&raw_vx, &raw_vy)) {
         g_host.old_playtest_trajectory_anchor_valid = 0;
         hide_old_playtest_trajectory();
         return 1;
     }
-    if (sample_vx < 0.0f) sample_vx = -sample_vx;
-    if (!g_host.old_playtest_motion_has_velocity) {
-        g_host.old_playtest_motion_vx = sample_vx;
-        g_host.old_playtest_motion_vy = sample_vy;
+
+    if (!g_host.old_playtest_motion_has_last) {
+        g_host.old_playtest_motion_last_x = x;
+        g_host.old_playtest_motion_last_y = y;
+        g_host.old_playtest_motion_vx = (float)raw_vx;
+        g_host.old_playtest_motion_vy = (float)raw_vy;
+        g_host.old_playtest_motion_has_last = 1;
         g_host.old_playtest_motion_has_velocity = 1;
         hide_old_playtest_trajectory();
         return 1;
     }
 
-    vx = g_host.old_playtest_motion_vx * 0.65f + sample_vx * 0.35f;
-    vy = g_host.old_playtest_motion_vy * 0.65f + sample_vy * 0.35f;
-    ay = vy - g_host.old_playtest_motion_vy;
-    if (ay > 0.35f) ay = 0.35f;
-    else if (ay < -0.35f) ay = -0.35f;
-    g_host.old_playtest_motion_vx = vx;
-    g_host.old_playtest_motion_vy = vy;
+    dx = x - g_host.old_playtest_motion_last_x;
+    dy = y - g_host.old_playtest_motion_last_y;
+    /* The bridge runs once before and once after nativeRender. Only the latter
+       advances PlayerObject, so ignore the duplicate zero-motion sample. */
+    if (dx * dx + dy * dy < 0.0001f) return 1;
 
-    /* Ship/UFO acceleration depends continuously on the held input, so a
-       pre-drawn ballistic arc would be dishonest. Hide it for those modes.
-       Cube/ball get a launch-anchored world-space path instead of a guide that
-       re-centres on the player every frame and appears to jump along with it. */
-    if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
+    previous_raw_vy = (double)g_host.old_playtest_motion_vy;
+    if (g_host.old_playtest_motion_has_velocity &&
+        fabs(g_host.old_playtest_motion_vx) > 1.0f) {
+        dt_game = (double)dx / (double)g_host.old_playtest_motion_vx;
+        if (dt_game > 0.001 && dt_game < 0.100) {
+            raw_ay = (raw_vy - (double)g_host.old_playtest_motion_vy) / dt_game;
+            if (isfinite(raw_ay) && fabs(raw_ay) > 1.0 && fabs(raw_ay) < 20000.0)
+                acceleration_sample_valid = 1;
+        }
+    }
+    vertical_impulse = fabs(raw_vy - previous_raw_vy) > 80.0;
+    g_host.old_playtest_motion_last_x = x;
+    g_host.old_playtest_motion_last_y = y;
+    g_host.old_playtest_motion_vx = (float)raw_vx;
+    g_host.old_playtest_motion_vy = (float)raw_vy;
+    g_host.old_playtest_motion_has_velocity = 1;
+
+    if (on_ground) {
         g_host.old_playtest_trajectory_anchor_valid = 0;
         hide_old_playtest_trajectory();
         return 1;
     }
-
-    /* While firmly on a surface there is no airborne trajectory to predict.
-       As soon as vertical motion begins, snapshot that launch. The snapshot is
-       deliberately NOT moved again until landing / gravity / mode changes. */
-    if (on_ground && fabsf(vy) < 0.10f) {
-        g_host.old_playtest_trajectory_anchor_valid = 0;
+    if (vertical_impulse) {
+        g_host.old_playtest_trajectory_anchor_valid = 1;
+        g_host.old_playtest_trajectory_anchor_mode = mode;
+        g_host.old_playtest_trajectory_anchor_gravity = gravity;
+        g_host.old_playtest_trajectory_anchor_x = x;
+        g_host.old_playtest_trajectory_anchor_y = y;
+        g_host.old_playtest_trajectory_anchor_vx = (float)raw_vx;
+        g_host.old_playtest_trajectory_anchor_vy = (float)raw_vy;
+        g_host.old_playtest_trajectory_anchor_ay = 0.0f;
         hide_old_playtest_trajectory();
         return 1;
     }
+
+    /* Snapshot the real launch state in world space. We wait for one more
+       physics tick before drawing so gravity is measured from the game's own
+       vertical-velocity field instead of guessing a made-up acceleration. */
     if (!g_host.old_playtest_trajectory_anchor_valid ||
         g_host.old_playtest_trajectory_anchor_mode != mode ||
         g_host.old_playtest_trajectory_anchor_gravity != gravity) {
@@ -1821,28 +1906,47 @@ static int update_old_playtest_trajectory(float x, float y) {
         g_host.old_playtest_trajectory_anchor_gravity = gravity;
         g_host.old_playtest_trajectory_anchor_x = x;
         g_host.old_playtest_trajectory_anchor_y = y;
-        g_host.old_playtest_trajectory_anchor_vx = vx > 0.05f ? vx : 0.05f;
-        g_host.old_playtest_trajectory_anchor_vy = vy;
-        /* The sampled acceleration can be nearly zero on the first airborne
-           frame. Use the game's gravity direction as a conservative fallback. */
-        if (fabsf(ay) < 0.015f) ay = gravity ? 0.18f : -0.18f;
-        g_host.old_playtest_trajectory_anchor_ay = ay;
+        g_host.old_playtest_trajectory_anchor_vx = (float)raw_vx;
+        g_host.old_playtest_trajectory_anchor_vy = (float)raw_vy;
+        g_host.old_playtest_trajectory_anchor_ay = 0.0f;
+        hide_old_playtest_trajectory();
+        return 1;
+    }
+    if (fabsf(g_host.old_playtest_trajectory_anchor_ay) < 1.0f &&
+        acceleration_sample_valid) {
+        g_host.old_playtest_trajectory_anchor_ay = (float)raw_ay;
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_TRAJECTORY_CALIBRATED vx=%.3f vy=%.3f ay=%.3f",
+                    g_host.old_playtest_trajectory_anchor_vx,
+                    g_host.old_playtest_trajectory_anchor_vy,
+                    g_host.old_playtest_trajectory_anchor_ay);
+    }
+    if (fabsf(g_host.old_playtest_trajectory_anchor_ay) < 1.0f) {
+        hide_old_playtest_trajectory();
+        return 1;
     }
 
-    x = g_host.old_playtest_trajectory_anchor_x;
-    y = g_host.old_playtest_trajectory_anchor_y;
-    vx = g_host.old_playtest_trajectory_anchor_vx;
-    vy = g_host.old_playtest_trajectory_anchor_vy;
-    ay = g_host.old_playtest_trajectory_anchor_ay;
-    px = x;
-    py = y;
+    px = g_host.old_playtest_trajectory_anchor_x;
+    py = g_host.old_playtest_trajectory_anchor_y;
     for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
-        const float t = (float)(i + 1) * 2.0f;
-        const float nx = x + vx * t;
-        const float ny = y + vy * t + 0.5f * ay * t * t;
+        /* update() multiplies the velocity fields by the game's scaled dt.
+           0.045 is ~50 ms of real time at the old 0.9 time scale. */
+        const float t = (float)(i + 1) * 0.045f;
+        const float nx = g_host.old_playtest_trajectory_anchor_x +
+                         g_host.old_playtest_trajectory_anchor_vx * t;
+        const float ny = g_host.old_playtest_trajectory_anchor_y +
+                         g_host.old_playtest_trajectory_anchor_vy * t +
+                         0.5f * g_host.old_playtest_trajectory_anchor_ay * t * t;
+        const float camera_y = g_host.old_playtest_play_game_layer
+            ? g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer) : 0.0f;
+        if (ny + camera_y < 82.0f) {
+            int j;
+            for (j = i; j < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++j)
+                if (g_host.old_playtest_trajectory[j])
+                    g_host.ccnode_set_visible(g_host.old_playtest_trajectory[j], 0);
+            break;
+        }
         if (!g_host.old_playtest_trajectory[i]) {
-            g_host.old_playtest_trajectory[i] =
-                g_host.sprite_create_file("square.png");
+            g_host.old_playtest_trajectory[i] = g_host.sprite_create_file("square.png");
             if (!g_host.old_playtest_trajectory[i]) return 0;
             g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
             if (!add_extras_child(g_host.old_playtest_trail,
@@ -1954,10 +2058,8 @@ static int start_inline_old_playtest(void) {
         if (g_host.ccobject_release) g_host.ccobject_release(level_clone);
         return 0;
     }
-    /* Hold an explicit retain on the hidden PlayLayer. On stop we detach it
-       from the scene but intentionally do not destroy it while the old editor
-       is still alive; its delayed destructor was a prime remaining UAF source
-       in the post-play object-placement crash. */
+    /* Hold an explicit retain on the hidden PlayLayer. Stop parks it in the
+       scene without onExit/destruction while the old editor remains alive. */
     if (g_host.ccobject_retain) g_host.ccobject_retain(play_layer);
     test_mode = (unsigned char *)play_layer +
                 g_host.old_playtest_test_mode_offset;
@@ -2003,6 +2105,10 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_editor_camera_original_y =
         g_host.ccnode_get_position_y(editor_game_layer);
     g_host.old_playtest_editor_camera_original_valid = 1;
+    /* Gameplay touches must never fall through to EditorUI/LevelEditorLayer.
+       newera9 proved teardown was not the placement-crash source; the editor
+       was still consuming every jump touch behind the hidden PlayLayer. */
+    set_old_playtest_editor_input_enabled(0);
     g_host.old_playtest_death_grace_until = GetTickCount64() + OLD_PLAYTEST_DEATH_GRACE_MS;
     if (!set_old_playtest_destroy_player_suppressed(1) ||
         !set_old_playtest_reset_level_suppressed(1)) {
@@ -2058,7 +2164,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=0 scene-isolated=1");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled camera-y-offset=0 scene-isolated=1 editor-input=suspended");
     return 1;
 }
 
@@ -2066,6 +2172,8 @@ static int stop_inline_old_playtest(void) {
     void *retired_layer;
     void *retired_ui = NULL;
     if (!g_host.old_playtest_layer) {
+        if (g_host.old_playtest_editor_input_suspended)
+            set_old_playtest_editor_input_enabled(1);
         (void)set_old_playtest_reset_level_suppressed(0);
         (void)set_old_playtest_destroy_player_suppressed(0);
         (void)set_old_playtest_end_trigger_suppressed(0);
@@ -2091,6 +2199,8 @@ static int stop_inline_old_playtest(void) {
             g_host.old_playtest_editor_camera_original_y);
     }
     g_host.old_playtest_editor_camera_original_valid = 0;
+    if (g_host.old_playtest_editor_input_suspended)
+        set_old_playtest_editor_input_enabled(1);
 
     /* Do not remove ANY playtest node while the old editor scene is alive.
        newera8 still reproduced strlen(0x210) after remove(..., false), proving
@@ -2170,7 +2280,7 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored");
     return 1;
 }
 
@@ -3083,6 +3193,8 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode10setVisibleEb");
     g_host.cclayer_set_touch_enabled = (CcLayerSetBoolFunction)elf_image_find_export(
         &image, "_ZN7cocos2d7CCLayer15setTouchEnabledEb");
+    g_host.cclayer_is_touch_enabled = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d7CCLayer14isTouchEnabledEv");
     g_host.cclayer_set_keypad_enabled = (CcLayerSetBoolFunction)elf_image_find_export(
         &image, "_ZN7cocos2d7CCLayer16setKeypadEnabledEb");
     g_host.ccnode_unschedule_update = (CcNodeNoArgFunction)elf_image_find_export(
