@@ -66,6 +66,7 @@ typedef void (__cdecl *CcNodeSetFloatFunction)(void *self, float value);
 typedef void *(__cdecl *CcNodeCreateFunction)(void);
 typedef void (__cdecl *CcNodeRemoveFunction)(void *self, int cleanup);
 typedef void (__cdecl *CcNodeSetVisibleFunction)(void *self, int visible);
+typedef void (__cdecl *CcLayerSetBoolFunction)(void *self, int enabled);
 typedef void (__cdecl *CcNodeNoArgFunction)(void *self);
 typedef void (__cdecl *CcObjectRefFunction)(void *self);
 typedef void *(__cdecl *LevelEditorGetLevelFunction)(void *self);
@@ -166,6 +167,8 @@ typedef struct {
     CcNodeCreateFunction ccnode_create;
     CcNodeRemoveFunction ccnode_remove;
     CcNodeSetVisibleFunction ccnode_set_visible;
+    CcLayerSetBoolFunction cclayer_set_touch_enabled;
+    CcLayerSetBoolFunction cclayer_set_keypad_enabled;
     CcNodeNoArgFunction ccnode_unschedule_update;
     CcNodeNoArgFunction ccnode_unschedule_all_selectors;
     CcNodeNoArgFunction ccnode_stop_all_actions;
@@ -188,7 +191,10 @@ typedef struct {
     void *play_layer_get_test_mode;
     NodeGetterFunction play_layer_get_player;
     NodeGetterFunction play_layer_get_game_layer;
+    NodeGetterFunction play_layer_get_ui_layer;
     IntGetterFunction player_get_is_dead;
+    IntGetterFunction player_get_on_ground;
+    IntGetterFunction player_get_gravity_flipped;
     IntGetterFunction player_get_fly_mode;
     IntGetterFunction player_get_roll_mode;
     IntGetterFunction player_get_bird_mode;
@@ -256,6 +262,14 @@ typedef struct {
     float old_playtest_motion_vy;
     int old_playtest_motion_has_last;
     int old_playtest_motion_has_velocity;
+    int old_playtest_trajectory_anchor_valid;
+    int old_playtest_trajectory_anchor_mode;
+    int old_playtest_trajectory_anchor_gravity;
+    float old_playtest_trajectory_anchor_x;
+    float old_playtest_trajectory_anchor_y;
+    float old_playtest_trajectory_anchor_vx;
+    float old_playtest_trajectory_anchor_vy;
+    float old_playtest_trajectory_anchor_ay;
     float old_playtest_editor_camera_original_x;
     float old_playtest_editor_camera_original_y;
     int old_playtest_editor_camera_original_valid;
@@ -282,7 +296,7 @@ static GameHost g_host;
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 18
-#define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 32.0f
+#define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
 #define OLD_PLAYTEST_RAD_TO_DEG 57.29577951308232f
 
 enum {
@@ -1661,6 +1675,7 @@ static void clear_old_playtest_trail(void) {
     g_host.old_playtest_trajectory_initialized = 0;
     g_host.old_playtest_motion_has_last = 0;
     g_host.old_playtest_motion_has_velocity = 0;
+    g_host.old_playtest_trajectory_anchor_valid = 0;
 }
 
 static void position_old_playtest_line_sprite(void *sprite,
@@ -1679,8 +1694,11 @@ static void position_old_playtest_line_sprite(void *sprite,
     g_host.ccnode_set_visible(sprite, 1);
     g_host.ccnode_set_position(sprite, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f);
     g_host.ccnode_set_rotation(sprite, atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
-    /* square.png is a solid 32x32 texture. A tiny X overlap hides rotated-joint seams without the dotted alpha pattern from streak.png. */
-    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.04f);
+    /* With -hd assets active, square.png's 32 physical pixels are 16 Cocos
+       points. Scaling against 32 only covered half of every requested segment,
+       which is exactly why newera8 still looked dotted. Add a little overlap so
+       rotated segment joints cannot expose one-pixel cracks. */
+    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.10f);
     g_host.ccnode_set_scale_y(sprite, thickness);
 }
 
@@ -1711,7 +1729,7 @@ static int append_old_playtest_trail_segment(float x, float y) {
     position_old_playtest_line_sprite(segment,
                                       g_host.old_playtest_trail_last_x,
                                       g_host.old_playtest_trail_last_y,
-                                      x, y, 0.060f);
+                                      x, y, 0.090f);
     if (!add_extras_child(g_host.old_playtest_trail, segment,
                           (int)g_host.old_playtest_trail_segments)) return 0;
     ++g_host.old_playtest_trail_segments;
@@ -1720,44 +1738,102 @@ static int append_old_playtest_trail_segment(float x, float y) {
     return 1;
 }
 
-static int update_old_playtest_trajectory(float x, float y) {
+static void hide_old_playtest_trajectory(void) {
     int i;
-    float vx, vy, ay, px, py;
+    for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
+        if (g_host.old_playtest_trajectory[i])
+            g_host.ccnode_set_visible(g_host.old_playtest_trajectory[i], 0);
+    }
+    g_host.old_playtest_trajectory_initialized = 0;
+}
+
+static int update_old_playtest_trajectory(float x, float y) {
+    int i, on_ground = 0, gravity = 0, mode;
+    float sample_vx, sample_vy, vx, vy, ay, px, py;
     GdCcColor3B orange = {255u, 84u, 0u};
     if (!g_host.old_playtest_trail) return 1;
+
+    mode = g_host.old_playtest_proxy_mode;
+    if (g_host.player_get_on_ground)
+        on_ground = g_host.player_get_on_ground(g_host.old_playtest_player) != 0;
+    if (g_host.player_get_gravity_flipped)
+        gravity = g_host.player_get_gravity_flipped(g_host.old_playtest_player) != 0;
+
     if (!g_host.old_playtest_motion_has_last) {
         g_host.old_playtest_motion_last_x = x;
         g_host.old_playtest_motion_last_y = y;
         g_host.old_playtest_motion_has_last = 1;
+        hide_old_playtest_trajectory();
         return 1;
     }
-    vx = x - g_host.old_playtest_motion_last_x;
-    vy = y - g_host.old_playtest_motion_last_y;
-    if (vx > 64.0f || vx < -64.0f || vy > 64.0f || vy < -64.0f) {
+
+    sample_vx = x - g_host.old_playtest_motion_last_x;
+    sample_vy = y - g_host.old_playtest_motion_last_y;
+    g_host.old_playtest_motion_last_x = x;
+    g_host.old_playtest_motion_last_y = y;
+    if (sample_vx > 64.0f || sample_vx < -64.0f ||
+        sample_vy > 64.0f || sample_vy < -64.0f) {
         g_host.old_playtest_motion_has_velocity = 0;
-        g_host.old_playtest_motion_last_x = x;
-        g_host.old_playtest_motion_last_y = y;
+        g_host.old_playtest_trajectory_anchor_valid = 0;
+        hide_old_playtest_trajectory();
         return 1;
     }
-    /* Old GD levels only scroll forward. Portal/camera transitions can make a
-       single sampled X delta look negative; never let that flip the prediction
-       behind the player. */
-    if (vx < 0.0f) vx = -vx;
+    if (sample_vx < 0.0f) sample_vx = -sample_vx;
     if (!g_host.old_playtest_motion_has_velocity) {
-        g_host.old_playtest_motion_vx = vx;
-        g_host.old_playtest_motion_vy = vy;
+        g_host.old_playtest_motion_vx = sample_vx;
+        g_host.old_playtest_motion_vy = sample_vy;
         g_host.old_playtest_motion_has_velocity = 1;
-        g_host.old_playtest_motion_last_x = x;
-        g_host.old_playtest_motion_last_y = y;
+        hide_old_playtest_trajectory();
         return 1;
     }
-    /* Low-pass the sampled velocity so the guide is a continuous arc instead
-       of ten twitchy dashes. Only predict vertical acceleration; horizontal
-       acceleration made the old guide fold back on itself near portals. */
-    vx = g_host.old_playtest_motion_vx * 0.65f + vx * 0.35f;
-    vy = g_host.old_playtest_motion_vy * 0.65f + vy * 0.35f;
+
+    vx = g_host.old_playtest_motion_vx * 0.65f + sample_vx * 0.35f;
+    vy = g_host.old_playtest_motion_vy * 0.65f + sample_vy * 0.35f;
     ay = vy - g_host.old_playtest_motion_vy;
-    if (ay > 0.35f) ay = 0.35f; else if (ay < -0.35f) ay = -0.35f;
+    if (ay > 0.35f) ay = 0.35f;
+    else if (ay < -0.35f) ay = -0.35f;
+    g_host.old_playtest_motion_vx = vx;
+    g_host.old_playtest_motion_vy = vy;
+
+    /* Ship/UFO acceleration depends continuously on the held input, so a
+       pre-drawn ballistic arc would be dishonest. Hide it for those modes.
+       Cube/ball get a launch-anchored world-space path instead of a guide that
+       re-centres on the player every frame and appears to jump along with it. */
+    if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
+        g_host.old_playtest_trajectory_anchor_valid = 0;
+        hide_old_playtest_trajectory();
+        return 1;
+    }
+
+    /* While firmly on a surface there is no airborne trajectory to predict.
+       As soon as vertical motion begins, snapshot that launch. The snapshot is
+       deliberately NOT moved again until landing / gravity / mode changes. */
+    if (on_ground && fabsf(vy) < 0.10f) {
+        g_host.old_playtest_trajectory_anchor_valid = 0;
+        hide_old_playtest_trajectory();
+        return 1;
+    }
+    if (!g_host.old_playtest_trajectory_anchor_valid ||
+        g_host.old_playtest_trajectory_anchor_mode != mode ||
+        g_host.old_playtest_trajectory_anchor_gravity != gravity) {
+        g_host.old_playtest_trajectory_anchor_valid = 1;
+        g_host.old_playtest_trajectory_anchor_mode = mode;
+        g_host.old_playtest_trajectory_anchor_gravity = gravity;
+        g_host.old_playtest_trajectory_anchor_x = x;
+        g_host.old_playtest_trajectory_anchor_y = y;
+        g_host.old_playtest_trajectory_anchor_vx = vx > 0.05f ? vx : 0.05f;
+        g_host.old_playtest_trajectory_anchor_vy = vy;
+        /* The sampled acceleration can be nearly zero on the first airborne
+           frame. Use the game's gravity direction as a conservative fallback. */
+        if (fabsf(ay) < 0.015f) ay = gravity ? 0.18f : -0.18f;
+        g_host.old_playtest_trajectory_anchor_ay = ay;
+    }
+
+    x = g_host.old_playtest_trajectory_anchor_x;
+    y = g_host.old_playtest_trajectory_anchor_y;
+    vx = g_host.old_playtest_trajectory_anchor_vx;
+    vy = g_host.old_playtest_trajectory_anchor_vy;
+    ay = g_host.old_playtest_trajectory_anchor_ay;
     px = x;
     py = y;
     for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
@@ -1774,15 +1850,11 @@ static int update_old_playtest_trajectory(float x, float y) {
                                   5000 + i)) return 0;
         }
         position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
-                                          px, py, nx, ny, 0.055f);
+                                          px, py, nx, ny, 0.080f);
         px = nx;
         py = ny;
     }
     g_host.old_playtest_trajectory_initialized = 1;
-    g_host.old_playtest_motion_vx = vx;
-    g_host.old_playtest_motion_vy = vy;
-    g_host.old_playtest_motion_last_x = x;
-    g_host.old_playtest_motion_last_y = y;
     return 1;
 }
 
@@ -1992,6 +2064,7 @@ static int start_inline_old_playtest(void) {
 
 static int stop_inline_old_playtest(void) {
     void *retired_layer;
+    void *retired_ui = NULL;
     if (!g_host.old_playtest_layer) {
         (void)set_old_playtest_reset_level_suppressed(0);
         (void)set_old_playtest_destroy_player_suppressed(0);
@@ -2003,10 +2076,11 @@ static int stop_inline_old_playtest(void) {
         return 1;
     }
     retired_layer = g_host.old_playtest_layer;
+    if (g_host.play_layer_get_ui_layer)
+        retired_ui = g_host.play_layer_get_ui_layer(retired_layer);
     audio_stop_background();
     (void)set_old_playtest_reset_level_suppressed(0);
     (void)set_old_playtest_destroy_player_suppressed(0);
-    remove_old_playtest_proxy_visuals();
 
     if (g_host.old_playtest_editor_camera_original_valid &&
         g_host.old_playtest_editor_game_layer &&
@@ -2018,9 +2092,14 @@ static int stop_inline_old_playtest(void) {
     }
     g_host.old_playtest_editor_camera_original_valid = 0;
 
-    /* The overlay is scene-owned rather than editor-owned in newera8, so its
-       destruction cannot mutate LevelEditorLayer/EditorUI child arrays. */
-    clear_old_playtest_trail();
+    /* Do not remove ANY playtest node while the old editor scene is alive.
+       newera8 still reproduced strlen(0x210) after remove(..., false), proving
+       that merely running CCNode::onExit / touch-unregister teardown is enough
+       to leave these ancient editor builds in a poisoned state. Park the whole
+       subtree in-place, invisible and inert, and let scene destruction own it. */
+    if (g_host.old_playtest_trail &&
+        memory_range_is_readable(g_host.old_playtest_trail, sizeof(void *)))
+        g_host.ccnode_set_visible(g_host.old_playtest_trail, 0);
     if (g_host.old_playtest_player &&
         memory_range_is_readable(g_host.old_playtest_player, sizeof(void *))) {
         if (g_host.ccnode_stop_all_actions)
@@ -2029,18 +2108,27 @@ static int stop_inline_old_playtest(void) {
             g_host.ccnode_unschedule_all_selectors(g_host.old_playtest_player);
     }
     if (retired_layer && memory_range_is_readable(retired_layer, sizeof(void *))) {
+        g_host.ccnode_set_visible(retired_layer, 0);
+        if (g_host.cclayer_set_touch_enabled)
+            g_host.cclayer_set_touch_enabled(retired_layer, 0);
+        if (g_host.cclayer_set_keypad_enabled)
+            g_host.cclayer_set_keypad_enabled(retired_layer, 0);
         if (g_host.ccnode_stop_all_actions)
             g_host.ccnode_stop_all_actions(retired_layer);
         if (g_host.ccnode_unschedule_all_selectors)
             g_host.ccnode_unschedule_all_selectors(retired_layer);
         if (g_host.ccnode_unschedule_update)
             g_host.ccnode_unschedule_update(retired_layer);
-        /* removeFromParentAndCleanup(false) still performs the normal onExit/touch
-           unregister path, but deliberately skips recursive cleanup of the old
-           PlayLayer subtree. Newera7's stop frame freed thousands of PlayLayer
-           allocations immediately before the reproducible editor strlen(0x210)
-           crash; the explicit retain keeps the detached tree alive as well. */
-        g_host.ccnode_remove(retired_layer, 0);
+    }
+    if (retired_ui && memory_range_is_readable(retired_ui, sizeof(void *))) {
+        if (g_host.cclayer_set_touch_enabled)
+            g_host.cclayer_set_touch_enabled(retired_ui, 0);
+        if (g_host.cclayer_set_keypad_enabled)
+            g_host.cclayer_set_keypad_enabled(retired_ui, 0);
+        if (g_host.ccnode_stop_all_actions)
+            g_host.ccnode_stop_all_actions(retired_ui);
+        if (g_host.ccnode_unschedule_all_selectors)
+            g_host.ccnode_unschedule_all_selectors(retired_ui);
     }
     if (g_host.game_manager_shared_state && g_host.game_manager_set_play_layer) {
         void *manager = g_host.game_manager_shared_state();
@@ -2049,10 +2137,9 @@ static int stop_inline_old_playtest(void) {
                 manager, g_host.old_playtest_previous_play_layer);
     }
     g_host.old_playtest_previous_play_layer = NULL;
-    /* Both the detached PlayLayer and its private level retain are deliberately
-       parked until process/scene teardown. A small leak is preferable to the
-       reproducible 0x210 strlen UAF seen immediately after old PlayLayer
-       destruction when placing an editor object. */
+    /* The scene parent + explicit retain intentionally keep the retired
+       PlayLayer and private level alive. This is diagnostic/stability-first:
+       zero teardown is much safer than a repeatable post-play editor UAF. */
     g_host.old_playtest_level_clone = NULL;
     if (!set_old_playtest_end_trigger_suppressed(0))
         runtime_log("ERROR: failed to restore EndPortalObject::triggerObject");
@@ -2065,13 +2152,25 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_player = NULL;
     g_host.old_playtest_play_game_layer = NULL;
     g_host.old_playtest_editor_game_layer = NULL;
+    g_host.old_playtest_proxy_primary = NULL;
+    g_host.old_playtest_proxy_secondary = NULL;
+    g_host.old_playtest_proxy_tertiary = NULL;
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
+    g_host.old_playtest_trail = NULL;
+    g_host.old_playtest_trail_has_last = 0;
+    g_host.old_playtest_trail_segments = 0;
+    memset(g_host.old_playtest_trajectory, 0,
+           sizeof(g_host.old_playtest_trajectory));
+    g_host.old_playtest_trajectory_initialized = 0;
+    g_host.old_playtest_motion_has_last = 0;
+    g_host.old_playtest_motion_has_velocity = 0;
+    g_host.old_playtest_trajectory_anchor_valid = 0;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=removed music=stopped end=restored camera=restored playlayer=detached-retained-cleanup0");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1");
     return 1;
 }
 
@@ -2982,6 +3081,10 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb");
     g_host.ccnode_set_visible = (CcNodeSetVisibleFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode10setVisibleEb");
+    g_host.cclayer_set_touch_enabled = (CcLayerSetBoolFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d7CCLayer15setTouchEnabledEb");
+    g_host.cclayer_set_keypad_enabled = (CcLayerSetBoolFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d7CCLayer16setKeypadEnabledEb");
     g_host.ccnode_unschedule_update = (CcNodeNoArgFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode16unscheduleUpdateEv");
     g_host.ccnode_unschedule_all_selectors = (CcNodeNoArgFunction)elf_image_find_export(
@@ -3029,8 +3132,14 @@ int main(int argc, char **argv) {
         &image, "_ZNK9PlayLayer9getPlayerEv");
     g_host.play_layer_get_game_layer = (NodeGetterFunction)elf_image_find_export(
         &image, "_ZNK9PlayLayer12getGameLayerEv");
+    g_host.play_layer_get_ui_layer = (NodeGetterFunction)elf_image_find_export(
+        &image, "_ZNK9PlayLayer10getUILayerEv");
     g_host.player_get_is_dead = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK12PlayerObject9getIsDeadEv");
+    g_host.player_get_on_ground = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject11getOnGroundEv");
+    g_host.player_get_gravity_flipped = (IntGetterFunction)elf_image_find_export(
+        &image, "_ZNK12PlayerObject17getGravityFlippedEv");
     g_host.player_get_fly_mode = (IntGetterFunction)elf_image_find_export(
         &image, "_ZNK12PlayerObject10getFlyModeEv");
     g_host.player_get_roll_mode = (IntGetterFunction)elf_image_find_export(

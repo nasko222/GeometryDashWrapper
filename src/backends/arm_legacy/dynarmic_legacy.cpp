@@ -1029,6 +1029,8 @@ struct ElfRuntime {
     u32 play_layer_get_player = 0;
     u32 play_layer_get_game_layer = 0;
     u32 player_get_is_dead = 0;
+    u32 player_get_on_ground = 0;
+    u32 player_get_gravity_flipped = 0;
     u32 player_get_fly_mode = 0;
     u32 player_get_roll_mode = 0;
     u32 player_get_bird_mode = 0;
@@ -1045,6 +1047,8 @@ struct ElfRuntime {
     u32 menu_item_sprite_extra_create = 0;
     u32 cc_menu_create = 0;
     u32 ccnode_set_visible = 0;
+    u32 cclayer_set_touch_enabled = 0;
+    u32 cclayer_set_keypad_enabled = 0;
     u32 ccnode_unschedule_update = 0;
     u32 ccnode_unschedule_all_selectors = 0;
     u32 ccnode_stop_all_actions = 0;
@@ -1639,6 +1643,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.play_layer_get_game_layer = address;
             else if (name == "_ZNK12PlayerObject9getIsDeadEv")
                 runtime.player_get_is_dead = address;
+            else if (name == "_ZNK12PlayerObject11getOnGroundEv")
+                runtime.player_get_on_ground = address;
+            else if (name == "_ZNK12PlayerObject17getGravityFlippedEv")
+                runtime.player_get_gravity_flipped = address;
             else if (name == "_ZNK12PlayerObject10getFlyModeEv")
                 runtime.player_get_fly_mode = address;
             else if (name == "_ZNK12PlayerObject11getRollModeEv")
@@ -1735,6 +1743,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccobject_release = address;
             else if (name == "_ZN7cocos2d6CCNode26removeFromParentAndCleanupEb")
                 runtime.ccnode_remove_from_parent_cleanup = address;
+            else if (name == "_ZN7cocos2d7CCLayer15setTouchEnabledEb")
+                runtime.cclayer_set_touch_enabled = address;
+            else if (name == "_ZN7cocos2d7CCLayer16setKeypadEnabledEb")
+                runtime.cclayer_set_keypad_enabled = address;
             else if (name == "_ZN7cocos2d12CCLayerColor6createERKNS_10_ccColor4BE")
                 runtime.cclayer_color_create = address;
             else if (name == "_ZN7UILayer7onCheckEPN7cocos2d8CCObjectE") {
@@ -3838,6 +3850,7 @@ public:
         old_playtest_trajectory_.fill(0u);
         old_playtest_motion_has_last_ = false;
         old_playtest_motion_has_velocity_ = false;
+        old_playtest_trajectory_anchor_valid_ = false;
         return true;
     }
 
@@ -3867,7 +3880,7 @@ public:
                            nullptr, "rotate playtest line", 0u,
                            std::chrono::milliseconds(300)) &&
                RunFunction(runtime_.ccnode_set_scale_x,
-                           {sprite, FloatToWord((length / 32.0f) * 1.04f)},
+                           {sprite, FloatToWord((length / 16.0f) * 1.10f)},
                            nullptr, "stretch playtest line", 0u,
                            std::chrono::milliseconds(300)) &&
                RunFunction(runtime_.ccnode_set_scale_y,
@@ -3912,7 +3925,7 @@ public:
                          std::chrono::milliseconds(300)) ||
             !PositionOldVersionPlaytestLineSprite(
                 segment, old_playtest_trail_last_x_, old_playtest_trail_last_y_,
-                x, y, 0.060f) ||
+                x, y, 0.090f) ||
             !AddExtrasChild(old_playtest_trail_, segment,
                             static_cast<int>(old_playtest_trail_segments_)))
             return false;
@@ -3922,43 +3935,97 @@ public:
         return true;
     }
 
+    bool HideOldVersionPlaytestTrajectory() {
+        bool ok = true;
+        for (u32 sprite : old_playtest_trajectory_) {
+            if (!sprite) continue;
+            ok = RunFunction(runtime_.ccnode_set_visible, {sprite, 0u}, nullptr,
+                             "hide anchored playtest trajectory", 0u,
+                             std::chrono::milliseconds(300)) && ok;
+        }
+        return ok;
+    }
+
     bool UpdateOldVersionPlaytestTrajectory(float x, float y) {
         if (!old_playtest_trail_) return true;
+        u32 on_ground_word = 0u, gravity_word = 0u;
+        const int mode = old_playtest_proxy_mode_;
+        bool on_ground = false, gravity = false;
+        if (runtime_.player_get_on_ground &&
+            RunFunction(runtime_.player_get_on_ground, {old_playtest_player_},
+                        &on_ground_word, "PlayerObject::getOnGround trajectory", 0u,
+                        std::chrono::milliseconds(300)))
+            on_ground = on_ground_word != 0u;
+        if (runtime_.player_get_gravity_flipped &&
+            RunFunction(runtime_.player_get_gravity_flipped, {old_playtest_player_},
+                        &gravity_word, "PlayerObject::getGravityFlipped trajectory", 0u,
+                        std::chrono::milliseconds(300)))
+            gravity = gravity_word != 0u;
+
         if (!old_playtest_motion_has_last_) {
             old_playtest_motion_last_x_ = x;
             old_playtest_motion_last_y_ = y;
             old_playtest_motion_has_last_ = true;
-            return true;
+            return HideOldVersionPlaytestTrajectory();
         }
-        float vx = x - old_playtest_motion_last_x_;
-        float vy = y - old_playtest_motion_last_y_;
-        if (std::fabs(vx) > 64.0f || std::fabs(vy) > 64.0f) {
+        float sample_vx = x - old_playtest_motion_last_x_;
+        float sample_vy = y - old_playtest_motion_last_y_;
+        old_playtest_motion_last_x_ = x;
+        old_playtest_motion_last_y_ = y;
+        if (std::fabs(sample_vx) > 64.0f || std::fabs(sample_vy) > 64.0f) {
             old_playtest_motion_has_velocity_ = false;
-            old_playtest_motion_last_x_ = x;
-            old_playtest_motion_last_y_ = y;
-            return true;
+            old_playtest_trajectory_anchor_valid_ = false;
+            return HideOldVersionPlaytestTrajectory();
         }
-        /* Early Geometry Dash scrolls only forward. A portal/camera transition
-           can make one sampled X delta look negative; don't let the guide arc
-           flip behind the player. */
-        if (vx < 0.0f) vx = -vx;
+        if (sample_vx < 0.0f) sample_vx = -sample_vx;
         if (!old_playtest_motion_has_velocity_) {
-            old_playtest_motion_vx_ = vx;
-            old_playtest_motion_vy_ = vy;
+            old_playtest_motion_vx_ = sample_vx;
+            old_playtest_motion_vy_ = sample_vy;
             old_playtest_motion_has_velocity_ = true;
-            old_playtest_motion_last_x_ = x;
-            old_playtest_motion_last_y_ = y;
-            return true;
+            return HideOldVersionPlaytestTrajectory();
         }
-        vx = old_playtest_motion_vx_ * 0.65f + vx * 0.35f;
-        vy = old_playtest_motion_vy_ * 0.65f + vy * 0.35f;
-        const float ay = std::clamp(vy - old_playtest_motion_vy_, -0.35f, 0.35f);
+        float vx = old_playtest_motion_vx_ * 0.65f + sample_vx * 0.35f;
+        float vy = old_playtest_motion_vy_ * 0.65f + sample_vy * 0.35f;
+        float ay = std::clamp(vy - old_playtest_motion_vy_, -0.35f, 0.35f);
+        old_playtest_motion_vx_ = vx;
+        old_playtest_motion_vy_ = vy;
+
+        /* Ship/UFO are continuously input-driven and cannot be represented by
+           an honest fixed ballistic path. Cube/ball instead snapshot the launch
+           once so the red-orange guide stays in world space and the player can
+           actually travel along it, rather than the guide jumping with him. */
+        if (mode == 1 || mode == 3) {
+            old_playtest_trajectory_anchor_valid_ = false;
+            return HideOldVersionPlaytestTrajectory();
+        }
+        if (on_ground && std::fabs(vy) < 0.10f) {
+            old_playtest_trajectory_anchor_valid_ = false;
+            return HideOldVersionPlaytestTrajectory();
+        }
+        if (!old_playtest_trajectory_anchor_valid_ ||
+            old_playtest_trajectory_anchor_mode_ != mode ||
+            old_playtest_trajectory_anchor_gravity_ != gravity) {
+            old_playtest_trajectory_anchor_valid_ = true;
+            old_playtest_trajectory_anchor_mode_ = mode;
+            old_playtest_trajectory_anchor_gravity_ = gravity;
+            old_playtest_trajectory_anchor_x_ = x;
+            old_playtest_trajectory_anchor_y_ = y;
+            old_playtest_trajectory_anchor_vx_ = vx > 0.05f ? vx : 0.05f;
+            old_playtest_trajectory_anchor_vy_ = vy;
+            if (std::fabs(ay) < 0.015f) ay = gravity ? 0.18f : -0.18f;
+            old_playtest_trajectory_anchor_ay_ = ay;
+        }
+
         if (!old_playtest_orange_color_) {
             old_playtest_orange_color_ = Allocate(4u);
             if (!old_playtest_orange_color_) return false;
-            /* ccColor3B bytes in guest memory: R=255, G=84, B=0. */
             env_.MemoryWrite32(old_playtest_orange_color_, 0x000054ffu);
         }
+        x = old_playtest_trajectory_anchor_x_;
+        y = old_playtest_trajectory_anchor_y_;
+        vx = old_playtest_trajectory_anchor_vx_;
+        vy = old_playtest_trajectory_anchor_vy_;
+        ay = old_playtest_trajectory_anchor_ay_;
         float px = x, py = y;
         for (std::size_t i = 0; i < old_playtest_trajectory_.size(); ++i) {
             const float t = static_cast<float>(i + 1u) * 2.0f;
@@ -3971,7 +4038,7 @@ public:
                     !RunFunction(runtime_.sprite_create_file,
                                  {old_playtest_streak_name_},
                                  &old_playtest_trajectory_[i],
-                                 "CCSprite::create trajectory line", 0u,
+                                 "CCSprite::create anchored trajectory line", 0u,
                                  std::chrono::milliseconds(700)) ||
                     !old_playtest_trajectory_[i] ||
                     !RunFunction(runtime_.sprite_set_color,
@@ -3982,15 +4049,11 @@ public:
                                     5000 + static_cast<int>(i))) return false;
             }
             if (!PositionOldVersionPlaytestLineSprite(old_playtest_trajectory_[i],
-                                                       px, py, nx, ny, 0.055f))
+                                                       px, py, nx, ny, 0.080f))
                 return false;
             px = nx;
             py = ny;
         }
-        old_playtest_motion_vx_ = vx;
-        old_playtest_motion_vy_ = vy;
-        old_playtest_motion_last_x_ = x;
-        old_playtest_motion_last_y_ = y;
         return true;
     }
 
@@ -4122,7 +4185,7 @@ public:
         if (!RunFunction(runtime_.play_layer_create, {level_clone}, &play_layer,
                          "PlayLayer::create inline playtest", 0u,
                          std::chrono::milliseconds(10000)) || !play_layer) return false;
-        /* Keep an explicit retain on PlayLayer. newera8 detaches it on stop so
+        /* Keep an explicit retain on PlayLayer. newera9 detaches it on stop so
            onExit/touch cleanup runs, but defers its destructor until the old
            editor is gone; that destructor timing is the strongest remaining
            suspect for the reproducible post-play strlen(0x210) crash. */
@@ -4255,10 +4318,14 @@ public:
             return end_ok && buttons_ok;
         }
         const u32 retired_layer = old_playtest_layer_;
+        u32 retired_ui = 0u;
+        if (runtime_.play_layer_get_ui_layer)
+            (void)RunFunction(runtime_.play_layer_get_ui_layer, {retired_layer},
+                              &retired_ui, "PlayLayer::getUILayer park", 0u,
+                              std::chrono::milliseconds(500));
         audio_stop_background();
         bool ok = SetOldVersionPlaytestResetLevelSuppressed(false);
         ok = SetOldVersionPlaytestDestroyPlayerSuppressed(false) && ok;
-        if (!RemoveOldVersionPlaytestProxyVisuals()) ok = false;
         if (old_playtest_editor_camera_original_valid_ &&
             old_playtest_editor_game_layer_)
             ok = RunFunction(runtime_.ccnode_set_position_ff,
@@ -4269,9 +4336,15 @@ public:
                              std::chrono::milliseconds(500)) && ok;
         old_playtest_editor_camera_original_valid_ = false;
 
-        /* newera8's visual root is a scene sibling, not an editor child, so
-           clearing it cannot disturb LevelEditorLayer's child array. */
-        if (!ClearOldVersionPlaytestTrail()) ok = false;
+        /* ZERO TEARDOWN while this editor scene lives. newera8 still crashed at
+           strlen(0x210) after removeFromParentAndCleanup(false), so even onExit
+           / delegate-unregister teardown is now forbidden. Keep PlayLayer and
+           every visual attached to the scene, just invisible + unscheduled. */
+        if (old_playtest_trail_)
+            ok = RunFunction(runtime_.ccnode_set_visible,
+                             {old_playtest_trail_, 0u}, nullptr,
+                             "park playtest visual root", 0u,
+                             std::chrono::milliseconds(500)) && ok;
         auto quiet_node = [&](u32 node, const char* label) {
             if (!node || !env_.IsMapped(node, 4u)) return;
             if (runtime_.ccnode_stop_all_actions)
@@ -4279,26 +4352,43 @@ public:
                                  label, 0u, std::chrono::milliseconds(500)) && ok;
             if (runtime_.ccnode_unschedule_all_selectors)
                 ok = RunFunction(runtime_.ccnode_unschedule_all_selectors, {node}, nullptr,
-                                 "CCNode::unscheduleAllSelectors playtest teardown", 0u,
+                                 "CCNode::unscheduleAllSelectors parked playtest", 0u,
                                  std::chrono::milliseconds(500)) && ok;
         };
         quiet_node(old_playtest_player_, "CCNode::stopAllActions playtest player");
-        quiet_node(retired_layer, "CCNode::stopAllActions hidden PlayLayer");
-        if (retired_layer && runtime_.ccnode_unschedule_update)
-            ok = RunFunction(runtime_.ccnode_unschedule_update,
-                             {retired_layer}, nullptr,
-                             "CCNode::unscheduleUpdate hidden PlayLayer", 0u,
-                             std::chrono::milliseconds(500)) && ok;
+        quiet_node(retired_layer, "CCNode::stopAllActions parked PlayLayer");
+        quiet_node(retired_ui, "CCNode::stopAllActions parked UILayer");
         if (retired_layer) {
-            /* removeFromParentAndCleanup(false) still runs the onExit/touch-unregister
-               path but skips recursive cleanup of the old PlayLayer subtree.
-               Newera7 freed thousands of allocations in the stop frame right
-               before the repeatable editor strlen(0x210) placement crash. The
-               explicit retain keeps the detached tree alive for this test. */
-            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {retired_layer, 0u}, nullptr,
-                             "detach retained hidden PlayLayer without cleanup", 0u,
-                             std::chrono::milliseconds(3000)) && ok;
+            ok = RunFunction(runtime_.ccnode_set_visible, {retired_layer, 0u}, nullptr,
+                             "hide parked PlayLayer", 0u,
+                             std::chrono::milliseconds(500)) && ok;
+            if (runtime_.cclayer_set_touch_enabled)
+                ok = RunFunction(runtime_.cclayer_set_touch_enabled,
+                                 {retired_layer, 0u}, nullptr,
+                                 "CCLayer::setTouchEnabled(false) parked PlayLayer", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
+            if (runtime_.cclayer_set_keypad_enabled)
+                ok = RunFunction(runtime_.cclayer_set_keypad_enabled,
+                                 {retired_layer, 0u}, nullptr,
+                                 "CCLayer::setKeypadEnabled(false) parked PlayLayer", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
+            if (runtime_.ccnode_unschedule_update)
+                ok = RunFunction(runtime_.ccnode_unschedule_update,
+                                 {retired_layer}, nullptr,
+                                 "CCNode::unscheduleUpdate parked PlayLayer", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
+        }
+        if (retired_ui) {
+            if (runtime_.cclayer_set_touch_enabled)
+                ok = RunFunction(runtime_.cclayer_set_touch_enabled,
+                                 {retired_ui, 0u}, nullptr,
+                                 "CCLayer::setTouchEnabled(false) parked UILayer", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
+            if (runtime_.cclayer_set_keypad_enabled)
+                ok = RunFunction(runtime_.cclayer_set_keypad_enabled,
+                                 {retired_ui, 0u}, nullptr,
+                                 "CCLayer::setKeypadEnabled(false) parked UILayer", 0u,
+                                 std::chrono::milliseconds(500)) && ok;
         }
         if (runtime_.game_manager_shared_state &&
             runtime_.game_manager_set_play_layer) {
@@ -4312,10 +4402,7 @@ public:
                                  0u, std::chrono::milliseconds(500)) && ok;
         }
         old_playtest_previous_play_layer_ = 0u;
-        /* Keep both explicit retains parked. The ARM 1.1 logs consistently
-           crash after PlayLayer teardown with strlen(0x210), so destruction is
-           deferred instead of gambling with another editor-side UAF. */
-        old_playtest_level_clone_ = 0u;
+        old_playtest_level_clone_ = 0u; /* retain intentionally parked */
         if (!SetOldVersionPlaytestEndTriggerSuppressed(false)) ok = false;
         if (old_playtest_play_button_)
             ok = RunFunction(runtime_.ccnode_set_visible,
@@ -4327,17 +4414,28 @@ public:
                              {old_playtest_stop_button_, 0u}, nullptr,
                              "hide persistent playtest pause", 0u,
                              std::chrono::milliseconds(500)) && ok;
+
         old_playtest_layer_ = 0u;
         old_playtest_player_ = 0u;
         old_playtest_play_game_layer_ = 0u;
         old_playtest_editor_game_layer_ = 0u;
+        old_playtest_proxy_primary_ = 0u;
+        old_playtest_proxy_secondary_ = 0u;
+        old_playtest_proxy_tertiary_ = 0u;
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
+        old_playtest_trail_ = 0u;
+        old_playtest_trail_has_last_ = false;
+        old_playtest_trail_segments_ = 0u;
+        old_playtest_trajectory_.fill(0u);
+        old_playtest_motion_has_last_ = false;
+        old_playtest_motion_has_velocity_ = false;
+        old_playtest_trajectory_anchor_valid_ = false;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=removed music=stopped end=restored camera=restored playlayer=detached-retained-cleanup0\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1\n";
             log_.flush();
         }
         return ok;
@@ -8755,6 +8853,14 @@ private:
     float old_playtest_motion_last_y_ = 0.0f;
     float old_playtest_motion_vx_ = 0.0f;
     float old_playtest_motion_vy_ = 0.0f;
+    bool old_playtest_trajectory_anchor_valid_ = false;
+    int old_playtest_trajectory_anchor_mode_ = -1;
+    bool old_playtest_trajectory_anchor_gravity_ = false;
+    float old_playtest_trajectory_anchor_x_ = 0.0f;
+    float old_playtest_trajectory_anchor_y_ = 0.0f;
+    float old_playtest_trajectory_anchor_vx_ = 0.0f;
+    float old_playtest_trajectory_anchor_vy_ = 0.0f;
+    float old_playtest_trajectory_anchor_ay_ = 0.0f;
     float old_playtest_editor_camera_original_x_ = 0.0f;
     float old_playtest_editor_camera_original_y_ = 0.0f;
     bool old_playtest_editor_camera_original_valid_ = false;

@@ -1,0 +1,57 @@
+GeometryDashWrapper 0.9.7-newera9 verification notes
+======================================================
+
+User evidence used
+------------------
+Latest supplied ARM 1.1 run: launcher newera8, package com.robtopx.geometryjump,
+version 1.1. The first-attempt preservation succeeds. After pause/stop, the
+first editor-placement touches fail in strlen with guest pointer 0x210.
+newera8 logged its stop as detached-retained-cleanup0, so cleanup=false did not
+eliminate the crash.
+
+Changes under test
+------------------
+1. Post-play placement crash:
+   - no removeFromParentAndCleanup call on normal playtest stop
+   - hidden PlayLayer remains attached to the scene
+   - PlayLayer and its UILayer are touch/keypad disabled when exports exist
+   - player/UILayer/PlayLayer actions and selectors are stopped
+   - PlayLayer update is unscheduled
+   - visual root is hidden, not removed
+   - GameManager play-layer pointer and patched guest code are restored
+   - retained temporary level/PlayLayer are intentionally parked
+
+2. Dotted line:
+   - square.png is treated as 16 Cocos points in the HD asset scale, not 32
+   - X scale uses length / 16 with 10% overlap
+   - applies to both green breadcrumb and orange trajectory segments
+
+3. Trajectory:
+   - cube/ball trajectory snapshots an airborne launch and remains in world
+     coordinates instead of being re-anchored every frame
+   - anchor resets on landing, gravity change, mode change, or teleport-sized
+     position discontinuity
+   - ship/UFO guide is hidden because a ballistic extrapolation without input
+     state is misleading
+
+Static/binary checks
+--------------------
+- ARM 1.1-like and x86 historical libraries export:
+  cocos2d::CCLayer::setTouchEnabled(bool)
+  cocos2d::CCLayer::setKeypadEnabled(bool)
+  PlayerObject::getOnGround() const
+  PlayerObject::getGravityFlipped() const
+- x86 historical library exports PlayLayer::getUILayer() const.
+- ARM legacy already resolved PlayLayer::getUILayer() const.
+- Source brace/parenthesis counts are balanced after edits.
+- Runtime Windows verification is still required.
+
+Critical test order
+-------------------
+1. Enter editor -> Play -> Pause.
+2. Immediately place a normal block.
+3. Immediately place a portal.
+4. Repeat Play -> Pause -> placement a second time.
+5. Check green trail continuity while moving.
+6. Jump as cube/ball and verify orange guide stays planted in world space.
+7. Enter ship/UFO and verify the incorrect orange predictor is absent.
