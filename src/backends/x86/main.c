@@ -283,6 +283,9 @@ typedef struct {
     float old_playtest_editor_camera_original_scale_y;
     int old_playtest_editor_camera_original_valid;
     int old_playtest_camera_fallback_logged;
+    int old_playtest_constrained_camera_valid;
+    int old_playtest_constrained_camera_mode;
+    float old_playtest_constrained_camera_y;
     void *old_playtest_editor_menus[128];
     unsigned char old_playtest_editor_menu_enabled[128];
     unsigned int old_playtest_editor_menu_count;
@@ -315,14 +318,9 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CAMERA_PIVOT_X 285.0f
 #define OLD_PLAYTEST_CAMERA_PIVOT_Y 160.0f
 #define OLD_PLAYTEST_CUBE_ZOOM_OUT_SCALE 0.90f
-#define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.75f
+#define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.70f
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
 #define OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y 25.0f
-#define OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y 25.0f
-#define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
-#define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
-#define OLD_PLAYTEST_BALL_BOTTOM 58.0f
-#define OLD_PLAYTEST_BALL_TOP 262.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
@@ -1947,9 +1945,9 @@ static int apply_old_playtest_camera(float player_x) {
        NEWERA15 IS THE BASELINE.
 
        Horizontal playtest scrolling is the known-good pre-newera11 path. Cube
-       Y never reads PlayerObject::Y. Constrained modes deliberately DO NOT read
-       PlayLayer's moving CCCamera either: ship/ball/UFO need one static viewport
-       which shows their complete legal vertical movement corridor at once.
+       Y never reads PlayerObject::Y. Constrained modes sample the historical
+       PlayLayer CCCamera exactly once on mode entry, then freeze that corridor
+       center so ship/ball/UFO never vertically follow the player.
     */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
@@ -1976,6 +1974,8 @@ static int apply_old_playtest_camera(float player_x) {
         (1.0f - zoom) * OLD_PLAYTEST_CAMERA_PIVOT_X;
 
     if (mode == OLD_PLAYTEST_MODE_CUBE) {
+        g_host.old_playtest_constrained_camera_valid = 0;
+        g_host.old_playtest_constrained_camera_mode = -1;
         /* Fixed-Y cube camera. Ground world Y=105 keeps the same relationship
            to level objects, then the whole play viewport is lifted 25 points
            clear of the editor selector. Jumping cannot alter this value. */
@@ -1984,15 +1984,48 @@ static int apply_old_playtest_camera(float player_x) {
                 (OLD_PLAYTEST_CUBE_GROUND_WORLD_Y - OLD_PLAYTEST_CAMERA_PIVOT_Y) +
             OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y;
     } else {
-        /* Ship/UFO legal range is 70..250 and ball is 58..262; both are centered
-           on world Y=160. Use a slightly wider 0.75x STATIC viewport with a
-           25-point lift. Relative to newera22 this keeps the lower edge almost
-           unchanged but reveals about ten extra screen points above the upper
-           corridor, covering the ceiling without any player-follow:
-             ship/UFO -> screen Y ~= 117.5..252.5
-             ball     -> screen Y ~= 108.5..261.5
-           No PlayerObject::Y, no dead-zone, no vertical follow. */
-        editor_camera_y = base_y + OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y;
+        /* NEWERA24: do not guess a fixed world corridor and do not follow the
+           player. NEWERA15 already proved that the hidden PlayLayer CCCamera
+           knows the correct vertical corridor for the exact historical build
+           and portal location. Capture that camera ONCE on gamemode entry,
+           freeze it, then zoom out around the logical screen center.
+
+           This is deliberately not a live CCCamera mirror: after the capture,
+           ship/ball/UFO movement cannot move the editor camera. */
+        if (!g_host.old_playtest_constrained_camera_valid ||
+            g_host.old_playtest_constrained_camera_mode != mode) {
+            float real_camera_x = 0.0f, real_camera_y = 0.0f;
+            if (read_old_playtest_real_camera(&real_camera_x, &real_camera_y)) {
+                (void)real_camera_x;
+                g_host.old_playtest_constrained_camera_y = base_y - real_camera_y;
+                g_host.old_playtest_constrained_camera_valid = 1;
+                g_host.old_playtest_constrained_camera_mode = mode;
+                runtime_log(
+                    "RESULT: X86_OLD_VER_PLAYTEST_STATIC_CORRIDOR_CAPTURE mode=%s source=PlayLayer-CCCamera camera-y=%.3f zoom=%.2f frozen=1",
+                    mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
+                    mode == OLD_PLAYTEST_MODE_BALL ? "ball" : "bird",
+                    g_host.old_playtest_constrained_camera_y,
+                    OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE);
+            } else {
+                /* Capability fallback: freeze the hidden game-layer Y once.
+                   Never read PlayerObject::Y here, so this still cannot become
+                   a player-following camera. */
+                g_host.old_playtest_constrained_camera_y = base_y;
+                g_host.old_playtest_constrained_camera_valid = 1;
+                g_host.old_playtest_constrained_camera_mode = mode;
+                runtime_log(
+                    "RESULT: X86_OLD_VER_PLAYTEST_STATIC_CORRIDOR_CAPTURE mode=%s source=game-layer-y camera-y=%.3f zoom=%.2f frozen=1",
+                    mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
+                    mode == OLD_PLAYTEST_MODE_BALL ? "ball" : "bird",
+                    g_host.old_playtest_constrained_camera_y,
+                    OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE);
+            }
+        }
+
+        /* Zoom the frozen NEWERA15 camera around screen Y=160. For an unscaled
+           camera translation C, scaling the whole viewport around the screen
+           center requires the editor-layer translation z*C. */
+        editor_camera_y = zoom * g_host.old_playtest_constrained_camera_y;
     }
     overlay_camera_y = editor_camera_y +
         (1.0f - zoom) * OLD_PLAYTEST_CAMERA_PIVOT_Y;
@@ -2219,6 +2252,9 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_proxy_poll_counter = 0u;
     g_host.old_playtest_camera_fallback_logged = 0;
+    g_host.old_playtest_constrained_camera_valid = 0;
+    g_host.old_playtest_constrained_camera_mode = -1;
+    g_host.old_playtest_constrained_camera_y = 0.0f;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_editor_camera_original_x =
@@ -2422,6 +2458,9 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
+    g_host.old_playtest_constrained_camera_valid = 0;
+    g_host.old_playtest_constrained_camera_mode = -1;
+    g_host.old_playtest_constrained_camera_y = 0.0f;
     g_host.gameplay_cache_time = 0;
     runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=editor-position-scale-restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=menus-restored edit-mode=restored slider=untouched");
     return 1;

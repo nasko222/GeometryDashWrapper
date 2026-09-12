@@ -4209,10 +4209,9 @@ public:
         constexpr float kPivotX = 285.0f;
         constexpr float kPivotY = 160.0f;
         constexpr float kCubeZoom = 0.90f;
-        constexpr float kConstrainedZoom = 0.75f;
+        constexpr float kConstrainedZoom = 0.70f;
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kCubeCameraLiftY = 25.0f;
-        constexpr float kConstrainedCameraLiftY = 25.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
@@ -4220,9 +4219,9 @@ public:
                               "CCNode::getPositionY static playtest camera"))
             return false;
 
-        /* NEWERA15 horizontal framing, with a fixed-Y camera. Constrained
-           gamemodes intentionally do not mirror the hidden PlayLayer CCCamera:
-           the whole legal vertical corridor must remain visible at once. */
+        /* NEWERA15 horizontal framing, with a fixed-Y cube camera. Constrained
+           gamemodes sample the hidden historical CCCamera only on mode entry
+           and then freeze that corridor center for the rest of the mode. */
         float camera_x = kAnchorX - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
         const int mode = old_playtest_proxy_mode_;
@@ -4239,17 +4238,50 @@ public:
 
         float editor_camera_y;
         if (mode == 0) {
+            old_playtest_constrained_camera_valid_ = false;
+            old_playtest_constrained_camera_mode_ = -1;
             /* Cube ground is world Y=105. This camera Y is independent of live
                player Y, so jumping cannot pull the camera. */
             editor_camera_y = base_y +
                 (1.0f - zoom) * (kCubeGroundWorldY - kPivotY) +
                 kCubeCameraLiftY;
         } else {
-            /* Static full-corridor viewport. Ship/UFO 70..250 and ball 58..262
-               are both centered on world Y=160. 0.75x plus a 25-point lift
-               keeps the lower framing essentially where newera22 had it while
-               revealing about ten extra screen points at the ceiling. */
-            editor_camera_y = base_y + kConstrainedCameraLiftY;
+            /* NEWERA24: capture the exact NEWERA15 PlayLayer camera once when
+               entering ship/ball/UFO, then freeze it. The historical game picks
+               the correct corridor for this portal/build; after this one sample
+               the player can move anywhere inside it without moving our camera. */
+            if (!old_playtest_constrained_camera_valid_ ||
+                old_playtest_constrained_camera_mode_ != mode) {
+                float real_camera_x = 0.0f, real_camera_y = 0.0f;
+                if (ReadOldVersionPlaytestRealCamera(real_camera_x, real_camera_y)) {
+                    (void)real_camera_x;
+                    old_playtest_constrained_camera_y_ = base_y - real_camera_y;
+                    old_playtest_constrained_camera_valid_ = true;
+                    old_playtest_constrained_camera_mode_ = mode;
+                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STATIC_CORRIDOR_CAPTURE mode="
+                         << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
+                         << " source=PlayLayer-CCCamera camera-y="
+                         << old_playtest_constrained_camera_y_
+                         << " zoom=" << kConstrainedZoom
+                         << " frozen=1\n";
+                    log_.flush();
+                } else {
+                    /* Static capability fallback; never sample PlayerObject::Y. */
+                    old_playtest_constrained_camera_y_ = base_y;
+                    old_playtest_constrained_camera_valid_ = true;
+                    old_playtest_constrained_camera_mode_ = mode;
+                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STATIC_CORRIDOR_CAPTURE mode="
+                         << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
+                         << " source=game-layer-y camera-y="
+                         << old_playtest_constrained_camera_y_
+                         << " zoom=" << kConstrainedZoom
+                         << " frozen=1\n";
+                    log_.flush();
+                }
+            }
+
+            /* Zoom around screen Y=160 using the frozen unscaled camera. */
+            editor_camera_y = zoom * old_playtest_constrained_camera_y_;
         }
         const float overlay_camera_y = editor_camera_y +
             (1.0f - zoom) * kPivotY;
@@ -4557,6 +4589,9 @@ public:
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
         old_playtest_camera_fallback_logged_ = false;
+        old_playtest_constrained_camera_valid_ = false;
+        old_playtest_constrained_camera_mode_ = -1;
+        old_playtest_constrained_camera_y_ = 0.0f;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
@@ -4796,6 +4831,9 @@ public:
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
         old_playtest_camera_fallback_logged_ = false;
+        old_playtest_constrained_camera_valid_ = false;
+        old_playtest_constrained_camera_mode_ = -1;
+        old_playtest_constrained_camera_y_ = 0.0f;
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
@@ -9228,6 +9266,9 @@ private:
     bool old_playtest_editor_camera_original_valid_ = false;
     u32 old_playtest_camera_xyz_ = 0u;
     bool old_playtest_camera_fallback_logged_ = false;
+    bool old_playtest_constrained_camera_valid_ = false;
+    int old_playtest_constrained_camera_mode_ = -1;
+    float old_playtest_constrained_camera_y_ = 0.0f;
     std::vector<u32> old_playtest_editor_menus_;
     std::vector<u8> old_playtest_editor_menu_enabled_;
     std::vector<u32> old_playtest_editor_sliders_;

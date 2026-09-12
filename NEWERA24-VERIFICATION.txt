@@ -1,0 +1,33 @@
+GeometryDashWrapper 0.9.7-newera24 verification
+================================================
+
+Base
+----
+- Source base: 0.9.7-newera23.
+- Cube camera math/framing behavior is intentionally preserved from newera23.
+
+Constrained camera fix
+----------------------
+- Removed fixed guessed ship/UFO range 70..250 and ball range 58..262 from the active camera path.
+- Ship/ball/UFO read the hidden PlayLayer CCCamera only once when the gamemode is entered.
+- The resulting NEWERA15-compatible unscaled camera Y is frozen until the mode changes.
+- No PlayerObject Y is used for constrained-mode camera motion after capture.
+- Constrained zoom is fixed at 0.70x and is independent from editor magnifier zoom.
+- No extra constrained vertical lift is added.
+- Editor game-layer and proxy/trail roots use separate aligned transforms under zoom.
+
+x86 stability
+-------------
+- CCMenuItemSpriteExtra remains excluded from CCMenu suspension.
+- Horizontal Slider remains untouched by x86 suspend/restore/resync.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE.
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE.
+
+Build metadata
+--------------
+- Wrapper/launcher: 0.9.7-newera24.
+- Branch: newera24.
+- Dynarmic builder revision: 136.

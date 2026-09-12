@@ -1,4 +1,17 @@
-# Geometry Dash Wrapper 0.9.7-newera23
+# Geometry Dash Wrapper 0.9.7-newera24
+
+## What newera24 changes
+
+- **Cube camera is visually unchanged from newera23.** Its fixed-Y 0.90x play-only framing remains the same; cube jump height still never enters the camera calculation.
+- **Removes the guessed ship/ball/UFO world corridors.** The old hardcoded `70..250` / `58..262` assumptions were wrong for vertically shifted historical fly/roll sections and could put the player completely outside the visible playtest viewport.
+- **Static corridor capture:** when ship, ball, or UFO/bird mode begins, the wrapper reads the hidden historical PlayLayer `CCCamera` Y exactly once (the same source that made newera15 framing correct), converts it to the newera15 unscaled camera translation, and freezes it for that gamemode. It is not read again until the mode changes.
+- **No constrained-mode player follow.** After that one mode-entry capture, PlayerObject Y cannot move the camera. Re-entering cube clears the frozen corridor; entering another constrained mode captures that mode's corridor once.
+- Constrained modes use a fixed **0.70x play-only zoom** around logical screen Y=160 with **no additional vertical lift**. This zoom is independent of the editor magnifier.
+- The editor game-layer and scene-root proxy/trail transforms remain separately aligned, so player proxies and level objects at the same world coordinate stay aligned while zoomed.
+- Keeps the newera23 x86 `CCMenu` RTTI fix and the earlier horizontal-Slider/freeze protections.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
+- Dynarmic builder revision is bumped to **136**.
+
 
 ## What newera23 changes
 
