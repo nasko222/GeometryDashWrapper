@@ -116,6 +116,7 @@ typedef struct {
     float last_touch_y;
     int native_ready;
     int mouse_down;
+    int mouse_touch_forwarded;
     int old_playtest_button_pointer_down;
     int keyboard_down;
     int native_paused;
@@ -321,7 +322,7 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.70f
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
 #define OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y 25.0f
-#define OLD_PLAYTEST_BALL_UFO_CAMERA_LIFT_Y 30.0f
+#define OLD_PLAYTEST_BALL_UFO_CAMERA_LIFT_Y 45.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
@@ -2349,7 +2350,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera26-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera28-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
     return 1;
 }
 
@@ -2751,6 +2752,66 @@ static void send_touch_move(float x, float y) {
                       g_host.touch_xs, g_host.touch_ys);
 }
 
+/*
+   Windows can cancel capture/focus without delivering the matching mouse-up or
+   key-up (Alt/system-menu transitions, Print Screen helpers, task switching,
+   etc.). Cocos 2.x keeps touch id 0 latched until touchesEnded arrives; if the
+   wrapper loses that END, every later editor/playtest button can appear dead.
+
+   Always close whatever gesture WE actually forwarded to Cocos, reset wrapper
+   pointer flags, and release Win32 capture. This is also called before a new
+   mouse-down so one lost Windows message can never permanently soft-lock the
+   session.
+*/
+static void cancel_native_input_state(HWND window, const char *reason) {
+    int had_state = 0;
+
+    if (g_host.old_playtest_button_pointer_down) {
+        g_host.old_playtest_button_pointer_down = 0;
+        had_state = 1;
+    }
+
+    if (g_host.mouse_down) {
+        int consumed = 0;
+        int action = gd_extras_menu_pointer_event(
+            &g_host.extras_menu, GD_EXTRAS_POINTER_END,
+            g_host.last_touch_x, g_host.last_touch_y,
+            g_host.native_width, g_host.native_height, &consumed);
+        if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
+        else if (action != GD_EXTRAS_ACTION_NONE)
+            runtime_log("Extras action %d is unavailable on x86", action);
+        if (g_host.mouse_touch_forwarded)
+            send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+        g_host.mouse_down = 0;
+        g_host.mouse_touch_forwarded = 0;
+        had_state = 1;
+    } else if (g_host.mouse_touch_forwarded) {
+        /* Defensive recovery for an impossible-but-dangerous half-cleared
+           wrapper state: Cocos saw BEGIN but our mouse_down bit was lost. */
+        send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
+        g_host.mouse_touch_forwarded = 0;
+        had_state = 1;
+    }
+
+    if (g_host.keyboard_down) {
+        g_host.keyboard_down = 0;
+        send_touch_end((float)g_host.native_width * 0.5f,
+                       (float)g_host.native_height * 0.5f);
+        had_state = 1;
+    }
+
+    if (window && GetCapture() == window) {
+        ReleaseCapture();
+        had_state = 1;
+    }
+
+    if (had_state) {
+        g_host.gameplay_cache_time = 0;
+        runtime_log("RESULT: X86_INPUT_STATE_RECOVERED reason=%s",
+                    reason ? reason : "unspecified");
+    }
+}
+
 static void send_text_character(WPARAM character) {
     WCHAR utf16[3] = {0, 0, 0};
     char utf8[12];
@@ -2843,6 +2904,17 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         toggle_fullscreen(window);
         return 0;
     }
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_SNAPSHOT) {
+        /* Print Screen itself should still reach Windows; only repair a touch
+           that would otherwise be stranded by screenshot/focus helpers. */
+        cancel_native_input_state(window, "print screen");
+    }
+    if ((message == WM_SYSKEYDOWN || message == WM_SYSKEYUP) &&
+        wparam == VK_MENU) {
+        cancel_native_input_state(window, "alt key");
+        return 0;
+    }
     switch (message) {
     case WM_CLOSE:
         g_host.closing = 1;
@@ -2866,9 +2938,25 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (wparam) {
             resume_native_game("window activated");
         } else {
+            cancel_native_input_state(window, "window deactivated");
             pause_native_game("window deactivated");
         }
         return 0;
+    case WM_KILLFOCUS:
+        cancel_native_input_state(window, "focus lost");
+        return 0;
+    case WM_CANCELMODE:
+        cancel_native_input_state(window, "cancel mode");
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wparam & 0xfff0u) == SC_KEYMENU) {
+            /* Do not let a bare Alt/F10 enter the Win32 menu state. There is
+               no native menu here, and old Cocos touch capture can otherwise
+               be left half-open until the next focus transition. */
+            cancel_native_input_state(window, "system key menu");
+            return 0;
+        }
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
@@ -2891,6 +2979,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         int consumed = 0;
         int action;
         SetFocus(window);
+        /* A brand-new DOWN is also a recovery point. If Windows dropped a
+           previous UP/CANCEL, close that old gesture before starting another. */
+        if (g_host.old_playtest_button_pointer_down || g_host.mouse_down ||
+            g_host.keyboard_down || g_host.mouse_touch_forwarded)
+            cancel_native_input_state(window, "new pointer down");
         /* Consume wrapper Play/Pause before the editor underneath sees DOWN. */
         if (old_playtest_button_hit_test(x, y)) {
             g_host.old_playtest_button_pointer_down = 1;
@@ -2898,6 +2991,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             return 0;
         }
         g_host.mouse_down = 1;
+        g_host.mouse_touch_forwarded = 0;
         SetCapture(window);
         action = gd_extras_menu_pointer_event(&g_host.extras_menu,
             GD_EXTRAS_POINTER_BEGIN, x, y, g_host.native_width,
@@ -2905,7 +2999,10 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
         else if (action != GD_EXTRAS_ACTION_NONE)
             runtime_log("Extras action %d is unavailable on x86", action);
-        if (!consumed) send_touch_begin(x, y);
+        if (!consumed) {
+            send_touch_begin(x, y);
+            g_host.mouse_touch_forwarded = 1;
+        }
         return 0;
     }
     case WM_MOUSEMOVE:
@@ -2919,7 +3016,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
             else if (action != GD_EXTRAS_ACTION_NONE)
                 runtime_log("Extras action %d is unavailable on x86", action);
-            if (!consumed) send_touch_move(x, y);
+            if (g_host.mouse_touch_forwarded) send_touch_move(x, y);
         }
         return 0;
     case WM_LBUTTONUP:
@@ -2946,7 +3043,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
             else if (action != GD_EXTRAS_ACTION_NONE)
                 runtime_log("Extras action %d is unavailable on x86", action);
-            if (!consumed) send_touch_end(x, y);
+            if (g_host.mouse_touch_forwarded) send_touch_end(x, y);
+            g_host.mouse_touch_forwarded = 0;
             /* A release can synchronously enter/leave PlayLayer.  Editor
                hotkey misses are cached per scene and are invalidated naturally
                when find_running_scene() observes the next scene. */
@@ -2954,21 +3052,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_CAPTURECHANGED:
-        if (g_host.old_playtest_button_pointer_down)
-            g_host.old_playtest_button_pointer_down = 0;
-        if (g_host.mouse_down) {
-            int consumed = 0;
-            int action;
-            g_host.mouse_down = 0;
-            action = gd_extras_menu_pointer_event(&g_host.extras_menu,
-                GD_EXTRAS_POINTER_END, g_host.last_touch_x, g_host.last_touch_y,
-                g_host.native_width, g_host.native_height, &consumed);
-            if (action == GD_EXTRAS_ACTION_UI_CHANGED) refresh_extras_visuals();
-            else if (action != GD_EXTRAS_ACTION_NONE)
-                runtime_log("Extras action %d is unavailable on x86", action);
-            if (!consumed) send_touch_end(g_host.last_touch_x, g_host.last_touch_y);
-            g_host.gameplay_cache_time = 0;
-        }
+        cancel_native_input_state(NULL, "capture changed");
         return 0;
     case WM_COMMAND: {
         int action = gd_extras_menu_handle_command(&g_host.extras_menu,
@@ -3004,6 +3088,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             return 0;
         }
         if ((wparam == VK_SPACE || wparam == VK_UP) && !g_host.keyboard_down &&
+            !g_host.mouse_down && !g_host.old_playtest_button_pointer_down &&
             !jni_shim_text_input_active()) {
             g_host.keyboard_down = 1;
             send_touch_begin((float)g_host.native_width * 0.5f,

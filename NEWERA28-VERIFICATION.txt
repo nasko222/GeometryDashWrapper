@@ -1,0 +1,38 @@
+GeometryDashWrapper 0.9.7-newera28 verification
+================================================
+
+Base
+----
+- Built from the exact newera27 full-source package generated in this conversation.
+
+Camera / rendering
+------------------
+- Cube camera: unchanged from newera27.
+- Ship camera: unchanged from newera27.
+- Ball + UFO/bird: static camera lift changed only from +30 to +45 Cocos points.
+- Constrained camera remains frozen on mode entry; no player-Y follow is added.
+- Proxy/icon rendering code is otherwise unchanged.
+
+x86 softlock recovery
+---------------------
+- Added mouse_touch_forwarded state so Cocos receives a matched MOVE/END only for gestures whose BEGIN was forwarded.
+- Added cancel_native_input_state(): closes active Cocos touch state and clears wrapper capture on focus loss, WM_CANCELMODE, capture loss, Alt menu-mode transitions, and Print Screen.
+- New WM_LBUTTONDOWN self-heals stale mouse/keyboard/wrapper-button input state before starting a new gesture.
+- Space/Up synthetic touches are blocked while a mouse or wrapper play/pause gesture is active.
+
+Gameplay logic preserved
+------------------------
+- newera26 attempt-2/autoretry reset guard remains.
+- destroyPlayer/collision remains live from frame zero.
+- x86 editor slider remains untouched by playtest suspension.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE.
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE.
+
+Validation
+----------
+- Source delimiter/sanity checks performed.
+- Transition patch round-trip must reconstruct final tree byte-for-byte before handoff.
+- Windows runtime behavior still requires user playtesting.

@@ -1,4 +1,15 @@
-# GeometryDashWrapper 0.9.7-newera27
+# GeometryDashWrapper 0.9.7-newera28
+
+
+## newera28 x86 input recovery + ball/UFO framing
+
+- **Cube and ship camera/player rendering are unchanged from newera27.**
+- Ball and UFO/bird keep the same frozen, non-following constrained camera, but their static framing is lifted another 15 Cocos points (45 total) so the lower movement extreme stays farther above the object-selector UI.
+- x86 now tracks whether a mouse gesture was actually forwarded to Cocos. Once a Cocos touch begins, move/end stay paired even if the pointer crosses wrapper UI.
+- x86 forcibly closes active Cocos touch id 0 on focus loss, `WM_CANCELMODE`, capture loss, Alt menu-mode transitions, and Print Screen. A new mouse-down also self-heals any stale gesture before beginning another one.
+- The synthetic Space/Up gameplay touch can no longer begin on top of an active mouse/wrapper-button gesture.
+- The newera26 attempt-2/autoretry guard and live hazard collision are unchanged.
+- Boomlings launcher defaults remain `SHOW_COMMAND_PROMPT=TRUE` and `OLD_VER_PLAYTEST=TRUE`; GDPS remains `FALSE` / `FALSE`.
 
 - Keeps the newera26 attempt/hazard split unchanged.
 - Keeps cube and ship playtest camera behavior unchanged.

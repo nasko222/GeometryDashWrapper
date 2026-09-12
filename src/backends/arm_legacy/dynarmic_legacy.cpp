@@ -4204,7 +4204,7 @@ public:
         constexpr float kConstrainedZoom = 0.70f;
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kCubeCameraLiftY = 25.0f;
-        constexpr float kBallUfoCameraLiftY = 30.0f;
+        constexpr float kBallUfoCameraLiftY = 45.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
@@ -4673,7 +4673,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera26-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera28-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched\n";
         log_.flush();
         return true;
     }
