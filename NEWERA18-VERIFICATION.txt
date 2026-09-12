@@ -1,0 +1,26 @@
+Geometry Dash Wrapper 0.9.7-newera18
+
+Camera correction
+-----------------
+- Base camera is the known-good newera15 behavior.
+- Zoom uses screen-space transform: screen' = A + 0.90 * (screen - A).
+- Cube Y pivot is fixed at 90.0; cube camera Y does not depend on PlayerObject Y.
+- Ship/ball/UFO Y pivot is fixed at 160.0 after the real historical CCCamera/framing is resolved.
+- Proxy inverse/counter-scale is removed. Proxy, breadcrumb, and editor world all receive the same camera scale.
+- X pivot preserves the already-correct newera15 player screen X.
+
+x86 editor stability
+--------------------
+- Slider remains excluded from editor-control suspension/restoration.
+- No forced EditorUI::updateSlider() after playtest.
+- Existing menu-only suspension and wrapper click consumption are retained.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE
+
+Metadata
+--------
+- version metadata updated to 0.9.7-newera18 / branch newera18
+- Dynarmic builder revision: dynarmic-x64-builder130-0.9.7-newera18

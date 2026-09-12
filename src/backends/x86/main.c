@@ -308,7 +308,9 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_ZOOM 0.90f
+#define OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE 0.90f
+#define OLD_PLAYTEST_CUBE_ZOOM_PIVOT_Y 90.0f
+#define OLD_PLAYTEST_CONSTRAINED_ZOOM_PIVOT_Y 160.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1916,12 +1918,13 @@ static int read_old_playtest_real_camera(float *world_x, float *world_y) {
 
 static int apply_old_playtest_camera(float player_x) {
     int mode = g_host.old_playtest_proxy_mode;
-    float player_y, base_y;
+    float player_y = 0.0f, base_y;
     float camera_x, camera_y;
     float real_camera_x = 0.0f, real_camera_y = 0.0f;
     float bottom, top, screen_y;
     float original_scale_x = 1.0f, original_scale_y = 1.0f;
     float zoom_scale_x, zoom_scale_y;
+    float pivot_screen_x, pivot_screen_y;
     float zoom_camera_x, zoom_camera_y;
 
     if (!g_host.old_playtest_editor_game_layer ||
@@ -1930,27 +1933,27 @@ static int apply_old_playtest_camera(float player_x) {
         return 0;
 
     /*
-       First reconstruct the EXACT newera15 camera. This is the known-good
-       alignment the user validated: cube uses the old pre-newera11 horizontal
-       camera, while ship/ball/UFO mirror the historical PlayLayer CCCamera Y.
-       Do not alter proxy coordinates or mode margins here.
+       Start from the exact newera15 camera that was visually correct:
+       cube uses the old pre-newera11 horizontal camera with fixed Y;
+       ship/ball/UFO mirror the historical PlayLayer CCCamera Y.
+       Zoom is applied only AFTER this camera has been resolved.
     */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
     base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
     camera_y = base_y;
-    player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
 
     if (mode == OLD_PLAYTEST_MODE_SHIP ||
         mode == OLD_PLAYTEST_MODE_BALL ||
         mode == OLD_PLAYTEST_MODE_BIRD) {
         if (read_old_playtest_real_camera(&real_camera_x, &real_camera_y)) {
-            (void)real_camera_x; /* preserve the known-good X framing */
+            (void)real_camera_x;
             camera_y = base_y - real_camera_y;
             g_host.old_playtest_camera_fallback_logged = 0;
         } else {
-            /* Capability fallback from newera15: clamp only at the legal
-               top/bottom play area; never center/follow the player. */
+            /* Same newera15 fallback: move only at the real mode boundaries.
+               This is the only path that reads player Y for camera logic. */
+            player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
             if (mode == OLD_PLAYTEST_MODE_BALL) {
                 bottom = OLD_PLAYTEST_BALL_BOTTOM;
                 top = OLD_PLAYTEST_BALL_TOP;
@@ -1976,29 +1979,41 @@ static int apply_old_playtest_camera(float player_x) {
         original_scale_x = g_host.old_playtest_editor_camera_original_scale_x;
         original_scale_y = g_host.old_playtest_editor_camera_original_scale_y;
     }
-    zoom_scale_x = original_scale_x * OLD_PLAYTEST_CAMERA_ZOOM;
-    zoom_scale_y = original_scale_y * OLD_PLAYTEST_CAMERA_ZOOM;
 
     /*
-       Proper zoom: zoom the WORLD around the player's already-correct screen
-       position. For a layer transform screen = scale*world + position, changing
-       scale from S to Z*S while adding (S-Z*S)*player to position leaves the
-       player's screen coordinate IDENTICAL. This avoids the newera16 offset.
+       TRUE zoom-out in screen space.
 
-       The editor world and breadcrumb root receive the same zoomed transform.
-       update_old_playtest_proxy_transform() counter-scales only the proxy root,
-       so the icon's screen position AND visual size remain exactly newera15.
+       Original: screen = S * world + T
+       Zoomed:   screen' = A + Z * (screen - A)
+
+       Therefore S' = Z*S and T' = A + Z*(T-A).
+       Z=0.90 makes every distance from fixed screen pivot A ten percent
+       smaller. That is unambiguously zoom OUT.
+
+       X pivots on the player's already-correct newera15 screen X so zoom does
+       not shove the player sideways. Y NEVER uses live cube/player Y:
+         cube          -> floor line Y=90 (jumping cannot move camera)
+         ship/ball/UFO -> gameplay-area center Y=160 (symmetric margins)
     */
-    zoom_camera_x = camera_x +
-        (original_scale_x - zoom_scale_x) * player_x;
-    zoom_camera_y = camera_y +
-        (original_scale_y - zoom_scale_y) * player_y;
+    zoom_scale_x = original_scale_x * OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE;
+    zoom_scale_y = original_scale_y * OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE;
+    pivot_screen_x = camera_x + original_scale_x * player_x;
+    pivot_screen_y = (mode == OLD_PLAYTEST_MODE_CUBE)
+        ? OLD_PLAYTEST_CUBE_ZOOM_PIVOT_Y
+        : OLD_PLAYTEST_CONSTRAINED_ZOOM_PIVOT_Y;
+    zoom_camera_x = pivot_screen_x +
+        OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE * (camera_x - pivot_screen_x);
+    zoom_camera_y = pivot_screen_y +
+        OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE * (camera_y - pivot_screen_y);
 
     g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, zoom_scale_x);
     g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, zoom_scale_y);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
                                zoom_camera_x, zoom_camera_y);
 
+    /* The proxy and breadcrumb are world-space children of this separate
+       scene-root overlay. Give that overlay the IDENTICAL camera transform.
+       Do not counter-scale the proxy: the player must zoom with the level. */
     if (g_host.old_playtest_trail) {
         g_host.ccnode_set_scale_x(g_host.old_playtest_trail, zoom_scale_x);
         g_host.ccnode_set_scale_y(g_host.old_playtest_trail, zoom_scale_y);
@@ -2087,13 +2102,10 @@ static int update_old_playtest_proxy_transform(void) {
        The extra +5 introduced in newera14 is what made cube render low/offset. */
     g_host.ccnode_set_position(g_host.old_playtest_proxy_root, x, y);
     g_host.ccnode_set_rotation(g_host.old_playtest_proxy_root, rotation);
-    /* The trail/world parent is camera-zoomed. Counter-scale only the proxy
-       root so its final on-screen size remains byte-for-byte equivalent to
-       newera15 while the camera shows more of the level. */
-    g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_root,
-        scale_x / OLD_PLAYTEST_CAMERA_ZOOM);
-    g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_root,
-        scale_y / OLD_PLAYTEST_CAMERA_ZOOM);
+    /* Proxy stays in the exact PlayerObject world coordinate system and obeys
+       the same camera zoom as every level object. No inverse/counter scale. */
+    g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_root, scale_x);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_root, scale_y);
     return append_old_playtest_trail_segment(x, y);
 }
 
@@ -2297,7 +2309,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-pivot-preserved constrained=real-CCCamera zoom=0.90 player-screen-pos=preserved proxy-screen-size=preserved scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-fixed-screen-pivot constrained=real-CCCamera zoom-out=0.90 cube-y-pivot=90 constrained-y-pivot=160 proxy-obeys-camera=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
     return 1;
 }
 

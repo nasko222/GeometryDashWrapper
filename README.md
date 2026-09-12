@@ -1,6 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera17
+# Geometry Dash Wrapper 0.9.7-newera18
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
+
+## What newera18 changes
+
+- Reverts the broken newera17 live-player camera pivot. Cube camera Y no longer reads player Y, so jumping cannot drag the viewport vertically.
+- Keeps the exact newera15 mode-aware camera as the base, then applies a true 0.90 screen-space zoom-out.
+- Cube zoom pivot is fixed at the historical floor line Y=90; constrained ship/ball/UFO modes zoom around gameplay-area center Y=160.
+- Removes the inverse proxy counter-scale from newera17. Player proxies now obey the exact same camera zoom as level objects and breadcrumbs, so they get smaller with the world instead of appearing oversized.
+- Keeps the x86 slider safety work: the editor horizontal Slider remains untouched by playtest suspend/restore and no forced updateSlider() is used.
+- Launcher defaults remain: BOOMLINGS has SHOW_COMMAND_PROMPT=TRUE and OLD_VER_PLAYTEST=TRUE; GDPS keeps both FALSE.
 
 ## What newera17 changes
 
