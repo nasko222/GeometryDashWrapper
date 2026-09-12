@@ -1,4 +1,11 @@
-# GeometryDashWrapper 0.9.7-newera30
+# GeometryDashWrapper 0.9.7-newera31
+
+## newera31 natural four-button pause layout
+
+- **Restart is now part of the native pause-button row:** on online levels, the wrapper finds the existing three-button `CCMenu` (practice / resume / list), shifts those three controls left by half one original slot, and inserts restart as the symmetric fourth slot on the right. The whole four-button group stays centered instead of leaving the old three fixed and hanging restart off the side.
+- **No hardcoded screen position:** x86 and ARM legacy derive the pause row's actual item spacing/Y at runtime. If a build does not expose a safe three-item pause row, the wrapper skips the injected restart control instead of drawing another overlapping overlay.
+- **`RESTART_BUTTON=TRUE` remains the default for both Boomlings and GDPS.** Native local-level restart remains untouched.
+- **Regression guard:** newera30 Linux/Wine networking, Delete-key support, instant pause/editor wrapper-control discovery, playtest camera/player/collision behavior, and x86 input recovery are unchanged.
 
 ## newera30 restart-menu cleanup + instant wrapper controls
 

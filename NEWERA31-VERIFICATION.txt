@@ -1,0 +1,18 @@
+GeometryDashWrapper 0.9.7-newera31 verification
+
+Base: exact 0.9.7-newera30 full-source package.
+
+Changes in this revision:
+- Reworked the wrapper-added online-level restart control on x86 and ARM legacy.
+- The wrapper now discovers the game's existing three-item pause CCMenu instead of creating a separate overlay menu.
+- The original practice/resume/list controls are shifted left by half one native slot and restart is inserted in the symmetric fourth slot, keeping the four-button group centered.
+- Pause row spacing and Y are derived from the live native menu; no fixed logical x/y placement is used.
+- If a safe three-item collinear pause row cannot be identified, restart injection is skipped rather than risking another overlapping layout.
+- RESTART_BUTTON remains TRUE by default and explicitly TRUE in both RUN_AUTO_BOOMLINGS.cmd and RUN_AUTO_GDPS.cmd.
+- No camera, player-proxy, collision/attempt, Linux/Wine networking, Delete-key, or input-recovery behavior was intentionally changed.
+
+Validation performed:
+- Static source checks and delimiter counts.
+- Restart-row math sanity check: native positions [-90, 0, 90] become [-135, -45, 45, 135], preserving the original group center.
+- Diff guard confirms old playtest camera/proxy/collision functions were not edited.
+- Patch round-trip: PASS (clean newera30 + patch reconstructed all 182 files byte-for-byte).

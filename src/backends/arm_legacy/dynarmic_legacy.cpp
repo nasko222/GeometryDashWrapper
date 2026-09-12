@@ -4969,9 +4969,11 @@ public:
     }
 
     bool RestartButtonSymbolsReady() const {
-        return runtime_.restart_callback && runtime_.cc_menu_create &&
-               runtime_.menu_item_sprite_extra_create &&
+        return runtime_.restart_callback && runtime_.menu_item_sprite_extra_create &&
                runtime_.ccnode_set_position_ff &&
+               runtime_.ccnode_get_children_count && runtime_.ccnode_get_children &&
+               runtime_.ccarray_object_at_index &&
+               runtime_.ccnode_get_position_x && runtime_.ccnode_get_position_y &&
                (runtime_.ccnode_add_child_z || runtime_.ccnode_add_child) &&
                (runtime_.pause_layer_on_restart ||
                 runtime_.play_layer_resume_and_restart);
@@ -4992,6 +4994,142 @@ public:
                          std::chrono::milliseconds(800))) return false;
         native_restart = level_type == 2u; /* GJLevelType::LocalLevel */
         return true;
+    }
+
+    bool FindPauseMainButtonMenu(u32 pause_layer, u32& menu_out,
+                                 float& spacing_out, float& row_y_out,
+                                 float& max_x_out) {
+        menu_out = 0u;
+        spacing_out = row_y_out = max_x_out = 0.0f;
+        if (!pause_layer || !runtime_.ccnode_get_children_count ||
+            !runtime_.ccnode_get_children || !runtime_.ccarray_object_at_index ||
+            !runtime_.ccnode_get_position_x || !runtime_.ccnode_get_position_y)
+            return true;
+        u32 pause_count = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children_count, {pause_layer},
+                         &pause_count, "PauseLayer child count restart layout", 0u,
+                         std::chrono::milliseconds(800)))
+            return false;
+        if (!pause_count) return true;
+        pause_count = std::min<u32>(pause_count, 128u);
+        u32 pause_children = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children, {pause_layer},
+                         &pause_children, "PauseLayer children restart layout", 0u,
+                         std::chrono::milliseconds(800)) || !pause_children)
+            return true;
+
+        for (u32 index = 0u; index < pause_count; ++index) {
+            u32 menu = 0u;
+            if (!RunFunction(runtime_.ccarray_object_at_index,
+                             {pause_children, index}, &menu,
+                             "PauseLayer child restart layout", 0u,
+                             std::chrono::milliseconds(500)))
+                return false;
+            if (!menu || !GuestObjectTypeContains(menu, "CCMenu") ||
+                GuestObjectTypeContains(menu, "CCMenuItem"))
+                continue;
+            u32 item_count = 0u;
+            if (!RunFunction(runtime_.ccnode_get_children_count, {menu},
+                             &item_count, "pause main menu child count", 0u,
+                             std::chrono::milliseconds(500)))
+                return false;
+            if (item_count != 3u) continue;
+            u32 items = 0u;
+            if (!RunFunction(runtime_.ccnode_get_children, {menu}, &items,
+                             "pause main menu children", 0u,
+                             std::chrono::milliseconds(500)) || !items)
+                continue;
+            float min_x = 0.0f, max_x = 0.0f, min_y = 0.0f, max_y = 0.0f;
+            bool valid = true;
+            for (u32 item_index = 0u; item_index < 3u; ++item_index) {
+                u32 item = 0u;
+                if (!RunFunction(runtime_.ccarray_object_at_index,
+                                 {items, item_index}, &item,
+                                 "pause main menu item", 0u,
+                                 std::chrono::milliseconds(500)))
+                    return false;
+                if (!item || !GuestObjectTypeContains(item, "CCMenuItem")) {
+                    valid = false;
+                    break;
+                }
+                float x = 0.0f, y = 0.0f;
+                if (!GuestFloatGetter(runtime_.ccnode_get_position_x, item, x,
+                                      "pause main item X") ||
+                    !GuestFloatGetter(runtime_.ccnode_get_position_y, item, y,
+                                      "pause main item Y"))
+                    return false;
+                if (item_index == 0u) {
+                    min_x = max_x = x;
+                    min_y = max_y = y;
+                } else {
+                    min_x = std::min(min_x, x);
+                    max_x = std::max(max_x, x);
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                }
+            }
+            if (!valid || max_x - min_x < 60.0f || max_y - min_y > 12.0f)
+                continue;
+            const float spacing = (max_x - min_x) * 0.5f;
+            if (spacing < 30.0f || spacing > 150.0f) continue;
+            menu_out = menu;
+            spacing_out = spacing;
+            row_y_out = (min_y + max_y) * 0.5f;
+            max_x_out = max_x;
+            return true;
+        }
+        return true;
+    }
+
+    bool RelayoutPauseRowForRestart(u32 menu, u32 restart_button,
+                                    float spacing, float row_y,
+                                    float old_max_x) {
+        if (!menu || !restart_button) return false;
+        u32 count = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children_count, {menu}, &count,
+                         "pause row count before restart", 0u,
+                         std::chrono::milliseconds(500)) || count != 3u)
+            return false;
+        u32 children = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children, {menu}, &children,
+                         "pause row children before restart", 0u,
+                         std::chrono::milliseconds(500)) || !children)
+            return false;
+        u32 original[3] = {0u, 0u, 0u};
+        float old_x[3] = {0.0f, 0.0f, 0.0f};
+        float old_y[3] = {0.0f, 0.0f, 0.0f};
+        for (u32 index = 0u; index < 3u; ++index) {
+            if (!RunFunction(runtime_.ccarray_object_at_index,
+                             {children, index}, &original[index],
+                             "pause row item before restart", 0u,
+                             std::chrono::milliseconds(500)) ||
+                !original[index] ||
+                !GuestObjectTypeContains(original[index], "CCMenuItem") ||
+                !GuestFloatGetter(runtime_.ccnode_get_position_x,
+                                  original[index], old_x[index],
+                                  "pause row original X") ||
+                !GuestFloatGetter(runtime_.ccnode_get_position_y,
+                                  original[index], old_y[index],
+                                  "pause row original Y"))
+                return false;
+        }
+        /* Attach first so a failed add never leaves the native three-button row
+           shifted without a restart control. */
+        if (!AddExtrasChild(menu, restart_button, 0)) return false;
+        const float half = spacing * 0.5f;
+        for (u32 index = 0u; index < 3u; ++index) {
+            if (!RunFunction(runtime_.ccnode_set_position_ff,
+                             {original[index], FloatToWord(old_x[index] - half),
+                              FloatToWord(old_y[index])}, nullptr,
+                             "shift native pause button left", 0u,
+                             std::chrono::milliseconds(800)))
+                return false;
+        }
+        return RunFunction(runtime_.ccnode_set_position_ff,
+                           {restart_button, FloatToWord(old_max_x + half),
+                            FloatToWord(row_y)}, nullptr,
+                           "position restart in pause row", 0u,
+                           std::chrono::milliseconds(800));
     }
 
     bool CreateRestartMenuItem(u32 pause_layer, u32& item_out) {
@@ -5089,24 +5227,19 @@ public:
             return true;
         }
         u32 menu = 0u, item = 0u;
-        if (!RunFunction(runtime_.cc_menu_create, {}, &menu,
-                         "CCMenu::create restart overlay", 0u,
-                         std::chrono::milliseconds(1200)) || !menu ||
-            !CreateRestartMenuItem(active_pause_layer_, item) || !item ||
-            !AddExtrasChild(menu, item, 0) ||
-            !RunFunction(runtime_.ccnode_set_position_ff,
-                         {menu, FloatToWord(0.0f), FloatToWord(0.0f)}, nullptr,
-                         "position restart menu", 0u,
-                         std::chrono::milliseconds(800)) ||
-            !RunFunction(runtime_.ccnode_set_position_ff,
-                         {item, FloatToWord(465.0f), FloatToWord(130.0f)}, nullptr,
-                         "position restart button", 0u,
-                         std::chrono::milliseconds(800)) ||
-            !AddExtrasChild(active_pause_layer_, menu, 30000))
+        float spacing = 0.0f, row_y = 0.0f, old_max_x = 0.0f;
+        if (!FindPauseMainButtonMenu(active_pause_layer_, menu, spacing,
+                                     row_y, old_max_x))
             return false;
+        if (!menu || !CreateRestartMenuItem(active_pause_layer_, item) || !item ||
+            !RelayoutPauseRowForRestart(menu, item, spacing, row_y, old_max_x)) {
+            log_ << "RESULT: DYNARMIC_RESTART_BUTTON_UNAVAILABLE reason=pause-row-layout\n";
+            log_.flush();
+            return true;
+        }
         restart_menu_ = menu;
         restart_button_ = item;
-        log_ << "RESULT: DYNARMIC_RESTART_BUTTON_READY mode=pause-overlay callback="
+        log_ << "RESULT: DYNARMIC_RESTART_BUTTON_READY mode=pause-main-row callback="
              << (runtime_.pause_layer_on_restart ? "PauseLayer::onRestart" :
                  "PlayLayer::resumeAndRestart") << "\n";
         log_.flush();

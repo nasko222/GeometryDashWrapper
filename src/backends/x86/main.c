@@ -326,8 +326,6 @@ static GameHost g_host;
 
 #define OLD_PLAYTEST_BUTTON_X 30.0f
 #define OLD_PLAYTEST_BUTTON_Y 186.0f
-#define WRAPPER_RESTART_BUTTON_X 465.0f
-#define WRAPPER_RESTART_BUTTON_Y 130.0f
 /* GJ_playBtn2 is about 82 px high; the pause icon is about 40 px. Scale the
    play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
    cannot restore the item to an oversized scale. */
@@ -1226,8 +1224,10 @@ static void __cdecl restart_button_callback(void *self, void *sender) {
 }
 
 static int restart_button_symbols_ready(void) {
-    return g_host.cc_menu_create && g_host.menu_item_sprite_extra_create &&
-           g_host.ccnode_set_position &&
+    return g_host.menu_item_sprite_extra_create && g_host.ccnode_set_position &&
+           g_host.ccnode_get_children_count && g_host.ccnode_get_children &&
+           g_host.ccarray_object_at_index && g_host.ccnode_get_position_x &&
+           g_host.ccnode_get_position_y &&
            (g_host.ccnode_add_child_z || g_host.ccnode_add_child) &&
            (g_host.pause_layer_on_restart ||
             g_host.pause_layer_on_restart_no_sender ||
@@ -1243,6 +1243,106 @@ static int active_level_already_has_native_restart(int *native_restart) {
     if (!level) return 1;
     if (native_restart)
         *native_restart = g_host.gj_game_level_get_level_type(level) == 2;
+    return 1;
+}
+
+/* Locate the game's real pause-button row instead of drawing a separate
+   overlay. Old GD PauseLayer::customSetup creates the large practice/resume/list
+   controls as three CCMenuItem children of one direct CCMenu. The smaller
+   Music/SFX/etc menu has multiple rows, so requiring exactly three collinear
+   items keeps this layout edit tightly scoped. */
+static void *find_pause_main_button_menu(void *pause_layer, float *spacing_out,
+                                         float *row_y_out, float *max_x_out) {
+    unsigned int pause_count, index;
+    void *pause_children;
+    if (spacing_out) *spacing_out = 0.0f;
+    if (row_y_out) *row_y_out = 0.0f;
+    if (max_x_out) *max_x_out = 0.0f;
+    if (!pause_layer || !g_host.ccnode_get_children_count ||
+        !g_host.ccnode_get_children || !g_host.ccarray_object_at_index ||
+        !g_host.ccnode_get_position_x || !g_host.ccnode_get_position_y)
+        return NULL;
+    pause_count = g_host.ccnode_get_children_count(pause_layer);
+    if (!pause_count) return NULL;
+    if (pause_count > 128u) pause_count = 128u;
+    pause_children = g_host.ccnode_get_children(pause_layer);
+    if (!pause_children) return NULL;
+
+    for (index = 0u; index < pause_count; ++index) {
+        void *menu = g_host.ccarray_object_at_index(pause_children, index);
+        unsigned int item_count, item_index;
+        void *items;
+        float min_x = 0.0f, max_x = 0.0f, min_y = 0.0f, max_y = 0.0f;
+        if (!menu || !object_type_contains(menu, "CCMenu") ||
+            object_type_contains(menu, "CCMenuItem"))
+            continue;
+        item_count = g_host.ccnode_get_children_count(menu);
+        if (item_count != 3u) continue;
+        items = g_host.ccnode_get_children(menu);
+        if (!items) continue;
+        for (item_index = 0u; item_index < item_count; ++item_index) {
+            void *item = g_host.ccarray_object_at_index(items, item_index);
+            float x, y;
+            if (!item || !object_type_contains(item, "CCMenuItem")) break;
+            x = g_host.ccnode_get_position_x(item);
+            y = g_host.ccnode_get_position_y(item);
+            if (item_index == 0u) {
+                min_x = max_x = x;
+                min_y = max_y = y;
+            } else {
+                if (x < min_x) min_x = x;
+                if (x > max_x) max_x = x;
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
+            }
+        }
+        if (item_index != item_count) continue;
+        if (max_x - min_x < 60.0f || max_y - min_y > 12.0f) continue;
+        {
+            const float spacing = (max_x - min_x) * 0.5f;
+            if (spacing < 30.0f || spacing > 150.0f) continue;
+            if (spacing_out) *spacing_out = spacing;
+            if (row_y_out) *row_y_out = (min_y + max_y) * 0.5f;
+            if (max_x_out) *max_x_out = max_x;
+            return menu;
+        }
+    }
+    return NULL;
+}
+
+static int relayout_pause_row_for_restart(void *menu, void *restart_button,
+                                          float spacing, float row_y,
+                                          float old_max_x) {
+    unsigned int count, index;
+    void *items;
+    void *original[3];
+    float old_x[3], old_y[3];
+    const float half = spacing * 0.5f;
+    if (!menu || !restart_button || !g_host.ccnode_get_children_count ||
+        !g_host.ccnode_get_children || !g_host.ccarray_object_at_index ||
+        !g_host.ccnode_get_position_x || !g_host.ccnode_get_position_y ||
+        !g_host.ccnode_set_position)
+        return 0;
+    /* Shift the original three left by half one slot, preserving their Y and
+       relative spacing. The new restart item occupies the symmetric fourth
+       slot, so the four-button group remains centered on the same menu. */
+    count = g_host.ccnode_get_children_count(menu);
+    if (count != 3u) return 0;
+    items = g_host.ccnode_get_children(menu);
+    if (!items) return 0;
+    for (index = 0u; index < count; ++index) {
+        original[index] = g_host.ccarray_object_at_index(items, index);
+        if (!original[index] ||
+            !object_type_contains(original[index], "CCMenuItem")) return 0;
+        old_x[index] = g_host.ccnode_get_position_x(original[index]);
+        old_y[index] = g_host.ccnode_get_position_y(original[index]);
+    }
+    /* Add first so a failed attach never leaves the native row half-relayouted. */
+    if (!add_extras_child(menu, restart_button, 0)) return 0;
+    for (index = 0u; index < count; ++index)
+        g_host.ccnode_set_position(original[index], old_x[index] - half,
+                                   old_y[index]);
+    g_host.ccnode_set_position(restart_button, old_max_x + half, row_y);
     return 1;
 }
 
@@ -1327,16 +1427,21 @@ static int ensure_restart_button(void) {
         }
         return 1;
     }
-    menu = g_host.cc_menu_create();
-    button = create_restart_menu_item(pause_layer);
-    if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
-    g_host.ccnode_set_position(menu, 0.0f, 0.0f);
-    g_host.ccnode_set_position(button, WRAPPER_RESTART_BUTTON_X,
-                               WRAPPER_RESTART_BUTTON_Y);
-    if (!add_extras_child(pause_layer, menu, 30000)) return 0;
+    {
+        float spacing = 0.0f, row_y = 0.0f, old_max_x = 0.0f;
+        menu = find_pause_main_button_menu(pause_layer, &spacing, &row_y,
+                                           &old_max_x);
+        button = create_restart_menu_item(pause_layer);
+        if (!menu || !button ||
+            !relayout_pause_row_for_restart(menu, button, spacing, row_y,
+                                            old_max_x)) {
+            runtime_log("RESULT: X86_RESTART_BUTTON_UNAVAILABLE reason=pause-row-layout");
+            return 1;
+        }
+    }
     g_host.restart_menu = menu;
     g_host.restart_button = button;
-    runtime_log("RESULT: X86_RESTART_BUTTON_READY mode=pause-overlay callback=%s",
+    runtime_log("RESULT: X86_RESTART_BUTTON_READY mode=pause-main-row callback=%s",
                 (g_host.pause_layer_on_restart ||
                  g_host.pause_layer_on_restart_no_sender)
                     ? "PauseLayer::onRestart"
