@@ -1,0 +1,56 @@
+GeometryDashWrapper 0.9.7-newera20 verification
+===============================================
+
+Base / rollback
+---------------
+- Source was rebuilt from the exact 0.9.7-newera15 full-source tree.
+- x86 and legacy ARM proxy-transform functions are byte-for-byte unchanged from newera15.
+- Camera BASE equations remain newera15:
+  * cube X: min(0, 120 - playerX)
+  * cube Y: hidden PlayLayer game-layer Y only (never PlayerObject Y)
+  * ship/ball/UFO Y: hidden PlayLayer CCCamera Y, with the same bounded-area fallback
+
+Play-only camera zoom
+---------------------
+- Playtest scale is absolute 0.90 on both editor game layer and wrapper proxy/trail root.
+- Saved editor magnifier scale is NOT referenced by the playtest camera function.
+- Stop restores the exact saved editor X/Y and scale X/Y.
+- Horizontal compensation preserves the newera15 player screen X:
+    zoomCameraX = cameraX + (1 - 0.90) * playerX
+- Cube vertical zoom is anchored to fixed world ground center Y=105:
+    zoomCameraY = cameraY + (1 - 0.90) * 105 + 25
+  Therefore jumping cannot move camera Y. Grounded cube placement is exactly
+  newera15 placement +25 Cocos points, while jump height is rendered at 0.90x.
+- Ship/ball/UFO use their newera15 real-camera framing first, then zoom around
+  fixed screen center Y=160 and lift the viewport 25 points.
+
+x86 purple-slider / freeze safety retained
+------------------------------------------
+- Horizontal Slider is not collected, disabled, retained, restored, or resynchronized.
+- EditorUI::updateSlider() is not required by OLD_VER_PLAYTEST and is not called on Stop.
+- Wrapper Play/Pause click is consumed by the Windows host before native touch dispatch,
+  preventing the editor control underneath from entering selected state.
+- Ordinary editor CCMenu controls remain suspended/restored during playtest.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd:
+    SHOW_COMMAND_PROMPT=TRUE
+    OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd:
+    SHOW_COMMAND_PROMPT=FALSE
+    OLD_VER_PLAYTEST=FALSE
+
+Static validation
+-----------------
+- Modified backend delimiter counts balanced.
+- No NUL bytes in modified backend source.
+- Focused camera-math invariants passed.
+- Proxy-transform functions match newera15 byte-for-byte.
+- Full source contains no APK, SO, EXE, or DLL game/runtime payloads.
+- Unified patch is generated from newera19 -> newera20 and is round-trip tested
+  against the exact newera19 full-source tree before handoff.
+
+Runtime note
+------------
+Windows runtime behavior still requires the user's real historical APK playtest.

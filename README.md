@@ -1,6 +1,16 @@
-# Geometry Dash Wrapper 0.9.7-newera19
+# Geometry Dash Wrapper 0.9.7-newera20
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
+
+## What newera20 changes
+
+- **Camera rollback first:** x86 and legacy ARM playtest camera/proxy behavior starts from the exact newera15 implementation again. The newera16-newera19 camera experiments are superseded; proxy world coordinates, ship/UFO/ball composition, mode margins, and cube horizontal-only follow remain newera15 behavior.
+- Playtest now has a **separate fixed 0.90x viewport zoom**. It does not read or multiply the editor magnifier scale. Whatever editor zoom/pan was active is saved before Playtest and restored on Stop.
+- Cube zoom is anchored to the fixed historical ground center at world Y=105, not to live PlayerObject Y. Jumping therefore moves only the cube; it cannot move the camera. The play camera is lifted 25 Cocos points so the grounded player clears the object selector.
+- Ship/ball/UFO still obtain their authoritative top/bottom framing from the hidden newera15 PlayLayer `CCCamera`; the fixed play-only zoom is applied around the gameplay view center afterward. No player-centering camera is reintroduced.
+- **x86 purple-slider/freeze fixes are retained from the later builds:** the horizontal Slider is never disabled/retained/restored/resynchronized, `EditorUI::updateSlider()` is not called on Stop, and the wrapper Play/Pause mouse click is consumed before the editor underneath can enter a selected state.
+- `RUN_AUTO_BOOMLINGS.cmd`: `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`. `RUN_AUTO_GDPS.cmd`: both remain `FALSE`.
+- Dynarmic builder revision is bumped to **132**.
 
 
 ## What newera19 changes
