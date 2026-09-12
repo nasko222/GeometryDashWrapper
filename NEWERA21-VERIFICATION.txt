@@ -1,0 +1,36 @@
+GeometryDashWrapper 0.9.7-newera21 verification
+================================================
+
+BASELINE
+- Camera/player rendering baseline is newera15.
+- The newera15 proxy transform/render code is unchanged.
+- Newera20 x86 purple-slider/freeze protections are preserved.
+
+CAMERA
+- Playtest world scale is absolute 0.90 while playtest is active.
+- Editor zoom/magnifier is not multiplied into playtest zoom.
+- Editor pan/scale are restored when playtest stops.
+- Cube uses fixed newera15 camera Y; cube jump height is not an input to camera Y.
+- Cube uses the existing +25 camera framing correction.
+- Ship / ball / UFO use newera15 mode camera, then camera-only dead-zone clamp:
+  visible player-center Y band = 120..245.
+- The clamp modifies only camera Y. Player/proxy world coordinates are untouched.
+
+X86 STABILITY
+- Horizontal Slider is not disabled, retained, restored, or updateSlider()-resynced.
+- Wrapper play/pause mouse click is host-consumed before editor controls receive it.
+- Existing retained CCMenu restore path remains.
+
+LAUNCHER DEFAULTS
+- RUN_AUTO_BOOMLINGS.cmd:
+  SHOW_COMMAND_PROMPT=TRUE
+  OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd:
+  SHOW_COMMAND_PROMPT=FALSE
+  OLD_VER_PLAYTEST=FALSE
+
+PACKAGING
+- Full source contains source only, no game APK/SO/EXE/DLL payloads.
+- Transition archive contains changed files at normal repository-relative paths.
+- Unified patch is generated against 0.9.7-newera20.
+- Patch round-trip must reconstruct the final source tree byte-for-byte.

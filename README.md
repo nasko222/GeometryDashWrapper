@@ -1,4 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera20
+# Geometry Dash Wrapper 0.9.7-newera21
+
+
+## What newera21 changes
+
+- Camera/player rendering baseline is the known-good **newera15** bridge. Player proxy/icon placement is unchanged.
+- Playtest uses an absolute **0.90** world scale while active; the editor magnifier scale is ignored during playtest and restored on stop.
+- Cube keeps the fixed-Y newera15 camera. Jumping cannot move camera Y.
+- Ship / ball / UFO keep the newera15 historical camera first, then a **camera-only dead-zone clamp** keeps the rendered player center between Y=120 and Y=245 so it cannot enter the bottom object selector or top editor toolbar.
+- The clamp changes only camera Y. It does not rewrite PlayerObject coordinates, proxy coordinates, vehicle offsets, icon offsets, or mode margins.
+- x86 keeps the later stability fix: the horizontal editor Slider is never disabled/retained/restored/resynced, and wrapper Play/Pause clicks are consumed before they can reach editor controls underneath.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE` and `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 

@@ -312,6 +312,8 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
 #define OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y 160.0f
 #define OLD_PLAYTEST_CAMERA_LIFT_Y 25.0f
+#define OLD_PLAYTEST_VISIBLE_BOTTOM 120.0f
+#define OLD_PLAYTEST_VISIBLE_TOP 245.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1997,6 +1999,20 @@ static int apply_old_playtest_camera(float player_x) {
         zoom_camera_y = OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y +
             zoom * (camera_y - OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y) +
             OLD_PLAYTEST_CAMERA_LIFT_Y;
+
+        /*
+           The historical ship/ball/UFO physics can move through a taller
+           vertical range than the editor leaves unobstructed. Keep the
+           newera15 mode camera and 0.90 play-only zoom, then move ONLY the
+           camera if the rendered player would enter the top toolbar or bottom
+           object selector. This is a dead-zone clamp, never player centering.
+        */
+        player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
+        screen_y = zoom * player_y + zoom_camera_y;
+        if (screen_y < OLD_PLAYTEST_VISIBLE_BOTTOM)
+            zoom_camera_y += OLD_PLAYTEST_VISIBLE_BOTTOM - screen_y;
+        else if (screen_y > OLD_PLAYTEST_VISIBLE_TOP)
+            zoom_camera_y -= screen_y - OLD_PLAYTEST_VISIBLE_TOP;
     }
 
     g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, zoom);
@@ -2295,7 +2311,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow lift=25 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow constrained-dead-zone=120..245 lift=25 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
     return 1;
 }
 

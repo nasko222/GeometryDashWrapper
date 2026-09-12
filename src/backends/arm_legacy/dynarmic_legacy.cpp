@@ -4210,6 +4210,8 @@ public:
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kConstrainedViewCenterY = 160.0f;
         constexpr float kCameraLiftY = 25.0f;
+        constexpr float kVisibleBottom = 120.0f;
+        constexpr float kVisibleTop = 245.0f;
         constexpr float kConstrainedBottom = 70.0f;
         constexpr float kConstrainedTop = 250.0f;
         constexpr float kBallBottom = 58.0f;
@@ -4265,12 +4267,32 @@ public:
            so jumping can never move the camera. */
         const float zoom_camera_x = camera_x +
             (1.0f - kZoomOutScale) * player_x;
-        const float zoom_camera_y = mode == 0
+        float zoom_camera_y = mode == 0
             ? camera_y + (1.0f - kZoomOutScale) * kCubeGroundWorldY +
                 kCameraLiftY
             : kConstrainedViewCenterY +
                 kZoomOutScale * (camera_y - kConstrainedViewCenterY) +
                 kCameraLiftY;
+
+        if (mode != 0) {
+            /*
+               Keep the exact newera15 constrained camera as the baseline, then
+               move ONLY the camera when the rendered ship/ball/UFO would enter
+               editor chrome. The middle of the legal band is static; this is
+               not a player-follow/centering camera.
+            */
+            float player_y = 0.0f;
+            if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
+                                  old_playtest_player_, player_y,
+                                  "CCNode::getPositionY constrained dead-zone"))
+                return false;
+            const float screen_y =
+                kZoomOutScale * player_y + zoom_camera_y;
+            if (screen_y < kVisibleBottom)
+                zoom_camera_y += kVisibleBottom - screen_y;
+            else if (screen_y > kVisibleTop)
+                zoom_camera_y -= screen_y - kVisibleTop;
+        }
 
         bool ok = true;
         ok = RunFunction(runtime_.ccnode_set_scale_x,
@@ -4648,7 +4670,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow lift=25 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow constrained-dead-zone=120..245 lift=25 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }
