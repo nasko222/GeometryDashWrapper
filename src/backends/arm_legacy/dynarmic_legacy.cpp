@@ -4206,124 +4206,82 @@ public:
             !old_playtest_player_) return false;
 
         constexpr float kAnchorX = 120.0f;
-        constexpr float kZoomOutScale = 0.90f;
+        constexpr float kPivotX = 285.0f;
+        constexpr float kPivotY = 160.0f;
+        constexpr float kCubeZoom = 0.90f;
+        constexpr float kConstrainedZoom = 0.80f;
         constexpr float kCubeGroundWorldY = 105.0f;
-        constexpr float kConstrainedViewCenterY = 160.0f;
-        constexpr float kCameraLiftY = 25.0f;
-        constexpr float kVisibleBottom = 120.0f;
-        constexpr float kVisibleTop = 245.0f;
-        constexpr float kConstrainedBottom = 70.0f;
-        constexpr float kConstrainedTop = 250.0f;
-        constexpr float kBallBottom = 58.0f;
-        constexpr float kBallTop = 262.0f;
+        constexpr float kCubeCameraLiftY = 25.0f;
+        constexpr float kConstrainedCameraLiftY = 30.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
                               old_playtest_play_game_layer_, base_y,
-                              "CCNode::getPositionY legacy cube camera"))
+                              "CCNode::getPositionY static playtest camera"))
             return false;
 
-        /* CAMERA BASELINE = NEWERA15, deliberately unchanged. */
+        /* NEWERA15 horizontal framing, with a fixed-Y camera. Constrained
+           gamemodes intentionally do not mirror the hidden PlayLayer CCCamera:
+           the whole legal vertical corridor must remain visible at once. */
         float camera_x = kAnchorX - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
-        float camera_y = base_y;
-
         const int mode = old_playtest_proxy_mode_;
-        if (mode == 1 || mode == 2 || mode == 3) {
-            float real_camera_x = 0.0f, real_camera_y = 0.0f;
-            if (ReadOldVersionPlaytestRealCamera(real_camera_x, real_camera_y)) {
-                (void)real_camera_x;
-                camera_y = base_y - real_camera_y;
-                old_playtest_camera_fallback_logged_ = false;
-            } else {
-                /* Exact newera15 fallback: clamp only to the historical mode
-                   play area; never center/follow the player. */
-                float player_y = 0.0f;
-                if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
-                                      old_playtest_player_, player_y,
-                                      "CCNode::getPositionY constrained fallback"))
-                    return false;
-                const float bottom = mode == 2 ? kBallBottom : kConstrainedBottom;
-                const float top = mode == 2 ? kBallTop : kConstrainedTop;
-                const float screen_y = player_y + camera_y;
-                if (screen_y < bottom)
-                    camera_y += bottom - screen_y;
-                else if (screen_y > top)
-                    camera_y -= screen_y - top;
+        const float zoom = mode == 0 ? kCubeZoom : kConstrainedZoom;
 
-                if (!old_playtest_camera_fallback_logged_) {
-                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_CAMERA_FALLBACK mode="
-                         << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
-                         << " source=bounded-game-area no-player-centering=1\n";
-                    log_.flush();
-                    old_playtest_camera_fallback_logged_ = true;
-                }
-            }
+        /* The editor CCLayer scales around logical center (285,160), while our
+           scene-root overlay CCNode scales around (0,0). Use separate positions
+           so a proxy and a level block at the same world coordinate remain
+           pixel-aligned after zoom. */
+        const float editor_camera_x = camera_x +
+            (1.0f - zoom) * (player_x - kPivotX);
+        const float overlay_camera_x = editor_camera_x +
+            (1.0f - zoom) * kPivotX;
+
+        float editor_camera_y;
+        if (mode == 0) {
+            /* Cube ground is world Y=105. This camera Y is independent of live
+               player Y, so jumping cannot pull the camera. */
+            editor_camera_y = base_y +
+                (1.0f - zoom) * (kCubeGroundWorldY - kPivotY) +
+                kCubeCameraLiftY;
+        } else {
+            /* Static full-corridor viewport. Ship/UFO 70..250 and ball 58..262
+               are both centered on world Y=160. 0.80x maps the entire ranges
+               above the object selector and below the top editor toolbar. */
+            editor_camera_y = base_y + kConstrainedCameraLiftY;
         }
-
-        /* Temporary play-only viewport. This is absolute 0.90 zoom and does
-           not depend on the editor magnifier at all. Stop restores the saved
-           editor scale + pan. Cube Y is anchored to fixed world ground Y=105,
-           so jumping can never move the camera. */
-        const float zoom_camera_x = camera_x +
-            (1.0f - kZoomOutScale) * player_x;
-        float zoom_camera_y = mode == 0
-            ? camera_y + (1.0f - kZoomOutScale) * kCubeGroundWorldY +
-                kCameraLiftY
-            : kConstrainedViewCenterY +
-                kZoomOutScale * (camera_y - kConstrainedViewCenterY) +
-                kCameraLiftY;
-
-        if (mode != 0) {
-            /*
-               Keep the exact newera15 constrained camera as the baseline, then
-               move ONLY the camera when the rendered ship/ball/UFO would enter
-               editor chrome. The middle of the legal band is static; this is
-               not a player-follow/centering camera.
-            */
-            float player_y = 0.0f;
-            if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
-                                  old_playtest_player_, player_y,
-                                  "CCNode::getPositionY constrained dead-zone"))
-                return false;
-            const float screen_y =
-                kZoomOutScale * player_y + zoom_camera_y;
-            if (screen_y < kVisibleBottom)
-                zoom_camera_y += kVisibleBottom - screen_y;
-            else if (screen_y > kVisibleTop)
-                zoom_camera_y -= screen_y - kVisibleTop;
-        }
+        const float overlay_camera_y = editor_camera_y +
+            (1.0f - zoom) * kPivotY;
 
         bool ok = true;
         ok = RunFunction(runtime_.ccnode_set_scale_x,
-                         {old_playtest_editor_game_layer_,
-                          FloatToWord(kZoomOutScale)},
-                         nullptr, "set absolute play-only zoom X", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(zoom)},
+                         nullptr, "set static play-only zoom X", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_scale_y,
-                         {old_playtest_editor_game_layer_,
-                          FloatToWord(kZoomOutScale)},
-                         nullptr, "set absolute play-only zoom Y", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(zoom)},
+                         nullptr, "set static play-only zoom Y", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_,
-                          FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
-                         nullptr, "apply newera15 camera with play-only zoom", 0u,
+                          FloatToWord(editor_camera_x), FloatToWord(editor_camera_y)},
+                         nullptr, "apply static playtest camera", 0u,
                          std::chrono::milliseconds(300)) && ok;
 
         if (old_playtest_trail_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_trail_, FloatToWord(kZoomOutScale)},
-                             nullptr, "set playtest overlay zoom X", 0u,
+                             {old_playtest_trail_, FloatToWord(zoom)},
+                             nullptr, "set aligned overlay zoom X", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_trail_, FloatToWord(kZoomOutScale)},
-                             nullptr, "set playtest overlay zoom Y", 0u,
+                             {old_playtest_trail_, FloatToWord(zoom)},
+                             nullptr, "set aligned overlay zoom Y", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_,
-                              FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
-                             nullptr, "apply play-only zoom to overlay", 0u,
+                              FloatToWord(overlay_camera_x),
+                              FloatToWord(overlay_camera_y)},
+                             nullptr, "align overlay to scaled editor layer", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;

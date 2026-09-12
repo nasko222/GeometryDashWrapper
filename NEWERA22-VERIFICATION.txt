@@ -1,0 +1,33 @@
+GeometryDashWrapper 0.9.7-newera22 verification
+
+Camera/rendering regression target
+----------------------------------
+- Base tree: 0.9.7-newera21, with newera15 proxy/icon rendering behavior preserved.
+- Cube camera Y is fixed: no PlayerObject::Y read is used by Apply/apply camera.
+- Constrained modes use a static vertical camera: no real CCCamera mirroring and no player-Y dead-zone/follow.
+- Cube playtest zoom: 0.90x.
+- Ship/ball/UFO playtest zoom: 0.80x.
+- Editor game layer uses logical scaling pivot (285,160).
+- Scene-root proxy/trail gets (1-scale)*pivot compensation so it stays aligned with level objects under zoom.
+- Static constrained view with +30 camera framing maps:
+  ship/UFO world 70..250 -> approximately screen 118..262
+  ball world 58..262 -> approximately screen 108.4..271.6
+- Cube ground world Y=105 maps identically for the editor layer and proxy overlay; +25 framing lift is fixed and independent of jump height.
+
+X86 stability protections preserved
+-----------------------------------
+- Editor Slider remains excluded from suspend/restore.
+- No forced EditorUI::updateSlider() on playtest stop.
+- Normal editor menus remain suspended during x86 playtest.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE
+
+Validation performed
+--------------------
+- Source delimiter/static checks.
+- Camera math invariant checks for proxy/object alignment and fixed-Y cube camera.
+- Constrained camera contains no live player-Y or CCCamera follow path.
+- Unified patch round-trip against clean newera21 must reproduce the final tree byte-for-byte.

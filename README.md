@@ -1,4 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera21
+# Geometry Dash Wrapper 0.9.7-newera22
+
+## What newera22 changes
+
+- **Rebases the playtest camera on the known-good newera15 rendering relationship.** The proxy/icon world coordinates and local ship/UFO/ball layouts are unchanged.
+- **Fixes the post-zoom player/object vertical mismatch.** `LevelEditorLayer`'s game layer scales around the logical 570×320 center `(285,160)`, while the scene-root proxy/trail node scales around `(0,0)`. newera22 uses separate camera positions for those two roots so a player proxy and a level block at the same world Y remain pixel-aligned after zoom.
+- **Cube:** fixed-Y camera, 0.90× play-only zoom, 25-point framing lift. Jump height never enters the camera calculation.
+- **Ship / ball / UFO:** one static vertical camera with 0.80× play-only zoom. It does **not** mirror/follow the hidden PlayLayer camera and does **not** dead-zone-follow the player. The full historical movement ranges fit in one view (ship/UFO `70..250`, ball `58..262`, centered on world Y=160).
+- Editor magnifier zoom is still ignored while playtest is running; stop restores the exact saved editor scale and pan.
+- Keeps the x86 purple horizontal-slider/freeze protections from newera17+: Slider is excluded from playtest suspend/restore and the forced `EditorUI::updateSlider()` resync remains removed.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
+
 
 
 ## What newera21 changes

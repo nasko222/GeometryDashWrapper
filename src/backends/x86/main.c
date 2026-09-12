@@ -308,12 +308,17 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE 0.90f
+/* The editor game layer is a CCLayer-sized 570x320 surface. Scaling that node
+   happens around its logical center, while the scene-root proxy/trail node has
+   a zero-sized anchor. Keep the two transforms separate or the player drifts
+   vertically from level objects as soon as playtest zoom != 1.0. */
+#define OLD_PLAYTEST_CAMERA_PIVOT_X 285.0f
+#define OLD_PLAYTEST_CAMERA_PIVOT_Y 160.0f
+#define OLD_PLAYTEST_CUBE_ZOOM_OUT_SCALE 0.90f
+#define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.80f
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
-#define OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y 160.0f
-#define OLD_PLAYTEST_CAMERA_LIFT_Y 25.0f
-#define OLD_PLAYTEST_VISIBLE_BOTTOM 120.0f
-#define OLD_PLAYTEST_VISIBLE_TOP 245.0f
+#define OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y 25.0f
+#define OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y 30.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1920,12 +1925,11 @@ static int read_old_playtest_real_camera(float *world_x, float *world_y) {
 
 static int apply_old_playtest_camera(float player_x) {
     int mode = g_host.old_playtest_proxy_mode;
-    float player_y, base_y;
-    float camera_x, camera_y;
-    float zoom_camera_x, zoom_camera_y;
-    float real_camera_x = 0.0f, real_camera_y = 0.0f;
-    float bottom, top, screen_y;
-    const float zoom = OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE;
+    float base_y;
+    float camera_x;
+    float editor_camera_x, editor_camera_y;
+    float overlay_camera_x, overlay_camera_y;
+    float zoom;
 
     if (!g_host.old_playtest_editor_game_layer ||
         !g_host.old_playtest_play_game_layer ||
@@ -1933,98 +1937,66 @@ static int apply_old_playtest_camera(float player_x) {
         return 0;
 
     /*
-       CAMERA BASELINE = NEWERA15, deliberately unchanged.
+       NEWERA15 IS THE BASELINE.
 
-       Cube uses the pre-newera11 horizontal camera and the hidden PlayLayer's
-       fixed game-layer Y. Ship/ball/UFO mirror the historical PlayLayer's real
-       CCCamera Y, including its top/bottom corridor restrictions. Never derive
-       cube camera Y from PlayerObject::Y.
+       Horizontal playtest scrolling is the known-good pre-newera11 path. Cube
+       Y never reads PlayerObject::Y. Constrained modes deliberately DO NOT read
+       PlayLayer's moving CCCamera either: ship/ball/UFO need one static viewport
+       which shows their complete legal vertical movement corridor at once.
     */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
     base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
-    camera_y = base_y;
 
-    if (mode == OLD_PLAYTEST_MODE_SHIP ||
-        mode == OLD_PLAYTEST_MODE_BALL ||
-        mode == OLD_PLAYTEST_MODE_BIRD) {
-        if (read_old_playtest_real_camera(&real_camera_x, &real_camera_y)) {
-            (void)real_camera_x; /* preserve newera15 horizontal framing */
-            camera_y = base_y - real_camera_y;
-            g_host.old_playtest_camera_fallback_logged = 0;
-        } else {
-            /* Exact newera15 capability fallback: clamp to the legal game area
-               only when the real CCCamera accessors are unavailable. */
-            player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
-            if (mode == OLD_PLAYTEST_MODE_BALL) {
-                bottom = OLD_PLAYTEST_BALL_BOTTOM;
-                top = OLD_PLAYTEST_BALL_TOP;
-            } else {
-                bottom = OLD_PLAYTEST_CONSTRAINED_BOTTOM;
-                top = OLD_PLAYTEST_CONSTRAINED_TOP;
-            }
-            screen_y = player_y + camera_y;
-            if (screen_y < bottom)
-                camera_y += bottom - screen_y;
-            else if (screen_y > top)
-                camera_y -= screen_y - top;
-            if (!g_host.old_playtest_camera_fallback_logged) {
-                runtime_log("RESULT: X86_OLD_VER_PLAYTEST_CAMERA_FALLBACK mode=%s source=bounded-game-area no-player-centering=1",
-                            mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
-                            mode == OLD_PLAYTEST_MODE_BALL ? "ball" : "bird");
-                g_host.old_playtest_camera_fallback_logged = 1;
-            }
-        }
-    }
+    zoom = mode == OLD_PLAYTEST_MODE_CUBE
+        ? OLD_PLAYTEST_CUBE_ZOOM_OUT_SCALE
+        : OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE;
 
     /*
-       The playtest zoom is its OWN temporary viewport, not editor magnification.
-       We force an absolute 0.90 scale while playing and restore the editor's
-       saved scale/position in stop_inline_old_playtest().
+       IMPORTANT: LevelEditorLayer's game layer and the scene-root proxy/trail
+       do NOT scale around the same local pivot. The game layer scales around
+       the logical 570x320 center (285,160); the plain CCNode overlay scales
+       around (0,0). Giving both nodes the same position is exactly what made
+       the cube render below a block at the same world Y in newera16-newera21.
 
-       X: zoom around the exact newera15 player screen X, so zoom never pushes
-          the player left/right.
-       Cube Y: zoom around the fixed historical ground center (world Y=105),
-          then lift the camera by 25 points. A jump changes PlayerObject::Y only;
-          camera Y remains fixed.
-       Ship/ball/UFO Y: zoom around the gameplay viewport center using the exact
-          newera15 constrained camera. This preserves the mode's real margins.
+       Compute the editor-layer transform first, then add (1-scale)*pivot to the
+       overlay transform. For any world point P, both paths then produce the
+       exact same screen coordinate.
     */
-    zoom_camera_x = camera_x + (1.0f - zoom) * player_x;
-    if (mode == OLD_PLAYTEST_MODE_CUBE) {
-        zoom_camera_y = camera_y +
-            (1.0f - zoom) * OLD_PLAYTEST_CUBE_GROUND_WORLD_Y +
-            OLD_PLAYTEST_CAMERA_LIFT_Y;
-    } else {
-        zoom_camera_y = OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y +
-            zoom * (camera_y - OLD_PLAYTEST_CONSTRAINED_VIEW_CENTER_Y) +
-            OLD_PLAYTEST_CAMERA_LIFT_Y;
+    editor_camera_x = camera_x +
+        (1.0f - zoom) * (player_x - OLD_PLAYTEST_CAMERA_PIVOT_X);
+    overlay_camera_x = editor_camera_x +
+        (1.0f - zoom) * OLD_PLAYTEST_CAMERA_PIVOT_X;
 
-        /*
-           The historical ship/ball/UFO physics can move through a taller
-           vertical range than the editor leaves unobstructed. Keep the
-           newera15 mode camera and 0.90 play-only zoom, then move ONLY the
-           camera if the rendered player would enter the top toolbar or bottom
-           object selector. This is a dead-zone clamp, never player centering.
-        */
-        player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
-        screen_y = zoom * player_y + zoom_camera_y;
-        if (screen_y < OLD_PLAYTEST_VISIBLE_BOTTOM)
-            zoom_camera_y += OLD_PLAYTEST_VISIBLE_BOTTOM - screen_y;
-        else if (screen_y > OLD_PLAYTEST_VISIBLE_TOP)
-            zoom_camera_y -= screen_y - OLD_PLAYTEST_VISIBLE_TOP;
+    if (mode == OLD_PLAYTEST_MODE_CUBE) {
+        /* Fixed-Y cube camera. Ground world Y=105 keeps the same relationship
+           to level objects, then the whole play viewport is lifted 25 points
+           clear of the editor selector. Jumping cannot alter this value. */
+        editor_camera_y = base_y +
+            (1.0f - zoom) *
+                (OLD_PLAYTEST_CUBE_GROUND_WORLD_Y - OLD_PLAYTEST_CAMERA_PIVOT_Y) +
+            OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y;
+    } else {
+        /* Ship/UFO legal range is 70..250 and ball is 58..262; both are centered
+           on world Y=160. At 0.80x, one STATIC camera shows the full corridor:
+             ship/UFO -> screen Y ~= 118..262
+             ball     -> screen Y ~= 108..272
+           No PlayerObject::Y, no dead-zone, no vertical follow. */
+        editor_camera_y = base_y + OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y;
     }
+    overlay_camera_y = editor_camera_y +
+        (1.0f - zoom) * OLD_PLAYTEST_CAMERA_PIVOT_Y;
 
     g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, zoom);
     g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, zoom);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
-                               zoom_camera_x, zoom_camera_y);
+                               editor_camera_x, editor_camera_y);
 
     if (g_host.old_playtest_trail) {
         g_host.ccnode_set_scale_x(g_host.old_playtest_trail, zoom);
         g_host.ccnode_set_scale_y(g_host.old_playtest_trail, zoom);
         g_host.ccnode_set_position(g_host.old_playtest_trail,
-                                   zoom_camera_x, zoom_camera_y);
+                                   overlay_camera_x, overlay_camera_y);
     }
     return 1;
 }
