@@ -4159,49 +4159,72 @@ public:
     }
 
     bool ApplyOldVersionPlaytestCamera(float player_x) {
-        (void)player_x;
-        if (!old_playtest_editor_game_layer_ || !old_playtest_play_game_layer_) return false;
+        if (!old_playtest_editor_game_layer_ || !old_playtest_player_) return false;
         constexpr float kZoom = 0.90f;
         constexpr float kCenterX = 285.0f;
         constexpr float kCenterY = 160.0f;
-        float base_x = 0.0f, base_y = 0.0f;
-        if (!GuestFloatGetter(runtime_.ccnode_get_position_x,
-                              old_playtest_play_game_layer_, base_x,
-                              "CCNode::getPositionX PlayLayer camera") ||
-            !GuestFloatGetter(runtime_.ccnode_get_position_y,
-                              old_playtest_play_game_layer_, base_y,
-                              "CCNode::getPositionY PlayLayer camera")) return false;
-        /* Old 1.0-1.7 gameplay has no camera-zoom trigger. Keep the visual
-           zoom fixed and avoid two guest ABI calls every frame. */
-        const float scale_x = kZoom;
-        const float scale_y = kZoom;
-        const float camera_x = kZoom * base_x + (1.0f - kZoom) * kCenterX;
-        const float camera_y = kZoom * base_y + (1.0f - kZoom) * kCenterY;
+        float player_y = 0.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_y, old_playtest_player_,
+                              player_y, "CCNode::getPositionY camera player"))
+            return false;
+
+        const auto now = std::chrono::steady_clock::now();
+        float follow_factor = 0.0f;
+        if (!old_playtest_camera_world_valid_) {
+            old_playtest_camera_world_y_ = 0.0f;
+            old_playtest_camera_last_update_ = now;
+            old_playtest_camera_world_valid_ = true;
+        } else {
+            const float elapsed = std::chrono::duration<float>(
+                now - old_playtest_camera_last_update_).count();
+            old_playtest_camera_last_update_ = now;
+            follow_factor = elapsed * 6.0f;
+            if (follow_factor > 1.0f) follow_factor = 1.0f;
+        }
+
+        float target_y = old_playtest_camera_world_y_;
+        if (player_y > old_playtest_camera_world_y_ + 120.0f)
+            target_y = player_y - 120.0f;
+        if (player_y < old_playtest_camera_world_y_ + 90.0f)
+            target_y = player_y - 90.0f;
+        old_playtest_camera_world_y_ +=
+            (target_y - old_playtest_camera_world_y_) * follow_factor;
+        if (old_playtest_camera_world_y_ < 0.0f)
+            old_playtest_camera_world_y_ = 0.0f;
+
+        /* 1.7-era PlayLayer::updateCamera stores a world camera at
+           (playerX-125, smoothedY) and applies it through CCCamera. The editor
+           bridge has no access to that camera object, so convert it into an
+           equivalent CCNode translation, then apply the requested zoom-out. */
+        const float camera_world_x = player_x - 125.0f;
+        const float camera_x = -kZoom * camera_world_x + (1.0f - kZoom) * kCenterX;
+        const float camera_y = -kZoom * old_playtest_camera_world_y_ +
+                               (1.0f - kZoom) * kCenterY;
         bool ok = RunFunction(runtime_.ccnode_set_scale_x,
-                              {old_playtest_editor_game_layer_, FloatToWord(scale_x)}, nullptr,
+                              {old_playtest_editor_game_layer_, FloatToWord(kZoom)}, nullptr,
                               "zoom editor game layer X", 0u,
                               std::chrono::milliseconds(300)) &&
                   RunFunction(runtime_.ccnode_set_scale_y,
-                              {old_playtest_editor_game_layer_, FloatToWord(scale_y)}, nullptr,
+                              {old_playtest_editor_game_layer_, FloatToWord(kZoom)}, nullptr,
                               "zoom editor game layer Y", 0u,
                               std::chrono::milliseconds(300)) &&
                   RunFunction(runtime_.ccnode_set_position_ff,
                               {old_playtest_editor_game_layer_, FloatToWord(camera_x),
                                FloatToWord(camera_y)}, nullptr,
-                              "mirror real PlayLayer camera into editor", 0u,
+                              "apply reconstructed old gameplay camera", 0u,
                               std::chrono::milliseconds(300));
         if (old_playtest_trail_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_trail_, FloatToWord(scale_x)}, nullptr,
+                             {old_playtest_trail_, FloatToWord(kZoom)}, nullptr,
                              "zoom playtest overlay X", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_trail_, FloatToWord(scale_y)}, nullptr,
+                             {old_playtest_trail_, FloatToWord(kZoom)}, nullptr,
                              "zoom playtest overlay Y", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_, FloatToWord(camera_x), FloatToWord(camera_y)},
-                             nullptr, "mirror PlayLayer camera into overlay", 0u,
+                             nullptr, "apply camera to playtest overlay", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;
@@ -4309,8 +4332,10 @@ public:
                               scale_x, "CCNode::getScaleX playtest player") ||
             !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
                               scale_y, "CCNode::getScaleY playtest player")) return false;
+        const float visual_y = y +
+            (old_playtest_proxy_mode_ == 0 ? 5.0f : 0.0f);
         if (!RunFunction(runtime_.ccnode_set_position_ff,
-                         {old_playtest_proxy_root_, FloatToWord(x), FloatToWord(y)}, nullptr,
+                         {old_playtest_proxy_root_, FloatToWord(x), FloatToWord(visual_y)}, nullptr,
                          "position playtest proxy root", 0u,
                          std::chrono::milliseconds(300)) ||
             !RunFunction(runtime_.ccnode_set_rotation,
@@ -4474,6 +4499,9 @@ public:
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
+        old_playtest_camera_world_y_ = 0.0f;
+        old_playtest_camera_world_valid_ = false;
+        old_playtest_camera_last_update_ = std::chrono::steady_clock::now();
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
@@ -4546,7 +4574,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=PlayLayer scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=1.7-updateCamera-model scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }
@@ -4712,6 +4740,7 @@ public:
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
+        old_playtest_camera_world_valid_ = false;
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
@@ -4800,6 +4829,7 @@ public:
             old_playtest_proxy_mode_ = -1;
             old_playtest_proxy_icon_ = -1;
             old_playtest_proxy_poll_counter_ = 0u;
+            old_playtest_camera_world_valid_ = false;
             old_playtest_level_clone_ = 0u;
             old_playtest_previous_play_layer_ = 0u;
             old_playtest_end_portal_ = 0u;
@@ -9141,6 +9171,9 @@ private:
     float old_playtest_editor_camera_original_scale_x_ = 1.0f;
     float old_playtest_editor_camera_original_scale_y_ = 1.0f;
     bool old_playtest_editor_camera_original_valid_ = false;
+    float old_playtest_camera_world_y_ = 0.0f;
+    bool old_playtest_camera_world_valid_ = false;
+    std::chrono::steady_clock::time_point old_playtest_camera_last_update_{};
     std::vector<u32> old_playtest_editor_menus_;
     std::vector<u8> old_playtest_editor_menu_enabled_;
     std::vector<u32> old_playtest_editor_sliders_;

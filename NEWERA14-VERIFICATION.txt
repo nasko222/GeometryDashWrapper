@@ -1,0 +1,28 @@
+Geometry Dash Wrapper 0.9.7-newera14
+
+Focus of this revision:
+- fix newera13 camera regression caused by reading CCNode position from a game layer whose camera is actually a CCCamera
+- reconstruct the 1.7-era gameplay camera on x86 and ARM legacy: X = playerX - 125, 90/120 vertical dead band, time-based Y smoothing
+- apply the 0.90 zoom as a layer transform after camera reconstruction so editor geometry and proxy overlay stay in the same coordinate space
+- correct the visibly sunken standalone cube proxy with a +5 world-unit visual offset
+- prevent the x86 pause/stop AV by retaining disabled CCMenu/Slider objects and restoring them directly instead of recursively walking the editor tree
+- keep trajectory prediction completely removed
+
+Static validation performed in this environment:
+- version/branch metadata is consistent at 0.9.7-newera14 / newera14
+- Dynarmic builder revision is 126
+- no backend source uses camera-source=PlayLayer or mirrors play-game-layer node X/Y as the gameplay camera
+- x86 stop restoration contains no old_playtest_node_is_descendant traversal
+- retained editor-control references are released on normal restore and scene-change cleanup
+- source delimiter/NUL checks pass
+- transition patch round-trip is verified after packaging
+
+Runtime checks requested:
+1. Start old editor Play and confirm the camera begins following as the cube moves.
+2. Check cube ground alignment and ship/UFO/ball vertical framing.
+3. Press pause/stop repeatedly on x86 and confirm no 0xc0000005 after EDIT_MODE_RESTORED.
+4. Confirm the editor controls and top X slider work normally again after stop.
+
+Windows runtime behavior still requires testing against the historical APKs.
+
+Dynarmic builder revision: 126

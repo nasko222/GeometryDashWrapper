@@ -277,6 +277,9 @@ typedef struct {
     float old_playtest_editor_camera_original_scale_x;
     float old_playtest_editor_camera_original_scale_y;
     int old_playtest_editor_camera_original_valid;
+    float old_playtest_camera_world_y;
+    ULONGLONG old_playtest_camera_last_tick;
+    int old_playtest_camera_world_valid;
     void *old_playtest_editor_menus[128];
     unsigned char old_playtest_editor_menu_enabled[128];
     unsigned int old_playtest_editor_menu_count;
@@ -1666,6 +1669,7 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
 }
 
 static void restore_old_playtest_edit_mode(void);
+static void release_old_playtest_editor_control_refs(int restore_state);
 
 static int ensure_old_playtest_button(void) {
     void *editor_ui;
@@ -1712,8 +1716,8 @@ static int ensure_old_playtest_button(void) {
             InterlockedExchange(&g_host.old_playtest_request, 0);
         }
         g_host.old_playtest_trail = NULL;
-        g_host.old_playtest_editor_menu_count = 0u;
-        g_host.old_playtest_editor_slider_count = 0u;
+        release_old_playtest_editor_control_refs(0);
+        g_host.old_playtest_camera_world_valid = 0;
     }
     if (!editor_ui || g_host.old_playtest_layer ||
         g_host.old_playtest_play_button) return 1;
@@ -1818,6 +1822,7 @@ static void collect_old_playtest_editor_controls(void *node,
     if (g_host.ccmenu_set_enabled && object_type_contains(node, "CCMenu") &&
         g_host.old_playtest_editor_menu_count < 128u) {
         unsigned int slot = g_host.old_playtest_editor_menu_count++;
+        g_host.ccobject_retain(node);
         g_host.old_playtest_editor_menus[slot] = node;
         g_host.old_playtest_editor_menu_enabled[slot] =
             g_host.ccmenu_is_enabled ? (unsigned char)(g_host.ccmenu_is_enabled(node) != 0) : 1u;
@@ -1826,6 +1831,7 @@ static void collect_old_playtest_editor_controls(void *node,
     if (g_host.cclayer_set_touch_enabled && object_type_contains(node, "Slider") &&
         g_host.old_playtest_editor_slider_count < 32u) {
         unsigned int slot = g_host.old_playtest_editor_slider_count++;
+        g_host.ccobject_retain(node);
         g_host.old_playtest_editor_sliders[slot] = node;
         g_host.old_playtest_editor_slider_touch_enabled[slot] =
             g_host.cclayer_is_touch_enabled
@@ -1845,97 +1851,103 @@ static void collect_old_playtest_editor_controls(void *node,
     }
 }
 
-static int old_playtest_node_is_descendant(void *node, void *target,
-                                           unsigned int depth,
-                                           unsigned int *visited) {
-    unsigned int i, count;
-    void *children;
-    if (!node || !target || !visited || depth > 16u || *visited >= 4096u ||
-        !memory_range_is_readable(node, sizeof(void *))) return 0;
-    if (node == target) return 1;
-    ++*visited;
-    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
-        !g_host.ccarray_object_at_index) return 0;
-    count = g_host.ccnode_get_children_count(node);
-    if (!count || count > 1024u) return 0;
-    children = g_host.ccnode_get_children(node);
-    if (!children) return 0;
-    for (i = 0u; i < count && *visited < 4096u; ++i) {
-        void *child = g_host.ccarray_object_at_index(children, i);
-        if (child && old_playtest_node_is_descendant(child, target,
-                                                     depth + 1u, visited))
-            return 1;
-    }
-    return 0;
-}
-
-static void set_old_playtest_editor_controls_enabled(int enabled) {
+static void release_old_playtest_editor_control_refs(int restore_state) {
     unsigned int i;
-    if (!enabled) {
-        unsigned int visited = 0u;
-        g_host.old_playtest_editor_menu_count = 0u;
-        g_host.old_playtest_editor_slider_count = 0u;
-        memset(g_host.old_playtest_editor_menus, 0, sizeof(g_host.old_playtest_editor_menus));
-        memset(g_host.old_playtest_editor_sliders, 0, sizeof(g_host.old_playtest_editor_sliders));
-        if (g_host.old_playtest_editor)
-            collect_old_playtest_editor_controls(g_host.old_playtest_editor, 0u, &visited);
-        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_SUSPENDED menus=%u sliders=%u",
-                    g_host.old_playtest_editor_menu_count,
-                    g_host.old_playtest_editor_slider_count);
-        return;
-    }
-    for (i = 0u; i < g_host.old_playtest_editor_menu_count; ++i) {
+    const unsigned int menu_count = g_host.old_playtest_editor_menu_count;
+    const unsigned int slider_count = g_host.old_playtest_editor_slider_count;
+    for (i = 0u; i < menu_count; ++i) {
         void *menu = g_host.old_playtest_editor_menus[i];
-        unsigned int visited = 0u;
-        if (menu && g_host.ccmenu_set_enabled && g_host.old_playtest_editor &&
-            old_playtest_node_is_descendant(g_host.old_playtest_editor, menu,
-                                            0u, &visited))
-            g_host.ccmenu_set_enabled(menu,
-                g_host.old_playtest_editor_menu_enabled[i] != 0);
+        if (!menu) continue;
+        if (restore_state && g_host.ccmenu_set_enabled)
+            g_host.ccmenu_set_enabled(
+                menu, g_host.old_playtest_editor_menu_enabled[i] != 0);
+        if (g_host.ccobject_release) g_host.ccobject_release(menu);
     }
-    for (i = 0u; i < g_host.old_playtest_editor_slider_count; ++i) {
+    for (i = 0u; i < slider_count; ++i) {
         void *slider = g_host.old_playtest_editor_sliders[i];
-        unsigned int visited = 0u;
-        if (slider && g_host.cclayer_set_touch_enabled && g_host.old_playtest_editor &&
-            old_playtest_node_is_descendant(g_host.old_playtest_editor, slider,
-                                            0u, &visited))
+        if (!slider) continue;
+        if (restore_state && g_host.cclayer_set_touch_enabled)
             g_host.cclayer_set_touch_enabled(
                 slider, g_host.old_playtest_editor_slider_touch_enabled[i] != 0);
+        if (g_host.ccobject_release) g_host.ccobject_release(slider);
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus=%u sliders=%u",
-                g_host.old_playtest_editor_menu_count,
-                g_host.old_playtest_editor_slider_count);
+    memset(g_host.old_playtest_editor_menus, 0, sizeof(g_host.old_playtest_editor_menus));
+    memset(g_host.old_playtest_editor_sliders, 0, sizeof(g_host.old_playtest_editor_sliders));
     g_host.old_playtest_editor_menu_count = 0u;
     g_host.old_playtest_editor_slider_count = 0u;
 }
 
+static void set_old_playtest_editor_controls_enabled(int enabled) {
+    if (!enabled) {
+        unsigned int visited = 0u;
+        /* The old editor may rebuild descendants while PlayLayer temporarily
+           owns GameManager state. Keep a reference to every control we disable
+           so stop never has to recursively walk a half-rebuilt Cocos tree. */
+        release_old_playtest_editor_control_refs(0);
+        if (g_host.old_playtest_editor && g_host.ccobject_retain &&
+            g_host.ccobject_release)
+            collect_old_playtest_editor_controls(g_host.old_playtest_editor, 0u, &visited);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_SUSPENDED menus=%u sliders=%u retained=1",
+                    g_host.old_playtest_editor_menu_count,
+                    g_host.old_playtest_editor_slider_count);
+        return;
+    }
+    {
+        const unsigned int menu_count = g_host.old_playtest_editor_menu_count;
+        const unsigned int slider_count = g_host.old_playtest_editor_slider_count;
+        release_old_playtest_editor_control_refs(1);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus=%u sliders=%u mode=retained-direct",
+                    menu_count, slider_count);
+    }
+}
+
 static int apply_old_playtest_camera(float player_x) {
-    float base_x, base_y;
-    float camera_x, camera_y, scale_x, scale_y;
-    (void)player_x;
-    if (!g_host.old_playtest_editor_game_layer || !g_host.old_playtest_play_game_layer)
+    float player_y, target_y, follow_factor;
+    float camera_world_x, camera_x, camera_y;
+    ULONGLONG now, elapsed_ms;
+    if (!g_host.old_playtest_editor_game_layer || !g_host.old_playtest_player)
         return 0;
 
-    /* Let the real hidden PlayLayer decide the camera. Its X/Y already contain
-       the mode-specific clamps/follow rules for cube, ship, ball and UFO. We
-       only apply a small visual zoom-out around the 570x320 design center. */
-    base_x = g_host.ccnode_get_position_x(g_host.old_playtest_play_game_layer);
-    base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
-    /* Historical 1.0-1.7 has no gameplay camera-zoom triggers: the camera
-       layer scale stays 1.0. Avoid two guest getter calls every frame. */
-    scale_x = OLD_PLAYTEST_CAMERA_ZOOM;
-    scale_y = OLD_PLAYTEST_CAMERA_ZOOM;
-    camera_x = OLD_PLAYTEST_CAMERA_ZOOM * base_x +
+    /* PlayLayer::updateCamera in the 1.7-era code moves a CCCamera, not the
+       game-layer CCNode. Mirroring gameLayer->getPosition() therefore produced
+       a perfectly static camera in newera13. Reproduce that old camera model:
+       X follows 125 units behind the player; Y has the original 90/120 dead
+       band and approximately the same time-based smoothing. */
+    player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
+    now = GetTickCount64();
+    if (!g_host.old_playtest_camera_world_valid) {
+        g_host.old_playtest_camera_world_y = 0.0f;
+        g_host.old_playtest_camera_last_tick = now;
+        g_host.old_playtest_camera_world_valid = 1;
+        follow_factor = 0.0f;
+    } else {
+        elapsed_ms = now - g_host.old_playtest_camera_last_tick;
+        g_host.old_playtest_camera_last_tick = now;
+        follow_factor = (float)elapsed_ms * 0.006f;
+        if (follow_factor > 1.0f) follow_factor = 1.0f;
+    }
+    target_y = g_host.old_playtest_camera_world_y;
+    if (player_y > g_host.old_playtest_camera_world_y + 120.0f)
+        target_y = player_y - 120.0f;
+    if (player_y < g_host.old_playtest_camera_world_y + 90.0f)
+        target_y = player_y - 90.0f;
+    g_host.old_playtest_camera_world_y +=
+        (target_y - g_host.old_playtest_camera_world_y) * follow_factor;
+    if (g_host.old_playtest_camera_world_y < 0.0f)
+        g_host.old_playtest_camera_world_y = 0.0f;
+
+    camera_world_x = player_x - 125.0f;
+    camera_x = -OLD_PLAYTEST_CAMERA_ZOOM * camera_world_x +
                (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_X;
-    camera_y = OLD_PLAYTEST_CAMERA_ZOOM * base_y +
+    camera_y = -OLD_PLAYTEST_CAMERA_ZOOM * g_host.old_playtest_camera_world_y +
                (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_Y;
 
-    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, scale_x);
-    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, scale_y);
+    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, OLD_PLAYTEST_CAMERA_ZOOM);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, OLD_PLAYTEST_CAMERA_ZOOM);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer, camera_x, camera_y);
     if (g_host.old_playtest_trail) {
-        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, scale_x);
-        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, scale_y);
+        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, OLD_PLAYTEST_CAMERA_ZOOM);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, OLD_PLAYTEST_CAMERA_ZOOM);
         g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
     }
     return 1;
@@ -2017,7 +2029,9 @@ static int update_old_playtest_proxy_transform(void) {
     rotation = g_host.ccnode_get_rotation(g_host.old_playtest_player);
     scale_x = g_host.ccnode_get_scale_x(g_host.old_playtest_player);
     scale_y = g_host.ccnode_get_scale_y(g_host.old_playtest_player);
-    g_host.ccnode_set_position(g_host.old_playtest_proxy_root, x, y);
+    g_host.ccnode_set_position(
+        g_host.old_playtest_proxy_root, x,
+        y + (g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_CUBE ? 5.0f : 0.0f));
     g_host.ccnode_set_rotation(g_host.old_playtest_proxy_root, rotation);
     g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_root, scale_x);
     g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_root, scale_y);
@@ -2147,6 +2161,9 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_proxy_poll_counter = 0u;
+    g_host.old_playtest_camera_world_y = 0.0f;
+    g_host.old_playtest_camera_last_tick = GetTickCount64();
+    g_host.old_playtest_camera_world_valid = 0;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_editor_camera_original_x =
@@ -2221,7 +2238,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=PlayLayer scene-isolated=1 editor-input=suspended editor-controls=suspended");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=1.7-updateCamera-model scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2263,6 +2280,7 @@ static int stop_inline_old_playtest(void) {
             g_host.old_playtest_editor_camera_original_y);
     }
     g_host.old_playtest_editor_camera_original_valid = 0;
+    g_host.old_playtest_camera_world_valid = 0;
     if (g_host.old_playtest_editor_input_suspended)
         set_old_playtest_editor_input_enabled(1);
 

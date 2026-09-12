@@ -1,16 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera13
+# Geometry Dash Wrapper 0.9.7-newera14
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
-## What newera13 changes
+## What newera14 changes
 
-- Replaces the fixed player-anchor camera with the **real hidden PlayLayer camera**. The wrapper reads that camera's X/Y every frame, so the old game's own cube/ship/ball/UFO vertical clamps and follow rules remain authoritative. A small `0.90x` visual zoom-out is then applied around the logical `570x320` playfield center.
-- Rebuilds the player proxy around one local-space root instead of positioning every sprite layer independently in world space. This fixes rotated ship/UFO offsets and reduces per-frame transform calls.
-- Matches the historical vehicle layout found in the old PlayerObject code: cube at local `(0,+5)` scaled to `0.55x`, ship body at `(0,-5)`, and UFO/bird body at `(0,-7)`. Newer x86 builds also use their secondary vehicle/detail frames when present.
-- Reduces proxy mode/icon probing to once every four frames, samples the green path every 16 world units, and caps the path at 256 segments. The trajectory predictor remains fully removed.
-- Keeps the stable first-attempt, edit-mode restoration, special-object placement, mirror-portal suppression, editor-control suspension and stop-path fixes from newera11/newera12.
-- Makes boolean values in both auto-run batch files consistently uppercase: `TRUE` / `FALSE`.
-- Dynarmic builder revision is bumped to **125**.
+- Fixes the newera13 static-camera regression. The old `PlayLayer` moves a `CCCamera`, not the game-layer node, so reading `gameLayer` X/Y could never follow the player. x86 and legacy ARM now reproduce the 1.7-era camera model directly: horizontal follow at `playerX - 125`, the original 90/120-unit vertical dead band, and time-based vertical smoothing.
+- Keeps the `0.90x` editor-playtest zoom-out, but converts the reconstructed world camera into an equivalent editor-layer translation around the logical `570x320` center. The editor level and proxy overlay receive the same transform so they stay aligned.
+- Raises only the standalone cube proxy by 5 world units to correct the visibly sunken overlay alignment; ship/UFO keep their historical local vehicle/cube offsets from newera13.
+- Fixes the x86 pause/stop access violation seen after `EDIT_MODE_RESTORED`. Disabled `CCMenu`/`Slider` controls are retained while playtest is active, restored directly, then released; stop no longer recursively walks a potentially rebuilt old Cocos editor tree.
+- Keeps the trajectory predictor fully removed, the reduced green-path sampling, uppercase batch booleans, first-attempt preservation, mirror suppression, and the zero-teardown playtest parking strategy.
+- Dynarmic builder revision is bumped to **126**.
 
 ## Architecture
 
@@ -185,6 +184,15 @@ The abandoned 1.02 comments hotkey and the progressively reconstructed stock 2.2
 ## License
 
 The wrapper's license is in `LICENSE`. Vendored zlib terms are in `third_party/ZLIB-LICENSE.txt`; stb_vorbis terms are in `third_party/stb/LICENSE`. Geometry Dash and its assets remain the property of their respective owners and are not distributed here.
+
+
+## newera14 editor-playtest changes
+
+- Replaced the broken newera13 `gameLayer->getPosition()` camera mirror with the actual old gameplay camera model. The playtest now follows horizontally, uses the 90/120 vertical dead band, and smooths vertical motion instead of remaining frozen at the editor start view.
+- The 0.90 zoom is applied after reconstructing the world camera, with identical transforms on the editor game layer and the scene-root proxy/path overlay.
+- Standalone cube proxy receives a +5 world-unit visual alignment correction; vehicle modes keep their local body/inner-cube layout.
+- x86 editor control restoration no longer traverses the editor scene tree during stop. Cached controls are retained before disabling, restored directly, and released, targeting the pause/stop AV that occurred immediately after edit-mode restoration.
+- Trajectory rendering remains completely removed.
 
 ## newera13 editor-playtest changes
 
