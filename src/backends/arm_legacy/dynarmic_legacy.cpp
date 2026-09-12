@@ -4209,10 +4209,10 @@ public:
         constexpr float kPivotX = 285.0f;
         constexpr float kPivotY = 160.0f;
         constexpr float kCubeZoom = 0.90f;
-        constexpr float kConstrainedZoom = 0.80f;
+        constexpr float kConstrainedZoom = 0.75f;
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kCubeCameraLiftY = 25.0f;
-        constexpr float kConstrainedCameraLiftY = 30.0f;
+        constexpr float kConstrainedCameraLiftY = 25.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
@@ -4246,8 +4246,9 @@ public:
                 kCubeCameraLiftY;
         } else {
             /* Static full-corridor viewport. Ship/UFO 70..250 and ball 58..262
-               are both centered on world Y=160. 0.80x maps the entire ranges
-               above the object selector and below the top editor toolbar. */
+               are both centered on world Y=160. 0.75x plus a 25-point lift
+               keeps the lower framing essentially where newera22 had it while
+               revealing about ten extra screen points at the ceiling. */
             editor_camera_y = base_y + kConstrainedCameraLiftY;
         }
         const float overlay_camera_y = editor_camera_y +

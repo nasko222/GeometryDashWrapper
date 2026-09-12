@@ -315,10 +315,10 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CAMERA_PIVOT_X 285.0f
 #define OLD_PLAYTEST_CAMERA_PIVOT_Y 160.0f
 #define OLD_PLAYTEST_CUBE_ZOOM_OUT_SCALE 0.90f
-#define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.80f
+#define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.75f
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
 #define OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y 25.0f
-#define OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y 30.0f
+#define OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y 25.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1835,7 +1835,14 @@ static void collect_old_playtest_editor_controls(void *node,
         !memory_range_is_readable(node, sizeof(void *))) return;
     ++*visited;
 
-    if (g_host.ccmenu_set_enabled && object_type_contains(node, "CCMenu") &&
+    /* RTTI substring matching must not treat CCMenuItemSpriteExtra as a
+       CCMenu. Calling CCMenu::setEnabled() with a CCMenuItem `this` corrupts
+       old x86 editor item state/scale (Build/Edit/Delete shrinking after a
+       playtest, and earlier selected/purple controls). Only real CCMenu
+       containers are suspended. */
+    if (g_host.ccmenu_set_enabled &&
+        object_type_contains(node, "CCMenu") &&
+        !object_type_contains(node, "CCMenuItem") &&
         g_host.old_playtest_editor_menu_count < 128u) {
         unsigned int slot = g_host.old_playtest_editor_menu_count++;
         g_host.ccobject_retain(node);
@@ -1978,9 +1985,12 @@ static int apply_old_playtest_camera(float player_x) {
             OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y;
     } else {
         /* Ship/UFO legal range is 70..250 and ball is 58..262; both are centered
-           on world Y=160. At 0.80x, one STATIC camera shows the full corridor:
-             ship/UFO -> screen Y ~= 118..262
-             ball     -> screen Y ~= 108..272
+           on world Y=160. Use a slightly wider 0.75x STATIC viewport with a
+           25-point lift. Relative to newera22 this keeps the lower edge almost
+           unchanged but reveals about ten extra screen points above the upper
+           corridor, covering the ceiling without any player-follow:
+             ship/UFO -> screen Y ~= 117.5..252.5
+             ball     -> screen Y ~= 108.5..261.5
            No PlayerObject::Y, no dead-zone, no vertical follow. */
         editor_camera_y = base_y + OLD_PLAYTEST_CONSTRAINED_CAMERA_LIFT_Y;
     }

@@ -1,0 +1,32 @@
+GeometryDashWrapper 0.9.7-newera23 verification
+
+Regression target
+-----------------
+- Base tree: 0.9.7-newera22.
+- Cube camera constants and cube branch are unchanged from newera22.
+- x86 editor control suspension must match real CCMenu containers only; any RTTI containing CCMenuItem is explicitly excluded.
+- Ship/ball/UFO remain static vertically: no PlayerObject::Y camera follow, no dead-zone follow, no hidden CCCamera mirroring.
+- Constrained playtest zoom: 0.75x.
+- Constrained camera lift: +25.
+- Static mapping:
+  ship/UFO world 70..250 -> approximately screen 117.5..252.5
+  ball world 58..262 -> approximately screen 108.5..261.5
+- This preserves approximately the same lower clearance as newera22 while exposing about ten more screen points of ceiling.
+
+X86 UI stability
+----------------
+- CCMenuItemSpriteExtra must never receive CCMenu::setEnabled through the playtest control collector.
+- Slider remains excluded from suspend/restore.
+- No forced EditorUI::updateSlider() runs on stop.
+- Wrapper Play/Pause click remains host-consumed before Cocos editor touch dispatch.
+
+Launcher defaults
+-----------------
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE
+
+Packaging validation
+--------------------
+- Full-source ZIP contains no game APK/SO/EXE/DLL payloads.
+- Transition ZIP contains changed files only at repository-relative paths.
+- Unified patch round-trip against clean newera22 must reproduce the final tree byte-for-byte.

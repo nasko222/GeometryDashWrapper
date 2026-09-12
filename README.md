@@ -1,4 +1,15 @@
-# Geometry Dash Wrapper 0.9.7-newera22
+# Geometry Dash Wrapper 0.9.7-newera23
+
+## What newera23 changes
+
+- **Cube camera/rendering is intentionally unchanged from newera22.** Its fixed-Y 0.90x play-only camera is left alone.
+- **x86 Build/Edit/Delete shrink fix:** the old editor-control walk used `object_type_contains(node, "CCMenu")`, which also matches `CCMenuItemSpriteExtra`. That meant `CCMenu::setEnabled()` could be called with a menu-item object as `this`, corrupting old x86 item state/scale. newera23 excludes every `CCMenuItem...` and suspends only actual `CCMenu` containers.
+- **Ship / ball / UFO remain one static non-following camera.** Constrained-mode zoom is widened from 0.80x to **0.75x**, and the framing lift changes from +30 to **+25**. This keeps the lower edge essentially unchanged while revealing roughly ten extra screen points at the ceiling.
+- Approximate static constrained mapping is now: ship/UFO world `70..250` -> screen `117.5..252.5`; ball world `58..262` -> screen `108.5..261.5`. No player-Y camera follow or dead-zone follow is used.
+- Editor magnifier zoom remains independent of playtest zoom; stopping Playtest restores the saved editor pan/scale.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
+- Dynarmic builder revision is bumped to **135**.
+
 
 ## What newera22 changes
 
