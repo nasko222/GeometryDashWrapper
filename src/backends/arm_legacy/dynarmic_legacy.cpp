@@ -3818,38 +3818,37 @@ public:
         };
 
         char name[64]{};
-        if (mode == 1) {
-            std::snprintf(name, sizeof(name), "ship_%02d_001.png", icon);
+        if (mode == 1 || mode == 3) {
+            /* Vehicle is the back layer. Put the selected cube above it so the
+               ship/UFO actually contains the player icon instead of covering it. */
+            std::snprintf(name, sizeof(name),
+                          mode == 1 ? "ship_%02d_001.png" : "bird_%02d_001.png",
+                          icon);
             (void)create_frame(name, old_playtest_proxy_primary_);
             u32 manager = 0u, cube_icon = 1u;
             if (runtime_.game_manager_shared_state &&
                 RunFunction(runtime_.game_manager_shared_state, {}, &manager,
-                            "GameManager::sharedState ship cube", 0u,
+                            "GameManager::sharedState vehicle cube", 0u,
                             std::chrono::milliseconds(300)) && manager &&
                 runtime_.game_manager_get_player_frame)
                 (void)RunFunction(runtime_.game_manager_get_player_frame, {manager},
-                                  &cube_icon, "GameManager::getPlayerFrame ship cube", 0u,
+                                  &cube_icon, "GameManager::getPlayerFrame vehicle cube", 0u,
                                   std::chrono::milliseconds(300));
             if (cube_icon < 1u || cube_icon > 99u) cube_icon = 1u;
             std::snprintf(name, sizeof(name), "player_%02u_001.png", cube_icon);
             (void)create_frame(name, old_playtest_proxy_secondary_);
             std::snprintf(name, sizeof(name), "player_%02u_2_001.png", cube_icon);
             (void)create_frame(name, old_playtest_proxy_tertiary_);
-            if (!tint(old_playtest_proxy_primary_, primary_color, "tint ship proxy") ||
-                !tint(old_playtest_proxy_secondary_, primary_color, "tint ship cube primary") ||
-                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint ship cube secondary"))
+            if (!tint(old_playtest_proxy_primary_, primary_color, "tint vehicle proxy") ||
+                !tint(old_playtest_proxy_secondary_, primary_color, "tint vehicle cube primary") ||
+                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint vehicle cube secondary"))
                 return false;
         } else {
-            const char* prefix = mode == 2 ? "player_ball" :
-                                 mode == 3 ? "bird" : "player";
+            const char* prefix = mode == 2 ? "player_ball" : "player";
             std::snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
             (void)create_frame(name, old_playtest_proxy_primary_);
             std::snprintf(name, sizeof(name), "%s_%02d_2_001.png", prefix, icon);
             (void)create_frame(name, old_playtest_proxy_secondary_);
-            if (mode == 3) {
-                std::snprintf(name, sizeof(name), "%s_%02d_3_001.png", prefix, icon);
-                (void)create_frame(name, old_playtest_proxy_tertiary_);
-            }
             if (!old_playtest_proxy_primary_) {
                 icon = mode == 2 ? 0 : 1;
                 std::snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
@@ -3864,26 +3863,25 @@ public:
                 (void)create_frame("player_01_2_001.png", old_playtest_proxy_secondary_);
             }
             if (!tint(old_playtest_proxy_primary_, primary_color, "tint player proxy primary") ||
-                !tint(old_playtest_proxy_secondary_, secondary_color, "tint player proxy secondary") ||
-                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint player proxy tertiary"))
+                !tint(old_playtest_proxy_secondary_, secondary_color, "tint player proxy secondary"))
                 return false;
         }
         if (!old_playtest_proxy_primary_) return false;
-        if (old_playtest_proxy_tertiary_ &&
-            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_tertiary_, 9998))
+        if (!AddExtrasChild(old_playtest_trail_, old_playtest_proxy_primary_, 9998))
             return false;
         if (old_playtest_proxy_secondary_ &&
             !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_secondary_, 9999))
             return false;
-        if (!AddExtrasChild(old_playtest_trail_, old_playtest_proxy_primary_, 10000))
+        if (old_playtest_proxy_tertiary_ &&
+            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_tertiary_, 10000))
             return false;
         old_playtest_proxy_mode_ = mode;
         old_playtest_proxy_icon_ = icon;
-        old_playtest_motion_has_velocity_ = false;
         log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_PROXY_MODE mode="
              << (mode == 1 ? "ship" : mode == 2 ? "ball" :
                  mode == 3 ? "bird" : "cube")
-             << " icon=" << icon << " colors=player\n";
+             << " icon=" << icon << " colors=player inner-icon="
+             << ((mode == 1 || mode == 3) ? "cube" : "native-layers") << "\n";
         log_.flush();
         return true;
     }
@@ -3906,13 +3904,6 @@ public:
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
-        old_playtest_trajectory_.fill(0u);
-        old_playtest_motion_has_last_ = false;
-        old_playtest_motion_has_velocity_ = false;
-        old_playtest_motion_prev_on_ground_ = false;
-        old_playtest_motion_prev_on_ground_valid_ = false;
-        old_playtest_trajectory_sample_count_ = 0;
-        old_playtest_trajectory_anchor_valid_ = false;
         return true;
     }
 
@@ -4041,6 +4032,35 @@ public:
         return ok;
     }
 
+    bool OldVersionPlaytestNodeInTree(u32 node, u32 target,
+                                          unsigned depth,
+                                          unsigned& visited) {
+        if (!node || !target || depth > 16u || visited >= 4096u ||
+            !env_.IsMapped(node, 4u)) return false;
+        if (node == target) return true;
+        ++visited;
+        if (!runtime_.ccnode_get_children || !runtime_.ccnode_get_children_count ||
+            !runtime_.ccarray_object_at_index) return false;
+        u32 count = 0u, children = 0u;
+        if (!RunFunction(runtime_.ccnode_get_children_count, {node}, &count,
+                         "CCNode::getChildrenCount editor restore membership", 0u,
+                         std::chrono::milliseconds(300)) || !count) return false;
+        if (count > 1024u) count = 1024u;
+        if (!RunFunction(runtime_.ccnode_get_children, {node}, &children,
+                         "CCNode::getChildren editor restore membership", 0u,
+                         std::chrono::milliseconds(300)) || !children) return false;
+        for (u32 i = 0u; i < count && visited < 4096u; ++i) {
+            u32 child = 0u;
+            if (!RunFunction(runtime_.ccarray_object_at_index, {children, i}, &child,
+                             "CCArray::objectAtIndex editor restore membership", 0u,
+                             std::chrono::milliseconds(300))) return false;
+            if (child && OldVersionPlaytestNodeInTree(child, target,
+                                                      depth + 1u, visited))
+                return true;
+        }
+        return false;
+    }
+
     bool SetOldVersionPlaytestEditorControlsEnabled(bool enabled) {
         bool ok = true;
         if (!enabled) {
@@ -4058,19 +4078,27 @@ public:
             return ok;
         }
         for (std::size_t i = 0; i < old_playtest_editor_menus_.size(); ++i) {
-            if (!runtime_.ccmenu_set_enabled) break;
+            if (!runtime_.ccmenu_set_enabled || !old_playtest_editor_) break;
+            unsigned visited = 0u;
+            if (!OldVersionPlaytestNodeInTree(old_playtest_editor_,
+                                              old_playtest_editor_menus_[i],
+                                              0u, visited)) continue;
             ok = RunFunction(runtime_.ccmenu_set_enabled,
                              {old_playtest_editor_menus_[i],
                               old_playtest_editor_menu_enabled_[i] ? 1u : 0u},
-                             nullptr, "CCMenu::setEnabled restore editor", 0u,
+                             nullptr, "CCMenu::setEnabled restore live editor", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         for (std::size_t i = 0; i < old_playtest_editor_sliders_.size(); ++i) {
-            if (!runtime_.cclayer_set_touch_enabled) break;
+            if (!runtime_.cclayer_set_touch_enabled || !old_playtest_editor_) break;
+            unsigned visited = 0u;
+            if (!OldVersionPlaytestNodeInTree(old_playtest_editor_,
+                                              old_playtest_editor_sliders_[i],
+                                              0u, visited)) continue;
             ok = RunFunction(runtime_.cclayer_set_touch_enabled,
                              {old_playtest_editor_sliders_[i],
                               old_playtest_editor_slider_touch_enabled_[i] ? 1u : 0u},
-                             nullptr, "CCLayer::setTouchEnabled restore Slider", 0u,
+                             nullptr, "CCLayer::setTouchEnabled restore live Slider", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus="
@@ -4086,7 +4114,7 @@ public:
 
     bool ApplyOldVersionPlaytestCamera(float player_x) {
         if (!old_playtest_editor_game_layer_ || !old_playtest_play_game_layer_) return false;
-        constexpr float kZoom = 0.92f;
+        constexpr float kZoom = 0.85f;
         constexpr float kCenterY = 160.0f;
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
@@ -4127,23 +4155,6 @@ public:
         return ok;
     }
 
-    bool ReadOldVersionPlaytestPlayerVelocity(double& vx, double& vy) {
-        if (!old_playtest_player_) return false;
-        /* ARM 1.0-1.4 PlayerObject::update uses the same motion block as the
-           tested v1.1 binary: +0x340 horizontal velocity, +0x370 vertical
-           velocity. Invalid layouts fail closed and simply hide the guide. */
-        constexpr u32 kVelocityXOffset = 0x340u;
-        constexpr u32 kVelocityYOffset = 0x370u;
-        if (!env_.IsMapped(old_playtest_player_ + kVelocityXOffset, 8u) ||
-            !env_.IsMapped(old_playtest_player_ + kVelocityYOffset, 8u))
-            return false;
-        const u64 raw_x = env_.MemoryRead64(old_playtest_player_ + kVelocityXOffset);
-        const u64 raw_y = env_.MemoryRead64(old_playtest_player_ + kVelocityYOffset);
-        std::memcpy(&vx, &raw_x, sizeof(vx));
-        std::memcpy(&vy, &raw_y, sizeof(vy));
-        return std::isfinite(vx) && std::isfinite(vy) &&
-               std::fabs(vx) < 100000.0 && std::fabs(vy) < 100000.0;
-    }
 
     bool PositionOldVersionPlaytestLineSprite(u32 sprite,
                                                float x1, float y1,
@@ -4190,9 +4201,9 @@ public:
         }
         const float dx = x - old_playtest_trail_last_x_;
         const float dy = y - old_playtest_trail_last_y_;
-        if (dx * dx + dy * dy < 0.25f) return true;
+        if (dx * dx + dy * dy < 64.0f) return true; /* 8 world-unit sampling */
         if (std::fabs(dx) > 192.0f || std::fabs(dy) > 192.0f ||
-            old_playtest_trail_segments_ >= 4096u) {
+            old_playtest_trail_segments_ >= 1024u) {
             old_playtest_trail_last_x_ = x;
             old_playtest_trail_last_y_ = y;
             return true;
@@ -4226,150 +4237,6 @@ public:
         return true;
     }
 
-    bool HideOldVersionPlaytestTrajectory() {
-        bool ok = true;
-        for (u32 sprite : old_playtest_trajectory_) {
-            if (!sprite) continue;
-            ok = RunFunction(runtime_.ccnode_set_visible, {sprite, 0u}, nullptr,
-                             "hide anchored playtest trajectory", 0u,
-                             std::chrono::milliseconds(300)) && ok;
-        }
-        return ok;
-    }
-
-    bool UpdateOldVersionPlaytestTrajectory(float x, float y) {
-        if (!old_playtest_trail_) return true;
-        u32 on_ground_word = 0u, gravity_word = 0u;
-        const int mode = old_playtest_proxy_mode_;
-        bool on_ground = false, gravity = false;
-
-        if (runtime_.player_get_on_ground &&
-            RunFunction(runtime_.player_get_on_ground, {old_playtest_player_},
-                        &on_ground_word, "PlayerObject::getOnGround trajectory", 0u,
-                        std::chrono::milliseconds(300)))
-            on_ground = on_ground_word != 0u;
-        if (runtime_.player_get_gravity_flipped &&
-            RunFunction(runtime_.player_get_gravity_flipped, {old_playtest_player_},
-                        &gravity_word, "PlayerObject::getGravityFlipped trajectory", 0u,
-                        std::chrono::milliseconds(300)))
-            gravity = gravity_word != 0u;
-
-        if (mode == 1 || mode == 3) {
-            old_playtest_trajectory_anchor_valid_ = false;
-            old_playtest_motion_has_last_ = false;
-            old_playtest_motion_has_velocity_ = false;
-            old_playtest_motion_prev_on_ground_valid_ = false;
-            return HideOldVersionPlaytestTrajectory();
-        }
-
-        if (!old_playtest_motion_has_last_) {
-            old_playtest_motion_last_x_ = x;
-            old_playtest_motion_last_y_ = y;
-            old_playtest_motion_has_last_ = true;
-            old_playtest_motion_prev_on_ground_ = on_ground;
-            old_playtest_motion_prev_on_ground_valid_ = true;
-            return HideOldVersionPlaytestTrajectory();
-        }
-
-        const float dx = x - old_playtest_motion_last_x_;
-        const float dy = y - old_playtest_motion_last_y_;
-        if (dx * dx + dy * dy < 0.0001f) return true;
-
-        const float previous_vy = old_playtest_motion_vy_;
-        const bool jump_started = old_playtest_motion_prev_on_ground_valid_ &&
-                                  old_playtest_motion_prev_on_ground_ && !on_ground;
-        const bool gravity_changed = old_playtest_trajectory_anchor_valid_ &&
-                                     old_playtest_trajectory_anchor_gravity_ != gravity;
-        const float acceleration = old_playtest_motion_has_velocity_
-                                     ? dy - previous_vy : 0.0f;
-        const bool impulse = old_playtest_motion_has_velocity_ &&
-                             std::fabs(acceleration) > 1.75f;
-
-        if (on_ground && std::fabs(dy) < 0.08f) {
-            old_playtest_trajectory_anchor_valid_ = false;
-            old_playtest_trajectory_sample_count_ = 0;
-            if (!HideOldVersionPlaytestTrajectory()) return false;
-        } else if (jump_started || gravity_changed || impulse ||
-                   (!old_playtest_trajectory_anchor_valid_ && std::fabs(dy) >= 0.08f)) {
-            old_playtest_trajectory_anchor_valid_ = true;
-            old_playtest_trajectory_anchor_mode_ = mode;
-            old_playtest_trajectory_anchor_gravity_ = gravity;
-            old_playtest_trajectory_anchor_x_ = x;
-            old_playtest_trajectory_anchor_y_ = y;
-            old_playtest_trajectory_anchor_vx_ = dx;
-            old_playtest_trajectory_anchor_vy_ = dy;
-            /* Render immediately; refine this fallback from real position
-               deltas on the following physics step. */
-            old_playtest_trajectory_anchor_ay_ = gravity ? 0.35f : -0.35f;
-            old_playtest_trajectory_sample_count_ = 1;
-            if (!HideOldVersionPlaytestTrajectory()) return false;
-        } else {
-            if (std::fabs(acceleration) > 0.01f && std::fabs(acceleration) < 2.0f) {
-                if (old_playtest_trajectory_sample_count_ == 0)
-                    old_playtest_trajectory_anchor_ay_ = acceleration;
-                else
-                    old_playtest_trajectory_anchor_ay_ =
-                        old_playtest_trajectory_anchor_ay_ * 0.65f +
-                        acceleration * 0.35f;
-                ++old_playtest_trajectory_sample_count_;
-            }
-
-            if (old_playtest_trajectory_sample_count_ >= 1) {
-                float px = old_playtest_trajectory_anchor_x_;
-                float py = old_playtest_trajectory_anchor_y_;
-                for (std::size_t i = 0; i < old_playtest_trajectory_.size(); ++i) {
-                    const float t = static_cast<float>(i + 1u) * 2.5f;
-                    const float nx = old_playtest_trajectory_anchor_x_ +
-                                     old_playtest_trajectory_anchor_vx_ * t;
-                    const float ny = old_playtest_trajectory_anchor_y_ +
-                                     old_playtest_trajectory_anchor_vy_ * t +
-                                     0.5f * old_playtest_trajectory_anchor_ay_ * t * t;
-                    if (!old_playtest_trajectory_[i]) {
-                        if (!old_playtest_streak_name_) {
-                            old_playtest_streak_name_ = AllocateString("square.png");
-                            if (!old_playtest_streak_name_) return false;
-                        }
-                        if (!old_playtest_orange_color_) {
-                            old_playtest_orange_color_ = Allocate(4u);
-                            if (!old_playtest_orange_color_) return false;
-                            env_.MemoryWrite32(old_playtest_orange_color_, 0x000054ffu);
-                        }
-                        u32 sprite = 0u;
-                        if (!RunFunction(runtime_.sprite_create_file,
-                                         {old_playtest_streak_name_}, &sprite,
-                                         "CCSprite::create trajectory", 0u,
-                                         std::chrono::milliseconds(700)) || !sprite ||
-                            !RunFunction(runtime_.sprite_set_color,
-                                         {sprite, old_playtest_orange_color_}, nullptr,
-                                         "CCSprite::setColor trajectory orange", 0u,
-                                         std::chrono::milliseconds(300)) ||
-                            !AddExtrasChild(old_playtest_trail_, sprite,
-                                            5000 + static_cast<int>(i)))
-                            return false;
-                        old_playtest_trajectory_[i] = sprite;
-                    }
-                    if (!RunFunction(runtime_.ccnode_set_visible,
-                                     {old_playtest_trajectory_[i], 1u}, nullptr,
-                                     "show anchored playtest trajectory", 0u,
-                                     std::chrono::milliseconds(300)) ||
-                        !PositionOldVersionPlaytestLineSprite(old_playtest_trajectory_[i],
-                                                               px, py, nx, ny, 0.080f))
-                        return false;
-                    px = nx;
-                    py = ny;
-                }
-            }
-        }
-
-        old_playtest_motion_last_x_ = x;
-        old_playtest_motion_last_y_ = y;
-        old_playtest_motion_vx_ = dx;
-        old_playtest_motion_vy_ = dy;
-        old_playtest_motion_has_velocity_ = true;
-        old_playtest_motion_prev_on_ground_ = on_ground;
-        old_playtest_motion_prev_on_ground_valid_ = true;
-        return true;
-    }
 
     bool UpdateOldVersionPlaytestProxyTransform() {
         if (!old_playtest_player_) return true;
@@ -4387,10 +4254,10 @@ public:
                               scale_x, "CCNode::getScaleX playtest player") ||
             !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
                               scale_y, "CCNode::getScaleY playtest player")) return false;
-        auto update_sprite = [&](u32 sprite, float factor) -> bool {
+        auto update_sprite = [&](u32 sprite, float factor, float offset_y) -> bool {
             if (!sprite) return true;
             return RunFunction(runtime_.ccnode_set_position_ff,
-                               {sprite, FloatToWord(x), FloatToWord(y)}, nullptr,
+                               {sprite, FloatToWord(x), FloatToWord(y + offset_y)}, nullptr,
                                "CCNode::setPosition playtest proxy", 0u,
                                std::chrono::milliseconds(300)) &&
                    RunFunction(runtime_.ccnode_set_rotation,
@@ -4406,12 +4273,17 @@ public:
                                "CCNode::setScaleY playtest proxy", 0u,
                                std::chrono::milliseconds(300));
         };
-        const float inner_factor = old_playtest_proxy_mode_ == 1 ? 0.55f : 1.0f;
-        if (!update_sprite(old_playtest_proxy_tertiary_, inner_factor) ||
-            !update_sprite(old_playtest_proxy_secondary_, inner_factor) ||
-            !update_sprite(old_playtest_proxy_primary_, 1.0f)) return false;
-        if (!AppendOldVersionPlaytestTrailSegment(x, y)) return false;
-        return UpdateOldVersionPlaytestTrajectory(x, y);
+        const bool vehicle = old_playtest_proxy_mode_ == 1 || old_playtest_proxy_mode_ == 3;
+        const float inner_factor = old_playtest_proxy_mode_ == 1 ? 0.55f :
+                                   old_playtest_proxy_mode_ == 3 ? 0.48f : 1.0f;
+        const float inner_y = old_playtest_proxy_mode_ == 1 ? 2.0f :
+                              old_playtest_proxy_mode_ == 3 ? 4.0f : 0.0f;
+        if (!update_sprite(old_playtest_proxy_primary_, 1.0f, 0.0f) ||
+            !update_sprite(old_playtest_proxy_secondary_, vehicle ? inner_factor : 1.0f,
+                           vehicle ? inner_y : 0.0f) ||
+            !update_sprite(old_playtest_proxy_tertiary_, vehicle ? inner_factor : 1.0f,
+                           vehicle ? inner_y : 0.0f)) return false;
+        return AppendOldVersionPlaytestTrailSegment(x, y);
     }
 
     bool StartInlineOldVersionPlaytest() {
@@ -4630,7 +4502,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.92 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.85 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }
@@ -4689,7 +4561,6 @@ public:
         old_playtest_editor_camera_original_valid_ = false;
         if (old_playtest_editor_input_suspended_ &&
             !SetOldVersionPlaytestEditorInputEnabled(true)) ok = false;
-        ok = SetOldVersionPlaytestEditorControlsEnabled(true) && ok;
 
         /* ZERO TEARDOWN while this editor scene lives. newera8 still crashed at
            strlen(0x210) after removeFromParentAndCleanup(false), so even onExit
@@ -4758,6 +4629,9 @@ public:
         }
         old_playtest_previous_play_layer_ = 0u;
         if (!RestoreOldVersionPlaytestEditMode()) ok = false;
+        /* Re-enable only controls that are still present in the live editor tree,
+           and do it after GameManager edit mode is back. */
+        ok = SetOldVersionPlaytestEditorControlsEnabled(true) && ok;
         if (runtime_.editor_ui_update_slider && old_playtest_ui_) {
             if (!RunFunction(runtime_.editor_ui_update_slider, {old_playtest_ui_}, nullptr,
                              "EditorUI::updateSlider after playtest", 0u,
@@ -4793,13 +4667,6 @@ public:
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
-        old_playtest_trajectory_.fill(0u);
-        old_playtest_motion_has_last_ = false;
-        old_playtest_motion_has_velocity_ = false;
-        old_playtest_motion_prev_on_ground_ = false;
-        old_playtest_motion_prev_on_ground_valid_ = false;
-        old_playtest_trajectory_sample_count_ = 0;
-        old_playtest_trajectory_anchor_valid_ = false;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
@@ -9213,25 +9080,6 @@ private:
     u32 old_playtest_green_color_ = 0u;
     u32 old_playtest_primary_color_ = 0u;
     u32 old_playtest_secondary_color_ = 0u;
-    u32 old_playtest_orange_color_ = 0u;
-    std::array<u32,18> old_playtest_trajectory_{};
-    bool old_playtest_motion_has_last_ = false;
-    bool old_playtest_motion_has_velocity_ = false;
-    bool old_playtest_motion_prev_on_ground_ = false;
-    bool old_playtest_motion_prev_on_ground_valid_ = false;
-    int old_playtest_trajectory_sample_count_ = 0;
-    float old_playtest_motion_last_x_ = 0.0f;
-    float old_playtest_motion_last_y_ = 0.0f;
-    float old_playtest_motion_vx_ = 0.0f;
-    float old_playtest_motion_vy_ = 0.0f;
-    bool old_playtest_trajectory_anchor_valid_ = false;
-    int old_playtest_trajectory_anchor_mode_ = -1;
-    bool old_playtest_trajectory_anchor_gravity_ = false;
-    float old_playtest_trajectory_anchor_x_ = 0.0f;
-    float old_playtest_trajectory_anchor_y_ = 0.0f;
-    float old_playtest_trajectory_anchor_vx_ = 0.0f;
-    float old_playtest_trajectory_anchor_vy_ = 0.0f;
-    float old_playtest_trajectory_anchor_ay_ = 0.0f;
     float old_playtest_editor_camera_original_x_ = 0.0f;
     float old_playtest_editor_camera_original_y_ = 0.0f;
     float old_playtest_editor_camera_original_scale_x_ = 1.0f;

@@ -1,0 +1,18 @@
+Geometry Dash Wrapper 0.9.7-newera11-fix1
+
+Compile hotfix for the x86 backend.
+
+Problem in newera11:
+  ensure_old_playtest_button() called restore_old_playtest_edit_mode()
+  before that static function had been declared/defined. Under C11 this is an
+  error because implicit function declarations are forbidden, and the later
+  static definition then conflicts with the implicit non-static declaration.
+
+Fix:
+  Added a forward declaration:
+      static void restore_old_playtest_edit_mode(void);
+  before ensure_old_playtest_button().
+
+No playtest behavior was changed by this hotfix.
+Builder revision bumped to 123 so cached Dynarmic outputs are not mistaken for
+this source revision.

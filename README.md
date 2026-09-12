@@ -1,4 +1,4 @@
-# Geometry Dash Wrapper 0.9.7-newera11
+# Geometry Dash Wrapper 0.9.7-newera12
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
@@ -10,7 +10,7 @@ Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as n
 - Suspends the editor's interactive chrome while inline gameplay owns input. In addition to `EditorUI` / `LevelEditorLayer` touch handling, descendant `CCMenu` controls and `Slider` controls are saved and disabled. This covers the settings/menu buttons and the top X-position mover without disabling the wrapper's scene-root pause button.
 - Restores the exact menu/slider/touch states on stop, restores the original editor camera scale/position, then calls `EditorUI::updateSlider()` so the top X mover resynchronizes to the editor's restored camera.
 - Makes mirror portals inert during inline playtest by temporarily replacing `PlayLayer::toggleFlipped(bool,bool)` with a return stub where that historical build exports the function; the original code is restored on stop. Builds without that export simply skip the optional mirror patch.
-- Fixes another trajectory visibility bug: re-anchoring hid existing orange trajectory sprites but never made them visible again. Newera11 explicitly re-shows reused segments, gives a newly detected airborne arc an immediate gravity fallback, and then refines it from real world-position physics samples. The arc stays anchored in level/world coordinates instead of following the cube. Ship/UFO remain intentionally hidden because continuously held input needs a separate predictor.
+- newera12 removes the experimental trajectory predictor entirely; it is no longer created, updated, or retained.
 - Keeps the corrected solid green breadcrumb rotation/overlap, endless editor playtest, player colors/gamemode proxies, music stop, play-button sizing, zero-teardown parking, texture/filtering/AA settings, and resolution behavior unchanged.
 - Dynarmic builder revision is bumped to **122**.
 
@@ -81,7 +81,7 @@ With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a small play co
 2. Before PlayLayer creation, snapshot the editor's `GameManager::m_playLayer` and **edit-mode state**. Run the authentic old `startGame()` / `resetLevel()` path while temporarily suppressing only `updateAttempts()` for the startup reset, preserving Attempt 1 without skipping spawn-queue initialization.
 3. Keep the real `PlayerObject` in its original hidden PlayLayer hierarchy for physics. A scene-root proxy mirrors its transform, colors, selected icon, and supported cube/ship/ball/UFO sprite family. Ship mode includes the selected cube inside the ship.
 4. Follow the real player horizontally and use the hidden gameplay camera vertically, but render the editor game layer and wrapper overlay at **0.92x scale** around the logical playfield center. Stop restores the exact original editor scale and position.
-5. Breadcrumb, trajectory, and proxy visuals live outside `LevelEditorLayer` / `EditorUI`. The green breadcrumb uses overlapping solid `square.png` segments with the old Cocos rotation convention. Cube/ball trajectory is a world-anchored orange arc based on observed physics movement; reused trajectory sprites are explicitly re-shown after a new jump/impulse. Ship/UFO trajectory remains hidden until an input-aware predictor exists.
+5. Breadcrumb and proxy visuals live outside `LevelEditorLayer` / `EditorUI`. The green breadcrumb uses connected solid `square.png` segments, sampled every 8 world units to cut sprite churn. The experimental orange trajectory predictor has been removed.
 6. Suppress `EndPortalObject::triggerObject()` and keep the hidden end portal far ahead as a secondary guard, so inline editor testing has no normal level-complete endpoint. Where available, also suppress `PlayLayer::toggleFlipped(bool,bool)` so mirror portals have no effect in the editor test.
 7. While playtest is active, save and disable EditorUI/LevelEditorLayer touch handling plus descendant `CCMenu` and `Slider` controls. The wrapper pause button is a scene-root sibling and remains usable. This prevents the top X mover, settings button, pause/menu controls, and build/edit/delete UI from reacting behind gameplay.
 8. Clicking the wrapper pause button or pressing Escape stops music, restores the original camera, editor touch/menu/slider state, `GameManager::m_playLayer`, **GameManager edit mode**, end/mirror patches, and calls `EditorUI::updateSlider()` to put the top X mover back on the restored editor camera position.
@@ -187,3 +187,11 @@ The abandoned 1.02 comments hotkey and the progressively reconstructed stock 2.2
 ## License
 
 The wrapper's license is in `LICENSE`. Vendored zlib terms are in `third_party/ZLIB-LICENSE.txt`; stb_vorbis terms are in `third_party/stb/LICENSE`. Geometry Dash and its assets remain the property of their respective owners and are not distributed here.
+
+## newera12 editor-playtest changes
+
+- Removed the experimental red/orange trajectory predictor completely.
+- Editor playtest camera is now 15% zoomed out (`0.85x`) while preserving follow and exact camera restoration.
+- Green breadcrumb rendering is sampled every 8 world units and capped at 1024 connected segments, dramatically reducing Cocos sprite churn while keeping the line continuous.
+- Ship and UFO proxies render their selected cube above the vehicle instead of hiding it behind the vehicle sprite.
+- Stop/pause restoration validates cached editor menu/slider nodes are still live descendants before calling into them, avoiding the x86 stale-menu crash seen in newera11-fix1.

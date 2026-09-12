@@ -268,25 +268,6 @@ typedef struct {
     float old_playtest_trail_last_y;
     int old_playtest_trail_has_last;
     unsigned int old_playtest_trail_segments;
-    void *old_playtest_trajectory[18];
-    int old_playtest_trajectory_initialized;
-    float old_playtest_motion_last_x;
-    float old_playtest_motion_last_y;
-    float old_playtest_motion_vx;
-    float old_playtest_motion_vy;
-    int old_playtest_motion_has_last;
-    int old_playtest_motion_has_velocity;
-    int old_playtest_motion_prev_on_ground;
-    int old_playtest_motion_prev_on_ground_valid;
-    int old_playtest_trajectory_sample_count;
-    int old_playtest_trajectory_anchor_valid;
-    int old_playtest_trajectory_anchor_mode;
-    int old_playtest_trajectory_anchor_gravity;
-    float old_playtest_trajectory_anchor_x;
-    float old_playtest_trajectory_anchor_y;
-    float old_playtest_trajectory_anchor_vx;
-    float old_playtest_trajectory_anchor_vy;
-    float old_playtest_trajectory_anchor_ay;
     float old_playtest_editor_camera_original_x;
     float old_playtest_editor_camera_original_y;
     float old_playtest_editor_camera_original_scale_x;
@@ -317,12 +298,13 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_ZOOM 0.92f
+#define OLD_PLAYTEST_CAMERA_ZOOM 0.85f
 #define OLD_PLAYTEST_VIEW_CENTER_Y 160.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
-#define OLD_PLAYTEST_TRAJECTORY_SEGMENTS 18
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
+#define OLD_PLAYTEST_TRAIL_STEP 8.0f
+#define OLD_PLAYTEST_TRAIL_MAX_SEGMENTS 1024u
 #define OLD_PLAYTEST_RAD_TO_DEG 57.29577951308232f
 
 enum {
@@ -1559,10 +1541,13 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
     remove_old_playtest_proxy_visuals();
     (void)old_playtest_get_player_colors(&primary_color, &secondary_color);
 
-    if (mode == OLD_PLAYTEST_MODE_SHIP) {
-        /* Ship is one vehicle sprite plus the selected cube sitting inside it.
-           Use the player's real palette on both parts. */
-        snprintf(primary_name, sizeof(primary_name), "ship_%02d_001.png", icon);
+    if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
+        /* Vehicle sprite underneath, selected cube icon above it.  Previous
+           builds put the ship/UFO at the highest Z and literally covered the
+           cube that was supposed to be riding inside it. */
+        snprintf(primary_name, sizeof(primary_name),
+                 mode == OLD_PLAYTEST_MODE_SHIP ? "ship_%02d_001.png" :
+                                                  "bird_%02d_001.png", icon);
         g_host.old_playtest_proxy_primary =
             g_host.sprite_create_with_frame(primary_name);
         manager = g_host.game_manager_shared_state
@@ -1588,21 +1573,15 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
             g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary,
                                     &secondary_color);
     } else {
-        if (mode == OLD_PLAYTEST_MODE_BALL) prefix = "player_ball";
-        else if (mode == OLD_PLAYTEST_MODE_BIRD) prefix = "bird";
-        else prefix = "player";
+        prefix = mode == OLD_PLAYTEST_MODE_BALL ? "player_ball" : "player";
         snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
         snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
-        snprintf(tertiary_name, sizeof(tertiary_name), "%s_%02d_3_001.png", prefix, icon);
         g_host.old_playtest_proxy_primary =
             g_host.sprite_create_with_frame(primary_name);
         g_host.old_playtest_proxy_secondary =
             g_host.sprite_create_with_frame(secondary_name);
-        if (mode == OLD_PLAYTEST_MODE_BIRD)
-            g_host.old_playtest_proxy_tertiary =
-                g_host.sprite_create_with_frame(tertiary_name);
         if (!g_host.old_playtest_proxy_primary) {
-            icon = (mode == OLD_PLAYTEST_MODE_BALL) ? 0 : 1;
+            icon = mode == OLD_PLAYTEST_MODE_BALL ? 0 : 1;
             snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
             snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
             g_host.old_playtest_proxy_primary =
@@ -1624,28 +1603,30 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
         if (g_host.old_playtest_proxy_secondary)
             g_host.sprite_set_color(g_host.old_playtest_proxy_secondary,
                                     &secondary_color);
-        if (g_host.old_playtest_proxy_tertiary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary,
-                                    &secondary_color);
     }
     if (!g_host.old_playtest_proxy_primary) return 0;
-    if (g_host.old_playtest_proxy_tertiary &&
-        !add_extras_child(g_host.old_playtest_trail,
-                          g_host.old_playtest_proxy_tertiary, 9998)) return 0;
+    /* Correct compositing order: base/vehicle first, detail layers above. */
+    if (!add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_primary, 9998)) return 0;
     if (g_host.old_playtest_proxy_secondary &&
         !add_extras_child(g_host.old_playtest_trail,
                           g_host.old_playtest_proxy_secondary, 9999)) return 0;
-    if (!add_extras_child(g_host.old_playtest_trail,
-                          g_host.old_playtest_proxy_primary, 10000)) return 0;
+    if (g_host.old_playtest_proxy_tertiary &&
+        !add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_tertiary, 10000)) return 0;
     g_host.old_playtest_proxy_mode = mode;
     g_host.old_playtest_proxy_icon = icon;
-    g_host.old_playtest_motion_has_velocity = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d colors=player",
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d colors=player inner-icon=%s",
                 mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
                 mode == OLD_PLAYTEST_MODE_BALL ? "ball" :
-                mode == OLD_PLAYTEST_MODE_BIRD ? "bird" : "cube", icon);
+                mode == OLD_PLAYTEST_MODE_BIRD ? "bird" : "cube",
+                icon,
+                (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD)
+                    ? "cube" : "native-layers");
     return 1;
 }
+
+static void restore_old_playtest_edit_mode(void);
 
 static int ensure_old_playtest_button(void) {
     void *editor_ui;
@@ -1727,15 +1708,6 @@ static void clear_old_playtest_trail(void) {
     g_host.old_playtest_trail = NULL;
     g_host.old_playtest_trail_has_last = 0;
     g_host.old_playtest_trail_segments = 0;
-    memset(g_host.old_playtest_trajectory, 0,
-           sizeof(g_host.old_playtest_trajectory));
-    g_host.old_playtest_trajectory_initialized = 0;
-    g_host.old_playtest_motion_has_last = 0;
-    g_host.old_playtest_motion_has_velocity = 0;
-    g_host.old_playtest_motion_prev_on_ground = 0;
-    g_host.old_playtest_motion_prev_on_ground_valid = 0;
-    g_host.old_playtest_trajectory_sample_count = 0;
-    g_host.old_playtest_trajectory_anchor_valid = 0;
 }
 
 static void set_old_playtest_editor_input_enabled(int enabled) {
@@ -1830,6 +1802,30 @@ static void collect_old_playtest_editor_controls(void *node,
     }
 }
 
+static int old_playtest_node_is_descendant(void *node, void *target,
+                                           unsigned int depth,
+                                           unsigned int *visited) {
+    unsigned int i, count;
+    void *children;
+    if (!node || !target || !visited || depth > 16u || *visited >= 4096u ||
+        !memory_range_is_readable(node, sizeof(void *))) return 0;
+    if (node == target) return 1;
+    ++*visited;
+    if (!g_host.ccnode_get_children || !g_host.ccnode_get_children_count ||
+        !g_host.ccarray_object_at_index) return 0;
+    count = g_host.ccnode_get_children_count(node);
+    if (!count || count > 1024u) return 0;
+    children = g_host.ccnode_get_children(node);
+    if (!children) return 0;
+    for (i = 0u; i < count && *visited < 4096u; ++i) {
+        void *child = g_host.ccarray_object_at_index(children, i);
+        if (child && old_playtest_node_is_descendant(child, target,
+                                                     depth + 1u, visited))
+            return 1;
+    }
+    return 0;
+}
+
 static void set_old_playtest_editor_controls_enabled(int enabled) {
     unsigned int i;
     if (!enabled) {
@@ -1847,14 +1843,19 @@ static void set_old_playtest_editor_controls_enabled(int enabled) {
     }
     for (i = 0u; i < g_host.old_playtest_editor_menu_count; ++i) {
         void *menu = g_host.old_playtest_editor_menus[i];
-        if (menu && g_host.ccmenu_set_enabled &&
-            memory_range_is_readable(menu, sizeof(void *)))
-            g_host.ccmenu_set_enabled(menu, g_host.old_playtest_editor_menu_enabled[i] != 0);
+        unsigned int visited = 0u;
+        if (menu && g_host.ccmenu_set_enabled && g_host.old_playtest_editor &&
+            old_playtest_node_is_descendant(g_host.old_playtest_editor, menu,
+                                            0u, &visited))
+            g_host.ccmenu_set_enabled(menu,
+                g_host.old_playtest_editor_menu_enabled[i] != 0);
     }
     for (i = 0u; i < g_host.old_playtest_editor_slider_count; ++i) {
         void *slider = g_host.old_playtest_editor_sliders[i];
-        if (slider && g_host.cclayer_set_touch_enabled &&
-            memory_range_is_readable(slider, sizeof(void *)))
+        unsigned int visited = 0u;
+        if (slider && g_host.cclayer_set_touch_enabled && g_host.old_playtest_editor &&
+            old_playtest_node_is_descendant(g_host.old_playtest_editor, slider,
+                                            0u, &visited))
             g_host.cclayer_set_touch_enabled(
                 slider, g_host.old_playtest_editor_slider_touch_enabled[i] != 0);
     }
@@ -1888,26 +1889,6 @@ static int apply_old_playtest_camera(float player_x) {
     return 1;
 }
 
-static int read_old_playtest_player_velocity(double *vx, double *vy) {
-    const unsigned char *player = (const unsigned char *)g_host.old_playtest_player;
-    /* 1.5-era PlayerObject::update integrates position from these doubles:
-       +0x38c = horizontal velocity, +0x3bc = vertical velocity. If an older
-       x86 layout does not look sane, simply hide the guide rather than risk
-       using garbage as trajectory data. */
-    const size_t vx_offset = 0x38cu;
-    const size_t vy_offset = 0x3bcu;
-    double local_vx = 0.0, local_vy = 0.0;
-    if (!player ||
-        !memory_range_is_readable(player + vx_offset, sizeof(double)) ||
-        !memory_range_is_readable(player + vy_offset, sizeof(double))) return 0;
-    memcpy(&local_vx, player + vx_offset, sizeof(local_vx));
-    memcpy(&local_vy, player + vy_offset, sizeof(local_vy));
-    if (!isfinite(local_vx) || !isfinite(local_vy) ||
-        fabs(local_vx) > 100000.0 || fabs(local_vy) > 100000.0) return 0;
-    if (vx) *vx = local_vx;
-    if (vy) *vy = local_vy;
-    return 1;
-}
 
 static void position_old_playtest_line_sprite(void *sprite,
                                                float x1, float y1,
@@ -1925,11 +1906,8 @@ static void position_old_playtest_line_sprite(void *sprite,
     g_host.ccnode_set_visible(sprite, 1);
     g_host.ccnode_set_position(sprite, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f);
     g_host.ccnode_set_rotation(sprite, -atan2f(dy, dx) * OLD_PLAYTEST_RAD_TO_DEG);
-    /* With -hd assets active, square.png's 32 physical pixels are 16 Cocos
-       points. Scaling against 32 only covered half of every requested segment,
-       which is exactly why newera8 still looked dotted. Add a little overlap so
-       rotated segment joints cannot expose one-pixel cracks. */
-    g_host.ccnode_set_scale_x(sprite, (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.25f);
+    g_host.ccnode_set_scale_x(sprite,
+        (length / OLD_PLAYTEST_LINE_TEXTURE_WIDTH) * 1.25f);
     g_host.ccnode_set_scale_y(sprite, thickness);
 }
 
@@ -1947,9 +1925,10 @@ static int append_old_playtest_trail_segment(float x, float y) {
     dx = x - g_host.old_playtest_trail_last_x;
     dy = y - g_host.old_playtest_trail_last_y;
     distance_squared = dx * dx + dy * dy;
-    if (distance_squared < 0.25f) return 1;
+    if (distance_squared < OLD_PLAYTEST_TRAIL_STEP * OLD_PLAYTEST_TRAIL_STEP)
+        return 1;
     if (dx > 192.0f || dx < -192.0f || dy > 192.0f || dy < -192.0f ||
-        g_host.old_playtest_trail_segments >= 4096u) {
+        g_host.old_playtest_trail_segments >= OLD_PLAYTEST_TRAIL_MAX_SEGMENTS) {
         g_host.old_playtest_trail_last_x = x;
         g_host.old_playtest_trail_last_y = y;
         return 1;
@@ -1966,136 +1945,6 @@ static int append_old_playtest_trail_segment(float x, float y) {
     ++g_host.old_playtest_trail_segments;
     g_host.old_playtest_trail_last_x = x;
     g_host.old_playtest_trail_last_y = y;
-    return 1;
-}
-
-static void hide_old_playtest_trajectory(void) {
-    int i;
-    for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
-        if (g_host.old_playtest_trajectory[i])
-            g_host.ccnode_set_visible(g_host.old_playtest_trajectory[i], 0);
-    }
-    g_host.old_playtest_trajectory_initialized = 0;
-}
-
-static int update_old_playtest_trajectory(float x, float y) {
-    int i, on_ground = 0, gravity = 0, mode;
-    float dx, dy, previous_vy, acceleration;
-    int moving_sample, jump_started, gravity_changed, impulse;
-    float px, py;
-    GdCcColor3B orange = {255u, 84u, 0u};
-    if (!g_host.old_playtest_trail) return 1;
-
-    mode = g_host.old_playtest_proxy_mode;
-    if (g_host.player_get_on_ground)
-        on_ground = g_host.player_get_on_ground(g_host.old_playtest_player) != 0;
-    if (g_host.player_get_gravity_flipped)
-        gravity = g_host.player_get_gravity_flipped(g_host.old_playtest_player) != 0;
-
-    /* Cube and ball have ballistic arcs. Ship/UFO are continuously controlled,
-       so a static parabola would lie about where the player is going. */
-    if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
-        g_host.old_playtest_trajectory_anchor_valid = 0;
-        g_host.old_playtest_motion_has_last = 0;
-        g_host.old_playtest_motion_has_velocity = 0;
-        g_host.old_playtest_motion_prev_on_ground_valid = 0;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-
-    if (!g_host.old_playtest_motion_has_last) {
-        g_host.old_playtest_motion_last_x = x;
-        g_host.old_playtest_motion_last_y = y;
-        g_host.old_playtest_motion_has_last = 1;
-        g_host.old_playtest_motion_prev_on_ground = on_ground;
-        g_host.old_playtest_motion_prev_on_ground_valid = 1;
-        hide_old_playtest_trajectory();
-        return 1;
-    }
-
-    dx = x - g_host.old_playtest_motion_last_x;
-    dy = y - g_host.old_playtest_motion_last_y;
-    moving_sample = dx * dx + dy * dy >= 0.0001f;
-    if (!moving_sample) return 1; /* pre/post-render duplicate sample */
-
-    previous_vy = g_host.old_playtest_motion_vy;
-    jump_started = g_host.old_playtest_motion_prev_on_ground_valid &&
-                   g_host.old_playtest_motion_prev_on_ground && !on_ground;
-    gravity_changed = g_host.old_playtest_trajectory_anchor_valid &&
-                      g_host.old_playtest_trajectory_anchor_gravity != gravity;
-    acceleration = g_host.old_playtest_motion_has_velocity ? dy - previous_vy : 0.0f;
-    impulse = g_host.old_playtest_motion_has_velocity && fabsf(acceleration) > 1.75f;
-
-    /* Position deltas are the most version-stable motion signal we have. The
-       old ARM/x86 PlayerObject layouts move around between releases, while
-       CCNode position is already the exact world-space result of physics. */
-    if (on_ground && fabsf(dy) < 0.08f) {
-        g_host.old_playtest_trajectory_anchor_valid = 0;
-        g_host.old_playtest_trajectory_sample_count = 0;
-        hide_old_playtest_trajectory();
-    } else if (jump_started || gravity_changed || impulse ||
-               (!g_host.old_playtest_trajectory_anchor_valid && fabsf(dy) >= 0.08f)) {
-        g_host.old_playtest_trajectory_anchor_valid = 1;
-        g_host.old_playtest_trajectory_anchor_mode = mode;
-        g_host.old_playtest_trajectory_anchor_gravity = gravity;
-        g_host.old_playtest_trajectory_anchor_x = x;
-        g_host.old_playtest_trajectory_anchor_y = y;
-        g_host.old_playtest_trajectory_anchor_vx = dx;
-        g_host.old_playtest_trajectory_anchor_vy = dy;
-        /* Draw immediately instead of waiting for a later gravity sample.
-           The measured acceleration below quickly replaces this fallback. */
-        g_host.old_playtest_trajectory_anchor_ay = gravity ? 0.35f : -0.35f;
-        g_host.old_playtest_trajectory_sample_count = 1;
-        hide_old_playtest_trajectory();
-    } else {
-        /* Calibrate gravity from the next few real physics steps after the
-           launch. This avoids hard-coded PlayerObject offsets and also adapts
-           to speed/gravity changes in old versions. */
-        if (fabsf(acceleration) > 0.01f && fabsf(acceleration) < 2.0f) {
-            if (g_host.old_playtest_trajectory_sample_count == 0)
-                g_host.old_playtest_trajectory_anchor_ay = acceleration;
-            else
-                g_host.old_playtest_trajectory_anchor_ay =
-                    g_host.old_playtest_trajectory_anchor_ay * 0.65f +
-                    acceleration * 0.35f;
-            ++g_host.old_playtest_trajectory_sample_count;
-        }
-
-        if (g_host.old_playtest_trajectory_sample_count >= 1) {
-            px = g_host.old_playtest_trajectory_anchor_x;
-            py = g_host.old_playtest_trajectory_anchor_y;
-            for (i = 0; i < OLD_PLAYTEST_TRAJECTORY_SEGMENTS; ++i) {
-                const float t = (float)(i + 1) * 2.5f; /* physics frames */
-                const float nx = g_host.old_playtest_trajectory_anchor_x +
-                                 g_host.old_playtest_trajectory_anchor_vx * t;
-                const float ny = g_host.old_playtest_trajectory_anchor_y +
-                                 g_host.old_playtest_trajectory_anchor_vy * t +
-                                 0.5f * g_host.old_playtest_trajectory_anchor_ay * t * t;
-                if (!g_host.old_playtest_trajectory[i]) {
-                    g_host.old_playtest_trajectory[i] = g_host.sprite_create_file("square.png");
-                    if (!g_host.old_playtest_trajectory[i]) return 0;
-                    g_host.sprite_set_color(g_host.old_playtest_trajectory[i], &orange);
-                    if (!add_extras_child(g_host.old_playtest_trail,
-                                          g_host.old_playtest_trajectory[i],
-                                          5000 + i)) return 0;
-                }
-                g_host.ccnode_set_visible(g_host.old_playtest_trajectory[i], 1);
-                position_old_playtest_line_sprite(g_host.old_playtest_trajectory[i],
-                                                  px, py, nx, ny, 0.080f);
-                px = nx;
-                py = ny;
-            }
-            g_host.old_playtest_trajectory_initialized = 1;
-        }
-    }
-
-    g_host.old_playtest_motion_last_x = x;
-    g_host.old_playtest_motion_last_y = y;
-    g_host.old_playtest_motion_vx = dx;
-    g_host.old_playtest_motion_vy = dy;
-    g_host.old_playtest_motion_has_velocity = 1;
-    g_host.old_playtest_motion_prev_on_ground = on_ground;
-    g_host.old_playtest_motion_prev_on_ground_valid = 1;
     return 1;
 }
 
@@ -2116,16 +1965,21 @@ static int update_old_playtest_proxy_transform(void) {
     sprites[2] = g_host.old_playtest_proxy_tertiary;
     for (index = 0; index < 3; ++index) {
         float factor = 1.0f;
+        float offset_y = 0.0f;
+        if ((g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP ||
+             g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_BIRD) && index > 0) {
+            factor = g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP
+                         ? 0.55f : 0.48f;
+            offset_y = g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP
+                           ? 2.0f : 4.0f;
+        }
         if (!sprites[index]) continue;
-        if (g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP &&
-            index > 0) factor = 0.55f;
-        g_host.ccnode_set_position(sprites[index], x, y);
+        g_host.ccnode_set_position(sprites[index], x, y + offset_y);
         g_host.ccnode_set_rotation(sprites[index], rotation);
         g_host.ccnode_set_scale_x(sprites[index], scale_x * factor);
         g_host.ccnode_set_scale_y(sprites[index], scale_y * factor);
     }
-    if (!append_old_playtest_trail_segment(x, y)) return 0;
-    return update_old_playtest_trajectory(x, y);
+    return append_old_playtest_trail_segment(x, y);
 }
 
 static int stop_inline_old_playtest(void);
@@ -2323,7 +2177,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.92 scene-isolated=1 editor-input=suspended editor-controls=suspended");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.85 scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2367,7 +2221,6 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_editor_camera_original_valid = 0;
     if (g_host.old_playtest_editor_input_suspended)
         set_old_playtest_editor_input_enabled(1);
-    set_old_playtest_editor_controls_enabled(1);
 
     /* Do not remove ANY playtest node while the old editor scene is alive.
        newera8 still reproduced strlen(0x210) after remove(..., false), proving
@@ -2415,6 +2268,11 @@ static int stop_inline_old_playtest(void) {
     }
     g_host.old_playtest_previous_play_layer = NULL;
     restore_old_playtest_edit_mode();
+    /* Restore menu/slider state only after the real editor global state is back.
+       newera11-fix1 crashed between EDITOR_INPUT_RESTORED and
+       EDITOR_CONTROLS_RESTORED, so stale/rebuilt controls are additionally
+       filtered by live-tree membership in the restore helper. */
+    set_old_playtest_editor_controls_enabled(1);
     if (g_host.editor_ui_update_slider && g_host.old_playtest_ui &&
         memory_range_is_readable(g_host.old_playtest_ui, sizeof(void *))) {
         g_host.editor_ui_update_slider(g_host.old_playtest_ui);
@@ -2445,15 +2303,6 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_trail = NULL;
     g_host.old_playtest_trail_has_last = 0;
     g_host.old_playtest_trail_segments = 0;
-    memset(g_host.old_playtest_trajectory, 0,
-           sizeof(g_host.old_playtest_trajectory));
-    g_host.old_playtest_trajectory_initialized = 0;
-    g_host.old_playtest_motion_has_last = 0;
-    g_host.old_playtest_motion_has_velocity = 0;
-    g_host.old_playtest_motion_prev_on_ground = 0;
-    g_host.old_playtest_motion_prev_on_ground_valid = 0;
-    g_host.old_playtest_trajectory_sample_count = 0;
-    g_host.old_playtest_trajectory_anchor_valid = 0;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;

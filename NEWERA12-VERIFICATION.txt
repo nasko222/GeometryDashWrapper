@@ -1,0 +1,12 @@
+Geometry Dash Wrapper 0.9.7-newera12
+
+Focus of this revision:
+- experimental trajectory predictor removed from x86 and legacy ARM code/state
+- editor gameplay camera zoom changed from 0.92x to 0.85x
+- green trail sampling changed from 0.5 world units to 8 world units and segment cap reduced from 4096 to 1024
+- ship/UFO vehicle sprite is below the selected cube layers; inner icon receives dedicated scale/offset
+- cached CCMenu/Slider restoration now first proves the cached node is still a live descendant of the current editor tree
+- x86 stop crash evidence: newera11-fix1 restored EditorUI input, then crashed before the EDITOR_CONTROLS_RESTORED log; the stale cached menu/slider restore path is therefore guarded here
+- first-attempt, edit-mode restore, no-end, mirror suppression, music-stop, and post-play editor fixes remain unchanged
+
+Dynarmic builder revision: 124
