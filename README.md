@@ -1,15 +1,16 @@
-# Geometry Dash Wrapper 0.9.7-newera14
+# Geometry Dash Wrapper 0.9.7-newera15
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
-## What newera14 changes
+## What newera15 changes
 
-- Fixes the newera13 static-camera regression. The old `PlayLayer` moves a `CCCamera`, not the game-layer node, so reading `gameLayer` X/Y could never follow the player. x86 and legacy ARM now reproduce the 1.7-era camera model directly: horizontal follow at `playerX - 125`, the original 90/120-unit vertical dead band, and time-based vertical smoothing.
-- Keeps the `0.90x` editor-playtest zoom-out, but converts the reconstructed world camera into an equivalent editor-layer translation around the logical `570x320` center. The editor level and proxy overlay receive the same transform so they stay aligned.
-- Raises only the standalone cube proxy by 5 world units to correct the visibly sunken overlay alignment; ship/UFO keep their historical local vehicle/cube offsets from newera13.
-- Fixes the x86 pause/stop access violation seen after `EDIT_MODE_RESTORED`. Disabled `CCMenu`/`Slider` controls are retained while playtest is active, restored directly, then released; stop no longer recursively walks a potentially rebuilt old Cocos editor tree.
-- Keeps the trajectory predictor fully removed, the reduced green-path sampling, uppercase batch booleans, first-attempt preservation, mirror suppression, and the zero-teardown playtest parking strategy.
-- Dynarmic builder revision is bumped to **126**.
+- Restores **cube editor playtest camera behavior to the pre-newera11 path** on x86 and legacy ARM: horizontal scrolling uses the original `x = 120 - playerX` anchor, vertical translation comes from the hidden PlayLayer game-layer baseline, and the newera11+ global playtest zoom is not applied.
+- Ship, ball, and UFO no longer use the reconstructed player-following camera from newera14. The wrapper now reads the hidden historical PlayLayer's real Cocos `CCCamera` and mirrors its **vertical viewport** while preserving the old horizontal editor framing. This lets the game itself choose the constrained top/bottom play area.
+- If an unusually old image does not export `CCNode::getCamera` / `CCCamera::getCenterXYZ`, constrained modes fall back to a top/bottom dead-zone clamp. The fallback moves the viewport only when the player would leave the allowed area; it never centers the camera on the player.
+- Removes newera14's standalone cube `+5` world-Y proxy correction. The proxy root is again placed at the raw `PlayerObject` world position, matching the pre-newera11 bridge.
+- Keeps newera14's x86 pause/stop safety fix: disabled editor controls are retained and restored directly rather than recursively walking a rebuilt old Cocos tree.
+- Trajectory prediction remains fully removed; reduced green-path sampling, first-attempt preservation, mirror suppression, and zero-teardown playtest parking remain intact.
+- Dynarmic builder revision is bumped to **127**.
 
 ## Architecture
 

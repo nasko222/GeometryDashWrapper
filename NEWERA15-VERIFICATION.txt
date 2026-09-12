@@ -1,0 +1,50 @@
+Geometry Dash Wrapper 0.9.7-newera15
+
+Focus of this revision
+----------------------
+- restore cube editor-playtest framing to the known-good pre-newera11 path
+- remove newera14's reconstructed vertical player-follow camera and 0.90x zoom
+- use the hidden PlayLayer's real Cocos CCCamera Y for ship/ball/UFO bounded gameplay framing
+- keep pre-newera11 horizontal editor framing (x = 120 - playerX, clamped at 0)
+- combine constrained camera translation as game-layer base Y minus CCCamera center Y
+- provide a non-centering top/bottom clamp fallback when old binaries do not export the camera accessors
+- remove newera14's extra +5 Y on the standalone cube proxy root
+- preserve newera14's retained-direct x86 editor-control restore used to avoid the pause/stop AV
+- keep experimental trajectory prediction removed
+
+Source evidence used for the camera correction
+----------------------------------------------
+- Pre-newera11/newera10 wrapper camera: horizontal x=120-playerX, Y from the hidden PlayLayer game-layer node, no playtest zoom.
+- Historical PlayLayer::updateCamera uses m_gameLayer->getCamera() and writes camera center/eye coordinates instead of moving m_gameLayer itself.
+- Cocos2d-x CCNode::getCamera() exposes that node camera, and CCCamera::getCenterXYZ() exposes the camera center used by the view transform.
+
+Static validation performed in this environment
+-----------------------------------------------
+- version/branch metadata is consistent at 0.9.7-newera15 / newera15
+- Dynarmic builder revision is 127
+- exact-source x86 camera helpers compile as C11 with -Wall -Wextra -Werror in a focused harness
+- exact-source ARM camera helpers compile as C++20 with -Wall -Wextra -Werror in a focused harness
+- focused camera behavior simulation passes:
+  * cube camera Y remains at the old baseline even when PlayerObject Y changes
+  * cube horizontal framing remains the old 120-playerX path
+  * ship real-camera framing uses baseY-cameraCenterY and does not recenter when only PlayerObject Y changes
+  * fallback clamps to a boundary rather than centering the player
+- no OLD_PLAYTEST_CAMERA_ZOOM / newera14 1.7-updateCamera-model path remains in the modified backends
+- no newera14 standalone-cube +5 proxy-root offset remains
+- x86 stop still uses retained-direct CCMenu/Slider restoration and does not recursively traverse the editor tree on restore
+- modified backend delimiter/NUL checks pass
+- git diff whitespace/conflict checks pass
+- transition patch round-trip is verified after packaging
+
+Runtime checks requested
+------------------------
+1. Cube mode: compare directly with the last good pre-newera11 behavior. It should scroll horizontally as before and must NOT vertically follow the cube.
+2. Cube proxy: confirm it sits at the correct ground/player position with no visible vertical offset.
+3. Ship / ball / UFO: enter each mode and move toward the top and bottom. The visible editor game area should follow the historical PlayLayer viewport constraints rather than centering on the player.
+4. Mode transitions: cube -> ship/ball/UFO -> cube should immediately switch between constrained real-camera Y and the old cube baseline Y.
+5. x86: press pause/stop repeatedly and confirm there is no 0xc0000005 after edit-mode restoration.
+6. Confirm editor controls and the top X slider work normally after stopping playtest.
+
+Windows runtime behavior still requires testing against the historical APKs.
+
+Dynarmic builder revision: 127

@@ -61,6 +61,8 @@ typedef void (__cdecl *CcNodeSetPositionFunction)(void *self, float x, float y);
 typedef struct { float x, y; } GdCcPoint;
 typedef void (__cdecl *EndPortalSetPositionFunction)(void *self, const GdCcPoint *point);
 typedef float (__cdecl *CcNodeGetPositionFunction)(void *self);
+typedef void *(__cdecl *CcNodeGetCameraFunction)(void *self);
+typedef void (__cdecl *CcCameraGetXYZFunction)(void *self, float *x, float *y, float *z);
 typedef void (__cdecl *CcNodeSetScaleFunction)(void *self, float scale);
 typedef void (__cdecl *CcNodeSetFloatFunction)(void *self, float value);
 typedef void *(__cdecl *CcNodeCreateFunction)(void);
@@ -162,6 +164,8 @@ typedef struct {
     CcNodeGetPositionFunction ccnode_get_rotation;
     CcNodeGetPositionFunction ccnode_get_scale_x;
     CcNodeGetPositionFunction ccnode_get_scale_y;
+    CcNodeGetCameraFunction ccnode_get_camera;
+    CcCameraGetXYZFunction cccamera_get_center_xyz;
     CcNodeSetScaleFunction ccnode_set_scale;
     CcNodeSetFloatFunction ccnode_set_rotation;
     CcNodeSetFloatFunction ccnode_set_scale_x;
@@ -277,9 +281,7 @@ typedef struct {
     float old_playtest_editor_camera_original_scale_x;
     float old_playtest_editor_camera_original_scale_y;
     int old_playtest_editor_camera_original_valid;
-    float old_playtest_camera_world_y;
-    ULONGLONG old_playtest_camera_last_tick;
-    int old_playtest_camera_world_valid;
+    int old_playtest_camera_fallback_logged;
     void *old_playtest_editor_menus[128];
     unsigned char old_playtest_editor_menu_enabled[128];
     unsigned int old_playtest_editor_menu_count;
@@ -304,9 +306,11 @@ static GameHost g_host;
    play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
-#define OLD_PLAYTEST_CAMERA_ZOOM 0.90f
-#define OLD_PLAYTEST_VIEW_CENTER_X 285.0f
-#define OLD_PLAYTEST_VIEW_CENTER_Y 160.0f
+#define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
+#define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
+#define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
+#define OLD_PLAYTEST_BALL_BOTTOM 58.0f
+#define OLD_PLAYTEST_BALL_TOP 262.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
@@ -1717,7 +1721,7 @@ static int ensure_old_playtest_button(void) {
         }
         g_host.old_playtest_trail = NULL;
         release_old_playtest_editor_control_refs(0);
-        g_host.old_playtest_camera_world_valid = 0;
+        g_host.old_playtest_camera_fallback_logged = 0;
     }
     if (!editor_ui || g_host.old_playtest_layer ||
         g_host.old_playtest_play_button) return 1;
@@ -1901,58 +1905,111 @@ static void set_old_playtest_editor_controls_enabled(int enabled) {
     }
 }
 
-static int apply_old_playtest_camera(float player_x) {
-    float player_y, target_y, follow_factor;
-    float camera_world_x, camera_x, camera_y;
-    ULONGLONG now, elapsed_ms;
-    if (!g_host.old_playtest_editor_game_layer || !g_host.old_playtest_player)
+static int read_old_playtest_real_camera(float *world_x, float *world_y) {
+    void *camera;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (!g_host.old_playtest_play_game_layer ||
+        !g_host.ccnode_get_camera || !g_host.cccamera_get_center_xyz)
         return 0;
-
-    /* PlayLayer::updateCamera in the 1.7-era code moves a CCCamera, not the
-       game-layer CCNode. Mirroring gameLayer->getPosition() therefore produced
-       a perfectly static camera in newera13. Reproduce that old camera model:
-       X follows 125 units behind the player; Y has the original 90/120 dead
-       band and approximately the same time-based smoothing. */
-    player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
-    now = GetTickCount64();
-    if (!g_host.old_playtest_camera_world_valid) {
-        g_host.old_playtest_camera_world_y = 0.0f;
-        g_host.old_playtest_camera_last_tick = now;
-        g_host.old_playtest_camera_world_valid = 1;
-        follow_factor = 0.0f;
-    } else {
-        elapsed_ms = now - g_host.old_playtest_camera_last_tick;
-        g_host.old_playtest_camera_last_tick = now;
-        follow_factor = (float)elapsed_ms * 0.006f;
-        if (follow_factor > 1.0f) follow_factor = 1.0f;
-    }
-    target_y = g_host.old_playtest_camera_world_y;
-    if (player_y > g_host.old_playtest_camera_world_y + 120.0f)
-        target_y = player_y - 120.0f;
-    if (player_y < g_host.old_playtest_camera_world_y + 90.0f)
-        target_y = player_y - 90.0f;
-    g_host.old_playtest_camera_world_y +=
-        (target_y - g_host.old_playtest_camera_world_y) * follow_factor;
-    if (g_host.old_playtest_camera_world_y < 0.0f)
-        g_host.old_playtest_camera_world_y = 0.0f;
-
-    camera_world_x = player_x - 125.0f;
-    camera_x = -OLD_PLAYTEST_CAMERA_ZOOM * camera_world_x +
-               (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_X;
-    camera_y = -OLD_PLAYTEST_CAMERA_ZOOM * g_host.old_playtest_camera_world_y +
-               (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_Y;
-
-    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, OLD_PLAYTEST_CAMERA_ZOOM);
-    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, OLD_PLAYTEST_CAMERA_ZOOM);
-    g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer, camera_x, camera_y);
-    if (g_host.old_playtest_trail) {
-        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, OLD_PLAYTEST_CAMERA_ZOOM);
-        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, OLD_PLAYTEST_CAMERA_ZOOM);
-        g_host.ccnode_set_position(g_host.old_playtest_trail, camera_x, camera_y);
-    }
+    camera = g_host.ccnode_get_camera(g_host.old_playtest_play_game_layer);
+    if (!camera || !memory_range_is_readable(camera, sizeof(void *))) return 0;
+    g_host.cccamera_get_center_xyz(camera, &x, &y, &z);
+    if (!isfinite(x) || !isfinite(y) ||
+        fabsf(x) > 100000.0f || fabsf(y) > 100000.0f)
+        return 0;
+    if (world_x) *world_x = x;
+    if (world_y) *world_y = y;
     return 1;
 }
 
+static int apply_old_playtest_camera(float player_x) {
+    int mode = g_host.old_playtest_proxy_mode;
+    float player_y, base_y;
+    float camera_x, camera_y;
+    float real_camera_x = 0.0f, real_camera_y = 0.0f;
+    float bottom, top, screen_y;
+
+    if (!g_host.old_playtest_editor_game_layer ||
+        !g_host.old_playtest_play_game_layer ||
+        !g_host.old_playtest_player)
+        return 0;
+
+    /*
+       Cube framing is intentionally the exact pre-newera11 path. The editor
+       game layer scrolls horizontally only after the player reaches x=120,
+       while Y comes directly from the hidden PlayLayer game layer. Do not
+       synthesize a player-following Y camera and do not zoom this path.
+    */
+    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
+    if (camera_x > 0.0f) camera_x = 0.0f;
+    base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
+    camera_y = base_y;
+
+    /*
+       Ship/UFO/ball are different: their playable area is bounded by the old
+       game's top/bottom ground logic. PlayLayer applies that through the
+       Cocos CCCamera attached to m_gameLayer, so mirror the REAL camera Y
+       instead of centering on PlayerObject. This automatically follows the
+       corridor/roll-ground framing chosen by that exact historical build.
+    */
+    if (mode == OLD_PLAYTEST_MODE_SHIP ||
+        mode == OLD_PLAYTEST_MODE_BALL ||
+        mode == OLD_PLAYTEST_MODE_BIRD) {
+        if (read_old_playtest_real_camera(&real_camera_x, &real_camera_y)) {
+            (void)real_camera_x; /* keep the known-good pre-newera11 X framing */
+            camera_y = base_y - real_camera_y;
+            g_host.old_playtest_camera_fallback_logged = 0;
+        } else {
+            /*
+               Capability fallback for builds that do not export CCNode::getCamera
+               or CCCamera::getCenterXYZ. Keep the old base camera and move it
+               only enough to keep the player inside the mode's vertical play
+               area. This is a clamp/dead-zone, never a player-centering camera.
+            */
+            player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
+            if (mode == OLD_PLAYTEST_MODE_BALL) {
+                bottom = OLD_PLAYTEST_BALL_BOTTOM;
+                top = OLD_PLAYTEST_BALL_TOP;
+            } else {
+                bottom = OLD_PLAYTEST_CONSTRAINED_BOTTOM;
+                top = OLD_PLAYTEST_CONSTRAINED_TOP;
+            }
+            screen_y = player_y + camera_y;
+            if (screen_y < bottom)
+                camera_y += bottom - screen_y;
+            else if (screen_y > top)
+                camera_y -= screen_y - top;
+            if (!g_host.old_playtest_camera_fallback_logged) {
+                runtime_log("RESULT: X86_OLD_VER_PLAYTEST_CAMERA_FALLBACK mode=%s source=bounded-game-area no-player-centering=1",
+                            mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
+                            mode == OLD_PLAYTEST_MODE_BALL ? "ball" : "bird");
+                g_host.old_playtest_camera_fallback_logged = 1;
+            }
+        }
+    }
+
+    /* newera11+ zooming caused the world/proxy offset. Preserve the editor's
+       original scale, exactly like the known-good pre-newera11 bridge. */
+    if (g_host.old_playtest_editor_camera_original_valid) {
+        g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer,
+            g_host.old_playtest_editor_camera_original_scale_x);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer,
+            g_host.old_playtest_editor_camera_original_scale_y);
+    }
+    g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
+                               camera_x, camera_y);
+    if (g_host.old_playtest_trail) {
+        if (g_host.old_playtest_editor_camera_original_valid) {
+            g_host.ccnode_set_scale_x(g_host.old_playtest_trail,
+                g_host.old_playtest_editor_camera_original_scale_x);
+            g_host.ccnode_set_scale_y(g_host.old_playtest_trail,
+                g_host.old_playtest_editor_camera_original_scale_y);
+        }
+        g_host.ccnode_set_position(g_host.old_playtest_trail,
+                                   camera_x, camera_y);
+    }
+    return 1;
+}
 
 static void position_old_playtest_line_sprite(void *sprite,
                                                float x1, float y1,
@@ -2029,9 +2086,9 @@ static int update_old_playtest_proxy_transform(void) {
     rotation = g_host.ccnode_get_rotation(g_host.old_playtest_player);
     scale_x = g_host.ccnode_get_scale_x(g_host.old_playtest_player);
     scale_y = g_host.ccnode_get_scale_y(g_host.old_playtest_player);
-    g_host.ccnode_set_position(
-        g_host.old_playtest_proxy_root, x,
-        y + (g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_CUBE ? 5.0f : 0.0f));
+    /* PlayerObject world position is already the correct proxy root origin.
+       The extra +5 introduced in newera14 is what made cube render low/offset. */
+    g_host.ccnode_set_position(g_host.old_playtest_proxy_root, x, y);
     g_host.ccnode_set_rotation(g_host.old_playtest_proxy_root, rotation);
     g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_root, scale_x);
     g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_root, scale_y);
@@ -2161,9 +2218,7 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
     g_host.old_playtest_proxy_poll_counter = 0u;
-    g_host.old_playtest_camera_world_y = 0.0f;
-    g_host.old_playtest_camera_last_tick = GetTickCount64();
-    g_host.old_playtest_camera_world_valid = 0;
+    g_host.old_playtest_camera_fallback_logged = 0;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_editor_camera_original_x =
@@ -2238,7 +2293,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=1.7-updateCamera-model scene-isolated=1 editor-input=suspended editor-controls=suspended");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-pre-newera11 constrained=real-CCCamera no-global-zoom=1 scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2280,7 +2335,7 @@ static int stop_inline_old_playtest(void) {
             g_host.old_playtest_editor_camera_original_y);
     }
     g_host.old_playtest_editor_camera_original_valid = 0;
-    g_host.old_playtest_camera_world_valid = 0;
+    g_host.old_playtest_camera_fallback_logged = 0;
     if (g_host.old_playtest_editor_input_suspended)
         set_old_playtest_editor_input_enabled(1);
 
@@ -2401,8 +2456,8 @@ static int update_inline_old_playtest(void) {
 
     player_x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
     suppress_old_playtest_end_portal(g_host.old_playtest_layer, player_x);
-    if (!apply_old_playtest_camera(player_x)) return 0;
-    return update_old_playtest_proxy_transform();
+    if (!update_old_playtest_proxy_transform()) return 0;
+    return apply_old_playtest_camera(player_x);
 }
 
 static int process_old_playtest_request(void) {
@@ -3269,6 +3324,10 @@ int main(int argc, char **argv) {
         &image, "_ZN7cocos2d6CCNode9getScaleXEv");
     g_host.ccnode_get_scale_y = (CcNodeGetPositionFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode9getScaleYEv");
+    g_host.ccnode_get_camera = (CcNodeGetCameraFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d6CCNode9getCameraEv");
+    g_host.cccamera_get_center_xyz = (CcCameraGetXYZFunction)elf_image_find_export(
+        &image, "_ZN7cocos2d8CCCamera12getCenterXYZEPfS1_S1_");
     g_host.ccnode_set_scale = (CcNodeSetScaleFunction)elf_image_find_export(
         &image, "_ZN7cocos2d6CCNode8setScaleEf");
     g_host.ccnode_set_rotation = (CcNodeSetFloatFunction)elf_image_find_export(

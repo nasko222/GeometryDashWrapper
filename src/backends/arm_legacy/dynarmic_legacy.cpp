@@ -1064,6 +1064,8 @@ struct ElfRuntime {
     u32 ccnode_get_rotation = 0;
     u32 ccnode_get_scale_x = 0;
     u32 ccnode_get_scale_y = 0;
+    u32 ccnode_get_camera = 0;
+    u32 cccamera_get_center_xyz = 0;
     u32 ccnode_set_scale = 0;
     u32 ccnode_set_rotation = 0;
     u32 ccnode_set_scale_x = 0;
@@ -1746,6 +1748,10 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccnode_get_scale_x = address;
             else if (name == "_ZN7cocos2d6CCNode9getScaleYEv")
                 runtime.ccnode_get_scale_y = address;
+            else if (name == "_ZN7cocos2d6CCNode9getCameraEv")
+                runtime.ccnode_get_camera = address;
+            else if (name == "_ZN7cocos2d8CCCamera12getCenterXYZEPfS1_S1_")
+                runtime.cccamera_get_center_xyz = address;
             else if (name == "_ZN7cocos2d6CCNode8setScaleEf")
                 runtime.ccnode_set_scale = address;
             else if (name == "_ZN7cocos2d6CCNode11setRotationEf")
@@ -4158,78 +4164,151 @@ public:
         return ok;
     }
 
-    bool ApplyOldVersionPlaytestCamera(float player_x) {
-        if (!old_playtest_editor_game_layer_ || !old_playtest_player_) return false;
-        constexpr float kZoom = 0.90f;
-        constexpr float kCenterX = 285.0f;
-        constexpr float kCenterY = 160.0f;
-        float player_y = 0.0f;
-        if (!GuestFloatGetter(runtime_.ccnode_get_position_y, old_playtest_player_,
-                              player_y, "CCNode::getPositionY camera player"))
+    bool ReadOldVersionPlaytestRealCamera(float& world_x, float& world_y) {
+        if (!old_playtest_play_game_layer_ ||
+            !runtime_.ccnode_get_camera ||
+            !runtime_.cccamera_get_center_xyz)
             return false;
 
-        const auto now = std::chrono::steady_clock::now();
-        float follow_factor = 0.0f;
-        if (!old_playtest_camera_world_valid_) {
-            old_playtest_camera_world_y_ = 0.0f;
-            old_playtest_camera_last_update_ = now;
-            old_playtest_camera_world_valid_ = true;
-        } else {
-            const float elapsed = std::chrono::duration<float>(
-                now - old_playtest_camera_last_update_).count();
-            old_playtest_camera_last_update_ = now;
-            follow_factor = elapsed * 6.0f;
-            if (follow_factor > 1.0f) follow_factor = 1.0f;
+        u32 camera = 0u;
+        if (!RunFunction(runtime_.ccnode_get_camera,
+                         {old_playtest_play_game_layer_}, &camera,
+                         "CCNode::getCamera old playtest", 0u,
+                         std::chrono::milliseconds(300)) || !camera)
+            return false;
+
+        if (!old_playtest_camera_xyz_) {
+            old_playtest_camera_xyz_ = Allocate(12u);
+            if (!old_playtest_camera_xyz_) return false;
+        }
+        const u32 px = old_playtest_camera_xyz_;
+        const u32 py = old_playtest_camera_xyz_ + 4u;
+        const u32 pz = old_playtest_camera_xyz_ + 8u;
+        env_.MemoryWrite32(px, 0u);
+        env_.MemoryWrite32(py, 0u);
+        env_.MemoryWrite32(pz, 0u);
+        if (!RunFunction(runtime_.cccamera_get_center_xyz,
+                         {camera, px, py, pz}, nullptr,
+                         "CCCamera::getCenterXYZ old playtest", 0u,
+                         std::chrono::milliseconds(300)))
+            return false;
+
+        world_x = WordToFloat(env_.MemoryRead32(px));
+        world_y = WordToFloat(env_.MemoryRead32(py));
+        return std::isfinite(world_x) && std::isfinite(world_y) &&
+               std::fabs(world_x) < 100000.0f &&
+               std::fabs(world_y) < 100000.0f;
+    }
+
+    bool ApplyOldVersionPlaytestCamera(float player_x) {
+        if (!old_playtest_editor_game_layer_ ||
+            !old_playtest_play_game_layer_ ||
+            !old_playtest_player_) return false;
+
+        constexpr float kAnchorX = 120.0f;
+        constexpr float kConstrainedBottom = 70.0f;
+        constexpr float kConstrainedTop = 250.0f;
+        constexpr float kBallBottom = 58.0f;
+        constexpr float kBallTop = 262.0f;
+
+        float base_y = 0.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
+                              old_playtest_play_game_layer_, base_y,
+                              "CCNode::getPositionY legacy cube camera"))
+            return false;
+
+        /*
+           Cube is intentionally the exact pre-newera11 bridge: horizontal
+           scroll with the x=120 anchor and the hidden PlayLayer's game-layer
+           Y. No reconstructed vertical follow and no global zoom.
+        */
+        float camera_x = kAnchorX - player_x;
+        if (camera_x > 0.0f) camera_x = 0.0f;
+        float camera_y = base_y;
+
+        const int mode = old_playtest_proxy_mode_;
+        if (mode == 1 || mode == 2 || mode == 3) {
+            /*
+               Ship/UFO/ball use the REAL Cocos camera chosen by the historical
+               PlayLayer. That camera already contains the top/bottom corridor
+               and roll-ground restrictions. Mirror only its Y; keep the known
+               pre-newera11 horizontal framing.
+            */
+            float real_camera_x = 0.0f, real_camera_y = 0.0f;
+            if (ReadOldVersionPlaytestRealCamera(real_camera_x, real_camera_y)) {
+                (void)real_camera_x;
+                camera_y = base_y - real_camera_y;
+                old_playtest_camera_fallback_logged_ = false;
+            } else {
+                /*
+                   Older images that do not expose the camera accessors fall
+                   back to a bounded viewport. This only nudges the old camera
+                   when the player would leave the legal top/bottom game area;
+                   it never centers/follows the player vertically.
+                */
+                float player_y = 0.0f;
+                if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
+                                      old_playtest_player_, player_y,
+                                      "CCNode::getPositionY constrained fallback"))
+                    return false;
+                const float bottom = mode == 2 ? kBallBottom : kConstrainedBottom;
+                const float top = mode == 2 ? kBallTop : kConstrainedTop;
+                const float screen_y = player_y + camera_y;
+                if (screen_y < bottom)
+                    camera_y += bottom - screen_y;
+                else if (screen_y > top)
+                    camera_y -= screen_y - top;
+
+                if (!old_playtest_camera_fallback_logged_) {
+                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_CAMERA_FALLBACK mode="
+                         << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
+                         << " source=bounded-game-area no-player-centering=1\n";
+                    log_.flush();
+                    old_playtest_camera_fallback_logged_ = true;
+                }
+            }
         }
 
-        float target_y = old_playtest_camera_world_y_;
-        if (player_y > old_playtest_camera_world_y_ + 120.0f)
-            target_y = player_y - 120.0f;
-        if (player_y < old_playtest_camera_world_y_ + 90.0f)
-            target_y = player_y - 90.0f;
-        old_playtest_camera_world_y_ +=
-            (target_y - old_playtest_camera_world_y_) * follow_factor;
-        if (old_playtest_camera_world_y_ < 0.0f)
-            old_playtest_camera_world_y_ = 0.0f;
-
-        /* 1.7-era PlayLayer::updateCamera stores a world camera at
-           (playerX-125, smoothedY) and applies it through CCCamera. The editor
-           bridge has no access to that camera object, so convert it into an
-           equivalent CCNode translation, then apply the requested zoom-out. */
-        const float camera_world_x = player_x - 125.0f;
-        const float camera_x = -kZoom * camera_world_x + (1.0f - kZoom) * kCenterX;
-        const float camera_y = -kZoom * old_playtest_camera_world_y_ +
-                               (1.0f - kZoom) * kCenterY;
-        bool ok = RunFunction(runtime_.ccnode_set_scale_x,
-                              {old_playtest_editor_game_layer_, FloatToWord(kZoom)}, nullptr,
-                              "zoom editor game layer X", 0u,
-                              std::chrono::milliseconds(300)) &&
-                  RunFunction(runtime_.ccnode_set_scale_y,
-                              {old_playtest_editor_game_layer_, FloatToWord(kZoom)}, nullptr,
-                              "zoom editor game layer Y", 0u,
-                              std::chrono::milliseconds(300)) &&
-                  RunFunction(runtime_.ccnode_set_position_ff,
-                              {old_playtest_editor_game_layer_, FloatToWord(camera_x),
-                               FloatToWord(camera_y)}, nullptr,
-                              "apply reconstructed old gameplay camera", 0u,
-                              std::chrono::milliseconds(300));
-        if (old_playtest_trail_) {
+        bool ok = true;
+        if (old_playtest_editor_camera_original_valid_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_trail_, FloatToWord(kZoom)}, nullptr,
-                             "zoom playtest overlay X", 0u,
+                             {old_playtest_editor_game_layer_,
+                              FloatToWord(old_playtest_editor_camera_original_scale_x_)},
+                             nullptr, "restore pre-newera11 editor scale X", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_trail_, FloatToWord(kZoom)}, nullptr,
-                             "zoom playtest overlay Y", 0u,
+                             {old_playtest_editor_game_layer_,
+                              FloatToWord(old_playtest_editor_camera_original_scale_y_)},
+                             nullptr, "restore pre-newera11 editor scale Y", 0u,
                              std::chrono::milliseconds(300)) && ok;
+        }
+        ok = RunFunction(runtime_.ccnode_set_position_ff,
+                         {old_playtest_editor_game_layer_,
+                          FloatToWord(camera_x), FloatToWord(camera_y)},
+                         nullptr, "apply mode-aware old playtest camera", 0u,
+                         std::chrono::milliseconds(300)) && ok;
+
+        if (old_playtest_trail_) {
+            if (old_playtest_editor_camera_original_valid_) {
+                ok = RunFunction(runtime_.ccnode_set_scale_x,
+                                 {old_playtest_trail_,
+                                  FloatToWord(old_playtest_editor_camera_original_scale_x_)},
+                                 nullptr, "restore playtest overlay scale X", 0u,
+                                 std::chrono::milliseconds(300)) && ok;
+                ok = RunFunction(runtime_.ccnode_set_scale_y,
+                                 {old_playtest_trail_,
+                                  FloatToWord(old_playtest_editor_camera_original_scale_y_)},
+                                 nullptr, "restore playtest overlay scale Y", 0u,
+                                 std::chrono::milliseconds(300)) && ok;
+            }
             ok = RunFunction(runtime_.ccnode_set_position_ff,
-                             {old_playtest_trail_, FloatToWord(camera_x), FloatToWord(camera_y)},
+                             {old_playtest_trail_,
+                              FloatToWord(camera_x), FloatToWord(camera_y)},
                              nullptr, "apply camera to playtest overlay", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;
     }
-
 
     bool PositionOldVersionPlaytestLineSprite(u32 sprite,
                                                float x1, float y1,
@@ -4332,10 +4411,10 @@ public:
                               scale_x, "CCNode::getScaleX playtest player") ||
             !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
                               scale_y, "CCNode::getScaleY playtest player")) return false;
-        const float visual_y = y +
-            (old_playtest_proxy_mode_ == 0 ? 5.0f : 0.0f);
+        /* PlayerObject world position is already the proxy root origin.
+           newera14's extra cube +5 is removed to restore pre-newera11 alignment. */
         if (!RunFunction(runtime_.ccnode_set_position_ff,
-                         {old_playtest_proxy_root_, FloatToWord(x), FloatToWord(visual_y)}, nullptr,
+                         {old_playtest_proxy_root_, FloatToWord(x), FloatToWord(y)}, nullptr,
                          "position playtest proxy root", 0u,
                          std::chrono::milliseconds(300)) ||
             !RunFunction(runtime_.ccnode_set_rotation,
@@ -4499,9 +4578,7 @@ public:
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
-        old_playtest_camera_world_y_ = 0.0f;
-        old_playtest_camera_world_valid_ = false;
-        old_playtest_camera_last_update_ = std::chrono::steady_clock::now();
+        old_playtest_camera_fallback_logged_ = false;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
@@ -4574,7 +4651,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=1.7-updateCamera-model scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-pre-newera11 constrained=real-CCCamera no-global-zoom=1 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }
@@ -4740,7 +4817,7 @@ public:
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
         old_playtest_proxy_poll_counter_ = 0u;
-        old_playtest_camera_world_valid_ = false;
+        old_playtest_camera_fallback_logged_ = false;
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
@@ -4793,8 +4870,8 @@ public:
         if (!SuppressOldVersionPlaytestEndPortal(old_playtest_layer_, player_x))
             return false;
 
-        if (!ApplyOldVersionPlaytestCamera(player_x) ||
-            !UpdateOldVersionPlaytestProxyTransform()) return false;
+        if (!UpdateOldVersionPlaytestProxyTransform() ||
+            !ApplyOldVersionPlaytestCamera(player_x)) return false;
         return true;
     }
 
@@ -4829,7 +4906,7 @@ public:
             old_playtest_proxy_mode_ = -1;
             old_playtest_proxy_icon_ = -1;
             old_playtest_proxy_poll_counter_ = 0u;
-            old_playtest_camera_world_valid_ = false;
+            old_playtest_camera_fallback_logged_ = false;
             old_playtest_level_clone_ = 0u;
             old_playtest_previous_play_layer_ = 0u;
             old_playtest_end_portal_ = 0u;
@@ -9171,9 +9248,8 @@ private:
     float old_playtest_editor_camera_original_scale_x_ = 1.0f;
     float old_playtest_editor_camera_original_scale_y_ = 1.0f;
     bool old_playtest_editor_camera_original_valid_ = false;
-    float old_playtest_camera_world_y_ = 0.0f;
-    bool old_playtest_camera_world_valid_ = false;
-    std::chrono::steady_clock::time_point old_playtest_camera_last_update_{};
+    u32 old_playtest_camera_xyz_ = 0u;
+    bool old_playtest_camera_fallback_logged_ = false;
     std::vector<u32> old_playtest_editor_menus_;
     std::vector<u8> old_playtest_editor_menu_enabled_;
     std::vector<u32> old_playtest_editor_sliders_;
