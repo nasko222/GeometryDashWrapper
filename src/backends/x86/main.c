@@ -49,6 +49,11 @@ typedef void (__cdecl *EditorMoveObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorMoveEditCommandFunction)(void *self, int command);
 typedef void (__cdecl *EditorTransformObjectCallFunction)(void *self, void *sender);
 typedef void (__cdecl *EditorTransformEditCommandFunction)(void *self, int command);
+typedef void (__cdecl *EditorDeleteFunction)(void *self, void *sender);
+typedef void (__cdecl *EditorDeleteNoSenderFunction)(void *self);
+typedef void (__cdecl *PauseRestartFunction)(void *self, void *sender);
+typedef void (__cdecl *PauseRestartNoSenderFunction)(void *self);
+typedef void (__cdecl *PlayLayerResumeAndRestartFunction)(void *self);
 typedef void *(__cdecl *CcDirectorSharedFunction)(void);
 typedef void *(__cdecl *CcDirectorGetRunningSceneFunction)(void *self);
 typedef void *(__cdecl *CcNodeGetChildrenFunction)(void *self);
@@ -149,6 +154,11 @@ typedef struct {
     EditorMoveEditCommandFunction editor_move_edit_command;
     EditorTransformObjectCallFunction editor_transform_object_call;
     EditorTransformEditCommandFunction editor_transform_edit_command;
+    EditorDeleteFunction editor_on_delete;
+    EditorDeleteNoSenderFunction editor_on_delete_no_sender;
+    PauseRestartFunction pause_layer_on_restart;
+    PauseRestartNoSenderFunction pause_layer_on_restart_no_sender;
+    PlayLayerResumeAndRestartFunction play_layer_resume_and_restart;
     CcDirectorSharedFunction cc_director_shared;
     CcDirectorGetRunningSceneFunction cc_director_get_running_scene;
     size_t cc_director_running_scene_offset;
@@ -194,6 +204,7 @@ typedef struct {
     IntSetterFunction gj_game_level_set_level_type;
     PlayLayerCreateFunction play_layer_create;
     PlayLayerStartGameFunction play_layer_start_game;
+    NodeGetterFunction play_layer_get_level;
     void *play_layer_reset_level;
     void *play_layer_update_attempts;
     void *play_layer_destroy_player;
@@ -234,6 +245,14 @@ typedef struct {
     void *extras_time_button;
     void *extras_close_button;
     void *extras_empty_button;
+    volatile LONG restart_request;
+    ULONGLONG restart_check_time;
+    void *restart_scene;
+    void *restart_pause_layer;
+    void *restart_menu;
+    void *restart_button;
+    int restart_native_present;
+    int restart_unavailable_logged;
     volatile LONG old_playtest_request;
     ULONGLONG old_playtest_check_time;
     void *old_playtest_scene;
@@ -307,6 +326,8 @@ static GameHost g_host;
 
 #define OLD_PLAYTEST_BUTTON_X 30.0f
 #define OLD_PLAYTEST_BUTTON_Y 186.0f
+#define WRAPPER_RESTART_BUTTON_X 405.0f
+#define WRAPPER_RESTART_BUTTON_Y 130.0f
 /* GJ_playBtn2 is about 82 px high; the pause icon is about 40 px. Scale the
    play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
    cannot restore the item to an oversized scale. */
@@ -1176,6 +1197,178 @@ static void *create_extras_button(const char *text, void *parent,
     g_host.ccnode_set_position(button, x, y);
     if (!add_extras_child(parent, button, z)) return NULL;
     return button;
+}
+
+static void *find_direct_pause_layer(void *scene) {
+    unsigned int count, index;
+    void *children;
+    if (!scene || !g_host.ccnode_get_children_count ||
+        !g_host.ccnode_get_children || !g_host.ccarray_object_at_index)
+        return NULL;
+    count = g_host.ccnode_get_children_count(scene);
+    if (!count) return NULL;
+    if (count > 128u) count = 128u;
+    children = g_host.ccnode_get_children(scene);
+    if (!children) return NULL;
+    for (index = 0; index < count; ++index) {
+        void *child = g_host.ccarray_object_at_index(children, index);
+        if (child && object_type_contains(child, "PauseLayer") &&
+            !object_type_contains(child, "EditorPauseLayer"))
+            return child;
+    }
+    return NULL;
+}
+
+static void __cdecl restart_button_callback(void *self, void *sender) {
+    (void)self;
+    (void)sender;
+    InterlockedExchange(&g_host.restart_request, 1);
+}
+
+static int restart_button_symbols_ready(void) {
+    return g_host.cc_menu_create && g_host.menu_item_sprite_extra_create &&
+           g_host.ccnode_set_position &&
+           (g_host.ccnode_add_child_z || g_host.ccnode_add_child) &&
+           (g_host.pause_layer_on_restart ||
+            g_host.pause_layer_on_restart_no_sender ||
+            g_host.play_layer_resume_and_restart);
+}
+
+static int active_level_already_has_native_restart(int *native_restart) {
+    void *level;
+    if (native_restart) *native_restart = 0;
+    if (!g_host.active_play_layer || !g_host.play_layer_get_level ||
+        !g_host.gj_game_level_get_level_type) return 1;
+    level = g_host.play_layer_get_level(g_host.active_play_layer);
+    if (!level) return 1;
+    if (native_restart)
+        *native_restart = g_host.gj_game_level_get_level_type(level) == 2;
+    return 1;
+}
+
+static void *create_restart_menu_item(void *pause_layer) {
+    void *normal = NULL, *selected = NULL;
+    if (!g_host.menu_item_sprite_extra_create || !pause_layer) return NULL;
+    if (g_host.sprite_create_with_frame) {
+        normal = g_host.sprite_create_with_frame("GJ_replayBtn_001.png");
+        selected = g_host.sprite_create_with_frame("GJ_replayBtn_001.png");
+    }
+    if ((!normal || !selected) && g_host.button_sprite_create) {
+        normal = g_host.button_sprite_create("Restart");
+        selected = g_host.button_sprite_create("Restart");
+    }
+    if (!normal || !selected) return NULL;
+    return g_host.menu_item_sprite_extra_create(
+        normal, selected, pause_layer,
+        (uintptr_t)(void (__cdecl *)(void *, void *))restart_button_callback,
+        0);
+}
+
+static int ensure_restart_button(void) {
+    ULONGLONG now = GetTickCount64();
+    void *scene;
+    void *pause_layer;
+    void *menu;
+    void *button;
+    int native_restart = 0;
+    if (now - g_host.restart_check_time < 250u) return 1;
+    g_host.restart_check_time = now;
+
+    if (!detect_gameplay_active() || g_host.editor_cache_value ||
+        g_host.old_playtest_layer) {
+        g_host.restart_pause_layer = NULL;
+        g_host.restart_menu = NULL;
+        g_host.restart_button = NULL;
+        g_host.restart_native_present = 0;
+        return 1;
+    }
+    scene = find_running_scene();
+    if (g_host.restart_scene != scene) {
+        g_host.restart_scene = scene;
+        g_host.restart_pause_layer = NULL;
+        g_host.restart_menu = NULL;
+        g_host.restart_button = NULL;
+        g_host.restart_native_present = 0;
+    }
+    pause_layer = find_direct_pause_layer(scene);
+    if (!pause_layer) {
+        g_host.restart_pause_layer = NULL;
+        g_host.restart_menu = NULL;
+        g_host.restart_button = NULL;
+        g_host.restart_native_present = 0;
+        return 1;
+    }
+    if (g_host.restart_pause_layer != pause_layer) {
+        g_host.restart_pause_layer = pause_layer;
+        g_host.restart_menu = NULL;
+        g_host.restart_button = NULL;
+        g_host.restart_native_present = 0;
+    }
+    if (g_host.restart_button || g_host.restart_native_present) return 1;
+    active_level_already_has_native_restart(&native_restart);
+    if (native_restart) {
+        g_host.restart_native_present = 1;
+        runtime_log("RESULT: X86_RESTART_BUTTON native=1 wrapper=0 reason=local-level");
+        return 1;
+    }
+    if (!restart_button_symbols_ready()) {
+        if (!g_host.restart_unavailable_logged) {
+            g_host.restart_unavailable_logged = 1;
+            runtime_log("RESULT: X86_RESTART_BUTTON_UNAVAILABLE reason=missing-symbol");
+        }
+        return 1;
+    }
+    menu = g_host.cc_menu_create();
+    button = create_restart_menu_item(pause_layer);
+    if (!menu || !button || !add_extras_child(menu, button, 0)) return 0;
+    g_host.ccnode_set_position(menu, 0.0f, 0.0f);
+    g_host.ccnode_set_position(button, WRAPPER_RESTART_BUTTON_X,
+                               WRAPPER_RESTART_BUTTON_Y);
+    if (!add_extras_child(pause_layer, menu, 30000)) return 0;
+    g_host.restart_menu = menu;
+    g_host.restart_button = button;
+    runtime_log("RESULT: X86_RESTART_BUTTON_READY mode=pause-overlay callback=%s",
+                (g_host.pause_layer_on_restart ||
+                 g_host.pause_layer_on_restart_no_sender)
+                    ? "PauseLayer::onRestart"
+                    : "PlayLayer::resumeAndRestart");
+    return 1;
+}
+
+static int process_restart_request(void) {
+    LONG request = InterlockedExchange(&g_host.restart_request, 0);
+    void *pause_layer;
+    if (!request) return 1;
+    g_host.gameplay_cache_time = 0;
+    (void)detect_gameplay_active();
+    pause_layer = find_direct_pause_layer(find_running_scene());
+    if (!pause_layer && g_host.restart_pause_layer &&
+        memory_range_is_readable(g_host.restart_pause_layer, sizeof(void *)) &&
+        object_type_contains(g_host.restart_pause_layer, "PauseLayer"))
+        pause_layer = g_host.restart_pause_layer;
+
+    if (pause_layer && g_host.pause_layer_on_restart) {
+        g_host.pause_layer_on_restart(
+            pause_layer, g_host.restart_button ? g_host.restart_button : pause_layer);
+        runtime_log("RESULT: X86_RESTART_INVOKED path=PauseLayer::onRestart");
+    } else if (pause_layer && g_host.pause_layer_on_restart_no_sender) {
+        g_host.pause_layer_on_restart_no_sender(pause_layer);
+        runtime_log("RESULT: X86_RESTART_INVOKED path=PauseLayer::onRestart-no-sender");
+    } else if (g_host.active_play_layer && g_host.play_layer_resume_and_restart) {
+        g_host.play_layer_resume_and_restart(g_host.active_play_layer);
+        if (pause_layer && g_host.ccnode_remove &&
+            memory_range_is_readable(pause_layer, sizeof(void *)))
+            g_host.ccnode_remove(pause_layer, 1);
+        runtime_log("RESULT: X86_RESTART_INVOKED path=PlayLayer::resumeAndRestart");
+    } else {
+        runtime_log("RESULT: X86_RESTART_IGNORED reason=no-active-pause-or-callback");
+    }
+    g_host.restart_pause_layer = NULL;
+    g_host.restart_menu = NULL;
+    g_host.restart_button = NULL;
+    g_host.restart_native_present = 0;
+    g_host.gameplay_cache_time = 0;
+    return 1;
 }
 
 static void refresh_extras_visuals(void) {
@@ -2524,6 +2717,26 @@ static int process_old_playtest_request(void) {
     return 1;
 }
 
+static int send_editor_delete_hotkey(void) {
+    void *editor_ui;
+    if (!gd_settings_editor_controls()) return 0;
+    if (g_host.old_playtest_layer) return 0;
+    editor_ui = find_active_editor_ui();
+    if (!editor_ui) return 0;
+    if (g_host.editor_on_delete) {
+        g_host.editor_on_delete(editor_ui, editor_ui);
+        runtime_log("RESULT: X86_EDITOR_DELETE key=DELETE path=sender");
+        return 1;
+    }
+    if (g_host.editor_on_delete_no_sender) {
+        g_host.editor_on_delete_no_sender(editor_ui);
+        runtime_log("RESULT: X86_EDITOR_DELETE key=DELETE path=no-sender");
+        return 1;
+    }
+    runtime_log("RESULT: X86_EDITOR_DELETE_UNAVAILABLE reason=missing-onDelete-symbol");
+    return 1;
+}
+
 static int send_editor_hotkey(int tag, int virtual_key) {
     void *editor_ui;
     int old_tag;
@@ -3070,6 +3283,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
             return 0;
         }
         if (!(lparam & (1L << 30)) && !jni_shim_text_input_active()) {
+            if (wparam == VK_DELETE && send_editor_delete_hotkey())
+                return 0;
             const int editor_tag = editor_tag_for_key(wparam);
             if (editor_tag && send_editor_hotkey(editor_tag, (int)wparam))
                 return 0;
@@ -3287,6 +3502,12 @@ static int run_message_loop(void) {
                 !g_host.editor_cache_value);
             refresh_extras_visuals();
         }
+        if (!process_restart_request()) {
+            runtime_log("ERROR: restart button operation failed");
+        }
+        if (!ensure_restart_button()) {
+            runtime_log("ERROR: restart button creation failed");
+        }
         if (!process_old_playtest_request()) {
             runtime_log("ERROR: inline old-version playtest operation failed");
         }
@@ -3462,6 +3683,27 @@ int main(int argc, char **argv) {
     g_host.editor_transform_edit_command =
         (EditorTransformEditCommandFunction)elf_image_find_export(
             &image, "_ZN8EditorUI19transformObjectCallE11EditCommand");
+    g_host.editor_on_delete = (EditorDeleteFunction)elf_image_find_export(
+        &image, "_ZN8EditorUI8onDeleteEPN7cocos2d8CCObjectE");
+    if (!g_host.editor_on_delete)
+        g_host.editor_on_delete = (EditorDeleteFunction)elf_image_find_export(
+            &image, "_ZN8EditorUI8onDeleteEPN7cocos2d6CCNodeE");
+    if (!g_host.editor_on_delete)
+        g_host.editor_on_delete_no_sender =
+            (EditorDeleteNoSenderFunction)elf_image_find_export(
+                &image, "_ZN8EditorUI8onDeleteEv");
+    g_host.pause_layer_on_restart = (PauseRestartFunction)elf_image_find_export(
+        &image, "_ZN10PauseLayer9onRestartEPN7cocos2d8CCObjectE");
+    if (!g_host.pause_layer_on_restart)
+        g_host.pause_layer_on_restart = (PauseRestartFunction)elf_image_find_export(
+            &image, "_ZN10PauseLayer9onRestartEPN7cocos2d6CCNodeE");
+    if (!g_host.pause_layer_on_restart)
+        g_host.pause_layer_on_restart_no_sender =
+            (PauseRestartNoSenderFunction)elf_image_find_export(
+                &image, "_ZN10PauseLayer9onRestartEv");
+    g_host.play_layer_resume_and_restart =
+        (PlayLayerResumeAndRestartFunction)elf_image_find_export(
+            &image, "_ZN9PlayLayer16resumeAndRestartEv");
     g_host.cc_director_shared = (CcDirectorSharedFunction)elf_image_find_export(
         &image, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
     g_host.cc_director_get_running_scene =
@@ -3559,6 +3801,11 @@ int main(int argc, char **argv) {
     g_host.play_layer_start_game =
         (PlayLayerStartGameFunction)elf_image_find_export(
             &image, "_ZN9PlayLayer9startGameEv");
+    g_host.play_layer_get_level = (NodeGetterFunction)elf_image_find_export(
+        &image, "_ZNK9PlayLayer8getLevelEv");
+    if (!g_host.play_layer_get_level)
+        g_host.play_layer_get_level = (NodeGetterFunction)elf_image_find_export(
+            &image, "_ZN9PlayLayer8getLevelEv");
     g_host.play_layer_reset_level = elf_image_find_export(
         &image, "_ZN9PlayLayer10resetLevelEv");
     g_host.play_layer_update_attempts = elf_image_find_export(

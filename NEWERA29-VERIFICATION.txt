@@ -1,0 +1,54 @@
+GeometryDashWrapper 0.9.7-newera29 verification
+================================================
+Base: exact 0.9.7-newera28 full-source package from the preceding build.
+
+Scope
+-----
+1. ARM legacy Linux/Wine level-search freeze/crash
+   - The supplied failing log completed the legacy API request with HTTP 200,
+     then stayed inside nativeTouchesEnd for ~13.6 s at CCHttpClient::send /
+     sem_post until the 10 s guest-call wall guard aborted the run.
+   - Under Wine only, complete legacy PHP API requests now bypass synchronous
+     host WinHTTP and continue through the original nonblocking guest socket
+     path. Native Windows keeps the WinHTTP acceleration.
+   - Request classification/buffering remains host-side and GDPS request
+     rewriting is preserved before socket send.
+
+2. Editor Delete key
+   - x86 and ARM legacy resolve EditorUI::onDelete dynamically.
+   - Sender and no-sender old-version ABIs are supported.
+   - Delete is ignored while text entry is active and does not add an R hotkey.
+
+3. Pause-menu restart button
+   - x86 and ARM legacy resolve PauseLayer::onRestart dynamically, with
+     PlayLayer::resumeAndRestart as fallback.
+   - Uses GJ_replayBtn_001.png when present, otherwise a text ButtonSprite.
+   - Local levels retain the game's existing native restart button; wrapper
+     injection is for paused gameplay where that native button is absent.
+   - No hardcoded 1.1 address/byte patch is used.
+
+Regression guards
+-----------------
+- The following newera28 functions were compared byte-for-byte and are unchanged:
+  x86 update_old_playtest_proxy_transform
+  x86 apply_old_playtest_camera
+  x86 set_old_playtest_reset_level_suppressed
+  x86 set_old_playtest_destroy_player_suppressed
+  ARM UpdateOldVersionPlaytestProxyTransform
+  ARM ApplyOldVersionPlaytestCamera
+  ARM SetOldVersionPlaytestResetLevelSuppressed
+  ARM SetOldVersionPlaytestDestroyPlayerSuppressed
+- BOOMLINGS remains SHOW_COMMAND_PROMPT=TRUE and OLD_VER_PLAYTEST=TRUE.
+- GDPS remains SHOW_COMMAND_PROMPT=FALSE and OLD_VER_PLAYTEST=FALSE.
+- No .apk, .so, .exe, or .dll files are included in the source tree.
+- song_http_win.c passes local non-Windows clang syntax checking.
+- Modified source files contain no NUL bytes.
+- Generated patch passes git diff --check and is round-trip tested against the
+  exact newera28 source tree before packaging.
+
+Runtime note
+------------
+A Windows/Wine/Dynarmic runtime environment is not available in this container,
+so the Linux/Wine network fix and injected restart/delete controls still require
+real-game confirmation. The change is deliberately narrow and preserves the
+existing Windows WinHTTP path.

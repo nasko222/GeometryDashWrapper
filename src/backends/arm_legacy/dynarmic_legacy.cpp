@@ -1013,7 +1013,12 @@ struct ElfRuntime {
     u32 editor_move_edit_command = 0;
     u32 editor_transform_object_call = 0;
     u32 editor_transform_edit_command = 0;
+    u32 editor_on_delete = 0;
+    bool editor_on_delete_has_sender = false;
     u32 old_playtest_callback = 0;
+    u32 restart_callback = 0;
+    u32 pause_layer_on_restart = 0;
+    bool pause_layer_on_restart_has_sender = false;
     u32 level_editor_get_level = 0;
     u32 level_editor_get_game_layer = 0;
     u32 level_editor_get_level_string = 0;
@@ -1025,6 +1030,8 @@ struct ElfRuntime {
     u32 play_layer_create = 0;
     u32 play_layer_start_game = 0;
     u32 play_layer_reset_level = 0;
+    u32 play_layer_resume_and_restart = 0;
+    u32 play_layer_get_level = 0;
     u32 play_layer_update_attempts = 0;
     u32 play_layer_destroy_player = 0;
     u32 play_layer_get_test_mode = 0;
@@ -1622,7 +1629,15 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.editor_transform_object_call = address;
             else if (name == "_ZN8EditorUI19transformObjectCallE11EditCommand")
                 runtime.editor_transform_edit_command = address;
-            else if (name == "_ZNK16LevelEditorLayer8getLevelEv")
+            else if (name == "_ZN8EditorUI8onDeleteEPN7cocos2d8CCObjectE" ||
+                     name == "_ZN8EditorUI8onDeleteEPN7cocos2d6CCNodeE") {
+                runtime.editor_on_delete = address;
+                runtime.editor_on_delete_has_sender = true;
+            } else if (name == "_ZN8EditorUI8onDeleteEv" &&
+                       !runtime.editor_on_delete) {
+                runtime.editor_on_delete = address;
+                runtime.editor_on_delete_has_sender = false;
+            } else if (name == "_ZNK16LevelEditorLayer8getLevelEv")
                 runtime.level_editor_get_level = address;
             else if (name == "_ZNK16LevelEditorLayer12getGameLayerEv")
                 runtime.level_editor_get_game_layer = address;
@@ -1644,6 +1659,11 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.play_layer_start_game = address;
             else if (name == "_ZN9PlayLayer10resetLevelEv")
                 runtime.play_layer_reset_level = address;
+            else if (name == "_ZN9PlayLayer16resumeAndRestartEv")
+                runtime.play_layer_resume_and_restart = address;
+            else if (name == "_ZNK9PlayLayer8getLevelEv" ||
+                     name == "_ZN9PlayLayer8getLevelEv")
+                runtime.play_layer_get_level = address;
             else if (name == "_ZN9PlayLayer14updateAttemptsEv")
                 runtime.play_layer_update_attempts = address;
             else if (name == "_ZN9PlayLayer13destroyPlayerEv")
@@ -1726,7 +1746,15 @@ static ElfRuntime MapAndRelocateElf(const std::vector<u8>& elf, ProbeEnvironment
                 runtime.ccarray_object_at_index = address;
             else if (name == "_ZN13EndLevelLayer6onMenuEv")
                 runtime.end_level_on_menu = address;
-            else if (name == "_ZN12ButtonSprite6createEPKc")
+            else if (name == "_ZN10PauseLayer9onRestartEPN7cocos2d8CCObjectE" ||
+                     name == "_ZN10PauseLayer9onRestartEPN7cocos2d6CCNodeE") {
+                runtime.pause_layer_on_restart = address;
+                runtime.pause_layer_on_restart_has_sender = true;
+            } else if (name == "_ZN10PauseLayer9onRestartEv" &&
+                       !runtime.pause_layer_on_restart) {
+                runtime.pause_layer_on_restart = address;
+                runtime.pause_layer_on_restart_has_sender = false;
+            } else if (name == "_ZN12ButtonSprite6createEPKc")
                 runtime.button_sprite_create = address;
             else if (name == "_ZN7cocos2d6CCNode8addChildEPS0_")
                 runtime.ccnode_add_child = address;
@@ -1978,6 +2006,7 @@ enum class HostEventType {
     DeleteBackward,
     PracticeCheckpoint,
     EditorCommand,
+    EditorDelete,
     ExtrasAction,
     Pause,
     Resume
@@ -2567,6 +2596,10 @@ private:
             }
             if (!(lparam & (1L << 30)) && !self->text_input_active_ &&
                 gd_settings_editor_controls()) {
+                if (wparam == VK_DELETE) {
+                    self->Queue(HostEvent{HostEventType::EditorDelete});
+                    return 0;
+                }
                 const bool small = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 u32 tag = 0u;
                 if (wparam == 'A') tag = small ? 1u : 5u;
@@ -2860,6 +2893,15 @@ public:
                  << LOBYTE(winsock_data.wVersion) << '.' << HIBYTE(winsock_data.wVersion) << '\n';
         } else {
             log_ << "WARNING: Winsock initialization failed; online features unavailable\n";
+        }
+        {
+            HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+            wine_legacy_api_socket_fallback_ =
+                ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+            if (wine_legacy_api_socket_fallback_) {
+                log_ << "RESULT: DYNARMIC_WINE_HTTP_COMPAT legacy-api=guest-socket "
+                        "host-winhttp=disabled\n";
+            }
         }
 #endif
         storage_initialize(writable_path_.c_str());
@@ -3251,6 +3293,31 @@ public:
             log_.flush();
         }
         return 0u;
+    }
+
+    bool SendEditorDelete() {
+        if (!gd_settings_editor_controls()) return true;
+        if (old_playtest_layer_) return true;
+        const u32 editor_ui = FindActiveEditorUi();
+        if (!editor_ui) return true;
+        if (!runtime_.editor_on_delete) {
+            log_ << "RESULT: DYNARMIC_EDITOR_DELETE_UNAVAILABLE reason=missing-onDelete-symbol\n";
+            log_.flush();
+            return true;
+        }
+        std::vector<u32> arguments{editor_ui};
+        if (runtime_.editor_on_delete_has_sender) arguments.push_back(editor_ui);
+        const bool ok = RunFunction(
+            runtime_.editor_on_delete, arguments, nullptr,
+            "EditorUI::onDelete Delete-key", 100000000u,
+            std::chrono::milliseconds(2000));
+        if (ok) {
+            log_ << "RESULT: DYNARMIC_EDITOR_DELETE key=DELETE path="
+                 << (runtime_.editor_on_delete_has_sender ? "sender" : "no-sender")
+                 << "\n";
+            log_.flush();
+        }
+        return ok;
     }
 
     bool SendEditorCommand(u32 tag) {
@@ -4898,6 +4965,193 @@ public:
 
         if (!UpdateOldVersionPlaytestProxyTransform() ||
             !ApplyOldVersionPlaytestCamera(player_x)) return false;
+        return true;
+    }
+
+    bool RestartButtonSymbolsReady() const {
+        return runtime_.restart_callback && runtime_.cc_menu_create &&
+               runtime_.menu_item_sprite_extra_create &&
+               runtime_.ccnode_set_position_ff &&
+               (runtime_.ccnode_add_child_z || runtime_.ccnode_add_child) &&
+               (runtime_.pause_layer_on_restart ||
+                runtime_.play_layer_resume_and_restart);
+    }
+
+    bool ActiveLevelAlreadyHasNativeRestart(bool& native_restart) {
+        native_restart = false;
+        if (!active_play_layer_ || !runtime_.play_layer_get_level ||
+            !runtime_.gj_game_level_get_level_type) return true;
+        u32 level = 0u;
+        if (!RunFunction(runtime_.play_layer_get_level, {active_play_layer_}, &level,
+                         "PlayLayer::getLevel restart-button guard", 0u,
+                         std::chrono::milliseconds(800))) return false;
+        if (!level) return true;
+        u32 level_type = 0u;
+        if (!RunFunction(runtime_.gj_game_level_get_level_type, {level}, &level_type,
+                         "GJGameLevel::getLevelType restart-button guard", 0u,
+                         std::chrono::milliseconds(800))) return false;
+        native_restart = level_type == 2u; /* GJLevelType::LocalLevel */
+        return true;
+    }
+
+    bool CreateRestartMenuItem(u32 pause_layer, u32& item_out) {
+        item_out = 0u;
+        if (!runtime_.menu_item_sprite_extra_create || !runtime_.restart_callback)
+            return false;
+        u32 normal = 0u, selected = 0u;
+        if (runtime_.sprite_create_with_frame) {
+            const u32 frame = AllocateString("GJ_replayBtn_001.png");
+            if (frame) {
+                (void)RunFunction(runtime_.sprite_create_with_frame, {frame}, &normal,
+                                  "CCSprite::create replay restart", 0u,
+                                  std::chrono::milliseconds(1200));
+                (void)RunFunction(runtime_.sprite_create_with_frame, {frame}, &selected,
+                                  "CCSprite::create replay restart selected", 0u,
+                                  std::chrono::milliseconds(1200));
+            }
+        }
+        if ((!normal || !selected) && runtime_.button_sprite_create) {
+            const u32 text = AllocateString("Restart");
+            if (!text) return false;
+            normal = selected = 0u;
+            if (!RunFunction(runtime_.button_sprite_create, {text}, &normal,
+                             "ButtonSprite::create restart", 0u,
+                             std::chrono::milliseconds(1200)) || !normal ||
+                !RunFunction(runtime_.button_sprite_create, {text}, &selected,
+                             "ButtonSprite::create restart selected", 0u,
+                             std::chrono::milliseconds(1200)) || !selected)
+                return false;
+        }
+        if (!normal || !selected) return false;
+        return RunFunction(runtime_.menu_item_sprite_extra_create,
+                           {normal, selected, pause_layer,
+                            runtime_.restart_callback, 0u}, &item_out,
+                           "CCMenuItemSpriteExtra::create restart", 0u,
+                           std::chrono::milliseconds(1500)) && item_out;
+    }
+
+    bool EnsureRestartButton() {
+        const auto now = std::chrono::steady_clock::now();
+        if (restart_check_at_.time_since_epoch().count() != 0 &&
+            now - restart_check_at_ < std::chrono::milliseconds(250))
+            return true;
+        restart_check_at_ = now;
+        RefreshDesktopGameplayState();
+        if (restart_scene_ != active_scene_root_) {
+            restart_scene_ = active_scene_root_;
+            restart_pause_layer_ = 0u;
+            restart_menu_ = 0u;
+            restart_button_ = 0u;
+            restart_native_present_ = false;
+        }
+        if (!gameplay_active_cache_ || editor_active_cache_ || old_playtest_layer_) {
+            restart_pause_layer_ = 0u;
+            restart_menu_ = 0u;
+            restart_button_ = 0u;
+            restart_native_present_ = false;
+            return true;
+        }
+        if (!active_pause_layer_) {
+            restart_pause_layer_ = 0u;
+            restart_menu_ = 0u;
+            restart_button_ = 0u;
+            restart_native_present_ = false;
+            return true;
+        }
+        if (restart_pause_layer_ != active_pause_layer_) {
+            restart_pause_layer_ = active_pause_layer_;
+            restart_menu_ = 0u;
+            restart_button_ = 0u;
+            restart_native_present_ = false;
+        }
+        if (restart_button_ || restart_native_present_) return true;
+        bool native_restart = false;
+        if (!ActiveLevelAlreadyHasNativeRestart(native_restart)) return false;
+        if (native_restart) {
+            restart_native_present_ = true;
+            log_ << "RESULT: DYNARMIC_RESTART_BUTTON native=1 wrapper=0 reason=local-level\n";
+            log_.flush();
+            return true;
+        }
+        if (!RestartButtonSymbolsReady()) {
+            if (!restart_unavailable_logged_) {
+                restart_unavailable_logged_ = true;
+                log_ << "RESULT: DYNARMIC_RESTART_BUTTON_UNAVAILABLE reason=missing-symbol\n";
+                log_.flush();
+            }
+            return true;
+        }
+        u32 menu = 0u, item = 0u;
+        if (!RunFunction(runtime_.cc_menu_create, {}, &menu,
+                         "CCMenu::create restart overlay", 0u,
+                         std::chrono::milliseconds(1200)) || !menu ||
+            !CreateRestartMenuItem(active_pause_layer_, item) || !item ||
+            !AddExtrasChild(menu, item, 0) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {menu, FloatToWord(0.0f), FloatToWord(0.0f)}, nullptr,
+                         "position restart menu", 0u,
+                         std::chrono::milliseconds(800)) ||
+            !RunFunction(runtime_.ccnode_set_position_ff,
+                         {item, FloatToWord(405.0f), FloatToWord(130.0f)}, nullptr,
+                         "position restart button", 0u,
+                         std::chrono::milliseconds(800)) ||
+            !AddExtrasChild(active_pause_layer_, menu, 30000))
+            return false;
+        restart_menu_ = menu;
+        restart_button_ = item;
+        log_ << "RESULT: DYNARMIC_RESTART_BUTTON_READY mode=pause-overlay callback="
+             << (runtime_.pause_layer_on_restart ? "PauseLayer::onRestart" :
+                 "PlayLayer::resumeAndRestart") << "\n";
+        log_.flush();
+        return true;
+    }
+
+    bool ProcessRestartRequest() {
+        if (!restart_request_) return true;
+        restart_request_ = 0u;
+        gameplay_check_at_ = {};
+        RefreshDesktopGameplayState();
+        u32 pause_layer = restart_pause_layer_;
+        if (!GuestObjectTypeContains(pause_layer, "PauseLayer"))
+            pause_layer = active_pause_layer_;
+        if (pause_layer && runtime_.pause_layer_on_restart) {
+            std::vector<u32> arguments{pause_layer};
+            if (runtime_.pause_layer_on_restart_has_sender)
+                arguments.push_back(restart_button_ ? restart_button_ : pause_layer);
+            const bool ok = RunFunction(
+                runtime_.pause_layer_on_restart, arguments, nullptr,
+                "PauseLayer::onRestart wrapper button", 100000000u,
+                std::chrono::milliseconds(5000));
+            if (ok) {
+                log_ << "RESULT: DYNARMIC_RESTART_INVOKED path=PauseLayer::onRestart\n";
+                log_.flush();
+            }
+            restart_pause_layer_ = restart_menu_ = restart_button_ = 0u;
+            restart_native_present_ = false;
+            gameplay_check_at_ = {};
+            return ok;
+        }
+        if (active_play_layer_ && runtime_.play_layer_resume_and_restart) {
+            const bool ok = RunFunction(
+                runtime_.play_layer_resume_and_restart, {active_play_layer_}, nullptr,
+                "PlayLayer::resumeAndRestart wrapper button", 100000000u,
+                std::chrono::milliseconds(5000));
+            if (ok && pause_layer && runtime_.ccnode_remove_from_parent_cleanup)
+                (void)RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                                  {pause_layer, 1u}, nullptr,
+                                  "remove PauseLayer after restart fallback", 0u,
+                                  std::chrono::milliseconds(1000));
+            if (ok) {
+                log_ << "RESULT: DYNARMIC_RESTART_INVOKED path=PlayLayer::resumeAndRestart\n";
+                log_.flush();
+            }
+            restart_pause_layer_ = restart_menu_ = restart_button_ = 0u;
+            restart_native_present_ = false;
+            gameplay_check_at_ = {};
+            return ok;
+        }
+        log_ << "RESULT: DYNARMIC_RESTART_IGNORED reason=no-active-pause-or-callback\n";
+        log_.flush();
         return true;
     }
 
@@ -7720,9 +7974,27 @@ private:
         unsigned char* api_response = nullptr;
         std::size_t api_response_size = 0u;
         int api_response_code = 0;
-        const int api_request = gd_api_http_handle_raw_request(
-            request_data, request_size, &api_response, &api_response_size,
-            &api_response_code);
+        int api_request = 0;
+        if (wine_legacy_api_socket_fallback_) {
+            /* WinHTTP under Wine can complete successfully but take longer than
+               the 10 s nativeTouchesEnd wall guard.  Classify/buffer the
+               request without network I/O, then send the complete request via
+               the original nonblocking guest socket instead. */
+            api_request = gd_api_http_classify_raw_request(
+                request_data, request_size);
+            if (api_request == 1) {
+                if (!wine_api_request_logged_) {
+                    wine_api_request_logged_ = true;
+                    log_ << "[host] Wine legacy API request using guest socket; "
+                            "avoiding synchronous WinHTTP in touch callback\n";
+                }
+                api_request = 0;
+            }
+        } else {
+            api_request = gd_api_http_handle_raw_request(
+                request_data, request_size, &api_response, &api_response_size,
+                &api_response_code);
+        }
         if (api_request == 1) {
             SyntheticHttpResponse response;
             response.bytes.assign(api_response,
@@ -8577,6 +8849,13 @@ private:
             return true;
         }
 
+        if (name == "__gd_wrapper_restart_callback") {
+            restart_request_ = 1u;
+            cpu_.Regs()[0] = 0u;
+            ResumeAfterStub(import.address);
+            return true;
+        }
+
         if (import.name.rfind("__dynarmic_unz", 0) == 0)
             return DispatchHostMinizip(import);
         if (import.is_gl) return DispatchGl(import);
@@ -9186,6 +9465,8 @@ private:
     std::unordered_set<u32> socket_receive_logged_;
     std::unordered_map<u32, GuestAddrInfoAllocation> guest_addrinfo_;
     u64 network_log_count_=0;
+    bool wine_legacy_api_socket_fallback_=false;
+    bool wine_api_request_logged_=false;
 #endif
     const std::vector<u8>* apk_image_ = nullptr;
     ApkMemberCache apk_member_cache_;
@@ -9213,6 +9494,14 @@ private:
     u32 extras_time_button_ = 0u;
     u32 extras_close_button_ = 0u;
     u32 extras_empty_button_ = 0u;
+    std::chrono::steady_clock::time_point restart_check_at_{};
+    u32 restart_request_ = 0u;
+    u32 restart_scene_ = 0u;
+    u32 restart_pause_layer_ = 0u;
+    u32 restart_menu_ = 0u;
+    u32 restart_button_ = 0u;
+    bool restart_native_present_ = false;
+    bool restart_unavailable_logged_ = false;
     u32 old_playtest_request_ = 0u;
     u32 old_playtest_scene_ = 0u;
     u32 old_playtest_editor_ = 0u;
@@ -9874,6 +10163,8 @@ int main(int argc,char** argv) {
             runtime.old_playtest_callback = EnsureImport(
                 runtime, env, "__gd_wrapper_old_playtest_callback");
         }
+        runtime.restart_callback = EnsureImport(
+            runtime, env, "__gd_wrapper_restart_callback");
         const std::size_t zip_hooks=InstallCcFileUtilsZipHooks(runtime,env);
         MinizipHookCounts minizip_hooks{};
         if (legacy_gd_100) {
@@ -10107,6 +10398,9 @@ int main(int argc,char** argv) {
                 case HostEventType::EditorCommand:
                     if(!native_paused) ok=executor.SendEditorCommand(event.value);
                     break;
+                case HostEventType::EditorDelete:
+                    if(!native_paused) ok=executor.SendEditorDelete();
+                    break;
                 case HostEventType::ExtrasAction:
                     if(!native_paused) ok=executor.HandleExtrasAction(event.value);
                     break;
@@ -10131,6 +10425,8 @@ int main(int argc,char** argv) {
                     break;
                 }
             }
+            if (!native_paused && !executor.ProcessRestartRequest())
+                throw std::runtime_error(executor.LastError());
             if (!native_paused && !executor.ProcessOldVersionPlaytestRequest())
                 throw std::runtime_error(executor.LastError());
             const auto events_done=std::chrono::steady_clock::now();
@@ -10149,6 +10445,8 @@ int main(int argc,char** argv) {
 
             const auto render_start=std::chrono::steady_clock::now();
             executor.RefreshDesktopGameplayState();
+            if (!executor.EnsureRestartButton())
+                throw std::runtime_error(executor.LastError());
             if (!executor.EnsureOldVersionPlaytestButton())
                 throw std::runtime_error(executor.LastError());
             if (!executor.UpdateInlineOldVersionPlaytest())

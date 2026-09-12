@@ -629,6 +629,18 @@ cleanup:
 #endif
 }
 
+int gd_api_http_classify_raw_request(const void *request, size_t request_size) {
+#ifdef _WIN32
+    RawApiRequest parsed;
+    if (!request || !request_size) return 0;
+    return parse_api_request((const char *)request, request_size, &parsed);
+#else
+    (void)request;
+    (void)request_size;
+    return 0;
+#endif
+}
+
 int gd_api_http_handle_raw_request(const void *request, size_t request_size,
                                    unsigned char **response,
                                    size_t *response_size,

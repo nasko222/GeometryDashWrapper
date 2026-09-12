@@ -32,6 +32,15 @@ int gd_api_http_handle_raw_request(const void *request, size_t request_size,
                                    size_t *response_size,
                                    int *response_code);
 
+/*
+ * Parses/classifies the same legacy PHP request without performing network I/O.
+ * Returns 1 for a complete recognized request, 2 for a recognized request that
+ * is still incomplete, and 0 for unrelated traffic.  The ARM legacy backend
+ * uses this under Wine so slow WinHTTP compatibility never blocks a Cocos
+ * touch callback; the complete request then follows the original guest socket.
+ */
+int gd_api_http_classify_raw_request(const void *request, size_t request_size);
+
 #ifdef __cplusplus
 }
 #endif

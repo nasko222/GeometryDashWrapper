@@ -1,4 +1,12 @@
-# GeometryDashWrapper 0.9.7-newera28
+# GeometryDashWrapper 0.9.7-newera29
+
+## newera29 Linux/Wine search fix + desktop editor/restart controls
+
+- **ARM legacy Linux/Wine search compatibility:** legacy Geometry Dash PHP requests no longer run the full synchronous WinHTTP transaction from inside `nativeTouchesEnd` when the wrapper detects Wine. The request is still classified/buffered by the host, but complete API traffic returns to the original nonblocking guest socket path (including the configured GDPS request rewrite). Native Windows keeps the WinHTTP acceleration. This targets the Linux report where the HTTP request returned 200 but the touch callback exceeded its 10-second wall guard.
+- **Delete key in the editor:** desktop `Delete` now invokes the game's own `EditorUI::onDelete` callback on both x86 and ARM legacy. Sender and no-sender ABIs are resolved dynamically for old-version compatibility; text-entry fields remain protected.
+- **Universal old-version restart button:** when an online level is paused, x86 and ARM legacy add a replay/restart button to the existing `PauseLayer` and invoke the game's own `PauseLayer::onRestart` (with `PlayLayer::resumeAndRestart` as a symbol-driven fallback). Local levels keep their native restart button, so no duplicate is added. No hardcoded 1.1 byte offset and no `R` hotkey are used.
+- **Regression guard:** old-version editor playtest camera, player proxy rendering, collision/attempt handling, and the newera28 Alt/Print Screen input recovery are unchanged.
+
 
 
 ## newera28 x86 input recovery + ball/UFO framing
