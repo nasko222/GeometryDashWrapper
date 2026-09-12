@@ -17,6 +17,7 @@ int gd_settings_i_lost_the_game(void);
 int gd_settings_editor_controls(void);
 int gd_settings_extras_menu(void);
 int gd_settings_old_ver_playtest(void);
+int gd_settings_restart_button(void);
 int gd_settings_old_ver_playtest_supported_version(void);
 
 enum {

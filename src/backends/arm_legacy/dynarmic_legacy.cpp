@@ -5031,11 +5031,18 @@ public:
     }
 
     bool EnsureRestartButton() {
-        const auto now = std::chrono::steady_clock::now();
-        if (restart_check_at_.time_since_epoch().count() != 0 &&
-            now - restart_check_at_ < std::chrono::milliseconds(250))
+        if (!gd_settings_restart_button()) {
+            restart_pause_layer_ = 0u;
+            restart_menu_ = 0u;
+            restart_button_ = 0u;
+            restart_native_present_ = false;
             return true;
-        restart_check_at_ = now;
+        }
+
+        /* TouchEnd already calls InvalidateDesktopGameplayState(). With the
+           separate 250 ms restart poll removed, the normal cached scene walk
+           refreshes exactly when a click can create PauseLayer, so there is no
+           extra per-frame guest traversal (important for Wine/Dynarmic). */
         RefreshDesktopGameplayState();
         if (restart_scene_ != active_scene_root_) {
             restart_scene_ = active_scene_root_;
@@ -5092,7 +5099,7 @@ public:
                          "position restart menu", 0u,
                          std::chrono::milliseconds(800)) ||
             !RunFunction(runtime_.ccnode_set_position_ff,
-                         {item, FloatToWord(405.0f), FloatToWord(130.0f)}, nullptr,
+                         {item, FloatToWord(465.0f), FloatToWord(130.0f)}, nullptr,
                          "position restart button", 0u,
                          std::chrono::milliseconds(800)) ||
             !AddExtrasChild(active_pause_layer_, menu, 30000))

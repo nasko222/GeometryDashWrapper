@@ -20,7 +20,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-newera29"
+#define LAUNCHER_VERSION "0.9.7-newera30"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -718,6 +718,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t antialiasing[64];
     wchar_t show_command_prompt[64];
     wchar_t old_ver_playtest[64];
+    wchar_t restart_button[64];
     if (!PathJoin(path, ARRAY_COUNT(path), context->run_directory,
                   L"run-info.txt")) return 0;
     if (_wfopen_s(&file, path, L"wb, ccs=UTF-8") != 0 || !file) return 0;
@@ -775,6 +776,9 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     fwprintf(file, L"old_ver_playtest=%ls\n",
              GetSetting(L"OLD_VER_PLAYTEST", L"false", old_ver_playtest,
                         ARRAY_COUNT(old_ver_playtest)));
+    fwprintf(file, L"restart_button=%ls\n",
+             GetSetting(L"RESTART_BUTTON", L"true", restart_button,
+                        ARRAY_COUNT(restart_button)));
     fwprintf(file, L"x86_api_connect_mode=%ls\n",
              GetSetting(L"GD_X86_API_CONNECT_MODE",
                         IsX86Version211(context) ? L"real" : L"synthetic",

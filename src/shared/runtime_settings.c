@@ -154,6 +154,10 @@ int gd_settings_old_ver_playtest(void) {
     return gd_setting_bool("OLD_VER_PLAYTEST", 0);
 }
 
+int gd_settings_restart_button(void) {
+    return gd_setting_bool("RESTART_BUTTON", 1);
+}
+
 int gd_settings_old_ver_playtest_supported_version(void) {
     const char *value = getenv("GD_GAME_VERSION");
     char *end = NULL;

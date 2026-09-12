@@ -326,7 +326,7 @@ static GameHost g_host;
 
 #define OLD_PLAYTEST_BUTTON_X 30.0f
 #define OLD_PLAYTEST_BUTTON_Y 186.0f
-#define WRAPPER_RESTART_BUTTON_X 405.0f
+#define WRAPPER_RESTART_BUTTON_X 465.0f
 #define WRAPPER_RESTART_BUTTON_Y 130.0f
 /* GJ_playBtn2 is about 82 px high; the pause icon is about 40 px. Scale the
    play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
@@ -1265,15 +1265,24 @@ static void *create_restart_menu_item(void *pause_layer) {
 }
 
 static int ensure_restart_button(void) {
-    ULONGLONG now = GetTickCount64();
     void *scene;
     void *pause_layer;
     void *menu;
     void *button;
     int native_restart = 0;
-    if (now - g_host.restart_check_time < 250u) return 1;
-    g_host.restart_check_time = now;
 
+    if (!gd_settings_restart_button()) {
+        g_host.restart_pause_layer = NULL;
+        g_host.restart_menu = NULL;
+        g_host.restart_button = NULL;
+        g_host.restart_native_present = 0;
+        return 1;
+    }
+
+    /* WM_LBUTTONUP already invalidates the gameplay cache after forwarding the
+       native touch. Removing only the separate 250 ms restart poll means the
+       newly-created PauseLayer can be discovered immediately without adding
+       another recurring scene/game-state scan to the render loop. */
     if (!detect_gameplay_active() || g_host.editor_cache_value ||
         g_host.old_playtest_layer) {
         g_host.restart_pause_layer = NULL;
@@ -1884,12 +1893,11 @@ static int ensure_old_playtest_button(void) {
     void *menu;
     void *button;
     void *stop_button;
-    ULONGLONG now;
     if (!gd_settings_old_ver_playtest() ||
         !gd_settings_old_ver_playtest_supported_version()) return 1;
-    now = GetTickCount64();
-    if (now - g_host.old_playtest_check_time < 250u) return 1;
-    g_host.old_playtest_check_time = now;
+    /* The old 250 ms poll made the scene-overlay button visibly pop in after
+       the editor itself. EditorUI discovery is scene-cached, so checking each
+       host frame is cheap once the editor has been found. */
     editor_ui = find_active_editor_ui();
     if (g_host.old_playtest_scene != g_host.active_scene_root) {
         g_host.old_playtest_scene = g_host.active_scene_root;

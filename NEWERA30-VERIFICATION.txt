@@ -1,0 +1,21 @@
+GeometryDashWrapper 0.9.7-newera30 verification
+
+Base: exact 0.9.7-newera29 full-source package.
+
+Changes in this revision:
+- Added RESTART_BUTTON boolean runtime setting, default TRUE.
+- RUN_AUTO_BOOMLINGS.cmd: RESTART_BUTTON=TRUE.
+- RUN_AUTO_GDPS.cmd: RESTART_BUTTON=TRUE.
+- Wrapper restart button moved from logical x=405 to x=465, y=130 so it occupies a clean fourth pause-menu slot instead of overlapping the native list/menu button.
+- x86 restart discovery no longer has the 250 ms poll delay; it relies on the existing WM_LBUTTONUP gameplay-cache invalidation, avoiding any new recurring scene scan.
+- x86 old-version editor playtest button no longer has the 250 ms poll delay.
+- ARM legacy restart discovery removes only the separate 250 ms poll and relies on the existing TouchEnd scene-cache invalidation; no new per-frame guest traversal is added.
+- Generated batch boolean literals are normalized to uppercase TRUE/FALSE.
+- No R restart hotkey was added.
+- newera29 Linux/Wine networking behavior is preserved.
+- Inline-playtest camera, player proxy, collision and attempt handling are intentionally unchanged.
+
+Validation performed:
+- Static source checks and delimiter counts.
+- Camera/proxy/collision function comparisons against newera29.
+- Patch round-trip: PASS (clean newera29 + patch reconstructed all 181 files byte-for-byte).

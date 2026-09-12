@@ -1,4 +1,11 @@
-# GeometryDashWrapper 0.9.7-newera29
+# GeometryDashWrapper 0.9.7-newera30
+
+## newera30 restart-menu cleanup + instant wrapper controls
+
+- **Restart no longer overlaps the pause menu:** the wrapper restart control now occupies the clean fourth online-level slot at logical `(465, 130)` instead of sitting on top of the native list/menu button. The native local-level restart remains untouched.
+- **`RESTART_BUTTON` setting:** `RESTART_BUTTON=TRUE/FALSE` controls the wrapper-added online-level restart button. It defaults to `TRUE`, and both `RUN_AUTO_BOOMLINGS.cmd` and `RUN_AUTO_GDPS.cmd` explicitly set it to `TRUE`.
+- **No quarter-second pop-in:** x86 restart and old-version editor-playtest controls no longer use the old 250 ms poll. ARM legacy reuses the existing TouchEnd cache invalidation, so the normal cached scene scan refreshes immediately after the click that opens Pause without adding any new per-frame Dynarmic traversal.
+- **Regression guard:** newera29 Linux/Wine networking and the established playtest camera/player/collision behavior are unchanged.
 
 ## newera29 Linux/Wine search fix + desktop editor/restart controls
 
@@ -197,6 +204,7 @@ Edit the `set "NAME=value"` lines near the top of the two `RUN_AUTO_*.cmd` files
 | `ANTIALIASING` | `NONE` | Host antialiasing mode: `NONE`, `FXAA`, `MSAA2`, `MSAA4`, or `MSAA8`. Unsupported MSAA sample counts fall back to a lower count and then off. |
 | `SHOW_COMMAND_PROMPT` | Script-specific | `RUN_AUTO_BOOMLINGS.cmd` defaults to `TRUE`; `RUN_AUTO_GDPS.cmd` defaults to `FALSE`. Controls whether the launcher console stays visible. |
 | `OLD_VER_PLAYTEST` | Script-specific | `RUN_AUTO_BOOMLINGS.cmd` defaults to `TRUE`; `RUN_AUTO_GDPS.cmd` defaults to `FALSE`. Adds the inline editor play/stop control to Geometry Dash 1.0-1.7 on legacy ARM/x86. |
+| `RESTART_BUTTON` | `TRUE` | Adds the wrapper restart control to online-level pause menus when the old build does not already provide one. Local levels keep the game's native restart button. |
 | `VERSION_ISOLATED_SAVES` | `true` | Gives each package/version/backend combination its own save directory. Set `false` to use the shared `save` directory. |
 | `EDITOR_CONTROLLS` | `true` | Enables legacy/x86 editor movement and rotation shortcuts. The historical misspelling is part of the public setting name. |
 | `I_LOST_THE_GAME` | `true` | Launch guard set by the scripts. Direct backend execution without it shows the wrapper's launch message and exits. |

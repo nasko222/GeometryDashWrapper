@@ -32,7 +32,7 @@ $BoostDirectory = Join-Path $ToolsRoot "boost-$BoostVersion"
 $BoostSource = Join-Path $BoostDirectory "boost_1_84_0"
 $CMakeSha256 = "13D1A463D7130DF5339BAEDD63D8AE990AAF385062B2F42F372796143AE94086"
 $NinjaSha256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
-$BuilderRevision = "dynarmic-x64-builder141-0.9.7-newera29"
+$BuilderRevision = "dynarmic-x64-builder142-0.9.7-newera30"
 $CompatibleBuilderRevisions = @($BuilderRevision)
 
 function Invoke-External {
@@ -460,12 +460,13 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Output "save") | Out-Null
 $LegacyRun = @'
 @echo off
 cd /d "%~dp0.."
-set "I_LOST_THE_GAME=true"
-set "EDITOR_CONTROLLS=true"
+set "I_LOST_THE_GAME=TRUE"
+set "EDITOR_CONTROLLS=TRUE"
 set "RESOLUTION=1140x640"
 set "TEXTURE_FILTERING=GAME"
 set "ANTIALIASING=NONE"
-set "OLD_VER_PLAYTEST=false"
+set "OLD_VER_PLAYTEST=FALSE"
+set "RESTART_BUTTON=TRUE"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
@@ -478,12 +479,13 @@ for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-
 $LegacyDebug = @'
 @echo off
 cd /d "%~dp0.."
-set "I_LOST_THE_GAME=true"
-set "EDITOR_CONTROLLS=true"
+set "I_LOST_THE_GAME=TRUE"
+set "EDITOR_CONTROLLS=TRUE"
 set "RESOLUTION=1140x640"
 set "TEXTURE_FILTERING=GAME"
 set "ANTIALIASING=NONE"
-set "OLD_VER_PLAYTEST=false"
+set "OLD_VER_PLAYTEST=FALSE"
+set "RESTART_BUTTON=TRUE"
 if not exist game.apk (
   echo Put the ARM-only Geometry Dash 1.0-1.4 APK in dist-unified as game.apk
   pause
@@ -496,12 +498,13 @@ for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-
 $ArmV7Run = @'
 @echo off
 cd /d "%~dp0.."
-set "I_LOST_THE_GAME=true"
-set "EDITOR_CONTROLLS=true"
+set "I_LOST_THE_GAME=TRUE"
+set "EDITOR_CONTROLLS=TRUE"
 set "RESOLUTION=1140x640"
 set "TEXTURE_FILTERING=GAME"
 set "ANTIALIASING=NONE"
-set "OLD_VER_PLAYTEST=false"
+set "OLD_VER_PLAYTEST=FALSE"
+set "RESTART_BUTTON=TRUE"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause
@@ -514,12 +517,13 @@ for %%F in (gd-wrapper*.log gd-arm*.log gd-dynarmic*.log gd-networktest*.log gd-
 $ArmV7Debug = @'
 @echo off
 cd /d "%~dp0.."
-set "I_LOST_THE_GAME=true"
-set "EDITOR_CONTROLLS=true"
+set "I_LOST_THE_GAME=TRUE"
+set "EDITOR_CONTROLLS=TRUE"
 set "RESOLUTION=1140x640"
 set "TEXTURE_FILTERING=GAME"
 set "ANTIALIASING=NONE"
-set "OLD_VER_PLAYTEST=false"
+set "OLD_VER_PLAYTEST=FALSE"
+set "RESTART_BUTTON=TRUE"
 if not exist game.apk (
   echo Put the ARMv7 Geometry Dash 2.2 APK in dist-unified as game.apk
   pause
