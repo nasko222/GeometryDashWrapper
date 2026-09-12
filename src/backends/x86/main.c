@@ -240,11 +240,15 @@ typedef struct {
     void *old_playtest_player;
     void *old_playtest_play_game_layer;
     void *old_playtest_editor_game_layer;
+    void *old_playtest_proxy_root;
     void *old_playtest_proxy_primary;
     void *old_playtest_proxy_secondary;
     void *old_playtest_proxy_tertiary;
+    void *old_playtest_proxy_quaternary;
+    void *old_playtest_proxy_quinary;
     int old_playtest_proxy_mode;
     int old_playtest_proxy_icon;
+    unsigned int old_playtest_proxy_poll_counter;
     void *old_playtest_level_clone;
     void *old_playtest_previous_play_layer;
     int old_playtest_previous_edit_mode;
@@ -297,14 +301,14 @@ static GameHost g_host;
    play sprites themselves, not CCMenuItemSpriteExtra, so its press animation
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
-#define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
-#define OLD_PLAYTEST_CAMERA_ZOOM 0.85f
+#define OLD_PLAYTEST_CAMERA_ZOOM 0.90f
+#define OLD_PLAYTEST_VIEW_CENTER_X 285.0f
 #define OLD_PLAYTEST_VIEW_CENTER_Y 160.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
-#define OLD_PLAYTEST_TRAIL_STEP 8.0f
-#define OLD_PLAYTEST_TRAIL_MAX_SEGMENTS 1024u
+#define OLD_PLAYTEST_TRAIL_STEP 16.0f
+#define OLD_PLAYTEST_TRAIL_MAX_SEGMENTS 256u
 #define OLD_PLAYTEST_RAD_TO_DEG 57.29577951308232f
 
 enum {
@@ -1486,18 +1490,18 @@ static int old_playtest_icon_for_mode(int mode) {
 }
 
 static void remove_old_playtest_proxy_visuals(void) {
-    if (g_host.old_playtest_proxy_primary &&
-        memory_range_is_readable(g_host.old_playtest_proxy_primary, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_proxy_primary, 1);
-    if (g_host.old_playtest_proxy_secondary &&
-        memory_range_is_readable(g_host.old_playtest_proxy_secondary, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_proxy_secondary, 1);
-    if (g_host.old_playtest_proxy_tertiary &&
-        memory_range_is_readable(g_host.old_playtest_proxy_tertiary, sizeof(void *)))
-        g_host.ccnode_remove(g_host.old_playtest_proxy_tertiary, 1);
+    /* All proxy sprites live under one local-space root. Removing that root
+       removes every vehicle/cube layer together and avoids touching children
+       individually while Cocos is walking the scene tree. */
+    if (g_host.old_playtest_proxy_root &&
+        memory_range_is_readable(g_host.old_playtest_proxy_root, sizeof(void *)))
+        g_host.ccnode_remove(g_host.old_playtest_proxy_root, 1);
+    g_host.old_playtest_proxy_root = NULL;
     g_host.old_playtest_proxy_primary = NULL;
     g_host.old_playtest_proxy_secondary = NULL;
     g_host.old_playtest_proxy_tertiary = NULL;
+    g_host.old_playtest_proxy_quaternary = NULL;
+    g_host.old_playtest_proxy_quinary = NULL;
 }
 
 static int old_playtest_get_player_colors(GdCcColor3B *primary,
@@ -1524,70 +1528,109 @@ static int old_playtest_get_player_colors(GdCcColor3B *primary,
 
 static int rebuild_old_playtest_proxy_visuals(int force) {
     int mode, icon, cube_icon;
-    char primary_name[64];
-    char secondary_name[64];
-    char tertiary_name[64];
+    char name[64];
     const char *prefix;
     GdCcColor3B primary_color = {255u, 255u, 255u};
     GdCcColor3B secondary_color = {255u, 255u, 255u};
+    GdCcColor3B white = {255u, 255u, 255u};
     void *manager;
+    float vehicle_y = 0.0f;
     if (!g_host.old_playtest_player || !g_host.old_playtest_trail) return 1;
     mode = old_playtest_detect_mode();
     icon = old_playtest_icon_for_mode(mode);
-    if (!force && g_host.old_playtest_proxy_primary &&
+    if (!force && g_host.old_playtest_proxy_root &&
         mode == g_host.old_playtest_proxy_mode &&
         icon == g_host.old_playtest_proxy_icon) return 1;
 
     remove_old_playtest_proxy_visuals();
     (void)old_playtest_get_player_colors(&primary_color, &secondary_color);
+    g_host.old_playtest_proxy_root = g_host.ccnode_create();
+    if (!g_host.old_playtest_proxy_root ||
+        !add_extras_child(g_host.old_playtest_trail,
+                          g_host.old_playtest_proxy_root, 9998)) {
+        g_host.old_playtest_proxy_root = NULL;
+        return 0;
+    }
 
     if (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD) {
-        /* Vehicle sprite underneath, selected cube icon above it.  Previous
-           builds put the ship/UFO at the highest Z and literally covered the
-           cube that was supposed to be riding inside it. */
-        snprintf(primary_name, sizeof(primary_name),
+        /* Match the old PlayerObject layout instead of stacking everything at
+           one world-space point. 1.7 uses a cube at local (0,+5) scaled to
+           0.55; ship is at (0,-5), UFO/bird at (0,-7). The local proxy root
+           is rotated/scaled as a whole, so these offsets rotate correctly. */
+        vehicle_y = mode == OLD_PLAYTEST_MODE_SHIP ? -5.0f : -7.0f;
+        snprintf(name, sizeof(name),
                  mode == OLD_PLAYTEST_MODE_SHIP ? "ship_%02d_001.png" :
                                                   "bird_%02d_001.png", icon);
-        g_host.old_playtest_proxy_primary =
-            g_host.sprite_create_with_frame(primary_name);
+        g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(name);
+        if (mode == OLD_PLAYTEST_MODE_BIRD || g_host.player_get_bird_mode) {
+            if (mode == OLD_PLAYTEST_MODE_SHIP)
+                snprintf(name, sizeof(name), "ship_%02d_2_001.png", icon);
+            else
+                snprintf(name, sizeof(name), "bird_%02d_2_001.png", icon);
+            g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(name);
+        }
+        if (mode == OLD_PLAYTEST_MODE_BIRD) {
+            snprintf(name, sizeof(name), "bird_%02d_3_001.png", icon);
+            g_host.old_playtest_proxy_tertiary = g_host.sprite_create_with_frame(name);
+        }
+
         manager = g_host.game_manager_shared_state
                       ? g_host.game_manager_shared_state() : NULL;
         cube_icon = (manager && g_host.game_manager_get_player_frame)
                         ? g_host.game_manager_get_player_frame(manager) : 1;
         if (cube_icon < 1 || cube_icon > 99) cube_icon = 1;
-        snprintf(secondary_name, sizeof(secondary_name),
-                 "player_%02d_001.png", cube_icon);
-        snprintf(tertiary_name, sizeof(tertiary_name),
-                 "player_%02d_2_001.png", cube_icon);
-        g_host.old_playtest_proxy_secondary =
-            g_host.sprite_create_with_frame(secondary_name);
-        g_host.old_playtest_proxy_tertiary =
-            g_host.sprite_create_with_frame(tertiary_name);
-        if (g_host.old_playtest_proxy_primary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_primary,
-                                    &primary_color);
-        if (g_host.old_playtest_proxy_secondary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary,
-                                    &primary_color);
-        if (g_host.old_playtest_proxy_tertiary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary,
-                                    &secondary_color);
+        snprintf(name, sizeof(name), "player_%02d_001.png", cube_icon);
+        g_host.old_playtest_proxy_quaternary = g_host.sprite_create_with_frame(name);
+        snprintf(name, sizeof(name), "player_%02d_2_001.png", cube_icon);
+        g_host.old_playtest_proxy_quinary = g_host.sprite_create_with_frame(name);
+
+        if (g_host.old_playtest_proxy_primary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_primary, &primary_color);
+            g_host.ccnode_set_position(g_host.old_playtest_proxy_primary, 0.0f, vehicle_y);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_primary, 0)) return 0;
+        }
+        if (g_host.old_playtest_proxy_secondary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary, &secondary_color);
+            g_host.ccnode_set_position(g_host.old_playtest_proxy_secondary, 0.0f, vehicle_y);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_secondary, 1)) return 0;
+        }
+        if (g_host.old_playtest_proxy_tertiary) {
+            /* bird _3 is a neutral detail layer in the original object */
+            g_host.sprite_set_color(g_host.old_playtest_proxy_tertiary, &white);
+            g_host.ccnode_set_position(g_host.old_playtest_proxy_tertiary, 0.0f, vehicle_y);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_tertiary, 2)) return 0;
+        }
+        if (g_host.old_playtest_proxy_quaternary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_quaternary, &primary_color);
+            g_host.ccnode_set_position(g_host.old_playtest_proxy_quaternary, 0.0f, 5.0f);
+            g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_quaternary, 0.55f);
+            g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_quaternary, 0.55f);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_quaternary, 3)) return 0;
+        }
+        if (g_host.old_playtest_proxy_quinary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_quinary, &secondary_color);
+            g_host.ccnode_set_position(g_host.old_playtest_proxy_quinary, 0.0f, 5.0f);
+            g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_quinary, 0.55f);
+            g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_quinary, 0.55f);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_quinary, 4)) return 0;
+        }
     } else {
         prefix = mode == OLD_PLAYTEST_MODE_BALL ? "player_ball" : "player";
-        snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
-        snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
-        g_host.old_playtest_proxy_primary =
-            g_host.sprite_create_with_frame(primary_name);
-        g_host.old_playtest_proxy_secondary =
-            g_host.sprite_create_with_frame(secondary_name);
+        snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
+        g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(name);
+        snprintf(name, sizeof(name), "%s_%02d_2_001.png", prefix, icon);
+        g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(name);
         if (!g_host.old_playtest_proxy_primary) {
             icon = mode == OLD_PLAYTEST_MODE_BALL ? 0 : 1;
-            snprintf(primary_name, sizeof(primary_name), "%s_%02d_001.png", prefix, icon);
-            snprintf(secondary_name, sizeof(secondary_name), "%s_%02d_2_001.png", prefix, icon);
-            g_host.old_playtest_proxy_primary =
-                g_host.sprite_create_with_frame(primary_name);
-            g_host.old_playtest_proxy_secondary =
-                g_host.sprite_create_with_frame(secondary_name);
+            snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
+            g_host.old_playtest_proxy_primary = g_host.sprite_create_with_frame(name);
+            snprintf(name, sizeof(name), "%s_%02d_2_001.png", prefix, icon);
+            g_host.old_playtest_proxy_secondary = g_host.sprite_create_with_frame(name);
         }
         if (!g_host.old_playtest_proxy_primary && mode != OLD_PLAYTEST_MODE_CUBE) {
             mode = OLD_PLAYTEST_MODE_CUBE;
@@ -1597,32 +1640,28 @@ static int rebuild_old_playtest_proxy_visuals(int force) {
             g_host.old_playtest_proxy_secondary =
                 g_host.sprite_create_with_frame("player_01_2_001.png");
         }
-        if (g_host.old_playtest_proxy_primary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_primary,
-                                    &primary_color);
-        if (g_host.old_playtest_proxy_secondary)
-            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary,
-                                    &secondary_color);
+        if (g_host.old_playtest_proxy_primary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_primary, &primary_color);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_primary, 0)) return 0;
+        }
+        if (g_host.old_playtest_proxy_secondary) {
+            g_host.sprite_set_color(g_host.old_playtest_proxy_secondary, &secondary_color);
+            if (!add_extras_child(g_host.old_playtest_proxy_root,
+                                  g_host.old_playtest_proxy_secondary, 1)) return 0;
+        }
     }
-    if (!g_host.old_playtest_proxy_primary) return 0;
-    /* Correct compositing order: base/vehicle first, detail layers above. */
-    if (!add_extras_child(g_host.old_playtest_trail,
-                          g_host.old_playtest_proxy_primary, 9998)) return 0;
-    if (g_host.old_playtest_proxy_secondary &&
-        !add_extras_child(g_host.old_playtest_trail,
-                          g_host.old_playtest_proxy_secondary, 9999)) return 0;
-    if (g_host.old_playtest_proxy_tertiary &&
-        !add_extras_child(g_host.old_playtest_trail,
-                          g_host.old_playtest_proxy_tertiary, 10000)) return 0;
+    if (!g_host.old_playtest_proxy_primary) {
+        remove_old_playtest_proxy_visuals();
+        return 0;
+    }
     g_host.old_playtest_proxy_mode = mode;
     g_host.old_playtest_proxy_icon = icon;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d colors=player inner-icon=%s",
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_PROXY_MODE mode=%s icon=%d colors=player layout=authentic-local",
                 mode == OLD_PLAYTEST_MODE_SHIP ? "ship" :
                 mode == OLD_PLAYTEST_MODE_BALL ? "ball" :
                 mode == OLD_PLAYTEST_MODE_BIRD ? "bird" : "cube",
-                icon,
-                (mode == OLD_PLAYTEST_MODE_SHIP || mode == OLD_PLAYTEST_MODE_BIRD)
-                    ? "cube" : "native-layers");
+                icon);
     return 1;
 }
 
@@ -1657,11 +1696,15 @@ static int ensure_old_playtest_button(void) {
             g_host.old_playtest_player = NULL;
             g_host.old_playtest_play_game_layer = NULL;
             g_host.old_playtest_editor_game_layer = NULL;
+            g_host.old_playtest_proxy_root = NULL;
             g_host.old_playtest_proxy_primary = NULL;
             g_host.old_playtest_proxy_secondary = NULL;
             g_host.old_playtest_proxy_tertiary = NULL;
+            g_host.old_playtest_proxy_quaternary = NULL;
+            g_host.old_playtest_proxy_quinary = NULL;
             g_host.old_playtest_proxy_mode = -1;
             g_host.old_playtest_proxy_icon = -1;
+            g_host.old_playtest_proxy_poll_counter = 0u;
             g_host.old_playtest_level_clone = NULL;
             g_host.old_playtest_previous_play_layer = NULL;
             g_host.old_playtest_end_portal = NULL;
@@ -1867,17 +1910,26 @@ static void set_old_playtest_editor_controls_enabled(int enabled) {
 }
 
 static int apply_old_playtest_camera(float player_x) {
-    float base_y, camera_x, camera_y;
-    float scale_x, scale_y;
+    float base_x, base_y;
+    float camera_x, camera_y, scale_x, scale_y;
+    (void)player_x;
     if (!g_host.old_playtest_editor_game_layer || !g_host.old_playtest_play_game_layer)
         return 0;
+
+    /* Let the real hidden PlayLayer decide the camera. Its X/Y already contain
+       the mode-specific clamps/follow rules for cube, ship, ball and UFO. We
+       only apply a small visual zoom-out around the 570x320 design center. */
+    base_x = g_host.ccnode_get_position_x(g_host.old_playtest_play_game_layer);
     base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
-    scale_x = g_host.old_playtest_editor_camera_original_scale_x * OLD_PLAYTEST_CAMERA_ZOOM;
-    scale_y = g_host.old_playtest_editor_camera_original_scale_y * OLD_PLAYTEST_CAMERA_ZOOM;
-    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x * scale_x;
-    if (camera_x > 0.0f) camera_x = 0.0f;
-    camera_y = (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_Y +
-               OLD_PLAYTEST_CAMERA_ZOOM * base_y;
+    /* Historical 1.0-1.7 has no gameplay camera-zoom triggers: the camera
+       layer scale stays 1.0. Avoid two guest getter calls every frame. */
+    scale_x = OLD_PLAYTEST_CAMERA_ZOOM;
+    scale_y = OLD_PLAYTEST_CAMERA_ZOOM;
+    camera_x = OLD_PLAYTEST_CAMERA_ZOOM * base_x +
+               (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_X;
+    camera_y = OLD_PLAYTEST_CAMERA_ZOOM * base_y +
+               (1.0f - OLD_PLAYTEST_CAMERA_ZOOM) * OLD_PLAYTEST_VIEW_CENTER_Y;
+
     g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, scale_x);
     g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, scale_y);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer, camera_x, camera_y);
@@ -1950,37 +2002,28 @@ static int append_old_playtest_trail_segment(float x, float y) {
 
 static int update_old_playtest_proxy_transform(void) {
     float x, y, rotation, scale_x, scale_y;
-    void *sprites[3];
-    int index;
     if (!g_host.old_playtest_player) return 1;
-    if (!rebuild_old_playtest_proxy_visuals(0)) return 0;
-    if (!g_host.old_playtest_proxy_primary) return 1;
+    /* Mode/icon probing crosses the guest ABI and is much more expensive than
+       moving the already-built local proxy. Four-frame polling is visually
+       immediate at 60 Hz while cutting those calls by 75%. */
+    ++g_host.old_playtest_proxy_poll_counter;
+    if (!g_host.old_playtest_proxy_root ||
+        (g_host.old_playtest_proxy_poll_counter & 3u) == 0u) {
+        if (!rebuild_old_playtest_proxy_visuals(0)) return 0;
+    }
+    if (!g_host.old_playtest_proxy_root) return 1;
     x = g_host.ccnode_get_position_x(g_host.old_playtest_player);
     y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
     rotation = g_host.ccnode_get_rotation(g_host.old_playtest_player);
     scale_x = g_host.ccnode_get_scale_x(g_host.old_playtest_player);
     scale_y = g_host.ccnode_get_scale_y(g_host.old_playtest_player);
-    sprites[0] = g_host.old_playtest_proxy_primary;
-    sprites[1] = g_host.old_playtest_proxy_secondary;
-    sprites[2] = g_host.old_playtest_proxy_tertiary;
-    for (index = 0; index < 3; ++index) {
-        float factor = 1.0f;
-        float offset_y = 0.0f;
-        if ((g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP ||
-             g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_BIRD) && index > 0) {
-            factor = g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP
-                         ? 0.55f : 0.48f;
-            offset_y = g_host.old_playtest_proxy_mode == OLD_PLAYTEST_MODE_SHIP
-                           ? 2.0f : 4.0f;
-        }
-        if (!sprites[index]) continue;
-        g_host.ccnode_set_position(sprites[index], x, y + offset_y);
-        g_host.ccnode_set_rotation(sprites[index], rotation);
-        g_host.ccnode_set_scale_x(sprites[index], scale_x * factor);
-        g_host.ccnode_set_scale_y(sprites[index], scale_y * factor);
-    }
+    g_host.ccnode_set_position(g_host.old_playtest_proxy_root, x, y);
+    g_host.ccnode_set_rotation(g_host.old_playtest_proxy_root, rotation);
+    g_host.ccnode_set_scale_x(g_host.old_playtest_proxy_root, scale_x);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_proxy_root, scale_y);
     return append_old_playtest_trail_segment(x, y);
 }
+
 
 static int stop_inline_old_playtest(void);
 
@@ -2103,6 +2146,7 @@ static int start_inline_old_playtest(void) {
     g_host.old_playtest_level_clone = level_clone;
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
+    g_host.old_playtest_proxy_poll_counter = 0u;
     g_host.old_playtest_end_portal = NULL;
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_editor_camera_original_x =
@@ -2177,7 +2221,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.85 scene-isolated=1 editor-input=suspended editor-controls=suspended");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=PlayLayer scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2295,11 +2339,15 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_player = NULL;
     g_host.old_playtest_play_game_layer = NULL;
     g_host.old_playtest_editor_game_layer = NULL;
+    g_host.old_playtest_proxy_root = NULL;
     g_host.old_playtest_proxy_primary = NULL;
     g_host.old_playtest_proxy_secondary = NULL;
     g_host.old_playtest_proxy_tertiary = NULL;
+    g_host.old_playtest_proxy_quaternary = NULL;
+    g_host.old_playtest_proxy_quinary = NULL;
     g_host.old_playtest_proxy_mode = -1;
     g_host.old_playtest_proxy_icon = -1;
+    g_host.old_playtest_proxy_poll_counter = 0u;
     g_host.old_playtest_trail = NULL;
     g_host.old_playtest_trail_has_last = 0;
     g_host.old_playtest_trail_segments = 0;

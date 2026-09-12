@@ -1,0 +1,26 @@
+Geometry Dash Wrapper 0.9.7-newera13
+
+Focus of this revision:
+- inline editor camera no longer uses a fixed player X anchor or hand-made Y framing
+- x86 + ARM legacy now read the real hidden PlayLayer game-layer X/Y and mirror that camera into the editor
+- a 0.90 visual zoom-out is applied around the historical 570x320 logical center (285,160)
+- this preserves the old game's own cube/ship/ball/UFO camera clamps and screen-limited vertical behavior
+- player proxy now uses one local-space root; vehicle/cube offsets rotate together instead of being applied as world-space Y offsets
+- verified historical PlayerObject layout from the old binaries: cube local Y +5 at scale 0.55, ship body local Y -5, bird/UFO body local Y -7
+- x86 vehicle proxy uses secondary ship/bird frames and bird detail frame when those later assets/capabilities exist; early ARM ship mode does not request missing secondary frames
+- proxy mode/icon guest polling reduced to once every four frames
+- green trail sampling increased to 16 world units and capped at 256 segments; orange trajectory remains completely removed
+- RUN_AUTO_GDPS.cmd and RUN_AUTO_BOOMLINGS.cmd use uppercase TRUE/FALSE consistently for all boolean values
+- first-attempt preservation, edit-mode restoration, special-object placement fix, mirror suppression, editor-control suspension, music stop and stop-path safety remain unchanged
+
+Static validation performed in this environment:
+- C source delimiter balance matches clean expectations
+- ARM/C++ delimiter profile matches the newera12 baseline
+- no camera-zoom=0.85 markers remain in backend source
+- no lowercase true/false boolean values remain in the two auto-run .cmd files
+- patch round-trip is checked after packaging
+
+Runtime note:
+- Windows runtime behavior still requires user testing against the historical APKs.
+
+Dynarmic builder revision: 125

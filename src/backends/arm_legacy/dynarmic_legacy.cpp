@@ -3737,19 +3737,17 @@ public:
 
     bool RemoveOldVersionPlaytestProxyVisuals() {
         bool ok = true;
-        const std::array<u32,3> sprites = {
-            old_playtest_proxy_primary_, old_playtest_proxy_secondary_,
-            old_playtest_proxy_tertiary_};
-        for (u32 sprite : sprites) {
-            if (!sprite || !env_.IsMapped(sprite, 4u)) continue;
-            if (!RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
-                             {sprite, 1u}, nullptr,
-                             "remove playtest mode proxy", 0u,
-                             std::chrono::milliseconds(500))) ok = false;
-        }
+        if (old_playtest_proxy_root_ && env_.IsMapped(old_playtest_proxy_root_, 4u))
+            ok = RunFunction(runtime_.ccnode_remove_from_parent_cleanup,
+                             {old_playtest_proxy_root_, 1u}, nullptr,
+                             "remove playtest proxy root", 0u,
+                             std::chrono::milliseconds(500));
+        old_playtest_proxy_root_ = 0u;
         old_playtest_proxy_primary_ = 0u;
         old_playtest_proxy_secondary_ = 0u;
         old_playtest_proxy_tertiary_ = 0u;
+        old_playtest_proxy_quaternary_ = 0u;
+        old_playtest_proxy_quinary_ = 0u;
         return ok;
     }
 
@@ -3796,7 +3794,7 @@ public:
         if (!old_playtest_player_ || !old_playtest_trail_) return true;
         int mode = DetectOldVersionPlaytestMode();
         int icon = OldVersionPlaytestIconForMode(mode);
-        if (!force && old_playtest_proxy_primary_ &&
+        if (!force && old_playtest_proxy_root_ &&
             mode == old_playtest_proxy_mode_ && icon == old_playtest_proxy_icon_)
             return true;
         if (!RemoveOldVersionPlaytestProxyVisuals()) return false;
@@ -3816,15 +3814,45 @@ public:
                    RunFunction(runtime_.sprite_set_color, {sprite, color}, nullptr,
                                label, 0u, std::chrono::milliseconds(300));
         };
+        auto set_pos = [&](u32 node, float x, float y, const char* label) -> bool {
+            return !node || RunFunction(runtime_.ccnode_set_position_ff,
+                                         {node, FloatToWord(x), FloatToWord(y)}, nullptr,
+                                         label, 0u, std::chrono::milliseconds(300));
+        };
+        auto set_scale = [&](u32 node, float scale, const char* label) -> bool {
+            return !node ||
+                   (RunFunction(runtime_.ccnode_set_scale_x,
+                                {node, FloatToWord(scale)}, nullptr, label, 0u,
+                                std::chrono::milliseconds(300)) &&
+                    RunFunction(runtime_.ccnode_set_scale_y,
+                                {node, FloatToWord(scale)}, nullptr, label, 0u,
+                                std::chrono::milliseconds(300)));
+        };
+
+        if (!RunFunction(runtime_.ccnode_create, {}, &old_playtest_proxy_root_,
+                         "create playtest proxy local root", 0u,
+                         std::chrono::milliseconds(700)) || !old_playtest_proxy_root_ ||
+            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_root_, 9998))
+            return false;
 
         char name[64]{};
         if (mode == 1 || mode == 3) {
-            /* Vehicle is the back layer. Put the selected cube above it so the
-               ship/UFO actually contains the player icon instead of covering it. */
+            const float vehicle_y = mode == 1 ? -5.0f : -7.0f;
             std::snprintf(name, sizeof(name),
                           mode == 1 ? "ship_%02d_001.png" : "bird_%02d_001.png",
                           icon);
             (void)create_frame(name, old_playtest_proxy_primary_);
+            if (mode == 3 || runtime_.player_get_bird_mode) {
+                std::snprintf(name, sizeof(name),
+                              mode == 1 ? "ship_%02d_2_001.png" : "bird_%02d_2_001.png",
+                              icon);
+                (void)create_frame(name, old_playtest_proxy_secondary_);
+            }
+            if (mode == 3) {
+                std::snprintf(name, sizeof(name), "bird_%02d_3_001.png", icon);
+                (void)create_frame(name, old_playtest_proxy_tertiary_);
+            }
+
             u32 manager = 0u, cube_icon = 1u;
             if (runtime_.game_manager_shared_state &&
                 RunFunction(runtime_.game_manager_shared_state, {}, &manager,
@@ -3836,13 +3864,33 @@ public:
                                   std::chrono::milliseconds(300));
             if (cube_icon < 1u || cube_icon > 99u) cube_icon = 1u;
             std::snprintf(name, sizeof(name), "player_%02u_001.png", cube_icon);
-            (void)create_frame(name, old_playtest_proxy_secondary_);
+            (void)create_frame(name, old_playtest_proxy_quaternary_);
             std::snprintf(name, sizeof(name), "player_%02u_2_001.png", cube_icon);
-            (void)create_frame(name, old_playtest_proxy_tertiary_);
-            if (!tint(old_playtest_proxy_primary_, primary_color, "tint vehicle proxy") ||
-                !tint(old_playtest_proxy_secondary_, primary_color, "tint vehicle cube primary") ||
-                !tint(old_playtest_proxy_tertiary_, secondary_color, "tint vehicle cube secondary"))
+            (void)create_frame(name, old_playtest_proxy_quinary_);
+
+            if (!tint(old_playtest_proxy_primary_, primary_color, "tint vehicle primary") ||
+                !tint(old_playtest_proxy_secondary_, secondary_color, "tint vehicle secondary") ||
+                !tint(old_playtest_proxy_quaternary_, primary_color, "tint vehicle cube primary") ||
+                !tint(old_playtest_proxy_quinary_, secondary_color, "tint vehicle cube secondary") ||
+                !set_pos(old_playtest_proxy_primary_, 0.0f, vehicle_y, "position vehicle primary") ||
+                !set_pos(old_playtest_proxy_secondary_, 0.0f, vehicle_y, "position vehicle secondary") ||
+                !set_pos(old_playtest_proxy_tertiary_, 0.0f, vehicle_y, "position vehicle detail") ||
+                !set_pos(old_playtest_proxy_quaternary_, 0.0f, 5.0f, "position vehicle cube primary") ||
+                !set_pos(old_playtest_proxy_quinary_, 0.0f, 5.0f, "position vehicle cube secondary") ||
+                !set_scale(old_playtest_proxy_quaternary_, 0.55f, "scale vehicle cube primary") ||
+                !set_scale(old_playtest_proxy_quinary_, 0.55f, "scale vehicle cube secondary"))
                 return false;
+
+            if (old_playtest_proxy_primary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_primary_, 0)) return false;
+            if (old_playtest_proxy_secondary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_secondary_, 1)) return false;
+            if (old_playtest_proxy_tertiary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_tertiary_, 2)) return false;
+            if (old_playtest_proxy_quaternary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_quaternary_, 3)) return false;
+            if (old_playtest_proxy_quinary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_quinary_, 4)) return false;
         } else {
             const char* prefix = mode == 2 ? "player_ball" : "player";
             std::snprintf(name, sizeof(name), "%s_%02d_001.png", prefix, icon);
@@ -3865,23 +3913,21 @@ public:
             if (!tint(old_playtest_proxy_primary_, primary_color, "tint player proxy primary") ||
                 !tint(old_playtest_proxy_secondary_, secondary_color, "tint player proxy secondary"))
                 return false;
+            if (old_playtest_proxy_primary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_primary_, 0)) return false;
+            if (old_playtest_proxy_secondary_ &&
+                !AddExtrasChild(old_playtest_proxy_root_, old_playtest_proxy_secondary_, 1)) return false;
         }
-        if (!old_playtest_proxy_primary_) return false;
-        if (!AddExtrasChild(old_playtest_trail_, old_playtest_proxy_primary_, 9998))
+        if (!old_playtest_proxy_primary_) {
+            (void)RemoveOldVersionPlaytestProxyVisuals();
             return false;
-        if (old_playtest_proxy_secondary_ &&
-            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_secondary_, 9999))
-            return false;
-        if (old_playtest_proxy_tertiary_ &&
-            !AddExtrasChild(old_playtest_trail_, old_playtest_proxy_tertiary_, 10000))
-            return false;
+        }
         old_playtest_proxy_mode_ = mode;
         old_playtest_proxy_icon_ = icon;
         log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_PROXY_MODE mode="
              << (mode == 1 ? "ship" : mode == 2 ? "ball" :
                  mode == 3 ? "bird" : "cube")
-             << " icon=" << icon << " colors=player inner-icon="
-             << ((mode == 1 || mode == 3) ? "cube" : "native-layers") << "\n";
+             << " icon=" << icon << " colors=player layout=authentic-local\n";
         log_.flush();
         return true;
     }
@@ -4113,18 +4159,24 @@ public:
     }
 
     bool ApplyOldVersionPlaytestCamera(float player_x) {
+        (void)player_x;
         if (!old_playtest_editor_game_layer_ || !old_playtest_play_game_layer_) return false;
-        constexpr float kZoom = 0.85f;
+        constexpr float kZoom = 0.90f;
+        constexpr float kCenterX = 285.0f;
         constexpr float kCenterY = 160.0f;
-        float base_y = 0.0f;
-        if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
+        float base_x = 0.0f, base_y = 0.0f;
+        if (!GuestFloatGetter(runtime_.ccnode_get_position_x,
+                              old_playtest_play_game_layer_, base_x,
+                              "CCNode::getPositionX PlayLayer camera") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y,
                               old_playtest_play_game_layer_, base_y,
-                              "CCNode::getPositionY playtest camera")) return false;
-        const float scale_x = old_playtest_editor_camera_original_scale_x_ * kZoom;
-        const float scale_y = old_playtest_editor_camera_original_scale_y_ * kZoom;
-        float camera_x = 120.0f - player_x * scale_x;
-        if (camera_x > 0.0f) camera_x = 0.0f;
-        const float camera_y = (1.0f - kZoom) * kCenterY + kZoom * base_y;
+                              "CCNode::getPositionY PlayLayer camera")) return false;
+        /* Old 1.0-1.7 gameplay has no camera-zoom trigger. Keep the visual
+           zoom fixed and avoid two guest ABI calls every frame. */
+        const float scale_x = kZoom;
+        const float scale_y = kZoom;
+        const float camera_x = kZoom * base_x + (1.0f - kZoom) * kCenterX;
+        const float camera_y = kZoom * base_y + (1.0f - kZoom) * kCenterY;
         bool ok = RunFunction(runtime_.ccnode_set_scale_x,
                               {old_playtest_editor_game_layer_, FloatToWord(scale_x)}, nullptr,
                               "zoom editor game layer X", 0u,
@@ -4136,7 +4188,7 @@ public:
                   RunFunction(runtime_.ccnode_set_position_ff,
                               {old_playtest_editor_game_layer_, FloatToWord(camera_x),
                                FloatToWord(camera_y)}, nullptr,
-                              "position zoomed editor playtest camera", 0u,
+                              "mirror real PlayLayer camera into editor", 0u,
                               std::chrono::milliseconds(300));
         if (old_playtest_trail_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
@@ -4149,7 +4201,7 @@ public:
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_, FloatToWord(camera_x), FloatToWord(camera_y)},
-                             nullptr, "position zoomed playtest overlay", 0u,
+                             nullptr, "mirror PlayLayer camera into overlay", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;
@@ -4201,9 +4253,9 @@ public:
         }
         const float dx = x - old_playtest_trail_last_x_;
         const float dy = y - old_playtest_trail_last_y_;
-        if (dx * dx + dy * dy < 64.0f) return true; /* 8 world-unit sampling */
+        if (dx * dx + dy * dy < 256.0f) return true; /* 16 world-unit sampling */
         if (std::fabs(dx) > 192.0f || std::fabs(dy) > 192.0f ||
-            old_playtest_trail_segments_ >= 1024u) {
+            old_playtest_trail_segments_ >= 256u) {
             old_playtest_trail_last_x_ = x;
             old_playtest_trail_last_y_ = y;
             return true;
@@ -4240,8 +4292,11 @@ public:
 
     bool UpdateOldVersionPlaytestProxyTransform() {
         if (!old_playtest_player_) return true;
-        if (!RebuildOldVersionPlaytestProxyVisuals(false)) return false;
-        if (!old_playtest_proxy_primary_) return true;
+        ++old_playtest_proxy_poll_counter_;
+        if (!old_playtest_proxy_root_ || (old_playtest_proxy_poll_counter_ & 3u) == 0u) {
+            if (!RebuildOldVersionPlaytestProxyVisuals(false)) return false;
+        }
+        if (!old_playtest_proxy_root_) return true;
         float x = 0.0f, y = 0.0f, rotation = 0.0f;
         float scale_x = 1.0f, scale_y = 1.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, old_playtest_player_,
@@ -4254,37 +4309,25 @@ public:
                               scale_x, "CCNode::getScaleX playtest player") ||
             !GuestFloatGetter(runtime_.ccnode_get_scale_y, old_playtest_player_,
                               scale_y, "CCNode::getScaleY playtest player")) return false;
-        auto update_sprite = [&](u32 sprite, float factor, float offset_y) -> bool {
-            if (!sprite) return true;
-            return RunFunction(runtime_.ccnode_set_position_ff,
-                               {sprite, FloatToWord(x), FloatToWord(y + offset_y)}, nullptr,
-                               "CCNode::setPosition playtest proxy", 0u,
-                               std::chrono::milliseconds(300)) &&
-                   RunFunction(runtime_.ccnode_set_rotation,
-                               {sprite, FloatToWord(rotation)}, nullptr,
-                               "CCNode::setRotation playtest proxy", 0u,
-                               std::chrono::milliseconds(300)) &&
-                   RunFunction(runtime_.ccnode_set_scale_x,
-                               {sprite, FloatToWord(scale_x * factor)}, nullptr,
-                               "CCNode::setScaleX playtest proxy", 0u,
-                               std::chrono::milliseconds(300)) &&
-                   RunFunction(runtime_.ccnode_set_scale_y,
-                               {sprite, FloatToWord(scale_y * factor)}, nullptr,
-                               "CCNode::setScaleY playtest proxy", 0u,
-                               std::chrono::milliseconds(300));
-        };
-        const bool vehicle = old_playtest_proxy_mode_ == 1 || old_playtest_proxy_mode_ == 3;
-        const float inner_factor = old_playtest_proxy_mode_ == 1 ? 0.55f :
-                                   old_playtest_proxy_mode_ == 3 ? 0.48f : 1.0f;
-        const float inner_y = old_playtest_proxy_mode_ == 1 ? 2.0f :
-                              old_playtest_proxy_mode_ == 3 ? 4.0f : 0.0f;
-        if (!update_sprite(old_playtest_proxy_primary_, 1.0f, 0.0f) ||
-            !update_sprite(old_playtest_proxy_secondary_, vehicle ? inner_factor : 1.0f,
-                           vehicle ? inner_y : 0.0f) ||
-            !update_sprite(old_playtest_proxy_tertiary_, vehicle ? inner_factor : 1.0f,
-                           vehicle ? inner_y : 0.0f)) return false;
+        if (!RunFunction(runtime_.ccnode_set_position_ff,
+                         {old_playtest_proxy_root_, FloatToWord(x), FloatToWord(y)}, nullptr,
+                         "position playtest proxy root", 0u,
+                         std::chrono::milliseconds(300)) ||
+            !RunFunction(runtime_.ccnode_set_rotation,
+                         {old_playtest_proxy_root_, FloatToWord(rotation)}, nullptr,
+                         "rotate playtest proxy root", 0u,
+                         std::chrono::milliseconds(300)) ||
+            !RunFunction(runtime_.ccnode_set_scale_x,
+                         {old_playtest_proxy_root_, FloatToWord(scale_x)}, nullptr,
+                         "scale X playtest proxy root", 0u,
+                         std::chrono::milliseconds(300)) ||
+            !RunFunction(runtime_.ccnode_set_scale_y,
+                         {old_playtest_proxy_root_, FloatToWord(scale_y)}, nullptr,
+                         "scale Y playtest proxy root", 0u,
+                         std::chrono::milliseconds(300))) return false;
         return AppendOldVersionPlaytestTrailSegment(x, y);
     }
+
 
     bool StartInlineOldVersionPlaytest() {
         if (old_playtest_layer_) return true;
@@ -4430,6 +4473,7 @@ public:
         old_playtest_level_clone_ = level_clone;
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
+        old_playtest_proxy_poll_counter_ = 0u;
         old_playtest_end_portal_ = 0u;
         old_playtest_end_portal_scanned_ = false;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, editor_game_layer,
@@ -4502,7 +4546,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.85 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera-zoom=0.90 camera-source=PlayLayer scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }
@@ -4659,11 +4703,15 @@ public:
         old_playtest_player_ = 0u;
         old_playtest_play_game_layer_ = 0u;
         old_playtest_editor_game_layer_ = 0u;
+        old_playtest_proxy_root_ = 0u;
         old_playtest_proxy_primary_ = 0u;
         old_playtest_proxy_secondary_ = 0u;
         old_playtest_proxy_tertiary_ = 0u;
+        old_playtest_proxy_quaternary_ = 0u;
+        old_playtest_proxy_quinary_ = 0u;
         old_playtest_proxy_mode_ = -1;
         old_playtest_proxy_icon_ = -1;
+        old_playtest_proxy_poll_counter_ = 0u;
         old_playtest_trail_ = 0u;
         old_playtest_trail_has_last_ = false;
         old_playtest_trail_segments_ = 0u;
@@ -4743,11 +4791,15 @@ public:
             old_playtest_player_ = 0u;
             old_playtest_play_game_layer_ = 0u;
             old_playtest_editor_game_layer_ = 0u;
+            old_playtest_proxy_root_ = 0u;
             old_playtest_proxy_primary_ = 0u;
             old_playtest_proxy_secondary_ = 0u;
             old_playtest_proxy_tertiary_ = 0u;
+            old_playtest_proxy_quaternary_ = 0u;
+            old_playtest_proxy_quinary_ = 0u;
             old_playtest_proxy_mode_ = -1;
             old_playtest_proxy_icon_ = -1;
+            old_playtest_proxy_poll_counter_ = 0u;
             old_playtest_level_clone_ = 0u;
             old_playtest_previous_play_layer_ = 0u;
             old_playtest_end_portal_ = 0u;
@@ -9039,11 +9091,15 @@ private:
     u32 old_playtest_player_ = 0u;
     u32 old_playtest_play_game_layer_ = 0u;
     u32 old_playtest_editor_game_layer_ = 0u;
+    u32 old_playtest_proxy_root_ = 0u;
     u32 old_playtest_proxy_primary_ = 0u;
     u32 old_playtest_proxy_secondary_ = 0u;
     u32 old_playtest_proxy_tertiary_ = 0u;
+    u32 old_playtest_proxy_quaternary_ = 0u;
+    u32 old_playtest_proxy_quinary_ = 0u;
     int old_playtest_proxy_mode_ = -1;
     int old_playtest_proxy_icon_ = -1;
+    u32 old_playtest_proxy_poll_counter_ = 0u;
     u32 old_playtest_level_clone_ = 0u;
     u32 old_playtest_previous_play_layer_ = 0u;
     u32 old_playtest_previous_edit_mode_ = 0u;

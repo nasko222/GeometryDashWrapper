@@ -1,18 +1,16 @@
-# Geometry Dash Wrapper 0.9.7-newera12
+# Geometry Dash Wrapper 0.9.7-newera13
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
 
-## What newera11 changes
+## What newera13 changes
 
-- Keeps the confirmed first-attempt preservation path unchanged.
-- Targets the remaining **post-play special-object crash** at a newly identified global-state boundary: old `PlayLayer::init()` switches `GameManager` out of edit mode. The inline bridge now snapshots `GameManager::getEditMode()` before PlayLayer creation and restores the exact value on every stop/failure/scene-change path before editor work resumes. This specifically targets the portal/orb path that still reached `strlen(0x210)` after newera10 had already restored editor touch state.
-- Changes playtest framing from a vertical offset to a genuine **0.92x editor-game-layer zoom**. The real hidden gameplay camera still drives vertical movement and the editor follows the player horizontally, but screen-limited modes gain a little extra room above and below.
-- Suspends the editor's interactive chrome while inline gameplay owns input. In addition to `EditorUI` / `LevelEditorLayer` touch handling, descendant `CCMenu` controls and `Slider` controls are saved and disabled. This covers the settings/menu buttons and the top X-position mover without disabling the wrapper's scene-root pause button.
-- Restores the exact menu/slider/touch states on stop, restores the original editor camera scale/position, then calls `EditorUI::updateSlider()` so the top X mover resynchronizes to the editor's restored camera.
-- Makes mirror portals inert during inline playtest by temporarily replacing `PlayLayer::toggleFlipped(bool,bool)` with a return stub where that historical build exports the function; the original code is restored on stop. Builds without that export simply skip the optional mirror patch.
-- newera12 removes the experimental trajectory predictor entirely; it is no longer created, updated, or retained.
-- Keeps the corrected solid green breadcrumb rotation/overlap, endless editor playtest, player colors/gamemode proxies, music stop, play-button sizing, zero-teardown parking, texture/filtering/AA settings, and resolution behavior unchanged.
-- Dynarmic builder revision is bumped to **122**.
+- Replaces the fixed player-anchor camera with the **real hidden PlayLayer camera**. The wrapper reads that camera's X/Y every frame, so the old game's own cube/ship/ball/UFO vertical clamps and follow rules remain authoritative. A small `0.90x` visual zoom-out is then applied around the logical `570x320` playfield center.
+- Rebuilds the player proxy around one local-space root instead of positioning every sprite layer independently in world space. This fixes rotated ship/UFO offsets and reduces per-frame transform calls.
+- Matches the historical vehicle layout found in the old PlayerObject code: cube at local `(0,+5)` scaled to `0.55x`, ship body at `(0,-5)`, and UFO/bird body at `(0,-7)`. Newer x86 builds also use their secondary vehicle/detail frames when present.
+- Reduces proxy mode/icon probing to once every four frames, samples the green path every 16 world units, and caps the path at 256 segments. The trajectory predictor remains fully removed.
+- Keeps the stable first-attempt, edit-mode restoration, special-object placement, mirror-portal suppression, editor-control suspension and stop-path fixes from newera11/newera12.
+- Makes boolean values in both auto-run batch files consistently uppercase: `TRUE` / `FALSE`.
+- Dynarmic builder revision is bumped to **125**.
 
 ## Architecture
 
@@ -80,8 +78,8 @@ With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a small play co
 1. Read the live editor's unsaved level string, create a private temporary `GJGameLevel`, copy the playback metadata available in that build, and give only the clone to `PlayLayer`. The editor's own level object is not handed to gameplay.
 2. Before PlayLayer creation, snapshot the editor's `GameManager::m_playLayer` and **edit-mode state**. Run the authentic old `startGame()` / `resetLevel()` path while temporarily suppressing only `updateAttempts()` for the startup reset, preserving Attempt 1 without skipping spawn-queue initialization.
 3. Keep the real `PlayerObject` in its original hidden PlayLayer hierarchy for physics. A scene-root proxy mirrors its transform, colors, selected icon, and supported cube/ship/ball/UFO sprite family. Ship mode includes the selected cube inside the ship.
-4. Follow the real player horizontally and use the hidden gameplay camera vertically, but render the editor game layer and wrapper overlay at **0.92x scale** around the logical playfield center. Stop restores the exact original editor scale and position.
-5. Breadcrumb and proxy visuals live outside `LevelEditorLayer` / `EditorUI`. The green breadcrumb uses connected solid `square.png` segments, sampled every 8 world units to cut sprite churn. The experimental orange trajectory predictor has been removed.
+4. Mirror the hidden PlayLayer camera in both axes, then render the editor game layer / wrapper overlay at **0.90x scale** around the logical playfield center. The old game therefore keeps control of cube/ship/ball/UFO camera clamps while Stop still restores the exact original editor scale and position.
+5. Breadcrumb and proxy visuals live outside `LevelEditorLayer` / `EditorUI`. The green breadcrumb uses connected solid `square.png` segments, sampled every 16 world units and capped at 256 segments to cut sprite churn. The experimental orange trajectory predictor has been removed.
 6. Suppress `EndPortalObject::triggerObject()` and keep the hidden end portal far ahead as a secondary guard, so inline editor testing has no normal level-complete endpoint. Where available, also suppress `PlayLayer::toggleFlipped(bool,bool)` so mirror portals have no effect in the editor test.
 7. While playtest is active, save and disable EditorUI/LevelEditorLayer touch handling plus descendant `CCMenu` and `Slider` controls. The wrapper pause button is a scene-root sibling and remains usable. This prevents the top X mover, settings button, pause/menu controls, and build/edit/delete UI from reacting behind gameplay.
 8. Clicking the wrapper pause button or pressing Escape stops music, restores the original camera, editor touch/menu/slider state, `GameManager::m_playLayer`, **GameManager edit mode**, end/mirror patches, and calls `EditorUI::updateSlider()` to put the top X mover back on the restored editor camera position.
@@ -187,6 +185,15 @@ The abandoned 1.02 comments hotkey and the progressively reconstructed stock 2.2
 ## License
 
 The wrapper's license is in `LICENSE`. Vendored zlib terms are in `third_party/ZLIB-LICENSE.txt`; stb_vorbis terms are in `third_party/stb/LICENSE`. Geometry Dash and its assets remain the property of their respective owners and are not distributed here.
+
+## newera13 editor-playtest changes
+
+- Camera no longer invents a fixed player anchor. It mirrors the real hidden `PlayLayer` game-layer X/Y camera every frame, then applies a 0.90 visual zoom around the 570x320 design center. This preserves the original cube/ship/ball/UFO camera clamps and vertical restrictions instead of fighting them.
+- Player proxy sprites now live under one local-space root. Ship/UFO vehicle and cube offsets therefore rotate with the player rather than being applied as world-space Y offsets.
+- Vehicle composition is closer to the original `PlayerObject`: cube local position `(0,+5)` at `0.55x`, ship body `(0,-5)`, UFO/bird body `(0,-7)`. Newer x86 builds also use their secondary vehicle/detail frames when available.
+- Proxy mode/icon probing is reduced to once every four frames. The green path samples every 16 world units and caps at 256 segments, substantially reducing guest calls and draw-node growth.
+- `RUN_AUTO_GDPS.cmd` and `RUN_AUTO_BOOMLINGS.cmd` now use uppercase `TRUE` / `FALSE` consistently for every boolean setting.
+- The trajectory predictor remains fully removed. First-attempt preservation, edit-mode restoration, editor-control suspension, mirror suppression and stop-path safety are unchanged.
 
 ## newera12 editor-playtest changes
 

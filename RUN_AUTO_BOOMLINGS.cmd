@@ -3,9 +3,9 @@ setlocal
 cd /d "%~dp0"
 
 set "GDPS_SERVER=www.boomlings.com/database"
-set "HACK_ICONS=false"
-set "FULL_BYPASS=true"
-set "FORCE_HIGHEST_GRAPHICS=true"
+set "HACK_ICONS=FALSE"
+set "FULL_BYPASS=TRUE"
+set "FORCE_HIGHEST_GRAPHICS=TRUE"
 set "MUSIC_PULSE_MAX=0.30"
 set "FPS=VSYNC"
 set "RESOLUTION=1140x640"
@@ -13,9 +13,9 @@ set "TEXTURE_FILTERING=GAME"
 set "ANTIALIASING=NONE"
 set "SHOW_COMMAND_PROMPT=FALSE"
 set "OLD_VER_PLAYTEST=FALSE"
-set "VERSION_ISOLATED_SAVES=true"
-set "I_LOST_THE_GAME=true"
-set "EDITOR_CONTROLLS=true"
+set "VERSION_ISOLATED_SAVES=TRUE"
+set "I_LOST_THE_GAME=TRUE"
+set "EDITOR_CONTROLLS=TRUE"
 
 if not exist "GeometryDashLauncher.exe" (
   echo GeometryDashLauncher.exe is missing. Build the wrapper with BUILD_ALL.cmd.
