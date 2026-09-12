@@ -4204,7 +4204,7 @@ public:
         constexpr float kConstrainedZoom = 0.70f;
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kCubeCameraLiftY = 25.0f;
-        constexpr float kBallUfoCameraLiftY = 15.0f;
+        constexpr float kBallUfoCameraLiftY = 30.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,

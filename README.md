@@ -1,3 +1,10 @@
+# GeometryDashWrapper 0.9.7-newera27
+
+- Keeps the newera26 attempt/hazard split unchanged.
+- Keeps cube and ship playtest camera behavior unchanged.
+- Ball and UFO/bird remain static (no player-follow) but their playtest camera is lifted an additional 15 logical points: total static lift is now +30 instead of +15, keeping their lower movement extreme above the editor object selector.
+- Boomlings defaults remain SHOW_COMMAND_PROMPT=TRUE and OLD_VER_PLAYTEST=TRUE; GDPS remains FALSE/FALSE.
+
 # Geometry Dash Wrapper 0.9.7-newera26
 
 ## What newera26 changes

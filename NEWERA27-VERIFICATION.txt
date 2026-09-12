@@ -1,0 +1,18 @@
+NEWERA27 VERIFICATION
+=====================
+
+Base: 0.9.7-newera26
+Target: 0.9.7-newera27
+
+Scope intentionally tiny:
+- Cube playtest camera: unchanged.
+- Ship playtest camera: unchanged.
+- Ball/UFO playtest camera: static/no-follow behavior unchanged; only vertical camera lift changes from +15 to +30 logical points.
+- Attempt-2/hazard fix from newera26: unchanged.
+- x86 editor-menu/slider safety fixes: unchanged.
+- Proxy/player rendering code: unchanged.
+- Boomlings defaults: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE.
+- GDPS defaults: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE.
+
+Expected visual result:
+At the same ball/UFO world positions as newera26, the playtest scene is framed 15 logical points higher, giving the lower movement extreme about 30 physical pixels more clearance on a 2x-ish window, while retaining ample ceiling space.
