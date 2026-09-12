@@ -1,6 +1,18 @@
-# Geometry Dash Wrapper 0.9.7-newera15
+# Geometry Dash Wrapper 0.9.7-newera16
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
+
+## What newera16 changes
+
+- **Camera-only follow-up to newera15.** Proxy composition, icon offsets, mode margins, physics and player world positions are unchanged.
+- x86 and legacy ARM now apply a **0.90x camera zoom-out** to both the editor game layer and the scene-root proxy/trail overlay, keeping them perfectly aligned.
+- Cube zoom is anchored on the historical **y=90 floor line**. The floor stays fixed while the cube sits slightly lower on screen after zoom-out; cube still does not vertically follow the player.
+- Ship, ball and UFO continue using the real hidden PlayLayer `CCCamera` vertical restriction from newera15. After that authoritative camera is read, the view is zoomed around y=160 and lifted **8 points** so the lower game area clears the editor object selector.
+- Horizontal zoom is anchored at x=120, preserving the established player framing while revealing more world.
+- x86 wrapper Play/Pause mouse clicks are consumed by the host before Cocos touch dispatch, preventing the editor control underneath from entering a selected/purple state.
+- x86 no longer calls `EditorUI::updateSlider()` synchronously after playtest stop; that forced resync is removed from the freeze-sensitive stop path.
+- Existing retained editor-menu/slider suspension during gameplay and the zero-teardown stop strategy are otherwise unchanged.
+- Dynarmic builder revision is bumped to **128**.
 
 ## What newera15 changes
 

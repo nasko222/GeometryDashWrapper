@@ -116,6 +116,7 @@ typedef struct {
     float last_touch_y;
     int native_ready;
     int mouse_down;
+    int old_playtest_button_pointer_down;
     int keyboard_down;
     int native_paused;
     int window_active;
@@ -307,6 +308,10 @@ static GameHost g_host;
    cannot restore the item to an oversized scale. */
 #define OLD_PLAYTEST_PLAY_SPRITE_SCALE 0.49f
 #define OLD_PLAYTEST_CAMERA_ANCHOR_X 120.0f
+#define OLD_PLAYTEST_CAMERA_ZOOM 0.90f
+#define OLD_PLAYTEST_CUBE_ZOOM_ANCHOR_Y 90.0f
+#define OLD_PLAYTEST_CONSTRAINED_ZOOM_ANCHOR_Y 160.0f
+#define OLD_PLAYTEST_CONSTRAINED_SCREEN_SHIFT_Y 8.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1390,7 +1395,7 @@ static int old_playtest_symbols_ready(void) {
            g_host.play_layer_reset_level && g_host.play_layer_get_test_mode &&
            g_host.sprite_create_with_frame && g_host.cc_menu_create &&
            g_host.menu_item_sprite_extra_create && g_host.ccmenu_set_enabled &&
-           g_host.editor_ui_update_slider && g_host.ccnode_set_visible &&
+           g_host.ccnode_set_visible &&
            g_host.ccnode_set_position && g_host.ccnode_get_position_x &&
            g_host.ccnode_get_position_y && g_host.ccnode_get_rotation &&
            g_host.ccnode_get_scale_x && g_host.ccnode_get_scale_y &&
@@ -1928,6 +1933,8 @@ static int apply_old_playtest_camera(float player_x) {
     float camera_x, camera_y;
     float real_camera_x = 0.0f, real_camera_y = 0.0f;
     float bottom, top, screen_y;
+    float scale_x = OLD_PLAYTEST_CAMERA_ZOOM;
+    float scale_y = OLD_PLAYTEST_CAMERA_ZOOM;
 
     if (!g_host.old_playtest_editor_game_layer ||
         !g_host.old_playtest_play_game_layer ||
@@ -1935,36 +1942,39 @@ static int apply_old_playtest_camera(float player_x) {
         return 0;
 
     /*
-       Cube framing is intentionally the exact pre-newera11 path. The editor
-       game layer scrolls horizontally only after the player reaches x=120,
-       while Y comes directly from the hidden PlayLayer game layer. Do not
-       synthesize a player-following Y camera and do not zoom this path.
+       Start from the exact newera15/pre-newera11 framing. Camera zoom is then
+       applied as a pure scene transform; proxy/icon local positions are never
+       changed. Horizontally zoom around the historical x=120 player anchor so
+       gameplay keeps the same left/right composition while showing more world.
     */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
+    camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X +
+               OLD_PLAYTEST_CAMERA_ZOOM *
+               (camera_x - OLD_PLAYTEST_CAMERA_ANCHOR_X);
+
     base_y = g_host.ccnode_get_position_y(g_host.old_playtest_play_game_layer);
     camera_y = base_y;
 
     /*
-       Ship/UFO/ball are different: their playable area is bounded by the old
-       game's top/bottom ground logic. PlayLayer applies that through the
-       Cocos CCCamera attached to m_gameLayer, so mirror the REAL camera Y
-       instead of centering on PlayerObject. This automatically follows the
-       corridor/roll-ground framing chosen by that exact historical build.
+       Ship/UFO/ball remain authoritative to the REAL historical Cocos camera.
+       Do not center on the player. After the real restricted viewport is known,
+       zoom around y=160 and lift only the CAMERA by 8 points so the lower game
+       edge clears the editor object selector. The mode margins/proxy offsets are
+       untouched.
     */
     if (mode == OLD_PLAYTEST_MODE_SHIP ||
         mode == OLD_PLAYTEST_MODE_BALL ||
         mode == OLD_PLAYTEST_MODE_BIRD) {
         if (read_old_playtest_real_camera(&real_camera_x, &real_camera_y)) {
-            (void)real_camera_x; /* keep the known-good pre-newera11 X framing */
+            (void)real_camera_x; /* keep the known-good horizontal framing */
             camera_y = base_y - real_camera_y;
             g_host.old_playtest_camera_fallback_logged = 0;
         } else {
             /*
-               Capability fallback for builds that do not export CCNode::getCamera
-               or CCCamera::getCenterXYZ. Keep the old base camera and move it
-               only enough to keep the player inside the mode's vertical play
-               area. This is a clamp/dead-zone, never a player-centering camera.
+               Capability fallback: retain the bounded/dead-zone behavior from
+               newera15. It only shifts when the player would leave the legal
+               vertical area; it never follows/centers the player.
             */
             player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
             if (mode == OLD_PLAYTEST_MODE_BALL) {
@@ -1986,25 +1996,34 @@ static int apply_old_playtest_camera(float player_x) {
                 g_host.old_playtest_camera_fallback_logged = 1;
             }
         }
+        camera_y = OLD_PLAYTEST_CONSTRAINED_ZOOM_ANCHOR_Y +
+                   OLD_PLAYTEST_CAMERA_ZOOM *
+                   (camera_y - OLD_PLAYTEST_CONSTRAINED_ZOOM_ANCHOR_Y) +
+                   OLD_PLAYTEST_CONSTRAINED_SCREEN_SHIFT_Y;
+    } else {
+        /*
+           Cube gets the same 0.90 zoom but around the old 90-point floor line.
+           That preserves the floor/object-selector boundary while naturally
+           placing the cube a couple of pixels lower on screen after zoom-out.
+    */
+        camera_y = OLD_PLAYTEST_CUBE_ZOOM_ANCHOR_Y +
+                   OLD_PLAYTEST_CAMERA_ZOOM *
+                   (camera_y - OLD_PLAYTEST_CUBE_ZOOM_ANCHOR_Y);
     }
 
-    /* newera11+ zooming caused the world/proxy offset. Preserve the editor's
-       original scale, exactly like the known-good pre-newera11 bridge. */
     if (g_host.old_playtest_editor_camera_original_valid) {
-        g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer,
-            g_host.old_playtest_editor_camera_original_scale_x);
-        g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer,
-            g_host.old_playtest_editor_camera_original_scale_y);
+        scale_x = g_host.old_playtest_editor_camera_original_scale_x *
+                  OLD_PLAYTEST_CAMERA_ZOOM;
+        scale_y = g_host.old_playtest_editor_camera_original_scale_y *
+                  OLD_PLAYTEST_CAMERA_ZOOM;
     }
+    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, scale_x);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, scale_y);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
                                camera_x, camera_y);
     if (g_host.old_playtest_trail) {
-        if (g_host.old_playtest_editor_camera_original_valid) {
-            g_host.ccnode_set_scale_x(g_host.old_playtest_trail,
-                g_host.old_playtest_editor_camera_original_scale_x);
-            g_host.ccnode_set_scale_y(g_host.old_playtest_trail,
-                g_host.old_playtest_editor_camera_original_scale_y);
-        }
+        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, scale_x);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, scale_y);
         g_host.ccnode_set_position(g_host.old_playtest_trail,
                                    camera_x, camera_y);
     }
@@ -2293,7 +2312,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-pre-newera11 constrained=real-CCCamera no-global-zoom=1 scene-isolated=1 editor-input=suspended editor-controls=suspended");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-floor-anchored constrained=real-CCCamera zoom=0.90 constrained-shift-y=8 proxy-offsets=unchanged scene-isolated=1 editor-input=suspended editor-controls=suspended");
     return 1;
 }
 
@@ -2390,11 +2409,6 @@ static int stop_inline_old_playtest(void) {
        EDITOR_CONTROLS_RESTORED, so stale/rebuilt controls are additionally
        filtered by live-tree membership in the restore helper. */
     set_old_playtest_editor_controls_enabled(1);
-    if (g_host.editor_ui_update_slider && g_host.old_playtest_ui &&
-        memory_range_is_readable(g_host.old_playtest_ui, sizeof(void *))) {
-        g_host.editor_ui_update_slider(g_host.old_playtest_ui);
-        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_SLIDER_RESYNCED");
-    }
     /* The scene parent + explicit retain intentionally keep the retired
        PlayLayer and private level alive. This is diagnostic/stability-first:
        zero teardown is much safer than a repeatable post-play editor UAF. */
@@ -2428,7 +2442,7 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_end_portal_scanned = 0;
     g_host.old_playtest_death_grace_until = 0;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=restored edit-mode=restored slider=resynced");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=restored edit-mode=restored slider=resync-disabled");
     return 1;
 }
 
@@ -2757,6 +2771,20 @@ static void paste_clipboard_text(HWND window) {
     free(utf8);
 }
 
+static int old_playtest_button_hit_test(float x, float view_y) {
+    float cocos_y;
+    if (!gd_settings_old_ver_playtest() ||
+        !gd_settings_old_ver_playtest_supported_version() ||
+        (!g_host.old_playtest_play_button && !g_host.old_playtest_stop_button) ||
+        g_host.native_height <= 0)
+        return 0;
+    /* Android/Cocos touch input enters in top-left view coordinates, while
+       CCNode positions are bottom-left Cocos coordinates. */
+    cocos_y = (float)g_host.native_height - view_y;
+    return fabsf(x - OLD_PLAYTEST_BUTTON_X) <= 28.0f &&
+           fabsf(cocos_y - OLD_PLAYTEST_BUTTON_Y) <= 28.0f;
+}
+
 static LRESULT CALLBACK window_procedure(HWND window, UINT message,
                                          WPARAM wparam, LPARAM lparam) {
     float x = (float)GET_X_LPARAM(lparam);
@@ -2822,6 +2850,14 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         int consumed = 0;
         int action;
         SetFocus(window);
+        /* Consume the wrapper Play/Pause control before nativeTouchesBegin.
+           Otherwise the editor control directly underneath can also enter its
+           selected state before playtest suspension is installed. */
+        if (old_playtest_button_hit_test(x, y)) {
+            g_host.old_playtest_button_pointer_down = 1;
+            SetCapture(window);
+            return 0;
+        }
         g_host.mouse_down = 1;
         SetCapture(window);
         action = gd_extras_menu_pointer_event(&g_host.extras_menu,
@@ -2834,6 +2870,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         return 0;
     }
     case WM_MOUSEMOVE:
+        if (g_host.old_playtest_button_pointer_down)
+            return 0;
         if (g_host.mouse_down) {
             int consumed = 0;
             int action = gd_extras_menu_pointer_event(&g_host.extras_menu,
@@ -2846,6 +2884,18 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_LBUTTONUP:
+        if (g_host.old_playtest_button_pointer_down) {
+            const int activate = old_playtest_button_hit_test(x, y);
+            g_host.old_playtest_button_pointer_down = 0;
+            ReleaseCapture();
+            if (activate) {
+                InterlockedExchange(&g_host.old_playtest_request,
+                                    g_host.old_playtest_layer ? 2 : 1);
+                runtime_log("RESULT: X86_OLD_VER_PLAYTEST_WRAPPER_BUTTON_CLICK host-consumed=1 action=%s",
+                            g_host.old_playtest_layer ? "stop" : "start");
+            }
+            return 0;
+        }
         if (g_host.mouse_down) {
             int consumed = 0;
             int action;
@@ -2865,6 +2915,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message,
         }
         return 0;
     case WM_CAPTURECHANGED:
+        if (g_host.old_playtest_button_pointer_down)
+            g_host.old_playtest_button_pointer_down = 0;
         if (g_host.mouse_down) {
             int consumed = 0;
             int action;

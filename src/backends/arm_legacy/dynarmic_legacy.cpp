@@ -4206,6 +4206,10 @@ public:
             !old_playtest_player_) return false;
 
         constexpr float kAnchorX = 120.0f;
+        constexpr float kZoom = 0.90f;
+        constexpr float kCubeZoomAnchorY = 90.0f;
+        constexpr float kConstrainedZoomAnchorY = 160.0f;
+        constexpr float kConstrainedScreenShiftY = 8.0f;
         constexpr float kConstrainedBottom = 70.0f;
         constexpr float kConstrainedTop = 250.0f;
         constexpr float kBallBottom = 58.0f;
@@ -4217,35 +4221,22 @@ public:
                               "CCNode::getPositionY legacy cube camera"))
             return false;
 
-        /*
-           Cube is intentionally the exact pre-newera11 bridge: horizontal
-           scroll with the x=120 anchor and the hidden PlayLayer's game-layer
-           Y. No reconstructed vertical follow and no global zoom.
-        */
+        /* Start from the exact newera15 camera, then zoom the camera transform
+           only. No proxy/icon local offsets are changed. */
         float camera_x = kAnchorX - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
+        camera_x = kAnchorX + kZoom * (camera_x - kAnchorX);
         float camera_y = base_y;
 
         const int mode = old_playtest_proxy_mode_;
         if (mode == 1 || mode == 2 || mode == 3) {
-            /*
-               Ship/UFO/ball use the REAL Cocos camera chosen by the historical
-               PlayLayer. That camera already contains the top/bottom corridor
-               and roll-ground restrictions. Mirror only its Y; keep the known
-               pre-newera11 horizontal framing.
-            */
+            /* Ship/UFO/ball still use the REAL historical Cocos camera Y. */
             float real_camera_x = 0.0f, real_camera_y = 0.0f;
             if (ReadOldVersionPlaytestRealCamera(real_camera_x, real_camera_y)) {
                 (void)real_camera_x;
                 camera_y = base_y - real_camera_y;
                 old_playtest_camera_fallback_logged_ = false;
             } else {
-                /*
-                   Older images that do not expose the camera accessors fall
-                   back to a bounded viewport. This only nudges the old camera
-                   when the player would leave the legal top/bottom game area;
-                   it never centers/follows the player vertically.
-                */
                 float player_y = 0.0f;
                 if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
                                       old_playtest_player_, player_y,
@@ -4267,21 +4258,30 @@ public:
                     old_playtest_camera_fallback_logged_ = true;
                 }
             }
+            camera_y = kConstrainedZoomAnchorY +
+                       kZoom * (camera_y - kConstrainedZoomAnchorY) +
+                       kConstrainedScreenShiftY;
+        } else {
+            /* Zoom cube around the old 90-point floor line. The floor stays in
+               place while the cube naturally sits slightly lower on screen. */
+            camera_y = kCubeZoomAnchorY +
+                       kZoom * (camera_y - kCubeZoomAnchorY);
         }
 
+        const float scale_x = old_playtest_editor_camera_original_valid_
+            ? old_playtest_editor_camera_original_scale_x_ * kZoom : kZoom;
+        const float scale_y = old_playtest_editor_camera_original_valid_
+            ? old_playtest_editor_camera_original_scale_y_ * kZoom : kZoom;
+
         bool ok = true;
-        if (old_playtest_editor_camera_original_valid_) {
-            ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_editor_game_layer_,
-                              FloatToWord(old_playtest_editor_camera_original_scale_x_)},
-                             nullptr, "restore pre-newera11 editor scale X", 0u,
-                             std::chrono::milliseconds(300)) && ok;
-            ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_editor_game_layer_,
-                              FloatToWord(old_playtest_editor_camera_original_scale_y_)},
-                             nullptr, "restore pre-newera11 editor scale Y", 0u,
-                             std::chrono::milliseconds(300)) && ok;
-        }
+        ok = RunFunction(runtime_.ccnode_set_scale_x,
+                         {old_playtest_editor_game_layer_, FloatToWord(scale_x)},
+                         nullptr, "zoom old playtest camera X", 0u,
+                         std::chrono::milliseconds(300)) && ok;
+        ok = RunFunction(runtime_.ccnode_set_scale_y,
+                         {old_playtest_editor_game_layer_, FloatToWord(scale_y)},
+                         nullptr, "zoom old playtest camera Y", 0u,
+                         std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_,
                           FloatToWord(camera_x), FloatToWord(camera_y)},
@@ -4289,18 +4289,14 @@ public:
                          std::chrono::milliseconds(300)) && ok;
 
         if (old_playtest_trail_) {
-            if (old_playtest_editor_camera_original_valid_) {
-                ok = RunFunction(runtime_.ccnode_set_scale_x,
-                                 {old_playtest_trail_,
-                                  FloatToWord(old_playtest_editor_camera_original_scale_x_)},
-                                 nullptr, "restore playtest overlay scale X", 0u,
-                                 std::chrono::milliseconds(300)) && ok;
-                ok = RunFunction(runtime_.ccnode_set_scale_y,
-                                 {old_playtest_trail_,
-                                  FloatToWord(old_playtest_editor_camera_original_scale_y_)},
-                                 nullptr, "restore playtest overlay scale Y", 0u,
-                                 std::chrono::milliseconds(300)) && ok;
-            }
+            ok = RunFunction(runtime_.ccnode_set_scale_x,
+                             {old_playtest_trail_, FloatToWord(scale_x)},
+                             nullptr, "zoom playtest overlay X", 0u,
+                             std::chrono::milliseconds(300)) && ok;
+            ok = RunFunction(runtime_.ccnode_set_scale_y,
+                             {old_playtest_trail_, FloatToWord(scale_y)},
+                             nullptr, "zoom playtest overlay Y", 0u,
+                             std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_,
                               FloatToWord(camera_x), FloatToWord(camera_y)},
@@ -4651,7 +4647,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-pre-newera11 constrained=real-CCCamera no-global-zoom=1 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-floor-anchored constrained=real-CCCamera zoom=0.90 constrained-shift-y=8 proxy-offsets=unchanged scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }

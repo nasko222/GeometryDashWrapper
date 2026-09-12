@@ -1,0 +1,30 @@
+Geometry Dash Wrapper 0.9.7-newera16
+
+Focus:
+- camera-only framing change; proxy/icon offsets from newera15 are untouched
+- x86 + ARM legacy zoom editor gameplay world/overlay to 0.90x
+- cube zooms around the historical y=90 floor line, preserving the floor while placing the cube slightly lower on screen
+- ship/ball/UFO keep newera15 real-CCCamera vertical restrictions, zoom around y=160, then lift the camera by 8 points so the lower game edge clears editor object selection UI
+- horizontal camera zoom stays anchored at x=120
+- x86 no longer calls EditorUI::updateSlider() on playtest stop
+- x86 wrapper Play/Pause mouse clicks are consumed by the host before native touch dispatch so the editor control underneath cannot become selected/purple
+- x86 descendant CCMenu/Slider suspension remains active during gameplay; only the unsafe stop-time slider resync was removed
+
+Static checks:
+- no proxy position/scaling composition code changed from newera15
+- camera scale and translation are applied identically to editor game layer and scene-root proxy/trail overlay
+- cube floor point y=90 is invariant under the 0.90 camera zoom
+- constrained camera center receives +8 screen-point lift after zoom
+- wrapper button hit test converts top-left view Y to bottom-left Cocos Y before consuming the event
+- patch round-trip is verified during packaging
+
+Runtime boundary:
+- actual historical APK behavior still requires Windows playtest.
+Additional validation performed:
+- extracted x86 camera + wrapper-button hit-test functions compile cleanly under clang C11 with warnings-as-errors in a dependency stub harness
+- extracted ARM camera method compiles cleanly under clang++ C++20 with warnings-as-errors in a dependency stub harness
+- x86 source raw braces/parens balanced: 367/367 and 2105/2105
+- ARM legacy source raw braces/parens balanced: 1751/1751 and 7868/7868
+- x86 and ARM proxy-transform function bodies are byte-for-byte unchanged from newera15
+- camera formula check: cube floor y=90 -> y=90; cube y=105 -> y=103.5
+- constrained formula check: y=70 -> y=87, y=250 -> y=249 after zoom + lift
