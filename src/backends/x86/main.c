@@ -1869,8 +1869,14 @@ static void release_old_playtest_editor_control_refs(int restore_state) {
         void *menu = g_host.old_playtest_editor_menus[i];
         if (!menu) continue;
         if (restore_state && g_host.ccmenu_set_enabled)
-            g_host.ccmenu_set_enabled(
-                menu, g_host.old_playtest_editor_menu_enabled[i] != 0);
+            /* Hidden PlayLayer creation flips GameManager out of edit mode
+               before the old editor controls are suspended. Some historical
+               builds react by marking their editor CCMenus disabled. Restoring
+               that captured false state is what left Build/Edit/Delete locked
+               after playtest. Once edit mode is restored, every retained editor
+               CCMenu must be enabled again. Hidden/inapplicable buttons remain
+               governed by visibility and their callbacks. */
+            g_host.ccmenu_set_enabled(menu, 1);
         if (g_host.ccobject_release) g_host.ccobject_release(menu);
     }
     for (i = 0u; i < slider_count; ++i) {
@@ -1906,7 +1912,7 @@ static void set_old_playtest_editor_controls_enabled(int enabled) {
         const unsigned int menu_count = g_host.old_playtest_editor_menu_count;
         const unsigned int slider_count = g_host.old_playtest_editor_slider_count;
         release_old_playtest_editor_control_refs(1);
-        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus=%u sliders=%u mode=retained-direct slider-policy=untouched",
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus=%u sliders=%u mode=retained-force-enabled slider-policy=untouched",
                     menu_count, slider_count);
     }
 }
@@ -2271,12 +2277,11 @@ static int start_inline_old_playtest(void) {
        was still consuming every jump touch behind the hidden PlayLayer. */
     set_old_playtest_editor_input_enabled(0);
     set_old_playtest_editor_controls_enabled(0);
-    g_host.old_playtest_death_grace_until = GetTickCount64() + OLD_PLAYTEST_DEATH_GRACE_MS;
-    if (!set_old_playtest_destroy_player_suppressed(1) ||
-        !set_old_playtest_reset_level_suppressed(1)) {
-        (void)stop_inline_old_playtest();
-        return 0;
-    }
+    /* startGame() already completed the full reset synchronously above.
+       Do NOT suppress destroyPlayer/resetLevel after startup: the old 1500 ms
+       grace window made the first nearby solid blocks and hazards non-lethal.
+       Normal collision/death is live from the very first gameplay frame. */
+    g_host.old_playtest_death_grace_until = 0;
 
     player_x = g_host.ccnode_get_position_x(player);
     suppress_old_playtest_end_portal(play_layer, player_x);
@@ -2329,7 +2334,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow constrained-dead-zone=120..245 lift=25 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera24-frozen-corridor collision=live-from-frame0 startup-death-grace=0 editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
     return 1;
 }
 
@@ -2339,12 +2344,13 @@ static int stop_inline_old_playtest(void) {
     if (!g_host.old_playtest_layer) {
         if (g_host.old_playtest_editor_input_suspended)
             set_old_playtest_editor_input_enabled(1);
-        set_old_playtest_editor_controls_enabled(1);
         (void)set_old_playtest_reset_level_suppressed(0);
         (void)set_old_playtest_destroy_player_suppressed(0);
         (void)set_old_playtest_end_trigger_suppressed(0);
         (void)set_old_playtest_mirror_suppressed(0);
+        /* Edit mode must be back before menus are force-enabled. */
         restore_old_playtest_edit_mode();
+        set_old_playtest_editor_controls_enabled(1);
         if (g_host.old_playtest_play_button)
             g_host.ccnode_set_visible(g_host.old_playtest_play_button, 1);
         if (g_host.old_playtest_stop_button)
@@ -2462,7 +2468,7 @@ static int stop_inline_old_playtest(void) {
     g_host.old_playtest_constrained_camera_mode = -1;
     g_host.old_playtest_constrained_camera_y = 0.0f;
     g_host.gameplay_cache_time = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=editor-position-scale-restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=menus-restored edit-mode=restored slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=editor-position-scale-restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=menus-force-enabled edit-mode=restored slider=untouched");
     return 1;
 }
 

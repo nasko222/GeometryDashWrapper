@@ -4038,6 +4038,7 @@ public:
         ++visited;
         bool ok = true;
         if (runtime_.ccmenu_set_enabled && GuestObjectTypeContains(node, "CCMenu") &&
+            !GuestObjectTypeContains(node, "CCMenuItem") &&
             old_playtest_editor_menus_.size() < 128u) {
             u32 enabled = 1u;
             if (runtime_.ccmenu_is_enabled)
@@ -4048,19 +4049,6 @@ public:
             old_playtest_editor_menu_enabled_.push_back(enabled ? 1u : 0u);
             ok = RunFunction(runtime_.ccmenu_set_enabled, {node, 0u}, nullptr,
                              "CCMenu::setEnabled(false) playtest", 0u,
-                             std::chrono::milliseconds(300)) && ok;
-        }
-        if (runtime_.cclayer_set_touch_enabled && GuestObjectTypeContains(node, "Slider") &&
-            old_playtest_editor_sliders_.size() < 32u) {
-            u32 enabled = 1u;
-            if (runtime_.cclayer_is_touch_enabled)
-                (void)RunFunction(runtime_.cclayer_is_touch_enabled, {node}, &enabled,
-                                  "CCLayer::isTouchEnabled Slider", 0u,
-                                  std::chrono::milliseconds(300));
-            old_playtest_editor_sliders_.push_back(node);
-            old_playtest_editor_slider_touch_enabled_.push_back(enabled ? 1u : 0u);
-            ok = RunFunction(runtime_.cclayer_set_touch_enabled, {node, 0u}, nullptr,
-                             "CCLayer::setTouchEnabled(false) Slider", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         if (!runtime_.ccnode_get_children || !runtime_.ccnode_get_children_count ||
@@ -4135,10 +4123,13 @@ public:
             if (!OldVersionPlaytestNodeInTree(old_playtest_editor_,
                                               old_playtest_editor_menus_[i],
                                               0u, visited)) continue;
+            /* PlayLayer temporarily switches GameManager out of edit mode.
+               Capturing menu state after that can record false for otherwise
+               normal editor menus, leaving them locked on stop. Once edit mode
+               is restored, force every live retained editor CCMenu enabled. */
             ok = RunFunction(runtime_.ccmenu_set_enabled,
-                             {old_playtest_editor_menus_[i],
-                              old_playtest_editor_menu_enabled_[i] ? 1u : 0u},
-                             nullptr, "CCMenu::setEnabled restore live editor", 0u,
+                             {old_playtest_editor_menus_[i], 1u},
+                             nullptr, "CCMenu::setEnabled force editor restore", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         for (std::size_t i = 0; i < old_playtest_editor_sliders_.size(); ++i) {
@@ -4155,7 +4146,8 @@ public:
         }
         log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_EDITOR_CONTROLS_RESTORED menus="
              << old_playtest_editor_menus_.size()
-             << " sliders=" << old_playtest_editor_sliders_.size() << "\n";
+             << " sliders=" << old_playtest_editor_sliders_.size()
+             << " mode=force-enabled slider-policy=untouched\n";
         log_.flush();
         old_playtest_editor_menus_.clear();
         old_playtest_editor_menu_enabled_.clear();
@@ -4611,8 +4603,11 @@ public:
            delegates while gameplay owns the taps. */
         if (!SetOldVersionPlaytestEditorInputEnabled(false) ||
             !SetOldVersionPlaytestEditorControlsEnabled(false)) return false;
-        if (!SetOldVersionPlaytestDestroyPlayerSuppressed(true) ||
-            !SetOldVersionPlaytestResetLevelSuppressed(true)) return false;
+        /* startGame() already ran the complete reset. Leaving destroyPlayer
+           and resetLevel patched out for 1500 ms made nearby solids/hazards
+           non-lethal at the beginning of playtest. Collision/death must be live
+           from the first scheduled gameplay frame. */
+        old_playtest_death_grace_until_ = {};
 
         float start_player_x = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_x, player, start_player_x,
@@ -4664,7 +4659,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-baseline constrained=real-CCCamera play-zoom=0.90 editor-zoom-independent=1 cube-y=ground-anchored-no-follow constrained-dead-zone=120..245 lift=25 scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera24-frozen-corridor collision=live-from-frame0 startup-death-grace=0 editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched\n";
         log_.flush();
         return true;
     }
@@ -4841,7 +4836,7 @@ public:
         old_playtest_end_portal_scanned_ = false;
         InvalidateDesktopGameplayState();
         if (ok) {
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=restored edit-mode=restored slider=resynced\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STOPPED mode=scene-isolated visuals=parked music=stopped end=restored camera=restored playlayer=parked-attached-inert no-onExit=1 editor-input=restored editor-controls=menus-force-enabled edit-mode=restored slider=untouched\n";
             log_.flush();
         }
         return ok;

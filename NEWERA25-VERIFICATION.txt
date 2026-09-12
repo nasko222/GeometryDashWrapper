@@ -1,0 +1,28 @@
+GeometryDashWrapper 0.9.7-newera25 verification
+
+Scope
+- Camera/player rendering intentionally unchanged from newera24.
+- Fix editor CCMenu lockout after inline playtest.
+- Restore collision/death from the first gameplay frame.
+
+Input restore
+- x86 still excludes CCMenuItem* from CCMenu::setEnabled calls.
+- x86 Slider remains untouched.
+- x86 restores GameManager edit mode before restoring editor menus.
+- retained x86 editor CCMenus are force-enabled on stop instead of restoring a false state captured while hidden PlayLayer had edit mode disabled.
+- legacy ARM now excludes CCMenuItem* and does not suspend Slider.
+- legacy ARM editor CCMenus are force-enabled on restore.
+
+Collision
+- startGame() still runs the full reset and spawn-queue initialization.
+- only updateAttempts() is temporarily suppressed during synchronous startGame().
+- the old 1500 ms post-start destroyPlayer/resetLevel suppression is no longer enabled.
+- normal solid/hazard collision and PlayerObject death are live from frame zero.
+
+Launcher defaults
+- RUN_AUTO_BOOMLINGS.cmd: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE
+- RUN_AUTO_GDPS.cmd: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE
+
+Validation
+- Camera function checked byte-for-byte against newera24 after edits.
+- Patch round-trip is performed before packaging handoff.

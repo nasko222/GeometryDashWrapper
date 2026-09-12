@@ -1,4 +1,14 @@
-# Geometry Dash Wrapper 0.9.7-newera24
+# Geometry Dash Wrapper 0.9.7-newera25
+
+## What newera25 changes
+
+- **Camera and player rendering are intentionally unchanged from newera24.** Cube framing, frozen ship/ball/UFO corridor capture, zoom, proxy placement and mode visuals are not modified.
+- **Fixes intermittent editor-menu lockout after x86 playtest.** Hidden `PlayLayer` temporarily switches `GameManager` out of edit mode before control suspension, so some old builds can report normal editor `CCMenu`s as disabled. Restoring that captured false state left Build/Edit/Delete inert while editor placement still received clicks. Stop now restores edit mode first and force-enables every retained editor `CCMenu`.
+- Keeps the x86 `CCMenuItem...` exclusion and leaves the horizontal `Slider` completely untouched. Legacy ARM now gets the same `CCMenuItem` exclusion and Slider-untouched policy.
+- **Fixes non-lethal nearby blocks/hazards at playtest start.** The wrapper used to patch out `PlayLayer::destroyPlayer()` and `resetLevel()` for 1500 ms *after* `startGame()` had already completed. That grace period made early solids/hazards passable. The post-start death/reset guard is removed on x86 and legacy ARM; normal collision/death is active from the first gameplay frame.
+- First-attempt preservation is unchanged: only `updateAttempts()` is suppressed during the synchronous `startGame()` call, so the full gameplay reset/spawn initialization still runs.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
+- Dynarmic builder revision is bumped to **137**.
 
 ## What newera24 changes
 
