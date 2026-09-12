@@ -1,4 +1,13 @@
-# Geometry Dash Wrapper 0.9.7-newera25
+# Geometry Dash Wrapper 0.9.7-newera26
+
+## What newera26 changes
+
+- **Camera lock preserved:** cube and ship framing stay exactly on the working newera25/newera24 camera paths. No player-follow camera is reintroduced.
+- **Fixes the Attempt 2 / hazard coupling instead of trading one bug for the other.** The initial `startGame()` still performs its full `resetLevel()` while `updateAttempts()` is suppressed once, preserving Attempt 1 and gameplay initialization. After startup, `destroyPlayer()` stays fully live so solids/hazards kill from frame zero, while only later `resetLevel()` calls are suppressed. This blocks the hidden PlayLayer auto-retry that caused the synthetic second attempt.
+- **Ball/UFO framing only:** ball and UFO/bird keep the same frozen non-following corridor and 0.70x play-only zoom, but receive a constant +15 camera-Y framing lift because those two modes were visually sunken. Ship and cube receive no such lift.
+- x86 editor-menu/Slider safety fixes remain unchanged.
+- Launcher defaults remain: Boomlings `SHOW_COMMAND_PROMPT=TRUE`, `OLD_VER_PLAYTEST=TRUE`; GDPS both `FALSE`.
+- Dynarmic builder revision is bumped to **138**.
 
 ## What newera25 changes
 

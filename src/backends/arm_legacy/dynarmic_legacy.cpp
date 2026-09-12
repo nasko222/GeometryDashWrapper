@@ -3488,7 +3488,7 @@ public:
             cpu_.ClearCache();
             old_playtest_reset_level_thumb_ = thumb;
             old_playtest_reset_level_suppressed_ = true;
-            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD enabled=1500ms\n";
+            log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_AUTORETRY_RESET_GUARD enabled=1\n";
             log_.flush();
             return true;
         }
@@ -3499,7 +3499,7 @@ public:
             env_.MemoryWrite32(address, old_playtest_reset_level_original32_);
         cpu_.ClearCache();
         old_playtest_reset_level_suppressed_ = false;
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD restored\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_AUTORETRY_RESET_GUARD restored\n";
         log_.flush();
         return true;
     }
@@ -4204,6 +4204,7 @@ public:
         constexpr float kConstrainedZoom = 0.70f;
         constexpr float kCubeGroundWorldY = 105.0f;
         constexpr float kCubeCameraLiftY = 25.0f;
+        constexpr float kBallUfoCameraLiftY = 15.0f;
 
         float base_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
@@ -4272,8 +4273,13 @@ public:
                 }
             }
 
-            /* Zoom around screen Y=160 using the frozen unscaled camera. */
+            /* Zoom around screen Y=160 using the frozen unscaled camera. Ship
+               already frames correctly. Ball and UFO/bird are visually low in
+               the bridge, so lift only those two STATIC cameras; no player-Y
+               sampling or follow is introduced. */
             editor_camera_y = zoom * old_playtest_constrained_camera_y_;
+            if (mode == 2 || mode == 3)
+                editor_camera_y += kBallUfoCameraLiftY;
         }
         const float overlay_camera_y = editor_camera_y +
             (1.0f - zoom) * kPivotY;
@@ -4603,10 +4609,18 @@ public:
            delegates while gameplay owns the taps. */
         if (!SetOldVersionPlaytestEditorInputEnabled(false) ||
             !SetOldVersionPlaytestEditorControlsEnabled(false)) return false;
-        /* startGame() already ran the complete reset. Leaving destroyPlayer
-           and resetLevel patched out for 1500 ms made nearby solids/hazards
-           non-lethal at the beginning of playtest. Collision/death must be live
-           from the first scheduled gameplay frame. */
+        /* startGame() already ran the one complete initialization reset, with
+           updateAttempts() suppressed only for that synchronous call. Keep
+           destroyPlayer() live so hazards/solids kill immediately, but block
+           subsequent resetLevel() calls for the rest of playtest. That prevents
+           old auto-retry from restarting into synthetic Attempt 2 after death. */
+        if (!SetOldVersionPlaytestDestroyPlayerSuppressed(false) ||
+            !SetOldVersionPlaytestResetLevelSuppressed(true)) {
+            log_ << "ERROR: could not install playtest auto-retry reset guard\n";
+            log_.flush();
+            (void)StopInlineOldVersionPlaytest();
+            return false;
+        }
         old_playtest_death_grace_until_ = {};
 
         float start_player_x = 0.0f;
@@ -4659,7 +4673,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera24-frozen-corridor collision=live-from-frame0 startup-death-grace=0 editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera26-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched\n";
         log_.flush();
         return true;
     }
@@ -4844,11 +4858,12 @@ public:
 
     bool UpdateInlineOldVersionPlaytest() {
         if (!old_playtest_layer_) return true;
-        if ((old_playtest_destroy_player_suppressed_ ||
-             old_playtest_reset_level_suppressed_) &&
+        /* resetLevel() remains suppressed for the entire playtest so death
+           cannot auto-retry into Attempt 2. destroyPlayer() is live; only clear
+           a stale legacy death guard here if one somehow survived. */
+        if (old_playtest_destroy_player_suppressed_ &&
             std::chrono::steady_clock::now() >= old_playtest_death_grace_until_) {
-            if (!SetOldVersionPlaytestResetLevelSuppressed(false) ||
-                !SetOldVersionPlaytestDestroyPlayerSuppressed(false))
+            if (!SetOldVersionPlaytestDestroyPlayerSuppressed(false))
                 return false;
         }
         if (!old_playtest_player_ || !old_playtest_play_game_layer_ ||

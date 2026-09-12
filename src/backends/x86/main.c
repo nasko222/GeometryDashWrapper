@@ -321,6 +321,7 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CONSTRAINED_ZOOM_OUT_SCALE 0.70f
 #define OLD_PLAYTEST_CUBE_GROUND_WORLD_Y 105.0f
 #define OLD_PLAYTEST_CUBE_CAMERA_LIFT_Y 25.0f
+#define OLD_PLAYTEST_BALL_UFO_CAMERA_LIFT_Y 15.0f
 #define OLD_PLAYTEST_END_PORTAL_AHEAD_X 100000.0f
 #define OLD_PLAYTEST_DEATH_GRACE_MS 1500u
 #define OLD_PLAYTEST_LINE_TEXTURE_WIDTH 16.0f
@@ -1321,8 +1322,7 @@ static int set_old_playtest_reset_level_suppressed(int suppress) {
         if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
             return 0;
         g_host.old_playtest_reset_level_suppressed = 1;
-        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD enabled=%ums",
-                    (unsigned)OLD_PLAYTEST_DEATH_GRACE_MS);
+        runtime_log("RESULT: X86_OLD_VER_PLAYTEST_AUTORETRY_RESET_GUARD enabled=1");
         return 1;
     }
     if (!g_host.old_playtest_reset_level_suppressed) return 1;
@@ -1330,7 +1330,7 @@ static int set_old_playtest_reset_level_suppressed(int suppress) {
     if (!patch_x86_code(g_host.play_layer_reset_level, &replacement, 1u))
         return 0;
     g_host.old_playtest_reset_level_suppressed = 0;
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTUP_RESET_GUARD restored");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_AUTORETRY_RESET_GUARD restored");
     return 1;
 }
 
@@ -2030,8 +2030,14 @@ static int apply_old_playtest_camera(float player_x) {
 
         /* Zoom the frozen NEWERA15 camera around screen Y=160. For an unscaled
            camera translation C, scaling the whole viewport around the screen
-           center requires the editor-layer translation z*C. */
+           center requires the editor-layer translation z*C. Ship framing is
+           already correct; ball and UFO/bird sit visually low in the old
+           editor bridge, so lift only those two STATIC cameras. This is a
+           constant framing correction and never reads PlayerObject::Y. */
         editor_camera_y = zoom * g_host.old_playtest_constrained_camera_y;
+        if (mode == OLD_PLAYTEST_MODE_BALL ||
+            mode == OLD_PLAYTEST_MODE_BIRD)
+            editor_camera_y += OLD_PLAYTEST_BALL_UFO_CAMERA_LIFT_Y;
     }
     overlay_camera_y = editor_camera_y +
         (1.0f - zoom) * OLD_PLAYTEST_CAMERA_PIVOT_Y;
@@ -2277,10 +2283,19 @@ static int start_inline_old_playtest(void) {
        was still consuming every jump touch behind the hidden PlayLayer. */
     set_old_playtest_editor_input_enabled(0);
     set_old_playtest_editor_controls_enabled(0);
-    /* startGame() already completed the full reset synchronously above.
-       Do NOT suppress destroyPlayer/resetLevel after startup: the old 1500 ms
-       grace window made the first nearby solid blocks and hazards non-lethal.
-       Normal collision/death is live from the very first gameplay frame. */
+    /* startGame() already completed the one reset we actually need, with only
+       updateAttempts() suppressed for that synchronous call. From this point
+       on, keep destroyPlayer() fully live so solids/hazards kill immediately,
+       but suppress FUTURE resetLevel() calls. Old auto-retry schedules a reset
+       after death; allowing that reset is the source of the synthetic Attempt 2
+       / second-attempt bug. Splitting the two paths preserves lethal collision
+       from frame zero without letting the hidden PlayLayer restart itself. */
+    if (!set_old_playtest_destroy_player_suppressed(0) ||
+        !set_old_playtest_reset_level_suppressed(1)) {
+        runtime_log("ERROR: could not install playtest auto-retry reset guard");
+        (void)stop_inline_old_playtest();
+        return 0;
+    }
     g_host.old_playtest_death_grace_until = 0;
 
     player_x = g_host.ccnode_get_position_x(player);
@@ -2334,7 +2349,7 @@ static int start_inline_old_playtest(void) {
         (void)stop_inline_old_playtest();
         return 0;
     }
-    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera24-frozen-corridor collision=live-from-frame0 startup-death-grace=0 editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
+    runtime_log("RESULT: X86_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera26-mode-framing collision=live-from-frame0 autoretry-reset=blocked attempt2=blocked editor-zoom-independent=1 scene-isolated=1 editor-input=suspended editor-controls=menus-only slider=untouched");
     return 1;
 }
 
@@ -2476,11 +2491,12 @@ static int update_inline_old_playtest(void) {
     float player_x;
     void *current_player;
     if (!g_host.old_playtest_layer) return 1;
-    if ((g_host.old_playtest_destroy_player_suppressed ||
-         g_host.old_playtest_reset_level_suppressed) &&
+    /* resetLevel() stays intentionally suppressed for the entire playtest so
+       death cannot auto-retry into Attempt 2. destroyPlayer() is never guarded
+       by newera26; this fallback only clears a stale legacy death guard. */
+    if (g_host.old_playtest_destroy_player_suppressed &&
         GetTickCount64() >= g_host.old_playtest_death_grace_until) {
-        if (!set_old_playtest_reset_level_suppressed(0) ||
-            !set_old_playtest_destroy_player_suppressed(0)) return 0;
+        if (!set_old_playtest_destroy_player_suppressed(0)) return 0;
     }
     if (!g_host.old_playtest_player || !g_host.old_playtest_play_game_layer ||
         !g_host.old_playtest_editor_game_layer) return 0;

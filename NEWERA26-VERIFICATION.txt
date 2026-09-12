@@ -1,0 +1,24 @@
+GeometryDashWrapper 0.9.7-newera26 verification
+================================================
+
+Base: exact 0.9.7-newera25 full-source package from this conversation.
+
+newera26 changes:
+- Preserve working cube/ship camera paths.
+- Ball + UFO/bird only: +15 static camera-Y framing lift; no player follow.
+- Keep destroyPlayer live for lethal collision from frame zero.
+- Suppress resetLevel only AFTER startGame has completed its required initial reset.
+  This blocks hidden PlayLayer auto-retry / synthetic Attempt 2 without restoring
+  the old non-lethal hazard grace period.
+- x86 editor menu/Slider safety behavior retained.
+- Boomlings defaults: SHOW_COMMAND_PROMPT=TRUE, OLD_VER_PLAYTEST=TRUE.
+- GDPS defaults: SHOW_COMMAND_PROMPT=FALSE, OLD_VER_PLAYTEST=FALSE.
+
+Validation performed:
+- Source delimiter / NUL checks.
+- Camera branch inspection: cube and ship receive no new vertical lift.
+- Reset/death inspection: destroyPlayer is not suppressed after startup; resetLevel
+  stays suppressed until Stop restores it.
+- Patch round-trip from clean newera25 tree to final newera26 tree.
+
+Windows runtime behavior still requires the user's playtest.
