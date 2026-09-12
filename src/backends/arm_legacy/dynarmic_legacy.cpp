@@ -4201,106 +4201,99 @@ public:
     }
 
     bool ApplyOldVersionPlaytestCamera(float player_x) {
-        if (!old_playtest_editor_game_layer_ ||
-            !old_playtest_play_game_layer_ ||
+        if (!old_playtest_editor_game_layer_ || !old_playtest_play_game_layer_ ||
             !old_playtest_player_) return false;
 
         constexpr float kAnchorX = 120.0f;
         constexpr float kZoom = 0.90f;
-        constexpr float kCubeZoomAnchorY = 90.0f;
-        constexpr float kConstrainedZoomAnchorY = 160.0f;
-        constexpr float kConstrainedScreenShiftY = 8.0f;
         constexpr float kConstrainedBottom = 70.0f;
         constexpr float kConstrainedTop = 250.0f;
         constexpr float kBallBottom = 58.0f;
         constexpr float kBallTop = 262.0f;
 
         float base_y = 0.0f;
+        float player_y = 0.0f;
         if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
                               old_playtest_play_game_layer_, base_y,
-                              "CCNode::getPositionY legacy cube camera"))
+                              "CCNode::getPositionY legacy cube camera") ||
+            !GuestFloatGetter(runtime_.ccnode_get_position_y,
+                              old_playtest_player_, player_y,
+                              "CCNode::getPositionY playtest player camera pivot"))
             return false;
 
-        /* Start from the exact newera15 camera, then zoom the camera transform
-           only. No proxy/icon local offsets are changed. */
+        /* Reconstruct the exact newera15 camera first. */
         float camera_x = kAnchorX - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
-        camera_x = kAnchorX + kZoom * (camera_x - kAnchorX);
         float camera_y = base_y;
 
         const int mode = old_playtest_proxy_mode_;
         if (mode == 1 || mode == 2 || mode == 3) {
-            /* Ship/UFO/ball still use the REAL historical Cocos camera Y. */
             float real_camera_x = 0.0f, real_camera_y = 0.0f;
             if (ReadOldVersionPlaytestRealCamera(real_camera_x, real_camera_y)) {
                 (void)real_camera_x;
                 camera_y = base_y - real_camera_y;
                 old_playtest_camera_fallback_logged_ = false;
             } else {
-                float player_y = 0.0f;
-                if (!GuestFloatGetter(runtime_.ccnode_get_position_y,
-                                      old_playtest_player_, player_y,
-                                      "CCNode::getPositionY constrained fallback"))
-                    return false;
-                const float bottom = mode == 2 ? kBallBottom : kConstrainedBottom;
-                const float top = mode == 2 ? kBallTop : kConstrainedTop;
+                float bottom = mode == 2 ? kBallBottom : kConstrainedBottom;
+                float top = mode == 2 ? kBallTop : kConstrainedTop;
                 const float screen_y = player_y + camera_y;
                 if (screen_y < bottom)
                     camera_y += bottom - screen_y;
                 else if (screen_y > top)
                     camera_y -= screen_y - top;
-
                 if (!old_playtest_camera_fallback_logged_) {
-                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_CAMERA_FALLBACK mode="
-                         << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
+                    log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_CAMERA_FALLBACK"
+                         << " mode=" << (mode == 1 ? "ship" : mode == 2 ? "ball" : "bird")
                          << " source=bounded-game-area no-player-centering=1\n";
                     log_.flush();
                     old_playtest_camera_fallback_logged_ = true;
                 }
             }
-            camera_y = kConstrainedZoomAnchorY +
-                       kZoom * (camera_y - kConstrainedZoomAnchorY) +
-                       kConstrainedScreenShiftY;
-        } else {
-            /* Zoom cube around the old 90-point floor line. The floor stays in
-               place while the cube naturally sits slightly lower on screen. */
-            camera_y = kCubeZoomAnchorY +
-                       kZoom * (camera_y - kCubeZoomAnchorY);
         }
 
-        const float scale_x = old_playtest_editor_camera_original_valid_
-            ? old_playtest_editor_camera_original_scale_x_ * kZoom : kZoom;
-        const float scale_y = old_playtest_editor_camera_original_valid_
-            ? old_playtest_editor_camera_original_scale_y_ * kZoom : kZoom;
+        const float original_scale_x = old_playtest_editor_camera_original_valid_
+            ? old_playtest_editor_camera_original_scale_x_ : 1.0f;
+        const float original_scale_y = old_playtest_editor_camera_original_valid_
+            ? old_playtest_editor_camera_original_scale_y_ : 1.0f;
+        const float zoom_scale_x = original_scale_x * kZoom;
+        const float zoom_scale_y = original_scale_y * kZoom;
+
+        /* Zoom around the player's ALREADY-CORRECT newera15 screen position.
+           screen=S*world+T, so T' = T + (S-S')*player. This changes only the
+           visible camera area; it does not move the player on screen. */
+        const float zoom_camera_x = camera_x +
+            (original_scale_x - zoom_scale_x) * player_x;
+        const float zoom_camera_y = camera_y +
+            (original_scale_y - zoom_scale_y) * player_y;
 
         bool ok = true;
         ok = RunFunction(runtime_.ccnode_set_scale_x,
-                         {old_playtest_editor_game_layer_, FloatToWord(scale_x)},
-                         nullptr, "zoom old playtest camera X", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(zoom_scale_x)},
+                         nullptr, "zoom old playtest world X around player", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_scale_y,
-                         {old_playtest_editor_game_layer_, FloatToWord(scale_y)},
-                         nullptr, "zoom old playtest camera Y", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(zoom_scale_y)},
+                         nullptr, "zoom old playtest world Y around player", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_,
-                          FloatToWord(camera_x), FloatToWord(camera_y)},
-                         nullptr, "apply mode-aware old playtest camera", 0u,
+                          FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
+                         nullptr, "position pivot-preserved editor camera", 0u,
                          std::chrono::milliseconds(300)) && ok;
 
         if (old_playtest_trail_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_trail_, FloatToWord(scale_x)},
-                             nullptr, "zoom playtest overlay X", 0u,
+                             {old_playtest_trail_, FloatToWord(zoom_scale_x)},
+                             nullptr, "zoom playtest world overlay X", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_trail_, FloatToWord(scale_y)},
-                             nullptr, "zoom playtest overlay Y", 0u,
+                             {old_playtest_trail_, FloatToWord(zoom_scale_y)},
+                             nullptr, "zoom playtest world overlay Y", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_,
-                              FloatToWord(camera_x), FloatToWord(camera_y)},
-                             nullptr, "apply camera to playtest overlay", 0u,
+                              FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
+                             nullptr, "position pivot-preserved playtest overlay", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;
@@ -4418,12 +4411,12 @@ public:
                          "rotate playtest proxy root", 0u,
                          std::chrono::milliseconds(300)) ||
             !RunFunction(runtime_.ccnode_set_scale_x,
-                         {old_playtest_proxy_root_, FloatToWord(scale_x)}, nullptr,
-                         "scale X playtest proxy root", 0u,
+                         {old_playtest_proxy_root_, FloatToWord(scale_x / 0.90f)}, nullptr,
+                         "counter-scale X playtest proxy root", 0u,
                          std::chrono::milliseconds(300)) ||
             !RunFunction(runtime_.ccnode_set_scale_y,
-                         {old_playtest_proxy_root_, FloatToWord(scale_y)}, nullptr,
-                         "scale Y playtest proxy root", 0u,
+                         {old_playtest_proxy_root_, FloatToWord(scale_y / 0.90f)}, nullptr,
+                         "counter-scale Y playtest proxy root", 0u,
                          std::chrono::milliseconds(300))) return false;
         return AppendOldVersionPlaytestTrailSegment(x, y);
     }
@@ -4647,7 +4640,7 @@ public:
             (void)StopInlineOldVersionPlaytest();
             return false;
         }
-        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=cube-floor-anchored constrained=real-CCCamera zoom=0.90 constrained-shift-y=8 proxy-offsets=unchanged scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
+        log_ << "RESULT: DYNARMIC_OLD_VER_PLAYTEST_STARTED mode=editor-bridge-safe unsaved-level=clone first-attempt=preserved player=dynamic-proxy playlayer=hidden end=disabled mirror=disabled camera=newera15-pivot-preserved constrained=real-CCCamera zoom=0.90 player-screen-pos=preserved proxy-screen-size=preserved scene-isolated=1 editor-input=suspended editor-controls=suspended\n";
         log_.flush();
         return true;
     }

@@ -1,6 +1,17 @@
-# Geometry Dash Wrapper 0.9.7-newera16
+# Geometry Dash Wrapper 0.9.7-newera17
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
+
+## What newera17 changes
+
+- **Reverts newera16 player/framing displacement back to the validated newera15 camera first**, then applies zoom mathematically around the player's already-correct screen position. Cube and constrained-mode placement therefore start from the exact newera15 transform.
+- The editor gameplay world and green breadcrumb overlay use **0.90x zoom**, but camera translation is compensated by `(oldScale - zoomScale) * playerWorldPosition`. The player's screen coordinate does not move when zoom is enabled.
+- The proxy root is counter-scaled by `1 / 0.90`, cancelling the parent camera zoom. This preserves the newera15 cube/ship/ball/UFO icon size, vehicle offsets and margins while the world itself shows more area.
+- Removes newera16's fixed cube-floor and constrained-mode `+8` camera shifts. Those shifts changed the player/world alignment and are no longer used.
+- **x86 freeze/purple-control fix:** the horizontal editor `Slider` is no longer disabled, retained, restored, or resynchronized at all. Ordinary descendant `CCMenu`s remain suspended/restored so gameplay clicks cannot trigger editor buttons underneath. This removes the purple horizontal control from the risky Stop path without giving up menu isolation.
+- `EditorUI::updateSlider()` remains disabled on the x86 stop path.
+- `RUN_AUTO_BOOMLINGS.cmd` now defaults `SHOW_COMMAND_PROMPT=TRUE` and `OLD_VER_PLAYTEST=TRUE`; `RUN_AUTO_GDPS.cmd` intentionally keeps both `FALSE`.
+- Dynarmic builder revision is bumped to **129**.
 
 ## What newera16 changes
 
@@ -63,8 +74,8 @@ Edit the `set "NAME=value"` lines near the top of the two `RUN_AUTO_*.cmd` files
 | `RESOLUTION` | `1140x640` | Logical/native render size passed to the game window. Keep the default for the historical layout, or override it with values such as `1280x720`. |
 | `TEXTURE_FILTERING` | `GAME` | `GAME` preserves the guest's original magnification-filter requests. `LINEAR` smooths enlarged textures; `NEAREST` forces crisp pixels. |
 | `ANTIALIASING` | `NONE` | Host antialiasing mode: `NONE`, `FXAA`, `MSAA2`, `MSAA4`, or `MSAA8`. Unsupported MSAA sample counts fall back to a lower count and then off. |
-| `SHOW_COMMAND_PROMPT` | `FALSE` | Hides the launcher console. Set `TRUE` to keep it visible for diagnostics. Boolean settings also accept yes/no, on/off, and 1/0. |
-| `OLD_VER_PLAYTEST` | `FALSE` | Adds the inline editor play/stop control to Geometry Dash 1.0-1.7 on the legacy ARM and x86 backends. |
+| `SHOW_COMMAND_PROMPT` | Script-specific | `RUN_AUTO_BOOMLINGS.cmd` defaults to `TRUE`; `RUN_AUTO_GDPS.cmd` defaults to `FALSE`. Controls whether the launcher console stays visible. |
+| `OLD_VER_PLAYTEST` | Script-specific | `RUN_AUTO_BOOMLINGS.cmd` defaults to `TRUE`; `RUN_AUTO_GDPS.cmd` defaults to `FALSE`. Adds the inline editor play/stop control to Geometry Dash 1.0-1.7 on legacy ARM/x86. |
 | `VERSION_ISOLATED_SAVES` | `true` | Gives each package/version/backend combination its own save directory. Set `false` to use the shared `save` directory. |
 | `EDITOR_CONTROLLS` | `true` | Enables legacy/x86 editor movement and rotation shortcuts. The historical misspelling is part of the public setting name. |
 | `I_LOST_THE_GAME` | `true` | Launch guard set by the scripts. Direct backend execution without it shows the wrapper's launch message and exits. |
@@ -90,11 +101,11 @@ With `OLD_VER_PLAYTEST=TRUE`, Geometry Dash 1.0-1.7 editors gain a small play co
 1. Read the live editor's unsaved level string, create a private temporary `GJGameLevel`, copy the playback metadata available in that build, and give only the clone to `PlayLayer`. The editor's own level object is not handed to gameplay.
 2. Before PlayLayer creation, snapshot the editor's `GameManager::m_playLayer` and **edit-mode state**. Run the authentic old `startGame()` / `resetLevel()` path while temporarily suppressing only `updateAttempts()` for the startup reset, preserving Attempt 1 without skipping spawn-queue initialization.
 3. Keep the real `PlayerObject` in its original hidden PlayLayer hierarchy for physics. A scene-root proxy mirrors its transform, colors, selected icon, and supported cube/ship/ball/UFO sprite family. Ship mode includes the selected cube inside the ship.
-4. Mirror the hidden PlayLayer camera in both axes, then render the editor game layer / wrapper overlay at **0.90x scale** around the logical playfield center. The old game therefore keeps control of cube/ship/ball/UFO camera clamps while Stop still restores the exact original editor scale and position.
+4. Reconstruct the validated newera15 camera first, then zoom the editor world / breadcrumb overlay to **0.90x around the current player world point**. Translation compensation keeps the player at the exact same screen coordinate it had before zoom; the proxy root is counter-scaled so its on-screen size and local vehicle/icon layout also remain unchanged.
 5. Breadcrumb and proxy visuals live outside `LevelEditorLayer` / `EditorUI`. The green breadcrumb uses connected solid `square.png` segments, sampled every 16 world units and capped at 256 segments to cut sprite churn. The experimental orange trajectory predictor has been removed.
 6. Suppress `EndPortalObject::triggerObject()` and keep the hidden end portal far ahead as a secondary guard, so inline editor testing has no normal level-complete endpoint. Where available, also suppress `PlayLayer::toggleFlipped(bool,bool)` so mirror portals have no effect in the editor test.
-7. While playtest is active, save and disable EditorUI/LevelEditorLayer touch handling plus descendant `CCMenu` and `Slider` controls. The wrapper pause button is a scene-root sibling and remains usable. This prevents the top X mover, settings button, pause/menu controls, and build/edit/delete UI from reacting behind gameplay.
-8. Clicking the wrapper pause button or pressing Escape stops music, restores the original camera, editor touch/menu/slider state, `GameManager::m_playLayer`, **GameManager edit mode**, end/mirror patches, and calls `EditorUI::updateSlider()` to put the top X mover back on the restored editor camera position.
+7. While playtest is active, save and disable EditorUI/LevelEditorLayer root touch handling. On x86, ordinary descendant `CCMenu`s are also suspended, but the horizontal `Slider` is deliberately never disabled/retained/restored because that path caused it to return selected/purple and could freeze the app after Stop.
+8. Clicking the wrapper pause button or pressing Escape stops music, restores the original camera, root editor touch state, retained menu enabled states, `GameManager::m_playLayer`, **GameManager edit mode**, and end/mirror patches. The x86 path does not force `EditorUI::updateSlider()` and never mutates/restores the horizontal Slider.
 9. The retired hidden PlayLayer remains attached, invisible, unscheduled and touch-disabled until scene destruction instead of running fragile old `onExit` teardown. If the backing player genuinely dies or is replaced, the bridge stops the test rather than allowing the historical retry/scene lifecycle into the editor.
 
 The bridge covers ARM Geometry Dash 1.0-1.4 and x86 Geometry Dash 1.5-1.7 when the required exported game/Cocos2d-x interfaces are present. Missing capabilities fail closed and are logged. Runtime testing on the individual historical APKs is still required because their internal layouts differ by release.

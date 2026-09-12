@@ -1,0 +1,30 @@
+Geometry Dash Wrapper 0.9.7-newera17
+
+Focus
+-----
+- revert newera16 fixed-anchor/+8 camera displacement back to the validated newera15 camera before zoom
+- x86 + ARM legacy use 0.90 world zoom around the player's already-correct screen position
+- camera translation compensation: T' = T + (S - S') * playerWorld, so player screen X/Y are invariant under zoom
+- green breadcrumb/world overlay follows the zoomed camera
+- proxy root is counter-scaled by 1/0.90 so final player icon size and local ship/UFO/cube/ball composition remain equivalent to newera15
+- no +5 cube correction, no constrained +8 shift, no y=90/y=160 fixed zoom anchors
+- x86 horizontal Slider is never disabled, retained, restored, or resynchronized
+- x86 ordinary CCMenu descendants remain retained/disabled/restored during playtest for editor-button isolation
+- x86 EditorUI::updateSlider() remains removed from Stop
+- Boomlings launcher defaults SHOW_COMMAND_PROMPT=TRUE and OLD_VER_PLAYTEST=TRUE
+- GDPS launcher defaults SHOW_COMMAND_PROMPT=FALSE and OLD_VER_PLAYTEST=FALSE
+- Dynarmic builder revision 129
+
+Static validation
+-----------------
+- version metadata updated to 0.9.7-newera17 / branch newera17
+- BOOMLINGS/GDPS boolean defaults checked explicitly
+- x86 Slider collection code absent; CCMenu collection still present
+- x86/ARM fixed zoom-anchor and +8-shift constants removed
+- proxy local position remains raw PlayerObject world x/y; only inverse parent-zoom scale compensation is applied
+- formula simulation verifies player screen position before and after 0.90 zoom is identical for cube, ship, ball and UFO camera inputs
+- source delimiter/NUL checks and patch round-trip are performed during packaging
+
+Runtime boundary
+----------------
+Historical Windows APK behavior still needs user runtime testing. The x86 purple-slider/freeze fix specifically removes the Slider object from the retain/restore path that was still active in newera16.
