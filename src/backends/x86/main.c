@@ -311,6 +311,7 @@ static GameHost g_host;
 #define OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE 0.90f
 #define OLD_PLAYTEST_CUBE_ZOOM_PIVOT_Y 90.0f
 #define OLD_PLAYTEST_CONSTRAINED_ZOOM_PIVOT_Y 160.0f
+#define OLD_PLAYTEST_CAMERA_VIEWPORT_LIFT_Y 25.0f
 #define OLD_PLAYTEST_CONSTRAINED_BOTTOM 70.0f
 #define OLD_PLAYTEST_CONSTRAINED_TOP 250.0f
 #define OLD_PLAYTEST_BALL_BOTTOM 58.0f
@@ -1922,9 +1923,7 @@ static int apply_old_playtest_camera(float player_x) {
     float camera_x, camera_y;
     float real_camera_x = 0.0f, real_camera_y = 0.0f;
     float bottom, top, screen_y;
-    float original_scale_x = 1.0f, original_scale_y = 1.0f;
-    float zoom_scale_x, zoom_scale_y;
-    float pivot_screen_x, pivot_screen_y;
+    float pivot_screen_y;
     float zoom_camera_x, zoom_camera_y;
 
     if (!g_host.old_playtest_editor_game_layer ||
@@ -1933,10 +1932,11 @@ static int apply_old_playtest_camera(float player_x) {
         return 0;
 
     /*
-       Start from the exact newera15 camera that was visually correct:
-       cube uses the old pre-newera11 horizontal camera with fixed Y;
-       ship/ball/UFO mirror the historical PlayLayer CCCamera Y.
-       Zoom is applied only AFTER this camera has been resolved.
+       Start from the known-good newera15 camera model. This camera is derived
+       only from gameplay state, never from the editor's current pan/zoom.
+
+       Cube: horizontal follow only, fixed vertical baseline.
+       Ship/ball/UFO: same X, real hidden PlayLayer CCCamera Y where available.
     */
     camera_x = OLD_PLAYTEST_CAMERA_ANCHOR_X - player_x;
     if (camera_x > 0.0f) camera_x = 0.0f;
@@ -1951,8 +1951,8 @@ static int apply_old_playtest_camera(float player_x) {
             camera_y = base_y - real_camera_y;
             g_host.old_playtest_camera_fallback_logged = 0;
         } else {
-            /* Same newera15 fallback: move only at the real mode boundaries.
-               This is the only path that reads player Y for camera logic. */
+            /* Fallback is constrained-mode only. Cube never reads player Y for
+               camera motion, so cube jumps can never drag the viewport. */
             player_y = g_host.ccnode_get_position_y(g_host.old_playtest_player);
             if (mode == OLD_PLAYTEST_MODE_BALL) {
                 bottom = OLD_PLAYTEST_BALL_BOTTOM;
@@ -1975,48 +1975,44 @@ static int apply_old_playtest_camera(float player_x) {
         }
     }
 
-    if (g_host.old_playtest_editor_camera_original_valid) {
-        original_scale_x = g_host.old_playtest_editor_camera_original_scale_x;
-        original_scale_y = g_host.old_playtest_editor_camera_original_scale_y;
-    }
-
     /*
-       TRUE zoom-out in screen space.
+       Playtest owns its own viewport. Do NOT multiply by the editor's saved
+       scale: editor zoom before/during playtest must not alter gameplay zoom.
 
-       Original: screen = S * world + T
-       Zoomed:   screen' = A + Z * (screen - A)
-
-       Therefore S' = Z*S and T' = A + Z*(T-A).
-       Z=0.90 makes every distance from fixed screen pivot A ten percent
-       smaller. That is unambiguously zoom OUT.
-
-       X pivots on the player's already-correct newera15 screen X so zoom does
-       not shove the player sideways. Y NEVER uses live cube/player Y:
-         cube          -> floor line Y=90 (jumping cannot move camera)
-         ship/ball/UFO -> gameplay-area center Y=160 (symmetric margins)
+       Z=0.90 is absolute. X zooms around the already-correct newera15 player
+       screen X (120px once the horizontal follow clamp has engaged).
+       Y zooms around a fixed floor/game-area pivot, then the CAMERA alone is
+       moved down by 25 screen points (world moves up) so grounded gameplay no
+       longer sits inside the editor object selector.
     */
-    zoom_scale_x = original_scale_x * OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE;
-    zoom_scale_y = original_scale_y * OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE;
-    pivot_screen_x = camera_x + original_scale_x * player_x;
     pivot_screen_y = (mode == OLD_PLAYTEST_MODE_CUBE)
         ? OLD_PLAYTEST_CUBE_ZOOM_PIVOT_Y
         : OLD_PLAYTEST_CONSTRAINED_ZOOM_PIVOT_Y;
-    zoom_camera_x = pivot_screen_x +
-        OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE * (camera_x - pivot_screen_x);
+    /* Preserve the exact newera15 player screen X at every point, including
+       the level start before the x=120 follow clamp engages. */
+    {
+        const float player_screen_x = camera_x + player_x;
+        zoom_camera_x = player_screen_x +
+            OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE *
+            (camera_x - player_screen_x);
+    }
     zoom_camera_y = pivot_screen_y +
-        OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE * (camera_y - pivot_screen_y);
+        OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE *
+        (camera_y - pivot_screen_y) +
+        OLD_PLAYTEST_CAMERA_VIEWPORT_LIFT_Y;
 
-    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer, zoom_scale_x);
-    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer, zoom_scale_y);
+    g_host.ccnode_set_scale_x(g_host.old_playtest_editor_game_layer,
+                              OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE);
+    g_host.ccnode_set_scale_y(g_host.old_playtest_editor_game_layer,
+                              OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE);
     g_host.ccnode_set_position(g_host.old_playtest_editor_game_layer,
                                zoom_camera_x, zoom_camera_y);
 
-    /* The proxy and breadcrumb are world-space children of this separate
-       scene-root overlay. Give that overlay the IDENTICAL camera transform.
-       Do not counter-scale the proxy: the player must zoom with the level. */
     if (g_host.old_playtest_trail) {
-        g_host.ccnode_set_scale_x(g_host.old_playtest_trail, zoom_scale_x);
-        g_host.ccnode_set_scale_y(g_host.old_playtest_trail, zoom_scale_y);
+        g_host.ccnode_set_scale_x(g_host.old_playtest_trail,
+                                  OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE);
+        g_host.ccnode_set_scale_y(g_host.old_playtest_trail,
+                                  OLD_PLAYTEST_CAMERA_ZOOM_OUT_SCALE);
         g_host.ccnode_set_position(g_host.old_playtest_trail,
                                    zoom_camera_x, zoom_camera_y);
     }

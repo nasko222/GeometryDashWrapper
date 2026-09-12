@@ -1,0 +1,37 @@
+GeometryDashWrapper 0.9.7-newera19 verification
+================================================
+
+Base: 0.9.7-newera18
+
+Camera regression fixes
+-----------------------
+- Playtest zoom is absolute 0.90x. It no longer multiplies the editor's saved/current scale.
+- Editor zoom/pan state is restored after playtest but is ignored while playtest camera is active.
+- Cube camera Y does not read PlayerObject Y. Jumping cannot move cube camera Y.
+- Cube X remains the validated pre-newera11/newera15 follow, with zoom compensation preserving its exact pre-zoom screen X at level start and after the x=120 clamp.
+- Ship/ball/UFO retain the real hidden PlayLayer CCCamera vertical restriction, with the bounded fallback only for builds lacking camera exports.
+- A +25 screen-point camera translation is applied after zoom so the world renders higher above the editor object selector. This changes camera framing only, not player/proxy world coordinates.
+- Proxy construction/layout code is unchanged from newera18.
+
+x86 UI safety retained
+----------------------
+- Editor Slider is not disabled, retained, restored, or resynchronized by old-version playtest.
+- EditorUI::updateSlider() remains absent from the stop path.
+
+Launcher defaults
+-----------------
+RUN_AUTO_BOOMLINGS.cmd:
+  SHOW_COMMAND_PROMPT=TRUE
+  OLD_VER_PLAYTEST=TRUE
+RUN_AUTO_GDPS.cmd:
+  SHOW_COMMAND_PROMPT=FALSE
+  OLD_VER_PLAYTEST=FALSE
+
+Validation performed
+--------------------
+- Modified C/C++ sources contain no NUL bytes.
+- Brace/parenthesis counts are balanced in the modified backends.
+- Static assertions verify x86 and ARM play camera use absolute 0.90 scale and do not multiply by saved editor scale.
+- Static assertions verify cube camera path does not consult player Y.
+- Full source package contains no APK/SO/EXE/DLL game/runtime binaries.
+- Transition patch is round-trip tested against clean newera18 and reconstructs newera19 byte-for-byte.

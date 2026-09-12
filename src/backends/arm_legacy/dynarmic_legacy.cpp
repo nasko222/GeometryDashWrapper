@@ -4208,6 +4208,7 @@ public:
         constexpr float kZoomOutScale = 0.90f;
         constexpr float kCubeZoomPivotY = 90.0f;
         constexpr float kConstrainedZoomPivotY = 160.0f;
+        constexpr float kViewportLiftY = 25.0f;
         constexpr float kConstrainedBottom = 70.0f;
         constexpr float kConstrainedTop = 250.0f;
         constexpr float kBallBottom = 58.0f;
@@ -4219,8 +4220,8 @@ public:
                               "CCNode::getPositionY legacy cube camera"))
             return false;
 
-        /* Exact newera15 camera first. Cube Y is fixed; constrained modes use
-           the historical PlayLayer CCCamera (or the old boundary fallback). */
+        /* Known-good newera15 gameplay camera first. It is intentionally
+           independent of LevelEditorLayer's own current zoom/pan. */
         float camera_x = kAnchorX - player_x;
         if (camera_x > 0.0f) camera_x = 0.0f;
         float camera_y = base_y;
@@ -4255,54 +4256,47 @@ public:
             }
         }
 
-        const float original_scale_x = old_playtest_editor_camera_original_valid_
-            ? old_playtest_editor_camera_original_scale_x_ : 1.0f;
-        const float original_scale_y = old_playtest_editor_camera_original_valid_
-            ? old_playtest_editor_camera_original_scale_y_ : 1.0f;
-        const float zoom_scale_x = original_scale_x * kZoomOutScale;
-        const float zoom_scale_y = original_scale_y * kZoomOutScale;
-
-        /* True screen-space zoom out:
-             screen' = A + Z * (screen - A), Z=0.90.
-           X uses the already-correct player screen X. Y is fixed at 90 for
-           cube and 160 for constrained modes, so cube jumps NEVER alter camera
-           Y. The player is not counter-scaled; it zooms with the world. */
-        const float pivot_screen_x = camera_x + original_scale_x * player_x;
+        /* Absolute play viewport: editor zoom is ignored. Z=0.90 is always
+           the same play zoom. X preserves the newera15 player screen anchor.
+           Cube Y never reads player Y. The +25 translation
+           is CAMERA framing only; PlayerObject/proxy world coordinates are not
+           modified. */
         const float pivot_screen_y = mode == 0
             ? kCubeZoomPivotY : kConstrainedZoomPivotY;
-        const float zoom_camera_x = pivot_screen_x +
-            kZoomOutScale * (camera_x - pivot_screen_x);
+        const float player_screen_x = camera_x + player_x;
+        const float zoom_camera_x = player_screen_x +
+            kZoomOutScale * (camera_x - player_screen_x);
         const float zoom_camera_y = pivot_screen_y +
-            kZoomOutScale * (camera_y - pivot_screen_y);
+            kZoomOutScale * (camera_y - pivot_screen_y) + kViewportLiftY;
 
         bool ok = true;
         ok = RunFunction(runtime_.ccnode_set_scale_x,
-                         {old_playtest_editor_game_layer_, FloatToWord(zoom_scale_x)},
-                         nullptr, "true zoom-out old playtest world X", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(kZoomOutScale)},
+                         nullptr, "set absolute old playtest zoom X", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_scale_y,
-                         {old_playtest_editor_game_layer_, FloatToWord(zoom_scale_y)},
-                         nullptr, "true zoom-out old playtest world Y", 0u,
+                         {old_playtest_editor_game_layer_, FloatToWord(kZoomOutScale)},
+                         nullptr, "set absolute old playtest zoom Y", 0u,
                          std::chrono::milliseconds(300)) && ok;
         ok = RunFunction(runtime_.ccnode_set_position_ff,
                          {old_playtest_editor_game_layer_,
                           FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
-                         nullptr, "position fixed-pivot editor camera", 0u,
+                         nullptr, "position independent playtest camera", 0u,
                          std::chrono::milliseconds(300)) && ok;
 
         if (old_playtest_trail_) {
             ok = RunFunction(runtime_.ccnode_set_scale_x,
-                             {old_playtest_trail_, FloatToWord(zoom_scale_x)},
-                             nullptr, "true zoom-out playtest overlay X", 0u,
+                             {old_playtest_trail_, FloatToWord(kZoomOutScale)},
+                             nullptr, "set absolute playtest overlay zoom X", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_scale_y,
-                             {old_playtest_trail_, FloatToWord(zoom_scale_y)},
-                             nullptr, "true zoom-out playtest overlay Y", 0u,
+                             {old_playtest_trail_, FloatToWord(kZoomOutScale)},
+                             nullptr, "set absolute playtest overlay zoom Y", 0u,
                              std::chrono::milliseconds(300)) && ok;
             ok = RunFunction(runtime_.ccnode_set_position_ff,
                              {old_playtest_trail_,
                               FloatToWord(zoom_camera_x), FloatToWord(zoom_camera_y)},
-                             nullptr, "position fixed-pivot playtest overlay", 0u,
+                             nullptr, "position independent playtest overlay", 0u,
                              std::chrono::milliseconds(300)) && ok;
         }
         return ok;

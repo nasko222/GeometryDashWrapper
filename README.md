@@ -1,6 +1,17 @@
-# Geometry Dash Wrapper 0.9.7-newera18
+# Geometry Dash Wrapper 0.9.7-newera19
 
 Geometry Dash Wrapper runs selected historical Android Geometry Dash builds as native Windows desktop programs. It does not emulate Android as a complete operating system.
+
+
+## What newera19 changes
+
+- Fixes the playtest viewport being multiplied by the editor zoom. Playtest now uses an **absolute 0.90x scale** on x86 and legacy ARM, so zooming/panning the editor before or during playtest cannot change gameplay framing. Horizontal compensation preserves the exact newera15 player screen X even before the x=120 follow clamp engages.
+- Restores the validated newera15 camera equations as the base. Cube still has horizontal-only follow; its camera Y never reads PlayerObject Y, so jumping cannot move the viewport.
+- Moves **only the playtest camera** down by 25 Cocos points after zoom (world renders higher), keeping the grounded cube and constrained modes clear of the bottom object-selector panel. Player/proxy world coordinates are unchanged.
+- Ship/ball/UFO keep the hidden PlayLayer CCCamera top/bottom restrictions from newera15. Their real mode camera is resolved first, then the fixed zoom/lift is applied.
+- Keeps the x86 horizontal-Slider safety changes: Slider is untouched during playtest suspend/restore and no forced EditorUI::updateSlider() runs on stop.
+- Launcher defaults remain: BOOMLINGS has SHOW_COMMAND_PROMPT=TRUE and OLD_VER_PLAYTEST=TRUE; GDPS keeps both FALSE.
+- Dynarmic builder revision is bumped to **131**.
 
 ## What newera18 changes
 
