@@ -20,7 +20,7 @@
 #include "zlib.h"
 #include "win_dpi.h"
 
-#define LAUNCHER_VERSION "0.9.7-newera32"
+#define LAUNCHER_VERSION "0.9.7-newera33"
 #define ARRAY_COUNT(value) (sizeof(value) / sizeof((value)[0]))
 #define MAX_UTF8_TEXT 512
 #define MAX_COMMAND_LINE 32768
@@ -705,6 +705,7 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
     wchar_t server[1024];
     wchar_t hack_icons[64];
     wchar_t full_bypass[64];
+    wchar_t object_limit[64];
     wchar_t highest[64];
     wchar_t pulse[64];
     wchar_t fps[64];
@@ -747,6 +748,8 @@ static int WriteRunInfo(const LauncherContext *context, int finished,
              GetSetting(L"HACK_ICONS", L"false", hack_icons, ARRAY_COUNT(hack_icons)));
     fwprintf(file, L"full_bypass=%ls\n",
              GetSetting(L"FULL_BYPASS", L"true", full_bypass, ARRAY_COUNT(full_bypass)));
+    fwprintf(file, L"object_limit=%ls\n",
+             GetSetting(L"OBJECT_LIMIT", L"0", object_limit, ARRAY_COUNT(object_limit)));
     fwprintf(file, L"force_highest_graphics=%ls\n",
              GetSetting(L"FORCE_HIGHEST_GRAPHICS", L"true", highest, ARRAY_COUNT(highest)));
     fwprintf(file, L"music_pulse_max=%ls\n",

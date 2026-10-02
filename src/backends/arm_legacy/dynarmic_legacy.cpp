@@ -1360,6 +1360,63 @@ static std::size_t InstallConfigurableCreatorBypass(
     return patched;
 }
 
+struct ObjectLimitPatchCounts {
+    std::size_t constants = 0u;
+    std::size_t symbols = 0u;
+    u32 configured_limit = 0u;
+    u32 native_limit = 0u;
+};
+
+static bool ObjectLimitSymbolIsCandidate(const std::string& name) {
+    if (name.find("EditorUI") != std::string::npos &&
+        (name.find("onCreate") != std::string::npos ||
+         name.find("onDuplicate") != std::string::npos ||
+         name.find("onPaste") != std::string::npos ||
+         name.find("doPasteObjects") != std::string::npos)) return true;
+    if (name.find("LevelEditorLayer") != std::string::npos &&
+        name.find("createObjectsFromString") != std::string::npos) return true;
+    return false;
+}
+
+static ObjectLimitPatchCounts InstallObjectLimitOverride(
+    ElfRuntime& runtime, ProbeEnvironment& env) {
+    ObjectLimitPatchCounts counts{};
+    counts.configured_limit = static_cast<u32>(gd_settings_object_limit());
+    counts.native_limit = static_cast<u32>(gd_settings_native_object_limit());
+    if (!counts.configured_limit || !counts.native_limit ||
+        counts.configured_limit == counts.native_limit) return counts;
+
+    const u32 native_minus_one = counts.native_limit - 1u;
+    const u32 configured_minus_one = counts.configured_limit - 1u;
+    for (const SymbolRecord& symbol : runtime.symbols) {
+        if (symbol.size < 4u || !ObjectLimitSymbolIsCandidate(symbol.name))
+            continue;
+        const u32 start = symbol.address & ~1u;
+        const u64 end64 = static_cast<u64>(start) + symbol.size;
+        const u32 end = end64 > runtime.image_max
+            ? runtime.image_max : static_cast<u32>(end64);
+        if (start < runtime.image_min || start >= runtime.image_max ||
+            end <= start || end - start < 4u) continue;
+        std::size_t local_patches = 0u;
+        u32 address = (start + 3u) & ~3u;
+        for (; address <= end - 4u; address += 4u) {
+            const u32 current = env.MemoryRead32(address);
+            u32 replacement = 0u;
+            if (current == counts.native_limit)
+                replacement = counts.configured_limit;
+            else if (current == native_minus_one)
+                replacement = configured_minus_one;
+            else
+                continue;
+            env.MemoryWrite32(address, replacement);
+            ++counts.constants;
+            ++local_patches;
+        }
+        if (local_patches) ++counts.symbols;
+    }
+    return counts;
+}
+
 struct GraphicsPatchCounts {
     std::size_t hd = 0u;
     std::size_t low_memory = 0u;
@@ -10358,6 +10415,8 @@ int main(int argc,char** argv) {
             InstallConfigurableIconUnlockHooks(runtime, env);
         const std::size_t creator_bypass_hooks =
             InstallConfigurableCreatorBypass(runtime, env);
+        const ObjectLimitPatchCounts object_limit_patches =
+            InstallObjectLimitOverride(runtime, env);
         const GraphicsPatchCounts graphics_patches =
             InstallHighestGraphicsHooks(runtime, env,
                                         effective_highest_graphics);
@@ -10405,6 +10464,12 @@ int main(int argc,char** argv) {
              " full-bypass=" +
              (gd_settings_full_bypass() ? "true" : "false") +
              " bypass-hooks=" + std::to_string(creator_bypass_hooks) +
+             " object-limit=" +
+             std::to_string(object_limit_patches.configured_limit) +
+             " native-object-limit=" +
+             std::to_string(object_limit_patches.native_limit) +
+             " object-limit-patches=" +
+             std::to_string(object_limit_patches.constants) +
              " highest-graphics-requested=" +
              (gd_settings_force_highest_graphics() ? "true" : "false") +
              " highest-graphics-effective=" +

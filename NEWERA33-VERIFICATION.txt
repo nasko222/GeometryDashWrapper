@@ -1,0 +1,42 @@
+GeometryDashWrapper 0.9.7-newera33 verification
+
+Base
+----
+Exact source baseline: 0.9.7-newera32.
+
+Feature
+-------
+- Added OBJECT_LIMIT to both RUN_AUTO scripts, default 0.
+- OBJECT_LIMIT=0 preserves the game's native editor hard limit.
+- Any positive integer requests that exact hard object limit.
+- The wrapper patches the game's own historical object-limit constants at runtime.
+- x86-native, legacy ARM Dynarmic, and ARMv7 Dynarmic use the same shared setting.
+- Native historical limits are selected from GD_GAME_VERSION: 4000, 6000,
+  8000, 10000, 12000, 15000, 20000, 30000, or 80000.
+- Later 40,000-object high-object warnings are intentionally left unchanged;
+  OBJECT_LIMIT controls the hard/max count.
+- Invalid, zero, or negative values behave as 0. Values above INT_MAX clamp to INT_MAX.
+
+Representative binary validation
+--------------------------------
+The constant scanner was checked against archived wrapper test libraries and
+found the expected hard-limit sites without global number replacement:
+- 1.0 ARM: 1 site
+- 1.02 ARM: 1 site
+- 1.11 ARM: 1 site
+- 1.3 ARM: 1 site
+- 1.6 ARM: 2 sites
+- 1.6 x86: 2 sites
+- 2.11 ARMv7: 4 sites
+- 2.11 x86: 4 sites
+- 2.2-era ARMv7 beta: 4 sites
+
+The scanner finds the native hard-limit and hard-limit-minus-one constants only
+inside known editor limit owners (create, duplicate/paste, and level-string import paths). Warning/message and
+save-metadata thresholds are intentionally left native. It does not globally replace matching numbers.
+
+Regression scope
+----------------
+- newera32 120-second nativeTouchesEnd save watchdog is retained.
+- No camera, playtest, restart-button, networking, GDPS, texture, or input
+  behavior was intentionally changed.

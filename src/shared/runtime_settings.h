@@ -12,6 +12,10 @@ int gd_setting_bool(const char *name, int default_value);
 float gd_setting_float(const char *name, float default_value, float minimum, float maximum);
 int gd_settings_hack_icons(void);
 int gd_settings_full_bypass(void);
+/* 0 preserves the game default; positive values replace the native editor hard limit. */
+int gd_settings_object_limit(void);
+/* Historical native hard limit inferred from GD_GAME_VERSION for runtime constant patching. */
+int gd_settings_native_object_limit(void);
 int gd_settings_force_highest_graphics(void);
 int gd_settings_i_lost_the_game(void);
 int gd_settings_editor_controls(void);

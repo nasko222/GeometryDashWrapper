@@ -1,4 +1,12 @@
-# GeometryDashWrapper 0.9.7-newera32
+# GeometryDashWrapper 0.9.7-newera33
+
+## newera33 configurable historical editor object limit
+
+- **`OBJECT_LIMIT=0` keeps the original game limit.** This is the default in both supplied launch scripts.
+- **Any positive `OBJECT_LIMIT` replaces the editor hard limit with that number.** The wrapper patches the game's own version-specific object-count constants at startup instead of maintaining a separate wrapper-side counter.
+- The override covers the supported historical x86, legacy ARM, and ARMv7 editor paths, including create, duplicate/paste, and level-string import checks.
+- The 40,000-object high-object warning used by later builds remains a warning; `OBJECT_LIMIT` controls the hard/max count.
+- `newera32` large-level Save / Save & Play watchdog behavior is unchanged.
 
 ## newera32 large-level Save / Save & Play watchdog fix
 
@@ -210,6 +218,7 @@ Edit the `set "NAME=value"` lines near the top of the two `RUN_AUTO_*.cmd` files
 | `GDPS_SERVER` | Script-specific | GD API host and base path. `RUN_AUTO_BOOMLINGS.cmd` uses `www.boomlings.com/database`; the GDPS script contains the private-server endpoint. |
 | `HACK_ICONS` | `false` | Enables the supported icon-unlock patches. |
 | `FULL_BYPASS` | `true` | Enables supported restriction/bypass patches for recognized builds. |
+| `OBJECT_LIMIT` | `0` | `0` keeps the game's native editor object limit. Any positive integer replaces the version-specific hard object limit with that count. |
 | `FORCE_HIGHEST_GRAPHICS` | `true` | Requests the highest packaged graphics tier. It is suppressed for the verified 1.0 legacy binary because that build crashes on the forced path. |
 | `MUSIC_PULSE_MAX` | `0.30` | Clamps the music-derived pulse level from `0.0` to `1.0`. |
 | `FPS` | `VSYNC` | `VSYNC` requests swap interval 1. A numeric value from `1` through `10000` disables VSync and uses the shared high-resolution host frame cap. Invalid values fall back to VSync. |

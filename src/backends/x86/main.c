@@ -578,6 +578,72 @@ static int patch_x86_code(void *target, const void *bytes, size_t size) {
 #endif
 }
 
+static int object_limit_export_is_candidate(const char *name) {
+    if (!name) return 0;
+    if (strstr(name, "EditorUI") != NULL &&
+        (strstr(name, "onCreate") != NULL ||
+         strstr(name, "onDuplicate") != NULL ||
+         strstr(name, "onPaste") != NULL ||
+         strstr(name, "doPasteObjects") != NULL)) return 1;
+    if (strstr(name, "LevelEditorLayer") != NULL &&
+        strstr(name, "createObjectsFromString") != NULL) return 1;
+    return 0;
+}
+
+typedef struct {
+    uint32_t native_limit;
+    uint32_t configured_limit;
+    unsigned patched_constants;
+    unsigned patched_exports;
+} ObjectLimitPatchState;
+
+static int object_limit_x86_export_visitor(const char *name, void *address,
+                                           uint32_t size, void *opaque) {
+    ObjectLimitPatchState *state = (ObjectLimitPatchState *)opaque;
+    unsigned char *bytes = (unsigned char *)address;
+    uint32_t native_limit_minus_one;
+    uint32_t configured_limit_minus_one;
+    uint32_t offset;
+    unsigned local_patches = 0;
+    if (!state || !address || size < sizeof(uint32_t) ||
+        !object_limit_export_is_candidate(name)) return 1;
+    native_limit_minus_one = state->native_limit - 1u;
+    configured_limit_minus_one = state->configured_limit - 1u;
+    for (offset = 0; offset + sizeof(uint32_t) <= size; ++offset) {
+        uint32_t current;
+        uint32_t replacement;
+        memcpy(&current, bytes + offset, sizeof(current));
+        if (current == state->native_limit)
+            replacement = state->configured_limit;
+        else if (current == native_limit_minus_one)
+            replacement = configured_limit_minus_one;
+        else
+            continue;
+        if (patch_x86_code(bytes + offset, &replacement, sizeof(replacement))) {
+            ++state->patched_constants;
+            ++local_patches;
+            runtime_log("Object limit: patched %s +0x%x %u -> %u",
+                        name, offset, current, replacement);
+            offset += sizeof(uint32_t) - 1u;
+        }
+    }
+    if (local_patches) ++state->patched_exports;
+    return 1;
+}
+
+static ObjectLimitPatchState install_x86_object_limit_override(
+    const ElfImage *image) {
+    ObjectLimitPatchState state;
+    memset(&state, 0, sizeof(state));
+    state.native_limit = (uint32_t)gd_settings_native_object_limit();
+    state.configured_limit = (uint32_t)gd_settings_object_limit();
+    if (!state.configured_limit || !state.native_limit ||
+        state.configured_limit == state.native_limit) return state;
+    if (!elf_image_visit_exports(image, object_limit_x86_export_visitor, &state))
+        runtime_log("Object limit: x86 export scan ended early");
+    return state;
+}
+
 static int patch_x86_return_true(void *target) {
     static const unsigned char code[] = {
         0xb8, 0x01, 0x00, 0x00, 0x00, /* mov eax, 1 */
@@ -781,7 +847,9 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     unsigned low_memory_patches = 0;
     unsigned texture_quality_patches = 0;
     unsigned world_creator_patches = 0;
+    ObjectLimitPatchState object_limit_patches;
     size_t index;
+    object_limit_patches = install_x86_object_limit_override(image);
     if (gd_settings_hack_icons()) {
         icon_patches = patch_x86_return_true_exports(
             image, icon_checks, sizeof(icon_checks) / sizeof(icon_checks[0]));
@@ -819,7 +887,8 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
     runtime_log("Launch settings applied: server=%s hack-icons-colors=%s patches=%u "
                 "full-bypass=%s redirects=%u online-checks=%u "
                 "highest-graphics=%s hd=%u low-memory=%u texture-quality=%u "
-                "world-creator=%u music-pulse-max=%.3f",
+                "world-creator=%u object-limit=%u native-object-limit=%u "
+                "object-limit-patches=%u object-limit-exports=%u music-pulse-max=%.3f",
                 gd_settings_server(),
                 gd_settings_hack_icons() ? "true" : "false", icon_patches,
                 gd_settings_full_bypass() ? "true" : "false", bypass_patches,
@@ -827,6 +896,10 @@ static void install_configurable_x86_hacks(const ElfImage *image) {
                 gd_settings_force_highest_graphics() ? "true" : "false",
                 high_graphics_patches, low_memory_patches,
                 texture_quality_patches, world_creator_patches,
+                object_limit_patches.configured_limit,
+                object_limit_patches.native_limit,
+                object_limit_patches.patched_constants,
+                object_limit_patches.patched_exports,
                 gd_settings_music_pulse_max());
 }
 

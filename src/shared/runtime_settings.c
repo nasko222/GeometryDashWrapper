@@ -1,6 +1,7 @@
 #include "runtime_settings.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +133,35 @@ int gd_settings_hack_icons(void) {
 
 int gd_settings_full_bypass(void) {
     return gd_setting_bool("FULL_BYPASS", 1);
+}
+
+int gd_settings_object_limit(void) {
+    const char *value = getenv("OBJECT_LIMIT");
+    char *end = NULL;
+    long parsed;
+    if (!value || !*value) return 0;
+    parsed = strtol(value, &end, 10);
+    if (end == value || !end || *end != 0 || parsed <= 0) return 0;
+    if (parsed > INT_MAX) return INT_MAX;
+    return (int)parsed;
+}
+
+int gd_settings_native_object_limit(void) {
+    const char *value = getenv("GD_GAME_VERSION");
+    char *end = NULL;
+    double version;
+    if (!value || !*value) return 0;
+    version = strtod(value, &end);
+    if (end == value || version != version || version < 1.0) return 0;
+    if (version < 1.3) return 4000;
+    if (version < 1.6) return 6000;
+    if (version < 1.7) return 8000;
+    if (version < 1.8) return 10000;
+    if (version < 1.9) return 12000;
+    if (version < 1.921) return 15000;
+    if (version < 2.0) return 20000;
+    if (version < 2.1) return 30000;
+    return 80000;
 }
 
 int gd_settings_force_highest_graphics(void) {
