@@ -1,0 +1,17 @@
+GeometryDashWrapper 0.9.7-newera31 -> 0.9.7-newera32
+ACTUAL COMPLETE REPLACEMENT FILES
+
+Extract this ZIP directly over an exact newera31 source tree and allow it to
+overwrite existing files. These are complete files, not patches or fragments.
+
+Modified:
+  README.md
+  VERSION.txt
+  build_dynarmic.ps1
+  src/shared/build_info.h
+  src/launcher/native_launcher.c
+  src/backends/arm_legacy/dynarmic_legacy.cpp
+  src/backends/armv7/dynarmic_armv7.cpp
+
+Added:
+  NEWERA32-VERIFICATION.txt

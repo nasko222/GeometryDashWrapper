@@ -1,4 +1,11 @@
-# GeometryDashWrapper 0.9.7-newera31
+# GeometryDashWrapper 0.9.7-newera32
+
+## newera32 large-level Save / Save & Play watchdog fix
+
+- **Large ARM editor saves are no longer killed at exactly 10 seconds:** old Geometry Dash performs Save / Save & Play synchronously from `nativeTouchesEnd`, and large levels can legitimately keep working beyond the old generic 10-second guest-call watchdog.
+- **`nativeTouchesEnd` now gets a 120-second hard ceiling on ARM legacy and ARMv7.** Other touch/input callbacks retain the existing 10-second guard, so this does not remove hang protection globally.
+- **Slow-save diagnostics:** any `nativeTouchesEnd` taking at least one second now logs import deltas for that callback plus guest-heap status. This makes the next player log useful for finding the actual serialization/allocator bottleneck instead of showing only cumulative import totals.
+- **x86-native is unchanged.** No camera, old-version playtest, restart-button, networking, Delete-key, input-recovery, or GDPS behavior was intentionally changed.
 
 ## newera31 natural four-button pause layout
 

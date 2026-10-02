@@ -4354,8 +4354,37 @@ public:
         std::ostringstream details;
         details << std::fixed << std::setprecision(2) << "x=" << x << " y=" << y;
         LogHostDispatch(label, function, details.str());
-        return RunFunction(function, {kEnvObject, 0u, 0u, FloatToWord(x), FloatToWord(y)},
-                           nullptr, label, 0u, std::chrono::milliseconds(10000));
+
+        /* Save / Save & Play runs synchronously from nativeTouchesEnd in old
+           Geometry Dash. A large editor level can legitimately exceed the old
+           blanket 10 s wall guard while continuing to make guest progress. */
+        const bool touch_end = label == "nativeTouchesEnd";
+        const auto wall_budget = touch_end
+            ? std::chrono::milliseconds(120000)
+            : std::chrono::milliseconds(10000);
+        std::vector<u64> imports_before;
+        if (touch_end) imports_before = CaptureImportCounts();
+        const auto started = std::chrono::steady_clock::now();
+
+        const bool ok = RunFunction(
+            function, {kEnvObject, 0u, 0u, FloatToWord(x), FloatToWord(y)},
+            nullptr, label, 0u, wall_budget);
+
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        if (touch_end && elapsed >= std::chrono::milliseconds(1000)) {
+            const std::vector<u64> imports_after = CaptureImportCounts();
+            log_ << "Dynarmic slow nativeTouchesEnd: elapsed_ms="
+                 << std::fixed << std::setprecision(1)
+                 << std::chrono::duration<double, std::milli>(elapsed).count()
+                 << " status=" << (ok ? "ok" : "failed")
+                 << " top_import_deltas={"
+                 << DescribeTopImportDeltas(imports_before, imports_after, 16u, false)
+                 << "}\n";
+            log_.flush();
+            LogHeapStatus(ok ? "after-slow-nativeTouchesEnd"
+                             : "failed-slow-nativeTouchesEnd");
+        }
+        return ok;
     }
 
     bool SendTouchMove(u32 function, float x, float y) {
